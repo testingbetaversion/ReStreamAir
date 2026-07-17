@@ -51,8 +51,9 @@ jobs:
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
       - name: Stamp version
         run: |
+          COMMIT=$(echo "$GITHUB_SHA" | cut -c1-7)
           sed -i "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
-          sed -i "s/static let commit = \"unknown\"/static let commit = \"${GITHUB_SHA:0:7}\"/" Version.swift
+          sed -i "s/static let commit = \"unknown\"/static let commit = \"$COMMIT\"/" Version.swift
       - run: swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux
       - run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-linux.tar.gz restreamair-linux
       - uses: actions/upload-artifact@v4
