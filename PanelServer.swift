@@ -639,6 +639,7 @@ final class PanelServer {
         }
         listener?.start(queue: .global(qos: .userInitiated))
         startMetricsTimer()
+        DispatchQueue.global(qos: .utility).async { [weak self] in self?.checkForUpdate() }
         dispatchMain()
     }
 
@@ -656,6 +657,8 @@ final class PanelServer {
             self.pumpAllDirectStreams()
             if tick % 2 == 0 { self.superviseWorkers() }
             if tick % 10 == 0 { self.persistMetrics() }
+            // Re-check for a newer release every ~6 hours.
+            if tick % 21600 == 0 { DispatchQueue.global(qos: .utility).async { self.checkForUpdate() } }
         }
         timer.resume()
         sseTimer = timer
@@ -692,6 +695,68 @@ final class PanelServer {
             state.systemPeaks.maxMemoryBytes = max(state.systemPeaks.maxMemoryBytes, mem)
             try? writeState(state)
         }
+    }
+
+    private let updateInfoLock = NSLock()
+    private var updateInfoCache: [String: Any] = [:]
+
+    /// The build/version block shown in the UI (Server tab + an "update
+    /// available" banner). Merges the compiled-in identity with the latest
+    /// cached result of the GitHub release check.
+    func versionView() -> [String: Any] {
+        updateInfoLock.lock(); let cache = updateInfoCache; updateInfoLock.unlock()
+        var view: [String: Any] = [
+            "version": AppVersion.version,
+            "commit": AppVersion.commit,
+            "isRelease": AppVersion.isReleaseBuild,
+        ]
+        for (key, value) in cache { view[key] = value }
+        return view
+    }
+
+    /// Best-effort: ask GitHub for the repo's latest release tag and compare it
+    /// to this binary's version. The repo is private, so the API needs a token
+    /// — read from GITHUB_TOKEN / GH_TOKEN in the environment. Without one the
+    /// check degrades to a clear "needs a token" note rather than failing hard.
+    func checkForUpdate() {
+        let env = ProcessInfo.processInfo.environment
+        let token = (env["GITHUB_TOKEN"] ?? env["GH_TOKEN"] ?? "").trimmingCharacters(in: .whitespaces)
+        var headers: [(String, String)] = [("Accept", "application/vnd.github+json"), ("User-Agent", "ReStreamAir")]
+        if !token.isEmpty { headers.append(("Authorization", "Bearer \(token)")) }
+        var result: [String: Any] = ["checkedAt": ISO8601DateFormatter().string(from: Date())]
+        defer { updateInfoLock.lock(); updateInfoCache = result; updateInfoLock.unlock() }
+
+        guard let url = URL(string: "https://api.github.com/repos/\(AppVersion.repoOwner)/\(AppVersion.repoName)/releases/latest") else { return }
+        do {
+            let data = try HTTPClient(options: HTTPRequestOptions(timeout: 15, headers: headers)).get(url)
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = object["tag_name"] as? String else {
+                result["error"] = "no releases published yet"
+                return
+            }
+            let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            result["latest"] = latest
+            result["updateAvailable"] = AppVersion.isReleaseBuild && Self.isNewerVersion(latest, than: AppVersion.version)
+        } catch {
+            result["error"] = token.isEmpty
+                ? "update check needs a GitHub token (private repo) — set GITHUB_TOKEN"
+                : "\(error)"
+        }
+    }
+
+    /// Numeric dotted-version comparison (1.10.0 > 1.9.0). Non-numeric suffixes
+    /// are ignored.
+    static func isNewerVersion(_ candidate: String, than current: String) -> Bool {
+        func parts(_ s: String) -> [Int] {
+            s.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
+        }
+        let a = parts(candidate), b = parts(current)
+        for index in 0..<max(a.count, b.count) {
+            let x = index < a.count ? a[index] : 0
+            let y = index < b.count ? b[index] : 0
+            if x != y { return x > y }
+        }
+        return false
     }
 
     func handleEvents(_ connection: NWConnection, request: HTTPRequest) {
@@ -2289,7 +2354,8 @@ final class PanelServer {
             "apiKeys": state.apiKeys.map(keyView),
             "system": systemStats.snapshotView(peaks: state.systemPeaks),
             "bandwidth": metrics.globalBandwidthView(),
-            "settings": ["port": state.settings.port]
+            "settings": ["port": state.settings.port],
+            "version": versionView()
         ]
     }
 
