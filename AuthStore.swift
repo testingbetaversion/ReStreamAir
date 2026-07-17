@@ -35,28 +35,24 @@ final class AuthStore {
     private let cookieName = "restreamair_session"
 
     static func hashPassword(_ password: String) throws -> (hash: String, salt: String) {
-        #if canImport(CommonCrypto)
         var saltBytes = [UInt8](repeating: 0, count: 16)
         fillRandomBytes(&saltBytes)
         let salt = Data(saltBytes)
         let hash = try pbkdf2(password: password, salt: salt)
         return (hash.base64EncodedString(), salt.base64EncodedString())
-        #else
-        throw AuthError.unsupportedPlatform("Admin accounts require CommonCrypto and are only supported on Apple platforms.")
-        #endif
     }
 
     static func verifyPassword(_ password: String, hash: String, salt: String) -> Bool {
-        #if canImport(CommonCrypto)
         guard let saltData = Data(base64Encoded: salt), let computed = try? pbkdf2(password: password, salt: saltData) else { return false }
         return computed.base64EncodedString() == hash
-        #else
-        return false
-        #endif
     }
 
-    #if canImport(CommonCrypto)
+    /// PBKDF2-HMAC-SHA256, 100k iterations, 32-byte key. CommonCrypto on macOS,
+    /// the pure-Swift implementation everywhere else (Linux) — both produce the
+    /// same digest, verified against each other, so an account created on one
+    /// platform still logs in on the other.
     private static func pbkdf2(password: String, salt: Data) throws -> Data {
+        #if canImport(CommonCrypto)
         var derived = [UInt8](repeating: 0, count: 32)
         let passwordBytes = Array(password.utf8)
         let status = salt.withUnsafeBytes { saltPtr -> Int32 in
@@ -69,8 +65,10 @@ final class AuthStore {
         }
         guard status == kCCSuccess else { throw AuthError.unsupportedPlatform("PBKDF2 derivation failed (status \(status)).") }
         return Data(derived)
+        #else
+        return Data(PureCrypto.pbkdf2SHA256(password: Array(password.utf8), salt: Array(salt), iterations: 100_000, keyLength: 32))
+        #endif
     }
-    #endif
 
     func createSession(username: String, remember: Bool) -> String {
         let token = UUID().uuidString + UUID().uuidString

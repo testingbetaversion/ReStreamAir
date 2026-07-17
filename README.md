@@ -30,7 +30,7 @@ Under the hood `./run` compiles the sources to a cached binary in `.build/` and 
 `./run` just wraps this. The explicit one-shot build is a single `swiftc` invocation — no Package.swift/Xcode project:
 
 ```sh
-swiftc HTTPClient.swift Version.swift DashSegments.swift M3U8Rewriter.swift FFmpegLocator.swift FFmpegResident.swift LiveMPDToM3U8.swift PanelServer.swift CENCDecryptor.swift HLSDecryptor.swift MetricsStore.swift SystemStats.swift LogoLookup.swift AuthStore.swift LogStore.swift AudioDelay.swift ScriptRunner.swift -o restreamair
+swiftc HTTPClient.swift Version.swift Crypto.swift Net.swift DashSegments.swift M3U8Rewriter.swift FFmpegLocator.swift FFmpegResident.swift LiveMPDToM3U8.swift PanelServer.swift CENCDecryptor.swift HLSDecryptor.swift MetricsStore.swift SystemStats.swift LogoLookup.swift AuthStore.swift LogStore.swift AudioDelay.swift ScriptRunner.swift -o restreamair
 ./restreamair
 ```
 

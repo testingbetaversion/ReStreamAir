@@ -1,5 +1,9 @@
 import Foundation
+#if canImport(Network)
 import Network
+#else
+import Glibc
+#endif
 
 struct PanelState: Codable {
     var providers: [Provider] = []
@@ -488,7 +492,7 @@ enum HeaderCategory {
 /// concatenated fragmented-MP4 stream, not literal MPEG-TS; most players
 /// that accept a raw stream URL (ffplay/mpv/VLC) handle that natively.
 final class DirectStreamConnection {
-    let connection: NWConnection
+    let connection: ClientConnection
     let streamId: String
     let repId: String
     let identity: String
@@ -497,7 +501,7 @@ final class DirectStreamConnection {
     var sentInit = false
     var lastSentSegmentNumber: Int?
 
-    init(connection: NWConnection, streamId: String, repId: String, identity: String, clientIP: String, userAgent: String) {
+    init(connection: ClientConnection, streamId: String, repId: String, identity: String, clientIP: String, userAgent: String) {
         self.connection = connection
         self.streamId = streamId
         self.repId = repId
@@ -519,7 +523,9 @@ final class PanelServer {
     let runtimeDir: URL
     let stateFile: URL
     let selfBinary: URL
+    #if canImport(Network)
     var listener: NWListener?
+    #endif
     var jobs: [String: [RestreamJob]] = [:]
     private var lastRestartAttempt: [String: Date] = [:]
     private var restartFailureStreak: [String: Int] = [:]
@@ -542,7 +548,7 @@ final class PanelServer {
     let systemStats = SystemStats()
     let authStore = AuthStore()
     let logStore: LogStore
-    var sseConnections: [ObjectIdentifier: NWConnection] = [:]
+    var sseConnections: [ObjectIdentifier: ClientConnection] = [:]
     var directStreamConnections: [ObjectIdentifier: DirectStreamConnection] = [:]
     var sseTimer: DispatchSourceTimer?
 
@@ -606,6 +612,11 @@ final class PanelServer {
             if !portPinned { port = initial.settings.port }
             if !bindAddressPinned { bindAddress = initial.settings.bindAddress }
         }
+        let boundPort = port
+        let boundAddress = bindAddress
+        let portInUseMessage = "error: Port \(boundPort) is already in use — another instance of restreamair (or something else) is already listening there.\nStop it first (e.g. `lsof -ti:\(boundPort) | xargs kill`), or run with --port <n> to use a different port.\n"
+
+        #if canImport(Network)
         let params = NWParameters.tcp
         if !bindAddress.isEmpty {
             // requiredLocalEndpoint already carries the port; passing a
@@ -616,8 +627,6 @@ final class PanelServer {
         } else {
             listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         }
-        let boundPort = port
-        let boundAddress = bindAddress
         listener?.stateUpdateHandler = { state in
             switch state {
             case .ready:
@@ -625,7 +634,7 @@ final class PanelServer {
                 print("ReStreamAir Swift panel running at http://\(host):\(boundPort)")
             case .failed(let error):
                 if case .posix(let code) = error, code == .EADDRINUSE {
-                    fputs("error: Port \(boundPort) is already in use — another instance of restreamair (or something else) is already listening there.\nStop it first (e.g. `lsof -ti:\(boundPort) | xargs kill`), or run with --port <n> to use a different port.\n", stderr)
+                    fputs(portInUseMessage, stderr)
                 } else {
                     fputs("error: Listener failed: \(error)\n", stderr)
                 }
@@ -635,9 +644,25 @@ final class PanelServer {
             }
         }
         listener?.newConnectionHandler = { [weak self] connection in
-            self?.handle(connection)
+            self?.handle(ClientConnection(connection))
         }
         listener?.start(queue: .global(qos: .userInitiated))
+        #else
+        do {
+            try POSIXServer.listen(bindAddress: bindAddress, port: port) { [weak self] connection in
+                self?.handle(connection)
+            }
+            let host = boundAddress.isEmpty ? "127.0.0.1" : boundAddress
+            print("ReStreamAir Swift panel running at http://\(host):\(boundPort)")
+        } catch let error as POSIXServer.BindError {
+            if error.errnoValue == EADDRINUSE {
+                fputs(portInUseMessage, stderr)
+            } else {
+                fputs("error: Could not bind port \(boundPort): \(String(cString: strerror(error.errnoValue)))\n", stderr)
+            }
+            exit(1)
+        }
+        #endif
         startMetricsTimer()
         DispatchQueue.global(qos: .utility).async { [weak self] in self?.checkForUpdate() }
         dispatchMain()
@@ -678,10 +703,9 @@ final class PanelServer {
               let json = String(data: data, encoding: .utf8) else { return }
         let frame = "data: \(json)\n\n".data(using: .utf8)!
         for connection in connections {
-            guard connection.state == .ready else { continue }
-            connection.send(content: frame, completion: .contentProcessed { [weak self] error in
+            connection.send(frame) { [weak self] error in
                 if error != nil { self?.removeSSEConnection(connection) }
-            })
+            }
         }
     }
 
@@ -759,7 +783,7 @@ final class PanelServer {
         return false
     }
 
-    func handleEvents(_ connection: NWConnection, request: HTTPRequest) {
+    func handleEvents(_ connection: ClientConnection, request: HTTPRequest) {
         let headerText = [
             "HTTP/1.1 200 OK",
             "Content-Type: text/event-stream; charset=utf-8",
@@ -769,15 +793,8 @@ final class PanelServer {
             "", ""
         ].joined(separator: "\r\n")
         let key = ObjectIdentifier(connection)
-        connection.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .cancelled, .failed:
-                self?.removeSSEConnection(connection)
-            default:
-                break
-            }
-        }
-        connection.send(content: headerText.data(using: .utf8), completion: .contentProcessed { [weak self] error in
+        connection.onClose = { [weak self] in self?.removeSSEConnection(connection) }
+        connection.send(headerText.data(using: .utf8)) { [weak self] error in
             guard let self else { return }
             if error != nil {
                 self.removeSSEConnection(connection)
@@ -786,10 +803,10 @@ final class PanelServer {
             self.lock.lock()
             self.sseConnections[key] = connection
             self.lock.unlock()
-        })
+        }
     }
 
-    func removeSSEConnection(_ connection: NWConnection) {
+    func removeSSEConnection(_ connection: ClientConnection) {
         lock.lock()
         sseConnections.removeValue(forKey: ObjectIdentifier(connection))
         lock.unlock()
@@ -798,7 +815,7 @@ final class PanelServer {
 
     // MARK: - Direct stream (no m3u8, one persistent link)
 
-    func handleDirectStream(_ connection: NWConnection, request: HTTPRequest, identity: String, clientIP: String, userAgent: String) throws {
+    func handleDirectStream(_ connection: ClientConnection, request: HTTPRequest, identity: String, clientIP: String, userAgent: String) throws {
         guard let match = match(request.path, #"^/direct/([^/]+)(?:/([^/]+))?$"#) else {
             throw PanelError.notFound("Not found.")
         }
@@ -820,15 +837,8 @@ final class PanelServer {
         ].joined(separator: "\r\n")
         let key = ObjectIdentifier(connection)
         let directConnection = DirectStreamConnection(connection: connection, streamId: streamId, repId: repId, identity: identity, clientIP: clientIP, userAgent: userAgent)
-        connection.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .cancelled, .failed:
-                self?.removeDirectStreamConnection(connection)
-            default:
-                break
-            }
-        }
-        connection.send(content: headerText.data(using: .utf8), completion: .contentProcessed { [weak self] error in
+        connection.onClose = { [weak self] in self?.removeDirectStreamConnection(connection) }
+        connection.send(headerText.data(using: .utf8)) { [weak self] error in
             guard let self else { return }
             if error != nil {
                 self.removeDirectStreamConnection(connection)
@@ -838,7 +848,7 @@ final class PanelServer {
             self.directStreamConnections[key] = directConnection
             self.lock.unlock()
             self.pumpDirectStream(directConnection)
-        })
+        }
     }
 
     /// One-shot MPEG-TS download: remuxes whatever's currently buffered on
@@ -915,7 +925,7 @@ final class PanelServer {
         return lines.joined(separator: "\n") + "\n"
     }
 
-    func removeDirectStreamConnection(_ connection: NWConnection) {
+    func removeDirectStreamConnection(_ connection: ClientConnection) {
         lock.lock()
         directStreamConnections.removeValue(forKey: ObjectIdentifier(connection))
         lock.unlock()
@@ -969,9 +979,9 @@ final class PanelServer {
         }
         guard !payload.isEmpty else { return }
         metrics.recordRequest(streamId: directConnection.streamId, identity: directConnection.identity, bytes: payload.count, clientIP: directConnection.clientIP, userAgent: directConnection.userAgent)
-        directConnection.connection.send(content: payload, completion: .contentProcessed { [weak self] error in
+        directConnection.connection.send(payload) { [weak self] error in
             if error != nil { self?.removeDirectStreamConnection(directConnection.connection) }
-        })
+        }
     }
 
     func pumpAllDirectStreams() {
@@ -981,9 +991,9 @@ final class PanelServer {
         for directConnection in connections { pumpDirectStream(directConnection) }
     }
 
-    func handle(_ connection: NWConnection) {
-        connection.start(queue: .global(qos: .userInitiated))
-        let remoteAddress = remoteAddressString(for: connection)
+    func handle(_ connection: ClientConnection) {
+        connection.start()
+        let remoteAddress = connection.remoteAddress
         readRequest(connection) { [weak self] rawRequest in
             guard let self else { return }
             var request = rawRequest
@@ -999,7 +1009,7 @@ final class PanelServer {
                     try self.handleDirectStream(connection, request: request, identity: identity, clientIP: remoteAddress, userAgent: userAgent)
                 } catch {
                     let response = self.jsonResponse(status: 401, ["error": "\(error)"])
-                    connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
+                    connection.send(response) { _ in connection.cancel() }
                 }
                 return
             }
@@ -1012,36 +1022,24 @@ final class PanelServer {
                 if let identity {
                     self.metrics.recordRequest(streamId: self.extractStreamId(request.path), identity: identity, bytes: response.count, clientIP: remoteAddress, userAgent: userAgent)
                 }
-                connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
+                connection.send(response) { _ in connection.cancel() }
             } catch PanelError.notFound(let message) {
                 self.recordPlaybackError(request, remoteAddress: remoteAddress)
                 let response = self.jsonResponse(status: 404, ["error": message])
-                connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
+                connection.send(response) { _ in connection.cancel() }
             } catch PanelError.badRequest(let message) {
                 self.recordPlaybackError(request, remoteAddress: remoteAddress)
                 let response = self.jsonResponse(status: 400, ["error": message])
-                connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
+                connection.send(response) { _ in connection.cancel() }
             } catch PanelError.unauthorized(let message) {
                 let response = self.jsonResponse(status: 401, ["error": message])
-                connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
+                connection.send(response) { _ in connection.cancel() }
             } catch {
                 self.recordPlaybackError(request, remoteAddress: remoteAddress)
                 let response = self.jsonResponse(status: 500, ["error": "\(error)"])
-                connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
+                connection.send(response) { _ in connection.cancel() }
             }
         }
-    }
-
-    func remoteAddressString(for connection: NWConnection) -> String {
-        if case let .hostPort(host, _) = connection.endpoint {
-            switch host {
-            case .ipv4(let address): return "\(address)"
-            case .ipv6(let address): return "\(address)"
-            case .name(let name, _): return name
-            @unknown default: return "unknown"
-            }
-        }
-        return "unknown"
     }
 
     func isPlaybackPath(_ path: String) -> Bool {
@@ -1093,10 +1091,10 @@ final class PanelServer {
         throw PanelError.unauthorized("Sign in required.")
     }
 
-    func readRequest(_ connection: NWConnection, completion: @escaping (HTTPRequest) -> Void) {
+    func readRequest(_ connection: ClientConnection, completion: @escaping (HTTPRequest) -> Void) {
         var buffer = Data()
         func receive() {
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, complete, error in
+            connection.receive { data, complete, error in
                 if let data { buffer.append(data) }
                 if error != nil || complete { connection.cancel(); return }
                 if let request = self.parseRequest(buffer) {
