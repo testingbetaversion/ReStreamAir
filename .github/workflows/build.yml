@@ -1,0 +1,36 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      # Same source list the ./run script and README use: every .swift file
+      # except the optional macOS menu-bar companion (its own @main / AppKit).
+      - name: Build restreamair
+        run: swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair
+
+      - name: Build restreamair-menubar
+        run: swiftc HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKit
+
+      - name: Smoke test
+        run: ./restreamair dash --help
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: restreamair-macos
+          path: |
+            restreamair
+            restreamair-menubar
+          if-no-files-found: error

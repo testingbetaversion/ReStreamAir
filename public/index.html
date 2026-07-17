@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ReStreamAir Panel</title>
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/icons/icon-192.png">
+    <link rel="apple-touch-icon" href="/icons/icon-192.png">
+    <meta name="theme-color" content="#150a0a">
+  </head>
+  <body>
+    <div class="bg-blobs" aria-hidden="true"><span></span><span></span><span></span></div>
+    <video id="pipVideo" playsinline muted style="display:none"></video>
+    <div id="authScreen" class="auth-screen hidden">
+      <form id="authForm" class="auth-card">
+        <div class="brand-id">
+          <div class="mark"><span data-icon="broadcast"></span></div>
+          <div>
+            <h1>ReStreamAir</h1>
+            <p id="authSubtitle">Sign in</p>
+          </div>
+        </div>
+        <label>Username<input name="username" autocomplete="username" required></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required minlength="8"></label>
+        <label class="check"><input name="remember" type="checkbox" checked> Remember me</label>
+        <button type="submit" id="authSubmit">Sign in</button>
+        <p id="authError" class="auth-error hidden"></p>
+      </form>
+    </div>
+
+    <div id="app" class="app hidden">
+      <header class="appbar">
+        <div class="brand-id">
+          <div class="mark"><span data-icon="broadcast"></span></div>
+          <div>
+            <h1>ReStreamAir</h1>
+          </div>
+        </div>
+        <nav class="view-nav">
+          <button type="button" class="nav-btn" data-view="providers"><span data-icon="providers"></span>Providers</button>
+          <button type="button" class="nav-btn" data-view="grid"><span data-icon="grid"></span>All Streams</button>
+          <button type="button" class="nav-btn active" data-view="monitor"><span data-icon="monitor"></span>Server</button>
+          <button type="button" class="nav-btn" data-view="logs"><span data-icon="logs"></span>Logs</button>
+          <button type="button" class="nav-btn" data-view="keys"><span data-icon="keys"></span>API Keys</button>
+          <button type="button" class="nav-btn" data-view="settings"><span data-icon="settings"></span>Settings</button>
+        </nav>
+        <div class="actions">
+          <span id="whoami" class="field-hint"></span>
+          <button id="themeToggle" class="theme-toggle" type="button" title="Toggle light/dark theme"><span data-icon="sun"></span></button>
+          <button id="signOutBtn" class="ghost"><span data-icon="logout"></span>Sign out</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="page-head">
+          <h2 id="viewTitle">Server information</h2>
+          <p id="viewMeta">Live bandwidth, active clients, and server usage.</p>
+        </section>
+
+        <section id="providersView" class="hidden">
+          <div class="provider-bar">
+            <input id="providerSearch" class="quick-search" placeholder="Search providers…">
+            <a id="exportAllPlaylistBtn" href="/api/playlist.m3u8" download class="ghost" title="M3U playlist of every stream across every provider — add this URL to VLC/Kodi/an IPTV player, or download it"><span data-icon="download"></span>Export playlist (all)</a>
+            <button id="importProviderBtn" type="button" class="ghost"><span data-icon="download"></span>Import provider</button>
+            <input id="importProviderFile" type="file" accept=".json" class="hidden">
+            <button id="newProviderBtn" type="button" class="ghost"><span data-icon="plus"></span>New provider</button>
+          </div>
+
+          <div id="providerChips" class="provider-grid empty-state">No providers yet.</div>
+
+          <dialog id="newProviderDialog" class="stream-editor-dialog">
+            <div class="dialog-head">
+              <h3>New provider</h3>
+              <button id="closeNewProviderBtn" type="button" class="icon-btn ghost" title="Close"><span data-icon="close"></span></button>
+            </div>
+            <form id="providerForm" class="stream-form">
+              <label>Name<input name="name" placeholder="Provider name" required></label>
+              <div class="form-row">
+                <label>Logo URL<span class="field-hint">Blank = auto-detect from name on save</span><input name="logo" placeholder="Blank = auto-detect from name"></label>
+                <div class="actions"><button type="button" class="ghost find-logo-btn" title="Look up a logo for the current name"><span data-icon="search"></span>Find logo</button></div>
+              </div>
+              <div class="actions">
+                <button type="submit"><span data-icon="check"></span>Add provider</button>
+              </div>
+            </form>
+          </dialog>
+
+        </section>
+
+        <!-- Lives outside every view <section> on purpose: view sections are
+             toggled with display:none, and a nested <dialog> stays part of
+             that hidden layout box even after showModal() promotes it to the
+             top layer — it "opens" (open="") but renders as a 0×0 box and,
+             because native dialogs make the rest of the document inert while
+             open, the whole page becomes unclickable with nothing visible to
+             close. Opened cross-view (All Streams grid's settings shortcut,
+             not just the Providers tab), so it can't live inside providersView. -->
+        <dialog id="providerSettingsDialog" class="stream-editor-dialog">
+          <div class="dialog-head">
+            <h3>Provider settings</h3>
+            <button id="closeProviderSettingsBtn" type="button" class="icon-btn ghost" title="Close"><span data-icon="close"></span></button>
+          </div>
+          <form id="providerSettingsForm" class="stream-form">
+            <label>Name<input name="name" placeholder="Provider name" required></label>
+            <label>Proxy<span class="field-hint">Default for every stream under this provider</span><input name="proxy" placeholder="http://127.0.0.1:8888"></label>
+            <label>Generic headers<span class="field-hint">Applied to all requests for all streams, one "Name: value" per line</span><textarea name="headers" placeholder="Authorization: Bearer TOKEN"></textarea></label>
+            <label class="check"><input name="inheritUrlParams" type="checkbox"> Append each stream's own Source URL query params to its segments</label>
+            <label id="segmentUrlParamsField">Segment URL params<span class="field-hint">Fixed fallback appended to every media/init segment URL when the option above is off, e.g. token=abc&amp;region=us</span><input name="segmentUrlParams" placeholder="token=abc&region=us"></label>
+
+            <div class="field-group">
+              <div class="field-group-title">Script provider <span class="field-hint">optional — a script handles login/session/manifest/keys instead of a fixed URL</span></div>
+              <label>Script path<span class="field-hint">Absolute, or relative to wherever restreamair is running (e.g. scripts/provider.py) — a .py/.sh/executable script</span><input name="scriptPath" placeholder="/path/to/provider.py"></label>
+              <div class="form-row">
+                <label>Bind<span class="field-hint">Passed through as bind=</span><input name="scriptBind" placeholder="optional"></label>
+                <label>DoH URL<span class="field-hint">Passed through as doh=</span><input name="scriptDoh" placeholder="optional"></label>
+                <label>Worker<span class="field-hint">Passed through as worker=</span><input name="scriptWorker" placeholder="optional"></label>
+              </div>
+
+              <div class="field-group-title">Accounts<span class="field-hint">Sent as user=/password= — leave Password blank if your script only needs a username, or leave both blank for a credential-less pairing flow</span></div>
+              <label>Account selection<span class="field-hint">Which account Login/Pair/Load channels/Load events uses each time</span>
+                <select name="accountSelectionMode">
+                  <option value="fixed">Active account (radio button below)</option>
+                  <option value="rotate">Rotate — a different account each call, in turn</option>
+                  <option value="random">Random — a random account each call</option>
+                </select>
+              </label>
+              <div id="scriptAccountsList" class="script-accounts-list"></div>
+              <div class="script-account-add-row">
+                <input id="newScriptAccountUsername" placeholder="Username, e.g. family@example.com">
+                <input id="newScriptAccountPassword" type="password" placeholder="Password">
+                <button type="button" class="ghost" id="addScriptAccountBtn"><span data-icon="plus"></span>Add account</button>
+              </div>
+
+              <div class="actions">
+                <button type="button" class="ghost" id="scriptLoginBtn"><span data-icon="play"></span>Login</button>
+                <button type="button" class="ghost" id="scriptPairBtn"><span data-icon="play"></span>Pair</button>
+                <button type="button" class="ghost" id="scriptLoadChannelsBtn"><span data-icon="refresh"></span>Load channels</button>
+                <button type="button" class="ghost" id="scriptLoadEventsBtn"><span data-icon="refresh"></span>Load events</button>
+                <button type="button" class="ghost" id="toggleScriptOutputBtn"><span data-icon="logs"></span>Show terminal</button>
+              </div>
+              <pre id="scriptOutputBox" class="script-output hidden"></pre>
+            </div>
+
+            <div class="actions">
+              <button type="submit">Save provider settings</button>
+              <button id="deleteProviderBtn" type="button" class="danger"><span data-icon="trash"></span>Delete provider</button>
+            </div>
+          </form>
+        </dialog>
+
+        <dialog id="streamEditorDialog" class="stream-editor-dialog">
+          <div class="dialog-head">
+            <h3 id="streamEditorTitle">Stream</h3>
+            <button id="closeStreamEditorBtn" type="button" class="icon-btn ghost" title="Close"><span data-icon="close"></span></button>
+          </div>
+          <div class="tabs">
+            <button class="tab active" data-tab="editor">Config</button>
+            <button class="tab" data-tab="player">Player</button>
+          </div>
+
+          <form id="streamForm" class="stream-form">
+            <input type="hidden" name="id">
+            <input type="hidden" name="kind" value="mpd">
+            <label>Name<input name="name" placeholder="Sports HD" required></label>
+            <label>Source URL<input name="url" placeholder="https://example.com/index.mpd — type auto-detects" required></label>
+            <div id="detectStatus" class="field-hint"></div>
+            <label>CDN mirrors<span class="field-hint">Optional fallback source URLs, one per line — same content on other CDNs. If the primary manifest fails, the stream fails over to these in order.</span><textarea name="cdnUrls" rows="2" placeholder="https://cdn2.example.com/index.mpd&#10;https://cdn3.example.com/index.mpd"></textarea></label>
+            <div id="representationPicker" class="representation-picker hidden"></div>
+            <div class="form-row">
+              <label>Logo URL<span class="field-hint">Blank = auto-detect from name on save</span><input name="logo" placeholder="Blank = auto-detect from name"></label>
+              <div class="actions"><button type="button" class="ghost find-logo-btn" title="Look up a logo for the current name"><span data-icon="search"></span>Find logo</button></div>
+            </div>
+
+            <div class="field-group" data-kind-group="mpd">
+              <div class="field-group-title">DASH options</div>
+              <div class="form-row">
+                <label>Representation<span class="field-hint">Used when no qualities are picked above</span><input name="representation" placeholder="2"></label>
+                <label>Period<input name="period" placeholder="0 or period id"></label>
+              </div>
+              <div class="form-row">
+                <label>Playlist count<span class="field-hint">At least 3 — fewer makes the live edge unstable for most players</span><input name="playlistSegments" type="number" min="3" value="6"></label>
+                <label>Keep count<input name="keepSegments" type="number" min="1" value="10"></label>
+                <label>Download ahead<input name="downloadAhead" type="number" min="1" value="8"></label>
+              </div>
+              <div class="form-row">
+                <label>Poll seconds<input name="pollInterval" type="number" min="0.25" step="0.25" value="2"></label>
+                <label>Audio delay (ms)<span class="field-hint">Lip-sync offset, can be negative. Applied to the audio track only.</span><input name="audioDelayMs" type="number" step="10" value="0"></label>
+              </div>
+              <label class="check"><input name="forceOffline" type="checkbox"> Allow offline/static MPD</label>
+              <button type="button" id="showDecryptionKeysBtn" class="ghost hidden">Add decryption keys</button>
+              <div id="decryptionKeysGroup" class="key-field-group hidden">
+                <label>CENC decryption keys<span class="field-hint">One KID:KEY hex pair per line. When protection is auto-detected, KIDs are pre-filled with zeroed placeholder keys — replace the zeros with the real key. Works on any CENC "cenc" (AES-CTR) stream — including ones labeled Widevine/PlayReady — as long as you already know the raw key; this doesn't acquire keys from a license server. macOS only.</span><textarea name="decryptionKeys" placeholder="1234567890abcdef1234567890abcdef:abcdef1234567890abcdef1234567890"></textarea></label>
+              </div>
+            </div>
+
+            <div class="field-group" data-kind-group="m3u8">
+              <div class="field-group-title">HLS options</div>
+              <label>HLS key headers<span class="field-hint">AES-128 key fetch</span><textarea name="hlsKeyHeaders" placeholder="Name: value"></textarea></label>
+              <div class="form-row">
+                <label>HLS key (hex)<span class="field-hint">AES-128 decryption</span><input name="hlsKey" placeholder="32 hex characters"></label>
+                <label>HLS IV (hex)<span class="field-hint">optional — defaults to sequence number</span><input name="hlsIV" placeholder="32 hex characters"></label>
+              </div>
+            </div>
+
+            <label>Manifest headers<span class="field-hint">Manifest/playlist fetch (MPD or M3U8)</span><textarea name="manifestHeaders" placeholder="Name: value"></textarea></label>
+            <label>Media headers<span class="field-hint">Segment/init fetch</span><textarea name="mediaHeaders" placeholder="Name: value"></textarea></label>
+            <label>Network override<span class="field-hint">Blank = inherit provider proxy</span><input name="proxy" placeholder="http://127.0.0.1:8888"></label>
+
+            <div class="field-group">
+              <div class="field-group-title">Input/output pipeline<span class="field-hint">Internal remuxer needs no ffmpeg. FFmpeg modes spawn a resident ffmpeg that reads the source directly (decrypting CENC clearkey itself) and copy-remuxes to HLS, or pushes to SRT/UDP/TCP via the Output target.</span></div>
+              <div class="form-row">
+                <label>Input
+                  <select name="inputMode">
+                    <option value="internal">Internal remuxer (no ffmpeg)</option>
+                    <option value="ffmpegResident" data-needs-ffmpeg>FFmpeg resident</option>
+                    <option value="ffmpegTsHls" data-needs-ffmpeg>FFmpeg TS HLS/Direct</option>
+                    <option value="ffmpegMultiTsHls" data-needs-ffmpeg>FFmpeg MultiTS HLS</option>
+                    <option value="ffmpegFmp4Hls" data-needs-ffmpeg>FMP4 HLS</option>
+                  </select>
+                </label>
+                <label>Output
+                  <select name="outputMode">
+                    <option value="hls">HLS/Direct</option>
+                    <option value="srtServer" data-needs-ffmpeg>SRT Server</option>
+                    <option value="udpSrt" data-needs-ffmpeg>UDP/SRT</option>
+                    <option value="custom" data-needs-ffmpeg>Custom</option>
+                  </select>
+                </label>
+              </div>
+              <label id="outputTargetField" class="hidden">Output target<span class="field-hint" id="outputTargetHint"></span><input name="outputTarget"></label>
+              <div id="ffmpegNotice" class="field-hint hidden"></div>
+              <div id="ffmpegInstallRow" class="actions hidden">
+                <button type="button" class="ghost" id="ffmpegInstallBtn"><span data-icon="download"></span>Install ffmpeg</button>
+              </div>
+              <pre id="ffmpegInstallOutput" class="script-output hidden"></pre>
+            </div>
+
+            <div class="actions">
+              <button type="submit"><span data-icon="check"></span>Save Stream</button>
+              <button id="toggleRunBtn" type="button" class="success"><span data-icon="play"></span>Start</button>
+              <button id="deleteStreamBtn" type="button" class="icon-btn ghost" title="Delete stream"><span data-icon="trash"></span></button>
+            </div>
+          </form>
+
+          <div id="playerPanel" class="player-panel hidden">
+            <video id="video" controls playsinline></video>
+            <div id="playerTrackControls" class="form-row hidden">
+              <label id="qualitySelectField">Quality<select id="qualitySelect"></select></label>
+              <label id="audioTrackSelectField">Audio<select id="audioTrackSelect"></select></label>
+            </div>
+            <div class="link-row">
+              <input id="playLink" readonly placeholder="Start a stream to get a play link">
+              <button id="copyBtn" class="ghost"><span data-icon="copy"></span>Copy</button>
+            </div>
+            <div class="link-row link-row-list">
+              <div id="directLink" class="link-list empty-state">Start a stream to get a direct link</div>
+              <button id="copyDirectBtn" class="ghost" title="Copy all direct links"><span data-icon="copy"></span>Copy</button>
+            </div>
+            <pre id="statusBox"></pre>
+          </div>
+        </dialog>
+
+        <section id="streamsGridView" class="hidden">
+          <div class="monitor-panel full-width">
+            <div class="panel-head">
+              <h3>All streams</h3>
+              <div class="actions">
+                <select id="streamsGridProviderFilter"><option value="">All providers</option></select>
+                <select id="streamsGridTypeFilter">
+                  <option value="">All types</option>
+                  <option value="channel">Channels</option>
+                  <option value="event">Events</option>
+                  <option value="manual">Manually added</option>
+                </select>
+                <input id="streamsGridSearch" class="quick-search" placeholder="Search streams…">
+                <button id="gridNewStreamBtn" type="button"><span data-icon="plus"></span>New Stream</button>
+                <button id="gridImportChannelsBtn" type="button" class="ghost hidden"><span data-icon="refresh"></span>Import channels</button>
+                <button id="gridImportEventsBtn" type="button" class="ghost hidden"><span data-icon="refresh"></span>Import events</button>
+                <button id="gridProviderSettingsBtn" type="button" class="ghost mini-icon-btn hidden" title="Provider settings"><span data-icon="settings"></span></button>
+                <span id="streamsGridCount" class="field-hint"></span>
+              </div>
+            </div>
+            <div id="streamsGridImportStatus" class="field-hint hidden"></div>
+            <div id="streamsGrid" class="stream-grid empty-state">No streams yet.</div>
+          </div>
+        </section>
+
+        <section id="monitorView">
+          <div class="monitor-panel full-width">
+            <div class="panel-head">
+              <h3>Live monitoring</h3>
+              <span id="monitorStatus" class="field-hint">Connecting…</span>
+            </div>
+            <div class="monitor-body">
+              <div id="headlineTiles" class="tile-grid"></div>
+              <h3>Server</h3>
+              <div id="serverTiles" class="tile-grid"></div>
+              <h3>Per-stream</h3>
+              <div id="streamTiles" class="tile-grid empty-state">No streams yet.</div>
+              <div class="connections-head">
+                <h3>Active connections</h3>
+                <input id="connectionsSearch" class="quick-search" placeholder="Search connections…">
+              </div>
+              <div class="connections-table-wrap">
+                <table class="connections-table">
+                  <thead>
+                    <tr>
+                      <th>Stream</th><th>Provider</th><th>Type</th><th>User</th><th>Client IP</th>
+                      <th>User Agent</th><th>UID</th><th>Uptime</th><th>Errors</th><th>Bandwidth</th>
+                    </tr>
+                  </thead>
+                  <tbody id="connectionsTableBody"></tbody>
+                </table>
+                <div id="connectionsEmpty" class="empty-state">No active connections.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="logsView" class="hidden">
+          <div class="monitor-panel full-width">
+            <div class="panel-head">
+              <h3>Logs</h3>
+              <div class="actions">
+                <select id="logStreamFilter"><option value="">All streams</option></select>
+                <select id="logLevelFilter"><option value="">All levels</option><option value="error">Errors only</option></select>
+                <div class="log-mode-toggle">
+                  <button type="button" class="log-mode-btn active" data-mode="normal">Normal</button>
+                  <button type="button" class="log-mode-btn" data-mode="verbose">Verbose</button>
+                </div>
+                <button id="refreshLogsBtn" class="ghost" type="button"><span data-icon="refresh"></span>Refresh</button>
+              </div>
+            </div>
+            <div id="logList" class="log-list empty-state">No log entries yet — start a stream to see fetch/download activity here.</div>
+          </div>
+        </section>
+
+        <section id="keysView" class="hidden">
+          <div class="keys-panel full-width">
+            <div class="panel-head">
+              <h3>API keys</h3>
+              <span class="field-hint">Gate playback (/play, /proxy, /restream) only. Admin panel uses its own sign-in.</span>
+            </div>
+            <div class="keys-body">
+              <form id="keyForm" class="actions">
+                <input name="label" placeholder="Label (e.g. Living room TV)">
+                <button type="submit"><span data-icon="plus"></span>Generate key</button>
+              </form>
+              <div id="keyList" class="key-list empty-state">No keys yet — playback is open to anyone on the network.</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="settingsView" class="hidden">
+          <div class="keys-panel full-width">
+            <div class="panel-head"><h3>Server settings</h3></div>
+            <div class="keys-body">
+              <form id="portForm" class="form-row">
+                <label>Panel port<span class="field-hint">Takes effect after restart</span><input name="port" type="number" min="1" max="65535"></label>
+                <label>Bind address<span class="field-hint">Blank = all interfaces. Use 127.0.0.1 to only accept local connections.</span><input name="bindAddress" placeholder="0.0.0.0"></label>
+                <div class="actions"><button type="submit">Save</button></div>
+              </form>
+              <h3>Admin users</h3>
+              <form id="userForm" class="form-row">
+                <label>Username<input name="username" required></label>
+                <label>Password<input name="password" type="password" minlength="8" required></label>
+                <div class="actions"><button type="submit"><span data-icon="plus"></span>Add admin</button></div>
+              </form>
+              <div id="userList" class="key-list empty-state">Loading…</div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="/hls.min.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

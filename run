@@ -1,0 +1,53 @@
+#!/bin/sh
+# run — launch ReStreamAir straight from source with one command.
+#
+# You never call swiftc by hand or manage a binary: just `./run`, optionally
+# with the same arguments restreamair itself takes, e.g.
+#
+#     ./run                          # same as ./run serve (the web panel)
+#     ./run serve --port 9000
+#     ./run serve --bind 127.0.0.1
+#     ./run serve --admin-username admin --admin-password "a-new-password"
+#
+# Swift is a compiled language, so under the hood this compiles the sources to
+# a cached binary in .build/ — but only when a source file has actually changed
+# since the last run, so repeat launches are instant and there is no separate
+# build step to remember. A real compiled binary (rather than the `swift`
+# interpreter) is required because the panel re-execs itself to spawn its
+# live/dash worker processes; under the interpreter argv[0] is a .swift file,
+# which is not something that can be run.
+
+set -e
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="$DIR/.build"
+BIN="$BUILD_DIR/restreamair"
+
+# Same file list as the README's build line — keep them in sync.
+SOURCES="HTTPClient.swift DashSegments.swift M3U8Rewriter.swift FFmpegLocator.swift FFmpegResident.swift LiveMPDToM3U8.swift PanelServer.swift CENCDecryptor.swift HLSDecryptor.swift MetricsStore.swift SystemStats.swift LogoLookup.swift AuthStore.swift LogStore.swift AudioDelay.swift ScriptRunner.swift"
+
+# Rebuild only when the binary is missing or any source is newer than it, so an
+# unchanged tree launches with zero compile overhead.
+needs_build=0
+if [ ! -x "$BIN" ]; then
+    needs_build=1
+else
+    for src in $SOURCES; do
+        if [ "$DIR/$src" -nt "$BIN" ]; then
+            needs_build=1
+            break
+        fi
+    done
+fi
+
+if [ "$needs_build" -eq 1 ]; then
+    echo "run: compiling ReStreamAir from source (first run or sources changed)…" >&2
+    mkdir -p "$BUILD_DIR"
+    ( cd "$DIR" && swiftc $SOURCES -o "$BIN" )
+fi
+
+# exec so signals (Ctrl-C) and the process identity pass straight through, and
+# so the panel's own selfBinary (argv[0]) points at this real executable for
+# spawning its live/dash workers. cwd stays wherever ./run was invoked, so
+# state.json / public / runtime resolve exactly as they do for a plain binary.
+exec "$BIN" "$@"
