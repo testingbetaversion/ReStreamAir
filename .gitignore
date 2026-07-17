@@ -1,0 +1,18 @@
+# Runtime state / caches (may contain admin users, API keys, decryption keys)
+state.json
+logo-cache.json
+logs/
+runtime/
+
+# Provider script credentials — live session tokens, never commit
+scripts/*_user.json
+
+# Build products
+.build/
+*.dSYM/
+restreamair
+restreamair-menubar
+
+# macOS
+.DS_Store
+**/.DS_Store

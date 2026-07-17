@@ -1,0 +1,1392 @@
+:root {
+  color-scheme: dark;
+  --bg: #0c0707;
+  --panel: rgba(32, 19, 19, 0.66);
+  --panel-solid: #1f1212;
+  --line: rgba(239, 68, 68, 0.16);
+  --line-strong: rgba(239, 68, 68, 0.32);
+  --text: #f8eeee;
+  --muted: #ab9494;
+  --accent: #ff5a5a;
+  --accent-2: #dc2626;
+  --accent-grad: linear-gradient(135deg, #ff9d4d, #ff4d6d, #b83dff);
+  --accent-tint: rgba(255, 90, 90, 0.16);
+  --success: #34e0ac;
+  --success-grad: linear-gradient(135deg, #5af0c0, #0fa876);
+  --danger: #ff7a8a;
+  --danger-grad: linear-gradient(135deg, #ff8fa0, #e5395a);
+  --ok: #34e0ac;
+  --shadow: 0 1px 1px rgba(0, 0, 0, 0.3), 0 14px 34px -14px rgba(127, 29, 29, 0.55);
+  --shadow-lift: 0 6px 18px rgba(0, 0, 0, 0.4), 0 26px 60px -18px rgba(185, 28, 28, 0.55);
+  --glow-accent: 0 0 0 1px rgba(239, 68, 68, 0.12), 0 0 32px -4px rgba(248, 113, 113, 0.35);
+  --active-accent: #ff7aa8;
+  --active-tint: rgba(239, 68, 68, 0.22);
+  --focus-tint: rgba(255, 90, 90, 0.22);
+  --field-bg: rgba(255, 255, 255, 0.035);
+  --field-border-hover: #6b3a3a;
+  --ghost-bg: rgba(239, 68, 68, 0.08);
+  --ghost-hover: rgba(239, 68, 68, 0.15);
+  --badge-bg: rgba(255, 255, 255, 0.06);
+  --badge-text: #d4c2c2;
+  --badge-running-bg: rgba(52, 224, 172, 0.14);
+  --badge-running-text: #5cf0c2;
+  --video-bg: #000000;
+  --pre-bg: rgba(0, 0, 0, 0.28);
+  --skeleton-base: rgba(239, 68, 68, 0.08);
+  --skeleton-shine: rgba(239, 68, 68, 0.22);
+  --tile-bg: rgba(255, 255, 255, 0.035);
+  --radius-lg: 20px;
+  --radius-md: 14px;
+  --radius-sm: 10px;
+  --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+  --blob-1: #ff4d6d;
+  --blob-2: #fb923c;
+  --blob-3: #a855f7;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #faf4f4;
+  --panel: rgba(255, 255, 255, 0.78);
+  --panel-solid: #ffffff;
+  --line: #f5dcdc;
+  --line-strong: #f0c0c0;
+  --text: #241717;
+  --muted: #7a6363;
+  --accent: #dc2626;
+  --accent-2: #b91c1c;
+  --accent-grad: linear-gradient(135deg, #fb923c, #ef4444, #9333ea);
+  --accent-tint: rgba(220, 38, 38, 0.1);
+  --success: #0fa876;
+  --success-grad: linear-gradient(135deg, #22c08f, #0f9873);
+  --danger: #e5395a;
+  --danger-grad: linear-gradient(135deg, #f3696d, #d93b41);
+  --ok: #0fa876;
+  --shadow: 0 1px 2px rgba(36, 23, 23, 0.04), 0 12px 28px -8px rgba(127, 29, 29, 0.14);
+  --shadow-lift: 0 4px 10px rgba(36, 23, 23, 0.06), 0 20px 40px -12px rgba(127, 29, 29, 0.2);
+  --glow-accent: 0 0 0 1px rgba(220, 38, 38, 0.1), 0 0 26px -6px rgba(220, 38, 38, 0.25);
+  --active-accent: #e0356e;
+  --active-tint: rgba(255, 90, 90, 0.2);
+  --focus-tint: rgba(220, 38, 38, 0.16);
+  --field-bg: #ffffff;
+  --field-border-hover: #f0c0c0;
+  --ghost-bg: #fbecec;
+  --ghost-hover: #f7dede;
+  --badge-bg: #fbecec;
+  --badge-text: #7a3d3d;
+  --badge-running-bg: #dcf7ee;
+  --badge-running-text: #067a58;
+  --video-bg: #08080d;
+  --pre-bg: #fbf1f1;
+  --skeleton-base: #f5dcdc;
+  --skeleton-shine: #fdf3f3;
+  --tile-bg: #ffffff;
+  --blob-1: #ffa3b8;
+  --blob-2: #fbc39d;
+  --blob-3: #d3a3f5;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Inter var", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  letter-spacing: -0.01em;
+  overflow-x: hidden;
+}
+
+.bg-blobs {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.bg-blobs span {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(90px);
+  opacity: 0.38;
+  will-change: transform;
+}
+
+.bg-blobs span:nth-child(1) {
+  width: 620px; height: 620px; top: -220px; left: -160px;
+  background: var(--blob-1);
+  animation: driftA 26s ease-in-out infinite;
+}
+.bg-blobs span:nth-child(2) {
+  width: 520px; height: 520px; top: 10%; right: -180px;
+  background: var(--blob-2);
+  opacity: 0.28;
+  animation: driftB 32s ease-in-out infinite;
+}
+.bg-blobs span:nth-child(3) {
+  width: 460px; height: 460px; bottom: -200px; left: 30%;
+  background: var(--blob-3);
+  opacity: 0.2;
+  animation: driftC 30s ease-in-out infinite;
+}
+
+@keyframes driftA {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(60px, 40px) scale(1.08); }
+}
+@keyframes driftB {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(-50px, 30px) scale(1.1); }
+}
+@keyframes driftC {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(30px, -40px) scale(1.06); }
+}
+
+.icon {
+  width: 1em;
+  height: 1em;
+  display: inline-block;
+  vertical-align: -0.15em;
+  flex: 0 0 auto;
+}
+
+button, input, textarea, select {
+  font: inherit;
+  letter-spacing: -0.005em;
+}
+
+button, input, textarea, select, .stream-card, .provider-grid-card, .tab, .nav-btn, .rep-row, .stat-tile {
+  transition: background-color 0.16s var(--ease), border-color 0.16s var(--ease), color 0.16s var(--ease),
+    box-shadow 0.18s var(--ease), transform 0.16s var(--ease), filter 0.16s var(--ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, .skeleton, .bg-blobs span { transition: none !important; animation: none !important; }
+}
+
+button {
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--accent-grad);
+  color: #fff;
+  padding: 9px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  box-shadow: 0 2px 10px -2px rgba(185, 28, 28, 0.55);
+}
+
+button:hover { filter: brightness(1.08); transform: translateY(-1px); box-shadow: 0 6px 18px -4px rgba(248, 113, 113, 0.6); }
+button:active { transform: translateY(0); filter: brightness(0.97); }
+button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; filter: none; box-shadow: none; }
+
+.ghost {
+  background: var(--ghost-bg);
+  color: var(--text);
+  box-shadow: none;
+  border: 1px solid var(--line);
+}
+.ghost:hover { background: var(--ghost-hover); border-color: var(--line-strong); box-shadow: none; }
+
+/* <a class="ghost" download> (the .ts download link) needs the button base
+   rules too — the bare `button {}` selector above only targets <button>. */
+a.ghost {
+  border-radius: var(--radius-sm);
+  padding: 9px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-decoration: none;
+}
+
+.success { background: var(--success-grad); box-shadow: 0 2px 10px -2px rgba(15, 168, 118, 0.55); }
+.danger { background: var(--danger-grad); box-shadow: 0 2px 10px -2px rgba(229, 57, 90, 0.5); }
+
+/* Compact square icon-only button — secondary/destructive actions (Delete)
+   that shouldn't visually compete with the primary action row. */
+.icon-btn {
+  margin-left: auto;
+  padding: 9px;
+  color: var(--muted);
+}
+.icon-btn:hover { color: var(--danger); }
+.icon-btn .icon { width: 15px; height: 15px; }
+
+/* Same compact square shape as .icon-btn but without the auto-margin, for
+   inline icon-only actions (e.g. quick-play) that shouldn't get shoved to
+   the far edge of the row. */
+.mini-icon-btn {
+  padding: 9px;
+  color: var(--muted);
+}
+.mini-icon-btn:hover { color: var(--active-accent); }
+.mini-icon-btn .icon { width: 15px; height: 15px; }
+
+.app {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px;
+  animation: appIn 0.5s var(--ease);
+}
+
+@keyframes appIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* Single horizontal app bar: brand + nav + actions, all in one row */
+
+.appbar {
+  position: sticky;
+  top: 18px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 10px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lift);
+  backdrop-filter: blur(20px);
+}
+
+.brand-id {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+
+.mark {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  background: var(--accent-grad);
+  color: #fff;
+  font-weight: 800;
+  box-shadow: 0 4px 18px -2px rgba(248, 113, 113, 0.65);
+  flex: 0 0 auto;
+}
+
+.mark .icon { width: 19px; height: 19px; }
+
+.brand-id h1, .page-head h2, .page-head p, h3 {
+  margin: 0;
+}
+
+.brand-id h1 {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  background: linear-gradient(135deg, #fff, #ffc2c2);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  white-space: nowrap;
+}
+
+.theme-toggle {
+  background: var(--ghost-bg);
+  border: 1px solid var(--line);
+  color: var(--text);
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  padding: 0;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  box-shadow: none;
+}
+.theme-toggle:hover { background: var(--ghost-hover); transform: none; }
+
+input, textarea, select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 9px 12px;
+  background: var(--field-bg);
+  color: var(--text);
+  min-width: 0;
+}
+
+input:hover, textarea:hover, select:hover { border-color: var(--field-border-hover); }
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus-tint);
+}
+
+textarea {
+  min-height: 76px;
+  resize: vertical;
+}
+
+.field-hint {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+.view-nav {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  flex: 1;
+  min-width: 0;
+}
+
+.nav-btn {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid transparent;
+  text-align: left;
+  box-shadow: none;
+  padding: 8px 14px;
+  border-radius: 999px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  position: relative;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.nav-btn:hover { background: var(--ghost-bg); color: var(--text); transform: none; }
+
+.nav-btn.active {
+  background: var(--accent-grad);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: 0 3px 14px -4px rgba(248, 113, 113, 0.7);
+}
+
+.nav-btn .icon { color: var(--active-accent); }
+.nav-btn.active .icon { color: #fff; }
+
+.workspace {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.page-head {
+  padding: 2px 4px 0;
+  animation: viewIn 0.35s var(--ease);
+}
+
+.page-head h2 {
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.page-head p {
+  color: var(--muted);
+  margin-top: 3px;
+  font-size: 13px;
+}
+
+/* Provider picker: search + New provider up top, provider cards below */
+
+.provider-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.quick-search {
+  width: auto;
+  min-width: 160px;
+  max-width: 240px;
+  flex: 0 0 auto;
+}
+
+/* Small round logo badge — used by stream cards, falling back to the first
+   letter of the name when no logo is set. */
+.provider-logo {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  object-fit: cover;
+  background: var(--accent-tint);
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.provider-logo img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* Provider tab is a picker only — one card per provider (big logo, name,
+   settings/delete tucked in the corner). Clicking the card body (not a
+   button) jumps to that provider's streams in the All Streams tab. */
+.provider-grid {
+  padding: 16px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.provider-grid-card {
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 22px 16px 16px;
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.02);
+  cursor: pointer;
+}
+.provider-grid-card:hover { border-color: var(--field-border-hover); box-shadow: var(--shadow-lift); transform: translateY(-1px); }
+
+.provider-card-corner {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+}
+
+.provider-logo-lg {
+  width: 64px;
+  height: 64px;
+  border-radius: 999px;
+  object-fit: cover;
+  background: var(--accent-tint);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  font-size: 24px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.provider-logo-lg img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.provider-card-name { font-weight: 700; font-size: 15px; }
+.provider-card-meta { color: var(--muted); font-size: 12px; }
+
+@keyframes viewIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* Stream editor dialog — native <dialog>, opened via showModal() for both
+   New Stream and editing an existing one. No split view, no extra window. */
+
+.stream-editor-dialog {
+  width: min(640px, calc(100vw - 40px));
+  max-height: min(860px, calc(100vh - 40px));
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  background: var(--panel-solid);
+  color: var(--text);
+  box-shadow: var(--shadow-lift), var(--glow-accent);
+  animation: dialogIn 0.22s var(--ease);
+  overflow-y: auto;
+}
+
+.stream-editor-dialog::backdrop {
+  background: rgba(4, 2, 10, 0.6);
+  backdrop-filter: blur(3px);
+  animation: viewIn 0.2s var(--ease);
+}
+
+@keyframes dialogIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+.dialog-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-solid);
+}
+
+.dialog-head h3 { font-size: 15px; font-weight: 700; }
+.dialog-head .icon-btn { margin-left: 0; }
+
+/* All-streams grid */
+
+.stream-grid {
+  padding: 16px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.stream-grid-card {
+  /* Grid items default to min-width:auto, so a long unbreakable Source URL in
+     .stream-url refuses to shrink — the card blows past its track and its
+     right-edge buttons (Delete) spill onto the neighbouring card. Pin both the
+     card and its children to min-width:0 so the ellipsis actually clips. */
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  cursor: pointer;
+}
+.stream-grid-card:hover { border-color: var(--field-border-hover); box-shadow: var(--shadow-lift); transform: translateY(-1px); }
+.stream-grid-card > * { min-width: 0; }
+
+/* The grid card's action row carries six controls (copy, big-player, PiP,
+   logs, start/stop, delete). Let it wrap on a narrow card rather than
+   overflow the card edge, and don't force Delete to the far right with an
+   auto-margin (that's what made it wrap onto a line by itself before) — a
+   plain trailing button wraps cleanly with the rest. */
+.stream-grid-card .actions { flex-wrap: wrap; }
+.stream-grid-card .actions .icon-btn { margin-left: 0; }
+
+/* A centered hero avatar at the top of each stream card — bigger and centred
+   rather than a small afterthought tucked beside the name. */
+.stream-logo-hero {
+  display: grid;
+  place-items: center;
+  margin: 2px 0;
+}
+.stream-grid-card .provider-logo {
+  width: 56px;
+  height: 56px;
+  font-size: 22px;
+}
+/* Name row no longer carries the logo, so centre the name + status badge
+   under the hero avatar. */
+.stream-grid-card .stream-title { justify-content: center; }
+.stream-grid-card .stream-title-name { flex: 0 1 auto; }
+
+.stream-grid-card .provider-tag {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.source-type-tag {
+  color: var(--accent);
+}
+
+.streams-panel, .monitor-panel, .keys-panel {
+  background: var(--tile-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  min-width: 0;
+}
+
+.panel-head {
+  min-height: 54px;
+  padding: 13px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.panel-head h3 { font-size: 14px; font-weight: 700; }
+
+.stream-list {
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.stream-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.stream-card:hover { border-color: var(--field-border-hover); box-shadow: var(--shadow-lift); transform: translateY(-1px); }
+
+.stream-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus-tint), var(--glow-accent);
+}
+
+.stream-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.stream-title-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.stream-title-name strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stream-url {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stream-stats {
+  display: flex;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  align-items: center;
+}
+
+.stream-stats span { display: inline-flex; align-items: center; gap: 4px; }
+.stream-stats .mini-icon-btn { margin-left: auto; padding: 4px; }
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: var(--badge-bg);
+  color: var(--badge-text);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.badge.running {
+  background: var(--badge-running-bg);
+  color: var(--badge-running-text);
+}
+
+.badge.running::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  margin-right: 6px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 25%, transparent);
+  animation: pulseDot 1.8s ease-in-out infinite;
+}
+
+@keyframes pulseDot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 10px;
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+.tab {
+  background: transparent;
+  color: var(--muted);
+  box-shadow: none;
+  font-weight: 600;
+}
+.tab:hover { background: var(--ghost-bg); color: var(--text); transform: none; }
+
+.tab.active {
+  background: var(--accent-tint);
+  color: var(--active-accent);
+}
+
+.stream-form, .player-panel, .monitor-body, .keys-body {
+  padding: 16px;
+  display: grid;
+  gap: 14px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  min-width: 0;
+}
+
+.form-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.form-row:has(label:nth-child(3)) {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+/* A bare .actions sitting next to a label in a .form-row has no title/hint
+   text of its own, so grid's default top-alignment leaves its button
+   floating above the label's input instead of level with it. */
+.form-row > .actions {
+  align-self: end;
+}
+
+.check {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.check input {
+  width: auto;
+}
+
+.actions, .link-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.link-row input {
+  flex: 1;
+  min-width: 160px;
+}
+
+/* Direct link / Download link are real clickable <a> elements, one per
+   representation, instead of a read-only text field you have to select and
+   copy out of — a stream with more than one quality/track gets one link per
+   line, each independently clickable/copyable via the browser's own
+   right-click "copy link" instead of a bespoke copy button per row. */
+.link-row-list {
+  align-items: stretch;
+}
+
+.link-list {
+  flex: 1;
+  min-width: 160px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--field-bg);
+  font-size: 13px;
+}
+
+.link-list.empty-state {
+  color: var(--muted);
+  justify-content: center;
+}
+
+.link-list-row {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.link-list a {
+  color: var(--text);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.link-list a:hover {
+  color: var(--active-accent);
+  text-decoration: underline;
+}
+
+.link-list-label {
+  color: var(--muted);
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+
+.field-group {
+  display: grid;
+  gap: 14px;
+  padding: 12px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-md);
+}
+
+.field-group-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.key-field-group {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 90, 90, 0.08);
+  border: 1px solid var(--line-strong);
+  animation: viewIn 0.3s var(--ease);
+}
+
+video {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: var(--video-bg);
+  border-radius: var(--radius-md);
+}
+
+pre {
+  margin: 0;
+  min-height: 90px;
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--pre-bg);
+  color: var(--text);
+  white-space: pre-wrap;
+  font-size: 12px;
+}
+
+.empty-state {
+  color: var(--muted);
+  padding: 22px 18px;
+  font-size: 13px;
+  text-align: center;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.full-width {
+  grid-column: 1 / -1;
+}
+
+/* Monitoring / stat tiles */
+
+.tile-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.stat-tile {
+  background: var(--tile-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  display: grid;
+  gap: 4px;
+}
+
+.stat-tile:hover { box-shadow: var(--glow-accent); transform: translateY(-1px); border-color: var(--line-strong); }
+
+.stat-tile .stat-label {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.stat-tile .stat-value {
+  font-size: 21px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  background: linear-gradient(135deg, var(--text), var(--active-accent));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.stat-tile .stat-sub {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* Script provider: accounts list + add row + live output */
+
+.script-accounts-list {
+  display: grid;
+  gap: 8px;
+}
+
+.script-account-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.script-account-row .account-username,
+.script-account-row .account-password {
+  flex: 1 1 110px;
+  min-width: 0;
+}
+
+.script-account-row.account-disabled {
+  opacity: 0.5;
+}
+
+.script-account-add-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.script-account-add-row input {
+  flex: 1;
+  min-width: 140px;
+}
+
+.script-output {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+}
+
+/* API keys */
+
+.key-list {
+  display: grid;
+  gap: 8px;
+}
+
+.key-row {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.key-row .key-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.key-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: var(--pre-bg);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  word-break: break-all;
+}
+
+.key-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Skeleton loading */
+
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--skeleton-base);
+  border-radius: var(--radius-sm);
+  color: transparent !important;
+}
+
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, var(--skeleton-shine), transparent);
+  animation: skeleton-shine 1.3s ease-in-out infinite;
+}
+
+@keyframes skeleton-shine {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* Auth screen */
+
+.auth-screen {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+
+.auth-card {
+  width: min(380px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  box-shadow: var(--shadow-lift), var(--glow-accent);
+  backdrop-filter: blur(24px);
+  padding: 32px;
+  display: grid;
+  gap: 16px;
+  animation: authIn 0.5s var(--ease);
+}
+
+@keyframes authIn {
+  from { opacity: 0; transform: translateY(14px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+.auth-card .brand-id {
+  margin-bottom: 8px;
+}
+
+.auth-card label { color: var(--text); }
+
+.auth-error {
+  color: var(--danger);
+  font-size: 13px;
+  margin: 0;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+}
+
+/* Representation picker (probe results) */
+
+.representation-picker {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+  max-height: 240px;
+  overflow: auto;
+  background: var(--pre-bg);
+  animation: viewIn 0.3s var(--ease);
+}
+
+.representation-picker .rep-group-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 700;
+  margin-top: 4px;
+}
+
+.representation-picker .rep-group-label:first-child { margin-top: 0; }
+
+.mini-select-all {
+  padding: 2px 8px;
+  font-size: 10.5px;
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 600;
+  border-radius: 999px;
+}
+
+.rep-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.rep-row:hover { background: var(--ghost-bg); }
+
+.rep-row input {
+  width: auto;
+  accent-color: var(--accent);
+}
+
+.kid-hint {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--muted);
+  margin-left: auto;
+}
+
+.manual-rep-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.manual-rep-row input, .manual-rep-row select {
+  padding: 7px 9px;
+  font-size: 12.5px;
+}
+
+/* Monitoring: active connections table */
+
+.connections-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.connections-table-wrap {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  overflow: auto;
+  max-height: 50vh;
+}
+
+.connections-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.connections-table th {
+  position: sticky;
+  top: 0;
+  text-align: left;
+  padding: 9px 12px;
+  background: var(--panel-solid);
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--line);
+}
+
+.connections-table td {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+}
+
+.connections-table tr:last-child td { border-bottom: 0; }
+.connections-table tr:hover td { background: var(--ghost-bg); }
+
+.connections-table .ua-cell {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.connections-table .errors-cell {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+/* Logs */
+
+.log-list {
+  padding: 10px 16px 16px;
+  display: grid;
+  gap: 2px;
+  max-height: 65vh;
+  overflow: auto;
+}
+
+.log-row {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 12px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.log-row:hover { background: var(--ghost-bg); }
+
+.log-row .log-time {
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-row .log-event {
+  font-weight: 700;
+}
+
+.log-row.log-error .log-event {
+  color: var(--danger);
+}
+
+.log-row .log-detail {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Grouped script output (login/pair/channels/events stdout) — wraps and
+   preserves line breaks instead of the single-line ellipsis every other
+   row uses, since this is freeform text (often a traceback), not a
+   key/value event summary. */
+.log-row-script {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: start;
+  font-size: 12px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.log-detail-script {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--pre-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+/* Normal / Verbose toggle */
+
+.log-mode-toggle {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.log-mode-btn {
+  background: transparent;
+  color: var(--muted);
+  box-shadow: none;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.log-mode-btn:hover { background: var(--ghost-bg); color: var(--text); transform: none; }
+.log-mode-btn.active { background: var(--accent-grad); color: #fff; }
+
+/* Verbose log rows: full raw JSON instead of the one-line summary */
+
+.log-row-verbose {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+  align-items: start;
+}
+
+.log-row-verbose .log-time,
+.log-row-verbose .log-event {
+  display: inline;
+  margin-right: 8px;
+}
+
+.log-detail-verbose {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  background: var(--pre-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+}
+
+@media (max-width: 720px) {
+  .appbar {
+    flex-wrap: wrap;
+  }
+
+  .view-nav {
+    order: 3;
+    flex: 1 1 100%;
+  }
+}
+
+@media (max-width: 620px) {
+  .app {
+    padding: 10px;
+    gap: 10px;
+  }
+
+  .form-row, .form-row:has(label:nth-child(3)) {
+    grid-template-columns: 1fr;
+  }
+
+  .actions, .link-row {
+    flex-wrap: wrap;
+  }
+}
