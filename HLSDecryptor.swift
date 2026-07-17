@@ -52,7 +52,23 @@ enum HLSDecryptor {
         }
         return Data(outBuffer.prefix(outMoved))
         #else
-        throw HLSDecryptError.unsupportedPlatform("HLS AES-128 decryption requires CommonCrypto and is only supported on Apple platforms.")
+        // Linux: pure-Swift AES-128-CBC (no CommonCrypto). Same result, verified
+        // against CommonCrypto's CCCrypt(kCCDecrypt, kCCOptionPKCS7Padding).
+        guard let key = CENCDecryptor.dataFromHex(keyHex), key.count == 16 else {
+            throw HLSDecryptError.invalidKey("HLS key must be 32 hex characters (16 bytes).")
+        }
+        let iv: [UInt8]
+        if ivHex.trimmingCharacters(in: .whitespaces).isEmpty {
+            iv = Array(sequenceIV(sequence))
+        } else if let parsed = CENCDecryptor.dataFromHex(ivHex), parsed.count == 16 {
+            iv = Array(parsed)
+        } else {
+            throw HLSDecryptError.invalidKey("HLS IV must be 32 hex characters (16 bytes) when provided.")
+        }
+        guard let clear = AESCBC.decrypt(key: Array(key), iv: iv, ciphertext: Array(data)) else {
+            throw HLSDecryptError.cryptoFailed("AES-128-CBC decrypt failed.")
+        }
+        return Data(clear)
         #endif
     }
 

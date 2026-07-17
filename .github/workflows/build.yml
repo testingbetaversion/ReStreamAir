@@ -56,6 +56,12 @@ jobs:
       - name: CLI smoke test
         run: ./restreamair dash --help
 
+      # Prove the pure-Swift SHA-256/PBKDF2/AES produce correct bytes on Linux
+      # (known NIST/FIPS vectors) — this is what makes CENC/HLS decryption and
+      # admin login work here without CommonCrypto.
+      - name: Crypto self-test
+        run: ./restreamair selftest
+
       # Full runtime check: the POSIX server serves, and pure-Swift PBKDF2 lets
       # an admin account be created and logged into.
       - name: Serve + auth smoke test
@@ -81,3 +87,18 @@ jobs:
           name: restreamair-linux
           path: restreamair
           if-no-files-found: error
+
+  build-linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      # Build and run under arm64 emulation — slower, but works on any runner and
+      # verifies the pure-Swift crypto is byte-correct on arm64 too.
+      - name: Build restreamair (Linux arm64)
+        run: |
+          docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src swift:6.0 \
+            bash -c 'swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux-arm64'
+          file restreamair-linux-arm64
+      - name: Crypto self-test (arm64)
+        run: docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src swift:6.0 ./restreamair-linux-arm64 selftest
