@@ -34,3 +34,50 @@ jobs:
             restreamair
             restreamair-menubar
           if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install curl
+        run: apt-get update && apt-get install -y curl
+
+      - name: Swift version
+        run: swift --version
+
+      # No menu-bar target on Linux (it needs AppKit). restreamair itself uses
+      # a POSIX-socket server + pure-Swift crypto on Linux (see Net.swift /
+      # Crypto.swift); CENC/HLS internal decryption degrades to ffmpeg mode.
+      - name: Build restreamair (Linux)
+        run: swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair
+
+      - name: CLI smoke test
+        run: ./restreamair dash --help
+
+      # Full runtime check: the POSIX server serves, and pure-Swift PBKDF2 lets
+      # an admin account be created and logged into.
+      - name: Serve + auth smoke test
+        run: |
+          ./restreamair serve --port 8799 --bind 127.0.0.1 &
+          sleep 4
+          curl -sf -X POST http://127.0.0.1:8799/api/auth/setup \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"pw123456"}'
+          code=$(curl -s -c /tmp/c.txt -X POST http://127.0.0.1:8799/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"pw123456","remember":"true"}' \
+            -o /dev/null -w '%{http_code}')
+          echo "login HTTP $code"
+          test "$code" = "200"
+          state=$(curl -s -b /tmp/c.txt -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/api/state)
+          echo "state HTTP $state"
+          test "$state" = "200"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: restreamair-linux
+          path: restreamair
+          if-no-files-found: error
