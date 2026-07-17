@@ -5,48 +5,52 @@ A local DASH → HLS restreaming toolkit written in Swift, with a web control pa
 - `restreamair` — everything: the web panel/server (default), and the DASH-inspection/live-restream CLI tools as `dash`/`live` subcommands.
 - `restreamair-menubar` — optional macOS-only menu bar companion that launches/monitors `restreamair serve`.
 
-## Running from source
+## Install
+
+The quickest path is a prebuilt binary — no toolchain needed. Grab the one for your platform from the [latest release](https://github.com/testingbetaversion/ReStreamAir/releases/latest):
+
+| Platform | Asset |
+|----------|-------|
+| macOS (Apple Silicon) | `restreamair` |
+| Linux x86-64 | `restreamair-linux` |
+| Linux arm64 | `restreamair-linux-arm64` |
+
+```sh
+chmod +x restreamair          # (or restreamair-linux / restreamair-linux-arm64)
+./restreamair                 # starts the web panel — same as ./restreamair serve
+```
+
+## Building from source
 
 **Prerequisites**: a Swift 5.9+ toolchain.
 
 - macOS: Xcode or the Xcode Command Line Tools (`xcode-select --install`) already provide `swiftc`.
 - Linux: install a Swift toolchain from [swift.org/install](https://www.swift.org/install/) (or via `swiftly`). No other dependencies — this project has zero external packages, so there's nothing to fetch.
 
+Compile every `.swift` source into one binary — a single `swiftc` invocation, no Package.swift/Xcode project (`MenuBarApp.swift` is the separate, macOS-only menu-bar target, so it's excluded here):
+
 ```sh
 git clone <this repo> ReStreamAir
 cd ReStreamAir
-./run
-```
-
-`./run` is the whole thing — it runs ReStreamAir straight from the source in one command. You never invoke `swiftc` by hand or manage a binary. Pass it the same arguments the server itself takes, e.g. `./run serve --port 9000`; with no arguments it's shorthand for `./run serve` (the web panel/server).
-
-Under the hood `./run` compiles the sources to a cached binary in `.build/` and execs it, rebuilding **only** when a `.swift` file has actually changed — so the first launch pays a few seconds of compile and every launch after that is instant, with no separate build step to remember. (Swift's `swift` interpreter can't be used to "run" this project directly: it ignores the `@main` entry point in immediate mode, and the panel re-execs *itself* to spawn its `dash`/`live` worker subprocesses, which needs a real executable — the interpreter's `argv[0]` is a `.swift` file. `./run` gives you the one-command convenience while still producing the real binary those workers require.)
-
-`dash`/`live` are the panel's other two subcommands — the underlying CLI tools it spawns for you; you don't normally run them directly.
-
-<details>
-<summary>Prefer to build the binary yourself?</summary>
-
-`./run` just wraps this. The explicit one-shot build is a single `swiftc` invocation — no Package.swift/Xcode project:
-
-```sh
-swiftc HTTPClient.swift Version.swift Crypto.swift AES.swift Net.swift DashSegments.swift M3U8Rewriter.swift FFmpegLocator.swift FFmpegResident.swift LiveMPDToM3U8.swift PanelServer.swift CENCDecryptor.swift HLSDecryptor.swift MetricsStore.swift SystemStats.swift LogoLookup.swift AuthStore.swift LogStore.swift AudioDelay.swift ScriptRunner.swift -o restreamair
+swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair
 ./restreamair
 ```
 
-</details>
+(The `swift` interpreter can't run this project directly — it ignores the `@main` entry point in immediate mode, and the panel re-execs *itself* to spawn its `dash`/`live` worker subprocesses, which needs a real compiled executable. So it must be built with `swiftc`, not run with `swift`.)
+
+`dash`/`live` are the panel's other two subcommands — the underlying CLI tools it spawns for you; you don't normally run them directly.
 
 Open `http://127.0.0.1:8787` once it's running. The very first launch (nothing in `data/state.json` yet) serves a **Create admin account** screen instead of the normal UI — pick a username/password there, then sign in with them. Nothing else works until that account exists. Re-running later reuses whatever's already in `data/state.json` (providers, streams, that admin account, ...) — it's not reset on every run.
 
 Common overrides, all optional (fuller reference in [Provider defaults & per-stream network overrides](#provider-defaults--per-stream-network-overrides) and the sections after it):
 
 ```sh
-./run serve --port 9000                              # different port
-./run serve --bind 127.0.0.1                          # only accept local connections
-./run serve --admin-username admin --admin-password "a-new-password"  # reset/recover the admin account
+./restreamair serve --port 9000                              # different port
+./restreamair serve --bind 127.0.0.1                          # only accept local connections
+./restreamair serve --admin-username admin --admin-password "a-new-password"  # reset/recover the admin account
 ```
 
-To run it in the background instead of tying up a terminal: `nohup ./run > restreamair.log 2>&1 & disown`, or see [Launching without a terminal window](#launching-without-a-terminal-window) below for a proper macOS `.app`/menu-bar setup.
+To run it in the background instead of tying up a terminal: `nohup ./restreamair > restreamair.log 2>&1 & disown`, or see [Launching without a terminal window](#launching-without-a-terminal-window) below for a proper macOS `.app`/menu-bar setup.
 
 ### Build for macOS
 
