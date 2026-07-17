@@ -15,8 +15,8 @@ jobs:
       - name: Swift version
         run: swift --version
 
-      # Same source list the ./run script and README use: every .swift file
-      # except the optional macOS menu-bar companion (its own @main / AppKit).
+      # Every .swift source except the optional macOS menu-bar companion
+      # (its own @main / AppKit) — same command the README documents.
       - name: Build restreamair
         run: swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair
 

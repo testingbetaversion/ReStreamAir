@@ -7,11 +7,12 @@ runtime/
 # Provider script credentials — live session tokens, never commit
 scripts/*_user.json
 
-# Build products
-.build/
+# Build products — binaries are published on GitHub Releases, never committed
 *.dSYM/
 restreamair
 restreamair-menubar
+restreamair-linux
+restreamair-linux-arm64
 
 # macOS
 .DS_Store
