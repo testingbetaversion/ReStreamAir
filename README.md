@@ -58,7 +58,9 @@ swiftc HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKi
 
 ### Build for Linux
 
-Same single command as "Running from source" above — `restreamair` has no macOS-only imports. `restreamair-menubar` isn't buildable on Linux (it needs AppKit) and isn't part of the Linux build at all. A few *features* inside `restreamair` itself are macOS-only and degrade to a clear error at runtime rather than building differently: admin password hashing, CENC decryption, and HLS AES-128 decryption all use CommonCrypto (see the relevant sections below).
+Same single command as "Running from source" above — `restreamair` builds and runs on Linux. It uses a POSIX-socket HTTP server (instead of Apple's `Network` framework) and a pure-Swift PBKDF2 for admin password hashing, so the panel, admin login, live DASH→HLS restreaming, and the ffmpeg pipelines all work. `restreamair-menubar` isn't buildable on Linux (it needs AppKit) and isn't part of the Linux build.
+
+The one thing that's still macOS-only is the **internal** CENC/HLS-AES decryptor (it uses CommonCrypto). On Linux, decrypt encrypted (clearkey) sources by setting the stream's Input mode to one of the **FFmpeg** modes — ffmpeg does the CENC decryption there — rather than the Internal remuxer. Everything else is identical to the macOS build. Prebuilt Linux and macOS binaries are attached to each [GitHub release](https://github.com/testingbetaversion/ReStreamAir/releases).
 
 ### Already running?
 
