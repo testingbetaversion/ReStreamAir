@@ -58,9 +58,14 @@ swiftc HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKi
 
 ### Build for Linux
 
-Same single command as "Running from source" above — `restreamair` builds and runs on Linux. It uses a POSIX-socket HTTP server (instead of Apple's `Network` framework) and a pure-Swift PBKDF2 for admin password hashing, so the panel, admin login, live DASH→HLS restreaming, and the ffmpeg pipelines all work. `restreamair-menubar` isn't buildable on Linux (it needs AppKit) and isn't part of the Linux build.
+Same single command as "Running from source" above — `restreamair` builds and runs fully on Linux, with **no external dependencies and identical behaviour to the macOS build**. Where macOS uses Apple frameworks, Linux uses portable equivalents that are compiled in automatically:
 
-The one thing that's still macOS-only is the **internal** CENC/HLS-AES decryptor (it uses CommonCrypto). On Linux, decrypt encrypted (clearkey) sources by setting the stream's Input mode to one of the **FFmpeg** modes — ffmpeg does the CENC decryption there — rather than the Internal remuxer. Everything else is identical to the macOS build. Prebuilt Linux and macOS binaries are attached to each [GitHub release](https://github.com/testingbetaversion/ReStreamAir/releases).
+- HTTP server: a POSIX-socket server instead of Apple's `Network` framework.
+- Crypto: pure-Swift SHA-256/PBKDF2 (admin login) and AES (internal CENC clearkey + HLS AES-128 decryption) instead of CommonCrypto — verified byte-for-byte against it, and against NIST/FIPS test vectors (`restreamair selftest`).
+
+So the internal remuxer stays fully self-contained on Linux — clearkey/AES decryption does **not** require ffmpeg, same as on macOS. `restreamair-menubar` is the only thing not built on Linux (it needs AppKit).
+
+Prebuilt binaries are attached to each [GitHub release](https://github.com/testingbetaversion/ReStreamAir/releases): macOS (arm64), Linux x86-64 (`restreamair-linux`), and Linux arm64 (`restreamair-linux-arm64`).
 
 ### Already running?
 
