@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to release, e.g. v1.0.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_REF_NAME}"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # Stamp the resolved tag + commit into Version.swift so the released
+      # binary reports its real version (the update check compares against it).
+      - name: Stamp version
+        run: |
+          COMMIT=$(git rev-parse --short HEAD)
+          sed -i '' "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
+          sed -i '' "s/static let commit = \"unknown\"/static let commit = \"$COMMIT\"/" Version.swift
+          grep 'static let' Version.swift
+
+      - name: Build restreamair
+        run: swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair
+
+      - name: Build restreamair-menubar
+        run: swiftc HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKit
+
+      - name: Package
+        run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-macos.tar.gz restreamair restreamair-menubar
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            restreamair
+            restreamair-menubar
+            restreamair-${{ steps.ver.outputs.tag }}-macos.tar.gz

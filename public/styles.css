@@ -1173,6 +1173,45 @@ pre {
   margin-left: auto;
 }
 
+/* Update-available banner under the nav. */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: var(--accent-tint);
+  border-bottom: 1px solid var(--active-accent);
+  color: var(--text);
+  font-size: 13px;
+}
+.update-banner .icon { width: 16px; height: 16px; flex: 0 0 auto; color: var(--active-accent); }
+.update-banner .update-banner-text { flex: 1 1 auto; }
+.update-banner .icon-btn { margin-left: 0; }
+
+/* All-streams bulk actions: a second toolbar row under the filters. */
+.bulk-action-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.bulk-action-bar .bulk-spacer { flex: 1 1 auto; }
+.bulk-action-bar button { font-size: 12px; padding: 6px 10px; }
+.bulk-action-bar button[disabled] { opacity: 0.4; cursor: not-allowed; }
+.bulk-toggle.active { color: var(--active-accent); border-color: var(--active-accent); background: var(--accent-tint); }
+.danger-ghost:hover:not([disabled]) { color: var(--danger); border-color: var(--danger); }
+
+.cdn-mirrors-field { display: grid; gap: 8px; }
+.cdn-mirrors-field .field-label-row { font-weight: 600; display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.cdn-mirror-list { display: grid; gap: 8px; }
+.cdn-mirror-list:empty { display: none; }
+.cdn-mirror-row { display: flex; gap: 8px; align-items: center; }
+.cdn-mirror-row .cdn-mirror-input { flex: 1; min-width: 0; }
+.cdn-mirror-row .icon-btn { margin-left: 0; flex: 0 0 auto; }
+.add-cdn-btn { justify-self: start; }
+
 .manual-rep-row {
   display: flex;
   gap: 6px;

@@ -107,7 +107,37 @@ function render() {
   renderKeys();
   renderStreamsGrid();
   renderViewHeader();
+  renderUpdateBanner();
   applyIcons();
+}
+
+function appVersionLabel() {
+  const v = state.version || {};
+  return v.isRelease ? `v${v.version}` : "dev build";
+}
+
+function appVersionSubtitle() {
+  const v = state.version || {};
+  if (v.updateAvailable) return `update available: v${v.latest}`;
+  if (v.commit && v.commit !== "unknown") return v.commit;
+  if (v.error) return v.error;
+  return v.latest ? "up to date" : "";
+}
+
+// A dismissible banner under the nav when a newer release than this binary
+// exists on GitHub. Only a real (non-dev) build that the update check found to
+// be behind shows it.
+let updateBannerDismissed = false;
+function renderUpdateBanner() {
+  const banner = $("#updateBanner");
+  if (!banner) return;
+  const v = state.version || {};
+  const show = Boolean(v.updateAvailable) && !updateBannerDismissed;
+  banner.classList.toggle("hidden", !show);
+  if (show) {
+    banner.querySelector(".update-banner-text").textContent =
+      `A newer build is available — v${v.latest} (you're on v${v.version}). Download it from the latest GitHub release and restart.`;
+  }
 }
 
 function renderViewHeader() {
@@ -273,6 +303,62 @@ async function importProviderFromFile(file) {
 let streamsGridProviderId = "";
 let streamsGridTypeFilter = "";
 let streamsGridSearchQuery = "";
+let streamsGridRunningOnly = false;
+
+// The currently-visible stream rows after all filters (provider, type, search,
+// running-only). Shared by the grid render and the bulk actions so "Start all"
+// etc. act on exactly what's on screen.
+function filteredStreamRows() {
+  const query = streamsGridSearchQuery.trim().toLowerCase();
+  return state.providers.flatMap((provider) => provider.streams.map((stream) => ({ provider, stream })))
+    .filter(({ provider, stream }) => {
+      if (streamsGridProviderId && provider.id !== streamsGridProviderId) return false;
+      // "manual" means a hand-created stream — sourceType is only ever set by a
+      // channels/events import, so an empty sourceType is exactly that.
+      if (streamsGridTypeFilter && (stream.sourceType || "manual") !== streamsGridTypeFilter) return false;
+      if (streamsGridRunningOnly && !stream.running) return false;
+      if (query && !stream.name.toLowerCase().includes(query) && !stream.url.toLowerCase().includes(query)) return false;
+      return true;
+    });
+}
+
+// Enable/disable the bulk buttons to match what the filtered set can do, and
+// reflect the running-only toggle's state.
+function updateBulkActionBar(rows) {
+  const anyStopped = rows.some(({ stream }) => !stream.running);
+  const anyRunning = rows.some(({ stream }) => stream.running);
+  const startAll = $("#gridStartAllBtn");
+  const stopAll = $("#gridStopAllBtn");
+  const deleteAll = $("#gridDeleteAllBtn");
+  const runningOnly = $("#gridRunningOnlyBtn");
+  if (startAll) startAll.disabled = !anyStopped;
+  if (stopAll) stopAll.disabled = !anyRunning;
+  if (deleteAll) deleteAll.disabled = rows.length === 0;
+  if (runningOnly) runningOnly.classList.toggle("active", streamsGridRunningOnly);
+}
+
+// Run one action over every filtered stream, then re-render once. Bulk calls go
+// sequentially so the shared state.json write path isn't racing itself.
+async function bulkStreamAction(kind) {
+  const rows = filteredStreamRows();
+  if (kind === "delete") {
+    if (!rows.length) return;
+    if (!confirm(`Delete ${rows.length} stream${rows.length === 1 ? "" : "s"}? This stops them and removes their configuration. This cannot be undone.`)) return;
+  }
+  let count = 0;
+  for (const { stream } of rows) {
+    try {
+      if (kind === "start" && !stream.running) { state = await request(`/api/streams/${stream.id}/start`, { method: "POST", body: "{}" }); count++; }
+      else if (kind === "stop" && stream.running) { state = await request(`/api/streams/${stream.id}/stop`, { method: "POST", body: "{}" }); count++; }
+      else if (kind === "delete") { state = await request(`/api/streams/${stream.id}`, { method: "DELETE" }); count++; }
+    } catch (error) {
+      $("#streamsGridImportStatus").classList.remove("hidden");
+      $("#streamsGridImportStatus").textContent = `${kind} failed on "${stream.name}": ${error.message || error}`;
+    }
+  }
+  if (kind === "delete") { selectedStreamId = null; lastEditorStreamId = null; }
+  render();
+}
 
 function renderStreamsGrid() {
   const container = $("#streamsGrid");
@@ -294,16 +380,10 @@ function renderStreamsGrid() {
   $("#gridProviderSettingsBtn").classList.toggle("hidden", !filteredProvider);
 
   const allRows = state.providers.flatMap((provider) => provider.streams.map((stream) => ({ provider, stream })));
-  const query = streamsGridSearchQuery.trim().toLowerCase();
-  const rows = allRows.filter(({ provider, stream }) => {
-    if (streamsGridProviderId && provider.id !== streamsGridProviderId) return false;
-    // "manual" means a hand-created stream — sourceType is only ever set by
-    // a channels/events import (see importScriptEntries), so an empty
-    // sourceType is exactly that.
-    if (streamsGridTypeFilter && (stream.sourceType || "manual") !== streamsGridTypeFilter) return false;
-    if (query && !stream.name.toLowerCase().includes(query) && !stream.url.toLowerCase().includes(query)) return false;
-    return true;
-  });
+  const rows = filteredStreamRows();
+
+  // Bulk actions and the running-only toggle operate on this same filtered set.
+  updateBulkActionBar(rows);
 
   $("#streamsGridCount").textContent = allRows.length
     ? `${rows.length} of ${allRows.length} stream${allRows.length === 1 ? "" : "s"}`
@@ -418,6 +498,46 @@ function flashButtonCopied(button) {
   }, 1200);
 }
 
+// CDN mirrors: a progressive list rather than a raw textarea — each mirror is
+// its own input row you add/remove, so an empty stream shows just an "Add CDN
+// mirror" button instead of a big empty box.
+function renderCdnMirrors(urls) {
+  const list = $("#cdnMirrorList");
+  if (!list) return;
+  list.innerHTML = "";
+  for (const url of urls) addCdnMirrorRow(url);
+}
+
+function addCdnMirrorRow(value = "") {
+  const list = $("#cdnMirrorList");
+  if (!list) return;
+  const row = document.createElement("div");
+  row.className = "cdn-mirror-row";
+  const input = document.createElement("input");
+  input.type = "url";
+  input.className = "cdn-mirror-input";
+  input.placeholder = "https://cdn2.example.com/index.mpd";
+  input.value = value;
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "icon-btn ghost";
+  remove.title = "Remove this mirror";
+  remove.innerHTML = '<span data-icon="trash"></span>';
+  remove.addEventListener("click", () => row.remove());
+  row.append(input, remove);
+  list.appendChild(row);
+  applyIcons(row);
+  if (!value) input.focus();
+}
+
+function collectCdnMirrors() {
+  return Array.from(document.querySelectorAll("#cdnMirrorList .cdn-mirror-input"))
+    .map((input) => input.value.trim())
+    .filter(Boolean);
+}
+
+$("#addCdnMirrorBtn")?.addEventListener("click", () => addCdnMirrorRow(""));
+
 function updateKindVisibility() {
   const kind = $("#streamForm").elements.kind.value;
   document.querySelectorAll("[data-kind-group]").forEach((group) => {
@@ -507,7 +627,7 @@ function renderEditor() {
   // with just the highest-bandwidth default.
   lastAutoDetectedUrl = stream.url || "";
   form.elements.logo.value = stream.logo || "";
-  form.elements.cdnUrls.value = (stream.cdnUrls || []).join("\n");
+  renderCdnMirrors(stream.cdnUrls || []);
   form.elements.representation.value = stream.representation || "";
   form.elements.period.value = stream.period || "";
   form.elements.proxy.value = stream.proxy || "";
@@ -597,7 +717,7 @@ function streamPayload() {
     kind: form.elements.kind.value,
     url: form.elements.url.value,
     logo: form.elements.logo.value,
-    cdnUrls: form.elements.cdnUrls.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+    cdnUrls: collectCdnMirrors(),
     representation: form.elements.representation.value,
     representations: Array.from(selectedRepIds),
     representationMeta,
@@ -695,6 +815,7 @@ function newStream() {
   $("#streamForm").elements.pollInterval.value = 2;
   $("#playLink").value = "";
   setLinkField($("#directLink"), {});
+  renderCdnMirrors([]);
   $("#statusBox").textContent = "New stream.";
   clearRepresentationPicker();
   updateKindVisibility();
@@ -1692,6 +1813,17 @@ $("#streamsGridSearch").addEventListener("input", (event) => {
   streamsGridSearchQuery = event.currentTarget.value;
   renderStreamsGrid();
 });
+$("#gridRunningOnlyBtn").addEventListener("click", () => {
+  streamsGridRunningOnly = !streamsGridRunningOnly;
+  renderStreamsGrid();
+});
+$("#updateBannerDismiss")?.addEventListener("click", () => {
+  updateBannerDismissed = true;
+  $("#updateBanner").classList.add("hidden");
+});
+$("#gridStartAllBtn").addEventListener("click", () => bulkStreamAction("start"));
+$("#gridStopAllBtn").addEventListener("click", () => bulkStreamAction("stop"));
+$("#gridDeleteAllBtn").addEventListener("click", () => bulkStreamAction("delete"));
 $("#gridNewStreamBtn").addEventListener("click", () => {
   // Attach to whichever provider the grid is currently filtered to; with no
   // filter (viewing every provider's streams at once) fall back to the
@@ -1861,6 +1993,7 @@ function applyMetrics(payload) {
     statTile("Memory", formatBytes(memUsed), `of ${formatBytes(memTotal)} · peak ${formatBytes(system.peakMemoryBytes)}`),
     statTile("Disk", formatBytes((system.diskTotalBytes || 0) - (system.diskAvailableBytes || 0)), `of ${formatBytes(system.diskTotalBytes)} used`),
     statTile("Uptime", formatUptime(system.uptimeSeconds), system.osVersion || ""),
+    statTile("Build", appVersionLabel(), appVersionSubtitle()),
     statTile("All-time served", formatBytes(global.allTimeBytes)),
     statTile("All-time downloaded", formatBytes(globalInput.allTimeBytes)),
   ].join("");

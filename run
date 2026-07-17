@@ -24,7 +24,7 @@ BUILD_DIR="$DIR/.build"
 BIN="$BUILD_DIR/restreamair"
 
 # Same file list as the README's build line — keep them in sync.
-SOURCES="HTTPClient.swift DashSegments.swift M3U8Rewriter.swift FFmpegLocator.swift FFmpegResident.swift LiveMPDToM3U8.swift PanelServer.swift CENCDecryptor.swift HLSDecryptor.swift MetricsStore.swift SystemStats.swift LogoLookup.swift AuthStore.swift LogStore.swift AudioDelay.swift ScriptRunner.swift"
+SOURCES="HTTPClient.swift Version.swift DashSegments.swift M3U8Rewriter.swift FFmpegLocator.swift FFmpegResident.swift LiveMPDToM3U8.swift PanelServer.swift CENCDecryptor.swift HLSDecryptor.swift MetricsStore.swift SystemStats.swift LogoLookup.swift AuthStore.swift LogStore.swift AudioDelay.swift ScriptRunner.swift"
 
 # Rebuild only when the binary is missing or any source is newer than it, so an
 # unchanged tree launches with zero compile overhead.
