@@ -87,3 +87,18 @@ jobs:
           name: restreamair-linux
           path: restreamair
           if-no-files-found: error
+
+  build-linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      # Build and run under arm64 emulation — slower, but works on any runner and
+      # verifies the pure-Swift crypto is byte-correct on arm64 too.
+      - name: Build restreamair (Linux arm64)
+        run: |
+          docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src swift:6.0 \
+            bash -c 'swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux-arm64'
+          file restreamair-linux-arm64
+      - name: Crypto self-test (arm64)
+        run: docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src swift:6.0 ./restreamair-linux-arm64 selftest
