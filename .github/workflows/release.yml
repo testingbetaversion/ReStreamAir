@@ -63,8 +63,38 @@ jobs:
             restreamair-linux
             restreamair-${{ steps.ver.outputs.tag }}-linux.tar.gz
 
+  build-linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ github.event.inputs.tag }}"; [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Stamp version
+        run: |
+          COMMIT=$(echo "$GITHUB_SHA" | cut -c1-7)
+          sed -i "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
+          sed -i "s/static let commit = \"unknown\"/static let commit = \"$COMMIT\"/" Version.swift
+      - uses: docker/setup-qemu-action@v3
+      # arm64 via emulation (slow but runner-independent).
+      - name: Build restreamair (Linux arm64)
+        run: |
+          docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src swift:6.0 \
+            bash -c 'swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux-arm64'
+          docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src swift:6.0 ./restreamair-linux-arm64 selftest
+      - run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-linux-arm64.tar.gz restreamair-linux-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: |
+            restreamair-linux-arm64
+            restreamair-${{ steps.ver.outputs.tag }}-linux-arm64.tar.gz
+
   release:
-    needs: [build-macos, build-linux]
+    needs: [build-macos, build-linux, build-linux-arm64]
     runs-on: ubuntu-latest
     steps:
       - name: Resolve tag

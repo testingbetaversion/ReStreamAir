@@ -446,7 +446,6 @@ final class CENCDecryptor {
         for box in boxes where box.type == "pssh" { retypeToFree(&bytes, box) }
     }
 
-    #if canImport(CommonCrypto)
     func decryptMediaSegment(_ data: Data) throws -> Data {
         var bytes = [UInt8](data)
         let top = parseBoxes(bytes, 0, bytes.count)
@@ -518,6 +517,20 @@ final class CENCDecryptor {
             counterBlock.replaceSubrange(0..<min(iv.count, 16), with: iv.prefix(16))
         }
 
+        // Each tuple is (clearBytes, encryptedBytes). An empty subsample list
+        // means full-sample encryption — the *entire* sample is encrypted, with
+        // no clear prefix. This is the norm for audio (and any track whose senc
+        // box carries no per-sample subsample table). The fallback therefore
+        // has to be (clear: 0, encrypted: sampleSize) — decrypt the whole
+        // sample. It was previously (sampleSize, 0), i.e. "all clear, nothing
+        // encrypted", which silently skipped decryption entirely: subsample-
+        // encrypted video happened to work (it always has a real subsample
+        // table), but full-sample-encrypted audio was left ciphertext, so it
+        // decoded as garbage (e.g. "AAC: Number of bands exceeds limit") and
+        // no player could play the audio track.
+        let clearSubsamples = subsamples.isEmpty ? [(0, sampleSize)] : subsamples
+
+        #if canImport(CommonCrypto)
         var cryptorRef: CCCryptorRef?
         let status = key.withUnsafeBytes { keyPtr -> CCCryptorStatus in
             counterBlock.withUnsafeBytes { ivPtr in
@@ -532,19 +545,6 @@ final class CENCDecryptor {
             throw CENCError.cryptoFailed("Could not initialize AES-CTR cryptor (status \(status)).")
         }
         defer { CCCryptorRelease(cryptor) }
-
-        // Each tuple is (clearBytes, encryptedBytes). An empty subsample list
-        // means full-sample encryption — the *entire* sample is encrypted, with
-        // no clear prefix. This is the norm for audio (and any track whose senc
-        // box carries no per-sample subsample table). The fallback therefore
-        // has to be (clear: 0, encrypted: sampleSize) — decrypt the whole
-        // sample. It was previously (sampleSize, 0), i.e. "all clear, nothing
-        // encrypted", which silently skipped decryption entirely: subsample-
-        // encrypted video happened to work (it always has a real subsample
-        // table), but full-sample-encrypted audio was left ciphertext, so it
-        // decoded as garbage (e.g. "AAC: Number of bands exceeds limit") and
-        // no player could play the audio track.
-        let clearSubsamples = subsamples.isEmpty ? [(0, sampleSize)] : subsamples
         var cursor = sampleStart
         for (clear, encrypted) in clearSubsamples {
             cursor += clear
@@ -553,8 +553,28 @@ final class CENCDecryptor {
                 cursor += encrypted
             }
         }
+        #else
+        // Linux: pure-Swift AES-CTR (AES.swift). The cryptor is created once per
+        // sample and its keystream continues across subsamples, matching
+        // CommonCrypto's kCCModeOptionCTR_BE.
+        guard let ctr = AESCTR(key: Array(key), iv: counterBlock) else {
+            throw CENCError.cryptoFailed("Could not initialize AES-CTR cryptor.")
+        }
+        var cursor = sampleStart
+        for (clear, encrypted) in clearSubsamples {
+            cursor += clear
+            if encrypted > 0 {
+                guard cursor >= 0, cursor + encrypted <= bytes.count else {
+                    throw CENCError.parseFailed("Subsample range out of bounds.")
+                }
+                ctr.process(&bytes, start: cursor, length: encrypted)
+                cursor += encrypted
+            }
+        }
+        #endif
     }
 
+    #if canImport(CommonCrypto)
     private func decryptRange(_ bytes: inout [UInt8], start: Int, length: Int, cryptor: CCCryptorRef) throws {
         guard length > 0 else { return }
         guard start >= 0, start + length <= bytes.count else { throw CENCError.parseFailed("Subsample range out of bounds.") }
@@ -564,10 +584,6 @@ final class CENCDecryptor {
             return CCCryptorUpdate(cryptor, base, length, base, length, &moved)
         }
         guard status == kCCSuccess else { throw CENCError.cryptoFailed("AES-CTR decrypt failed (status \(status)).") }
-    }
-    #else
-    func decryptMediaSegment(_ data: Data) throws -> Data {
-        throw CENCError.unsupportedPlatform("CENC decryption requires CommonCrypto and is only supported on Apple platforms.")
     }
     #endif
 }

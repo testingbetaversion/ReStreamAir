@@ -3014,6 +3014,10 @@ struct RestreamAirMain {
             LiveM3U8ActionRuntime.run(Array(arguments.dropFirst()))
         case "serve":
             runServe(Array(arguments.dropFirst()))
+        case "selftest":
+            // Known-answer crypto vectors — verifies the pure-Swift SHA/PBKDF2/
+            // AES produce correct bytes on this platform (used by Linux CI).
+            CryptoSelfTest.runOrExit()
         default:
             runServe(arguments)
         }
