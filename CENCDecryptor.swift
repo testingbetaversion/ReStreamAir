@@ -424,6 +424,28 @@ final class CENCDecryptor {
         return key
     }
 
+    /// Retype a box in place to "free" — the ISO-BMFF free-space box every
+    /// parser skips. Used instead of excising the box because removal would
+    /// shift every following byte and force a rewrite of the enclosing
+    /// traf/moof sizes *and* each trun's moof-relative data_offset. Retyping
+    /// keeps the size and every offset identical, so nothing needs fixing up.
+    /// Pure box edit (no crypto) — patchInitSegment uses it on every platform,
+    /// so it lives outside the CommonCrypto guard.
+    private func retypeToFree(_ bytes: inout [UInt8], _ box: MP4Box) {
+        let free = Array("free".utf8)
+        // Box layout is [4-byte size][4-byte type], so the type starts at +4.
+        for i in 0..<4 { bytes[box.start + 4 + i] = free[i] }
+    }
+
+    /// `pssh` carries DRM system headers (Widevine/PlayReady). On content we've
+    /// already decrypted to clear they're worse than useless: the browser sees
+    /// them, fires `encrypted` media events, and blocks waiting on a CDM/EME key
+    /// that is never coming. Strip them from both the init moov and every moof.
+    /// (Also runs on the init segment on Linux, where decryption itself is off.)
+    private func neutralizePSSH(_ bytes: inout [UInt8], in boxes: [MP4Box]) {
+        for box in boxes where box.type == "pssh" { retypeToFree(&bytes, box) }
+    }
+
     #if canImport(CommonCrypto)
     func decryptMediaSegment(_ data: Data) throws -> Data {
         var bytes = [UInt8](data)
@@ -447,17 +469,6 @@ final class CENCDecryptor {
         // full Widevine/PlayReady headers in every single fragment.
         neutralizePSSH(&bytes, in: moof.children)
         return Data(bytes)
-    }
-
-    /// Retype a box in place to "free" — the ISO-BMFF free-space box every
-    /// parser skips. Used instead of excising the box because removal would
-    /// shift every following byte and force a rewrite of the enclosing
-    /// traf/moof sizes *and* each trun's moof-relative data_offset. Retyping
-    /// keeps the size and every offset identical, so nothing needs fixing up.
-    private func retypeToFree(_ bytes: inout [UInt8], _ box: MP4Box) {
-        let free = Array("free".utf8)
-        // Box layout is [4-byte size][4-byte type], so the type starts at +4.
-        for i in 0..<4 { bytes[box.start + 4 + i] = free[i] }
     }
 
     /// Once a fragment's samples have been decrypted in place, every trace of
@@ -494,14 +505,6 @@ final class CENCDecryptor {
                 break
             }
         }
-    }
-
-    /// `pssh` carries DRM system headers (Widevine/PlayReady). On content we've
-    /// already decrypted to clear they're worse than useless: the browser sees
-    /// them, fires `encrypted` media events, and blocks waiting on a CDM/EME key
-    /// that is never coming. Strip them from both the init moov and every moof.
-    private func neutralizePSSH(_ bytes: inout [UInt8], in boxes: [MP4Box]) {
-        for box in boxes where box.type == "pssh" { retypeToFree(&bytes, box) }
     }
 
     private func decryptSample(_ bytes: inout [UInt8], sampleStart: Int, sampleSize: Int, iv: [UInt8], subsamples: [(Int, Int)], key: Data) throws {
