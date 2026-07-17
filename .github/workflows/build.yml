@@ -56,6 +56,12 @@ jobs:
       - name: CLI smoke test
         run: ./restreamair dash --help
 
+      # Prove the pure-Swift SHA-256/PBKDF2/AES produce correct bytes on Linux
+      # (known NIST/FIPS vectors) — this is what makes CENC/HLS decryption and
+      # admin login work here without CommonCrypto.
+      - name: Crypto self-test
+        run: ./restreamair selftest
+
       # Full runtime check: the POSIX server serves, and pure-Swift PBKDF2 lets
       # an admin account be created and logged into.
       - name: Serve + auth smoke test
