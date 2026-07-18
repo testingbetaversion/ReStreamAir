@@ -327,6 +327,13 @@ struct StreamConfig: Codable {
     /// a mirror only has to serve the same content under its own host/path.
     var cdnUrls: [String] = []
 
+    /// When set, `/play/<id>/index.m3u8` (and `.mpd`) answer with a 302
+    /// straight to the origin source URL (or current CDN mirror) instead of
+    /// proxying/remuxing — the player fetches everything from the source
+    /// itself. Same behavior the explicit `/source/<id>` route always had,
+    /// now switchable per stream from the editor.
+    var directSource: Bool = false
+
     init(id: String, name: String, kind: String, url: String, representation: String, period: String, proxy: String, playlistSegments: Int, keepSegments: Int, downloadAhead: Int, pollInterval: Double, forceOffline: Bool, status: String, lastError: String?, logo: String = "", decryptionKeys: String = "", hlsKey: String = "", hlsIV: String = "", representations: [String] = [], representationMeta: [String: RepresentationMetaEntry] = [:], manifestHeaders: String = "", mediaHeaders: String = "", hlsKeyHeaders: String = "", audioDelayMs: Int = 0) {
         self.id = id
         self.name = name
@@ -403,6 +410,7 @@ struct StreamConfig: Codable {
         outputMode = try container.decodeIfPresent(String.self, forKey: .outputMode) ?? "hls"
         outputTarget = try container.decodeIfPresent(String.self, forKey: .outputTarget) ?? ""
         cdnUrls = try container.decodeIfPresent([String].self, forKey: .cdnUrls) ?? []
+        directSource = try container.decodeIfPresent(Bool.self, forKey: .directSource) ?? false
     }
 
     private enum LegacyCodingKeys: String, CodingKey {
@@ -535,6 +543,12 @@ final class PanelServer {
     /// (re)start so a resident ffmpeg cycles to the next CDN mirror when a
     /// source outage makes it exit and the supervisor restarts it.
     private var cdnRotation: [String: Int] = [:]
+    /// Script manifest-refresh throttling (lock-guarded): a stream whose
+    /// source keeps failing shouldn't hammer the provider script — one
+    /// attempt per stream per `scriptRefreshCooldown`, never two at once.
+    private var scriptRefreshLastAttempt: [String: Date] = [:]
+    private var scriptRefreshInFlight: Set<String> = []
+    static let scriptRefreshCooldown: TimeInterval = 60
     let lock = NSLock()
     // Every readState()+mutate+writeState() cycle funnels through this serial
     // queue. Requests are handled concurrently (handle(_:) starts each
@@ -1176,6 +1190,12 @@ final class PanelServer {
         guard let id = match(request.path, #"^/source/([^/]+)$"#)?.first else { throw PanelError.notFound("Not found.") }
         let state = try readState()
         guard let (_, stream) = providerAndStream(id, in: state) else { throw PanelError.notFound("Stream not found.") }
+        return try sourceRedirect(stream: stream)
+    }
+
+    /// The 302-to-origin response shared by `/source/<id>` and the per-stream
+    /// "Direct source" editor option on `/play/...`.
+    func sourceRedirect(stream: StreamConfig) throws -> Data {
         // Prefer the CDN mirror a resident ffmpeg last rotated to, else primary.
         let sources = [stream.url] + stream.cdnUrls
         lock.lock(); let rotation = cdnRotation[stream.id] ?? 0; lock.unlock()
@@ -2020,6 +2040,158 @@ final class PanelServer {
         return command.contains(selfBinary.lastPathComponent) || command.contains("ffmpeg")
     }
 
+    // MARK: - Script manifest refresh (source recovery)
+    //
+    // The README's script protocol defines an `action=manifest` call that
+    // returns a fresh ManifestUrl (+ CDN mirrors + headers) for a stream.
+    // This wires it up as the last-resort recovery step: when a stream's
+    // manifest fails on its primary URL *and* every CDN mirror, and its
+    // provider has a script configured, ask the script for a new manifest,
+    // persist it, and retry — instead of failing until someone re-imports
+    // the channel by hand.
+
+    struct ScriptManifestResult {
+        var manifestUrl: String
+        var cdnUrls: [String]
+        var manifestHeaders: String
+        var mediaHeaders: String
+    }
+
+    func canScriptRefresh(provider: Provider) -> Bool {
+        let path = provider.scriptPath.trimmingCharacters(in: .whitespaces)
+        return !path.isEmpty && ScriptRunner.scriptExists(ScriptRunner.normalizePath(path))
+    }
+
+    /// Throttle + single-flight gate: one attempt per stream per cooldown,
+    /// never two at once, no matter how many players/timers hit the failure.
+    private func reserveScriptRefresh(streamId: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if scriptRefreshInFlight.contains(streamId) { return false }
+        if let last = scriptRefreshLastAttempt[streamId],
+           Date().timeIntervalSince(last) < PanelServer.scriptRefreshCooldown { return false }
+        scriptRefreshLastAttempt[streamId] = Date()
+        scriptRefreshInFlight.insert(streamId)
+        return true
+    }
+
+    private func releaseScriptRefresh(streamId: String) {
+        lock.lock(); scriptRefreshInFlight.remove(streamId); lock.unlock()
+    }
+
+    /// Runs `action=manifest` (per the script protocol) and parses its JSON
+    /// reply. Blocking — never call while holding stateQueue.
+    func runManifestScript(provider: Provider, stream: StreamConfig, account: ScriptAccount) throws -> ScriptManifestResult {
+        var args = ScriptRunner.commonArgs(action: "manifest", bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
+        args += ScriptRunner.splitParams(stream.scriptParams)
+        let (stdout, _) = try ScriptRunner.runSync(scriptPath: provider.scriptPath, args: args, timeout: 45)
+        // Tolerate scripts that log a line or two before the JSON blob.
+        guard let braceIndex = stdout.firstIndex(of: "{"),
+              let object = (try? JSONSerialization.jsonObject(with: Data(stdout[braceIndex...].utf8))) as? [String: Any],
+              let manifestUrl = object["ManifestUrl"] as? String,
+              URL(string: manifestUrl)?.scheme?.hasPrefix("http") == true else {
+            throw PanelError.server("manifest script returned no usable ManifestUrl")
+        }
+        let cdns = (object["Cdn"] as? [[String: Any]] ?? [])
+            .compactMap { $0["ManifestUrl"] as? String }
+            .filter { URL(string: $0)?.scheme?.hasPrefix("http") == true && $0 != manifestUrl }
+        func headerText(_ value: Any?) -> String {
+            ((value as? [String: Any]) ?? [:])
+                .compactMap { key, val in (val as? String).map { "\(key): \($0)" } }
+                .sorted()
+                .joined(separator: "\n")
+        }
+        let headers = object["Headers"] as? [String: Any]
+        return ScriptManifestResult(
+            manifestUrl: manifestUrl,
+            cdnUrls: cdns,
+            manifestHeaders: headerText(headers?["manifest"]),
+            mediaHeaders: headerText(headers?["media"])
+        )
+    }
+
+    /// Persists a refresh so every pipeline — m3u8 passthrough, internal
+    /// workers, resident ffmpeg — picks the new source up on its next
+    /// fetch or supervisor restart.
+    func applyManifestRefresh(_ result: ScriptManifestResult, streamId: String) {
+        stateQueue.sync {
+            guard var state = try? readState(), let location = findStream(streamId, in: state) else { return }
+            state.providers[location.provider].streams[location.stream].url = result.manifestUrl
+            state.providers[location.provider].streams[location.stream].cdnUrls = result.cdnUrls
+            if !result.manifestHeaders.isEmpty { state.providers[location.provider].streams[location.stream].manifestHeaders = result.manifestHeaders }
+            if !result.mediaHeaders.isEmpty { state.providers[location.provider].streams[location.stream].mediaHeaders = result.mediaHeaders }
+            try? writeState(state)
+        }
+        lock.lock(); cdnRotation[streamId] = 0; lock.unlock()
+    }
+
+    /// Blocking refresh for request paths (runs the script inline, outside
+    /// stateQueue). Returns the refreshed provider+stream on success, nil when
+    /// refresh isn't configured, is throttled, or the script failed.
+    func refreshManifestViaScript(providerId: String, streamId: String, trigger: String) -> (Provider, StreamConfig)? {
+        guard reserveScriptRefresh(streamId: streamId) else { return nil }
+        defer { releaseScriptRefresh(streamId: streamId) }
+        // Snapshot provider/stream and resolve the account under stateQueue
+        // (account rotation writes state), then run the script lock-free.
+        var snapshot: (Provider, StreamConfig, ScriptAccount)?
+        stateQueue.sync {
+            guard var state = try? readState(),
+                  let providerIndex = state.providers.firstIndex(where: { $0.id == providerId }),
+                  let location = findStream(streamId, in: state) else { return }
+            let provider = state.providers[providerIndex]
+            guard canScriptRefresh(provider: provider) else { return }
+            guard let account = (try? resolveScriptAccount(providerIndex: providerIndex, state: &state)) ?? nil else { return }
+            snapshot = (provider, state.providers[location.provider].streams[location.stream], account)
+        }
+        guard let (provider, stream, account) = snapshot else { return nil }
+        logStore.record(streamId: streamId, level: "info", event: "scriptManifest", url: stream.url, message: "source failing (\(trigger)) — asking \((provider.scriptPath as NSString).lastPathComponent) for a fresh manifest")
+        do {
+            let result = try runManifestScript(provider: provider, stream: stream, account: account)
+            applyManifestRefresh(result, streamId: streamId)
+            logStore.record(streamId: streamId, level: "info", event: "scriptManifest", url: result.manifestUrl, message: "manifest refreshed (\(result.cdnUrls.count) CDN mirrors)")
+            var refreshed: (Provider, StreamConfig)?
+            stateQueue.sync {
+                guard let state = try? readState(), let location = findStream(streamId, in: state) else { return }
+                refreshed = (state.providers[location.provider], state.providers[location.provider].streams[location.stream])
+            }
+            return refreshed
+        } catch {
+            logStore.record(streamId: streamId, level: "error", event: "scriptManifest", url: nil, message: "manifest refresh failed: \(error)")
+            return nil
+        }
+    }
+
+    /// Non-blocking variant for the worker supervisor, which runs *on* the
+    /// state queue: fire the refresh in the background; the next supervision
+    /// tick restarts the worker against the refreshed URL.
+    func scheduleManifestRefresh(providerId: String, streamId: String, trigger: String) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            _ = self?.refreshManifestViaScript(providerId: providerId, streamId: streamId, trigger: trigger)
+        }
+    }
+
+    /// Manifest fetch that walks the primary URL and then every CDN mirror in
+    /// order before giving up — the m3u8 passthrough previously only ever
+    /// tried the primary, so configured mirrors never helped it.
+    func fetchManifestWithFailover(provider: Provider, stream: StreamConfig, primary: URL) throws -> Data {
+        var candidates = [primary]
+        for mirror in stream.cdnUrls {
+            if let url = URL(string: mirror), url != primary { candidates.append(url) }
+        }
+        var lastError: Error = PanelError.server("Stream has no source URL.")
+        for (index, url) in candidates.enumerated() {
+            do {
+                let data = try fetchRemote(provider: provider, stream: stream, url: url, category: .manifest)
+                let mirrorNote = index > 0 ? " · CDN mirror #\(index)" : ""
+                logStore.record(streamId: stream.id, level: "info", event: "fetchManifest", url: url.absoluteString, message: "success · \(data.count) bytes\(mirrorNote)")
+                return data
+            } catch {
+                logStore.record(streamId: stream.id, level: "error", event: "fetchManifest", url: url.absoluteString, message: "\(error)")
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
     /// Live workers already retry through routine network hiccups on their
     /// own (see fetchManifestWithRetries/downloadWithRetries in
     /// LiveMPDToM3U8.swift), but a persistent origin outage or an unexpected
@@ -2081,6 +2253,16 @@ final class PanelServer {
                     lock.unlock()
                     guard cooldownOK else { continue }
 
+                    // Two failed restarts means the worker has already been
+                    // through its own retries and (for ffmpeg) the CDN
+                    // rotation — the source itself has likely expired. Ask
+                    // the provider script for a fresh manifest in the
+                    // background (throttled + single-flight); the next
+                    // restart picks up whatever it persists.
+                    if streak >= 2, canScriptRefresh(provider: provider) {
+                        scheduleManifestRefresh(providerId: provider.id, streamId: streamSnapshot.id, trigger: "worker restart streak \(streak)")
+                    }
+
                     guard let location = findStream(streamSnapshot.id, in: mutableState) else { continue }
                     stop(stream: mutableState.providers[location.provider].streams[location.stream])
                     logStore.recordWorkerLine(#"{"event":"supervisorRestart","status":"start"}"#, streamId: streamSnapshot.id)
@@ -2099,6 +2281,16 @@ final class PanelServer {
     }
 
     func servePlay(_ request: HTTPRequest) throws -> Data {
+        // Direct-source streams answer every playlist/manifest request with a
+        // 302 to the origin — the player talks to the source directly and the
+        // panel never proxies a byte. Segment/runtime paths deliberately fall
+        // through: a redirected player should never request them anyway.
+        if let id = match(request.path, #"^/play/([^/]+)/index\.(?:m3u8|mpd)$"#)?.first {
+            let state = try readState()
+            if let (_, stream) = providerAndStream(id, in: state), stream.directSource {
+                return try sourceRedirect(stream: stream)
+            }
+        }
         if request.path.hasSuffix("/index.mpd"), let id = match(request.path, #"^/play/([^/]+)/index\.mpd$"#)?.first {
             let state = try readState()
             guard let (_, stream) = providerAndStream(id, in: state) else { throw PanelError.notFound("Stream not found.") }
@@ -2145,20 +2337,41 @@ final class PanelServer {
                 logStore.record(streamId: stream.id, level: "error", event: "fetchManifest", url: stream.url, message: "stream URL is not a valid URL")
                 throw PanelError.badRequest("Stream URL is not a valid URL — fix it in the stream editor.")
             }
+            let isVariant = request.query["variant"] != nil
+            var effectiveStream = stream
+            var effectiveManifestURL = manifestURL
             let data: Data
-            do {
-                data = try fetchRemote(provider: provider, stream: stream, url: manifestURL, category: .manifest)
-            } catch {
-                logStore.record(streamId: stream.id, level: "error", event: "fetchManifest", url: manifestURL.absoluteString, message: "\(error)")
-                throw error
+            if isVariant {
+                // A variant URL is an absolute link from an already-rewritten
+                // master — tied to whichever host served that master, so CDN
+                // failover / script refresh don't apply here.
+                do {
+                    data = try fetchRemote(provider: provider, stream: stream, url: manifestURL, category: .manifest)
+                    logStore.record(streamId: stream.id, level: "info", event: "fetchManifest", url: manifestURL.absoluteString, message: "success · \(data.count) bytes")
+                } catch {
+                    logStore.record(streamId: stream.id, level: "error", event: "fetchManifest", url: manifestURL.absoluteString, message: "\(error)")
+                    throw error
+                }
+            } else {
+                do {
+                    data = try fetchManifestWithFailover(provider: provider, stream: stream, primary: manifestURL)
+                } catch {
+                    // Primary + every CDN mirror failed. Last resort: ask the
+                    // provider script (when one is configured) for a brand-new
+                    // manifest and try the refreshed source once.
+                    guard let (freshProvider, freshStream) = refreshManifestViaScript(providerId: provider.id, streamId: stream.id, trigger: "manifest and all CDNs failed"),
+                          let freshURL = URL(string: freshStream.url) else { throw error }
+                    effectiveStream = freshStream
+                    effectiveManifestURL = freshURL
+                    data = try fetchManifestWithFailover(provider: freshProvider, stream: freshStream, primary: freshURL)
+                }
             }
-            logStore.record(streamId: stream.id, level: "info", event: "fetchManifest", url: manifestURL.absoluteString, message: "success · \(data.count) bytes")
             let text = String(data: data, encoding: .utf8) ?? ""
             if M3U8Rewriter.isMasterPlaylist(text) {
-                let rewritten = rewriteMasterM3U8(text, base: manifestURL, streamId: stream.id)
+                let rewritten = rewriteMasterM3U8(text, base: effectiveManifestURL, streamId: stream.id)
                 return response(status: 200, body: Data(rewritten.utf8), type: "application/vnd.apple.mpegurl; charset=utf-8", noStore: true)
             }
-            let rewritten = rewriteM3U8(text, base: manifestURL, streamId: stream.id, decrypt: !stream.hlsKey.isEmpty)
+            let rewritten = rewriteM3U8(text, base: effectiveManifestURL, streamId: stream.id, decrypt: !effectiveStream.hlsKey.isEmpty)
             return response(status: 200, body: Data(rewritten.utf8), type: "application/vnd.apple.mpegurl; charset=utf-8", noStore: true)
         }
         if stream.representations.count > 1 {
@@ -2639,6 +2852,8 @@ final class PanelServer {
             "bandwidth": metrics.bandwidthView(streamId: stream.id),
             "inputBandwidth": metrics.inputBandwidthView(streamId: stream.id),
             "playUrl": "http://\(host)/play/\(stream.id)/index.m3u8",
+            "directSource": stream.directSource,
+            "sourceUrl": "http://\(host)/source/\(stream.id)",
             "directUrl": stream.kind == "m3u8" ? "http://\(host)/play/\(stream.id)/index.m3u8" : "http://\(host)/restream/\(stream.id)/live.m3u8",
             "directStreamUrls": directUrls,
             "downloadUrls": downloadUrls,
@@ -2827,6 +3042,7 @@ final class PanelServer {
         stream.cdnUrls = cdnCandidates
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && URL(string: $0)?.scheme?.hasPrefix("http") == true }
+        stream.directSource = input["directSource"]?.bool ?? false
         return stream
     }
 

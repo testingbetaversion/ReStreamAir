@@ -600,6 +600,8 @@ function renderEditor() {
     activeClients: stream.activeClients,
     playUrl: stream.playUrl,
     directUrl: stream.directUrl,
+    directSource: Boolean(stream.directSource),
+    sourceUrl: stream.sourceUrl,
     directStreamUrls: stream.directStreamUrls || {},
     lastError: stream.lastError,
   }, null, 2);
@@ -638,6 +640,7 @@ function renderEditor() {
   form.elements.pollInterval.value = stream.pollInterval || 2;
   form.elements.audioDelayMs.value = stream.audioDelayMs || 0;
   form.elements.forceOffline.checked = Boolean(stream.forceOffline);
+  form.elements.directSource.checked = Boolean(stream.directSource);
   form.elements.manifestHeaders.value = stream.manifestHeaders || "";
   form.elements.mediaHeaders.value = stream.mediaHeaders || "";
   form.elements.hlsKeyHeaders.value = stream.hlsKeyHeaders || "";
@@ -730,6 +733,7 @@ function streamPayload() {
     pollInterval: Number(form.elements.pollInterval.value),
     audioDelayMs: Number(form.elements.audioDelayMs.value) || 0,
     forceOffline: form.elements.forceOffline.checked,
+    directSource: form.elements.directSource.checked,
     manifestHeaders: form.elements.manifestHeaders.value,
     mediaHeaders: form.elements.mediaHeaders.value,
     hlsKeyHeaders: form.elements.hlsKeyHeaders.value,
