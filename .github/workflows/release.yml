@@ -27,8 +27,8 @@ jobs:
         run: |
           sed -i '' "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
           sed -i '' "s/static let commit = \"unknown\"/static let commit = \"${GITHUB_SHA:0:7}\"/" Version.swift
-      - run: swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair
-      - run: swiftc HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKit
+      - run: swiftc -O $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair
+      - run: swiftc -O HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKit
       - run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-macos.tar.gz restreamair restreamair-menubar
       - uses: actions/upload-artifact@v4
         with:
@@ -40,7 +40,6 @@ jobs:
 
   build-linux:
     runs-on: ubuntu-latest
-    container: swift:6.0
     steps:
       - uses: actions/checkout@v4
       - name: Resolve version
@@ -54,7 +53,16 @@ jobs:
           COMMIT=$(echo "$GITHUB_SHA" | cut -c1-7)
           sed -i "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
           sed -i "s/static let commit = \"unknown\"/static let commit = \"$COMMIT\"/" Version.swift
-      - run: swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux
+      # Static Swift runtime → runs on any Linux without a toolchain.
+      - name: Build (static)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src swift:6.0 \
+            bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux'
+          file restreamair-linux
+      - name: Verify self-contained (bare host, no Swift)
+        run: |
+          if ldd restreamair-linux | grep -qi swift; then echo "ERROR: links Swift runtime"; exit 1; fi
+          ./restreamair-linux selftest
       - run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-linux.tar.gz restreamair-linux
       - uses: actions/upload-artifact@v4
         with:
@@ -79,12 +87,17 @@ jobs:
           sed -i "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
           sed -i "s/static let commit = \"unknown\"/static let commit = \"$COMMIT\"/" Version.swift
       - uses: docker/setup-qemu-action@v3
-      # arm64 via emulation (slow but runner-independent).
-      - name: Build restreamair (Linux arm64)
+      - name: Build (static, arm64 emulation)
         run: |
-          docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src swift:6.0 \
-            bash -c 'swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux-arm64'
-          docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src swift:6.0 ./restreamair-linux-arm64 selftest
+          docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src swift:6.0 \
+            bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux-arm64'
+          file restreamair-linux-arm64
+      - name: Verify self-contained (bare arm64, no Swift)
+        run: |
+          if docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 \
+               bash -c 'ldd restreamair-linux-arm64 | grep -qi swift'; then
+            echo "ERROR: links Swift runtime"; exit 1; fi
+          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 ./restreamair-linux-arm64 selftest
       - run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-linux-arm64.tar.gz restreamair-linux-arm64
       - uses: actions/upload-artifact@v4
         with:
