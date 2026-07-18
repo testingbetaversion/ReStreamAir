@@ -169,8 +169,19 @@ final class HTTPClient {
 /// segment downloader and the HLS proxy path so "append params to segments"
 /// is one implementation, not duplicated per pipeline.
 func appendingQueryParams(_ url: URL, _ paramString: String) -> URL {
-    let trimmed = paramString.trimmingCharacters(in: CharacterSet(charactersIn: " ?&"))
+    var trimmed = paramString.trimmingCharacters(in: CharacterSet(charactersIn: " ?&"))
     guard !trimmed.isEmpty, var components = URLComponents(url: url, resolvingAgainstBaseURL: true) else { return url }
+    // The `percentEncodedQuery` setter requires an already-valid encoded
+    // query and raises/traps on anything else. This string is free text from
+    // the stream editor, so a lone space, "#", or bare "%" typed there must
+    // be encoded here — not allowed to crash every segment request.
+    let allowed = CharacterSet.urlQueryAllowed
+    if trimmed.removingPercentEncoding == nil || !trimmed.unicodeScalars.allSatisfy({ allowed.contains($0) }) {
+        var literal = allowed
+        literal.remove(charactersIn: "%")
+        guard let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: literal) else { return url }
+        trimmed = encoded
+    }
     let existing = components.percentEncodedQuery
     components.percentEncodedQuery = [existing, trimmed].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "&")
     return components.url ?? url

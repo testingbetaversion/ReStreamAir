@@ -601,6 +601,10 @@ final class PanelServer {
     func start() throws {
         migrateLegacyDataLayout()
         try ensureData()
+        // If a previous panel process died uncleanly (crash → supervisor
+        // restart), its download/ffmpeg workers are still running with
+        // nobody supervising them — kill them before spawning replacements.
+        reapOrphanWorkers()
         if let username = adminUsernameOverride, let password = adminPasswordOverride {
             do {
                 try applyAdminOverride(username: username, password: password)
@@ -1093,12 +1097,21 @@ final class PanelServer {
         throw PanelError.unauthorized("Sign in required.")
     }
 
+    /// Hard ceiling on one buffered HTTP request (headers + body). Anything a
+    /// legitimate client sends (panel API JSON, playlist uploads) is far below
+    /// this; without a cap, a client that streams bytes without ever
+    /// terminating its headers grows the buffer without bound.
+    static let maxRequestBytes = 32 * 1024 * 1024
+
     func readRequest(_ connection: ClientConnection, completion: @escaping (HTTPRequest) -> Void) {
         var buffer = Data()
         func receive() {
             connection.receive { data, complete, error in
                 if let data { buffer.append(data) }
-                if error != nil || complete { connection.cancel(); return }
+                if error != nil || complete || buffer.count > PanelServer.maxRequestBytes {
+                    connection.cancel()
+                    return
+                }
                 if let request = self.parseRequest(buffer) {
                     completion(request)
                     return
@@ -1122,11 +1135,22 @@ final class PanelServer {
             guard let separator = line.firstIndex(of: ":") else { continue }
             headers[String(line[..<separator]).lowercased()] = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespaces)
         }
-        let contentLength = Int(headers["content-length"] ?? "0") ?? 0
+        // Clamp before doing arithmetic with it: a negative Content-Length
+        // would build a reversed (crashing) range below, and one near Int.max
+        // would overflow `bodyStart + contentLength`. Either arrives in a
+        // single hand-crafted request, so both must be survivable.
+        let contentLength = min(max(Int(headers["content-length"] ?? "0") ?? 0, 0), PanelServer.maxRequestBytes)
         let bodyStart = headerRange.upperBound
-        guard data.count >= bodyStart + contentLength else { return nil }
+        guard data.count - bodyStart >= contentLength else { return nil }
         let body = Data(data[bodyStart..<(bodyStart + contentLength)])
-        let url = URL(string: parts[1], relativeTo: URL(string: "http://localhost"))!
+        // A request target that isn't URL-parseable (control bytes, stray
+        // characters from a port scanner) must not take the server down —
+        // percent-encode and retry, and as a last resort route it as "/"
+        // (which serves the panel index; harmless for garbage input).
+        let base = URL(string: "http://localhost")
+        let url = URL(string: parts[1], relativeTo: base)
+            ?? URL(string: parts[1].addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? "/", relativeTo: base)
+            ?? URL(string: "http://localhost/")!
         let query = URLComponents(url: url, resolvingAgainstBaseURL: true)?.queryItems?.reduce(into: [String: String]()) {
             $0[$1.name] = $1.value ?? ""
         } ?? [:]
@@ -1805,12 +1829,14 @@ final class PanelServer {
                 self?.lock.lock()
                 self?.jobs[streamId]?.removeAll { $0.process === job.process }
                 self?.lock.unlock()
+                self?.persistWorkerPids()
             }
             try process.run()
             spawned.append(job)
         }
 
         lock.lock(); jobs[stream.id] = spawned; lock.unlock()
+        persistWorkerPids()
         stream.status = "running"
         stream.lastError = nil
     }
@@ -1909,10 +1935,12 @@ final class PanelServer {
             self?.lock.lock()
             self?.jobs[streamId]?.removeAll { $0.process === job.process }
             self?.lock.unlock()
+            self?.persistWorkerPids()
         }
         try process.run()
 
         lock.lock(); jobs[stream.id] = [job]; lock.unlock()
+        persistWorkerPids()
         stream.status = "running"
         stream.lastError = nil
     }
@@ -1937,6 +1965,59 @@ final class PanelServer {
             if pid > 0 { kill(pid, SIGKILL) }
             #endif
         }
+        persistWorkerPids()
+    }
+
+    // MARK: - Worker PID bookkeeping (restart hygiene)
+
+    /// PIDs of every live worker/ffmpeg child, persisted so a *new* panel
+    /// process (after a crash and supervisor restart) can clean up workers
+    /// the previous process left behind. Without this, every restart doubles
+    /// the downloader/ffmpeg population — the old ones keep fetching forever
+    /// with nobody supervising them.
+    var workerPidsFile: URL { runtimeDir.appendingPathComponent("worker-pids.json") }
+
+    func persistWorkerPids() {
+        lock.lock()
+        let pids = jobs.values.flatMap { $0 }.map { Int($0.process.processIdentifier) }.filter { $0 > 0 }
+        lock.unlock()
+        let data = (try? JSONSerialization.data(withJSONObject: pids)) ?? Data("[]".utf8)
+        try? data.write(to: workerPidsFile, options: [.atomic])
+    }
+
+    func reapOrphanWorkers() {
+        guard let data = try? Data(contentsOf: workerPidsFile),
+              let pids = (try? JSONSerialization.jsonObject(with: data)) as? [Int] else { return }
+        for pidValue in pids {
+            let pid = pid_t(pidValue)
+            guard pid > 1, pid != ProcessInfo.processInfo.processIdentifier else { continue }
+            // PIDs get reused by the OS — only kill if the process actually
+            // looks like one of ours, never blindly.
+            guard commandLooksLikeWorker(pid) else { continue }
+            kill(pid, SIGTERM)
+            #if os(Linux)
+            // Workers inherit a blocked SIGTERM mask (see stop()) — escalate.
+            kill(pid, SIGKILL)
+            #endif
+        }
+        try? FileManager.default.removeItem(at: workerPidsFile)
+    }
+
+    private func commandLooksLikeWorker(_ pid: pid_t) -> Bool {
+        #if os(Linux)
+        guard let raw = try? Data(contentsOf: URL(fileURLWithPath: "/proc/\(pid)/cmdline")) else { return false }
+        let command = String(decoding: raw, as: UTF8.self).replacingOccurrences(of: "\0", with: " ")
+        #else
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-o", "command=", "-p", "\(pid)"]
+        let pipe = Pipe()
+        ps.standardOutput = pipe
+        guard (try? ps.run()) != nil else { return false }
+        ps.waitUntilExit()
+        let command = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        #endif
+        return command.contains(selfBinary.lastPathComponent) || command.contains("ffmpeg")
     }
 
     /// Live workers already retry through routine network hiccups on their
@@ -2055,8 +2136,14 @@ final class PanelServer {
             let manifestURL: URL
             if let variant = request.query["variant"], let variantURL = URL(string: variant) {
                 manifestURL = variantURL
+            } else if let configured = URL(string: stream.url) ?? URL(string: stream.url.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                // Never force-unwrap a user-entered URL: a stream saved with a
+                // stray space used to trap here and kill the whole panel the
+                // moment any player requested the playlist.
+                manifestURL = configured
             } else {
-                manifestURL = URL(string: stream.url)!
+                logStore.record(streamId: stream.id, level: "error", event: "fetchManifest", url: stream.url, message: "stream URL is not a valid URL")
+                throw PanelError.badRequest("Stream URL is not a valid URL — fix it in the stream editor.")
             }
             let data: Data
             do {
@@ -3044,13 +3131,96 @@ struct RestreamAirMain {
         case "live":
             LiveM3U8ActionRuntime.run(Array(arguments.dropFirst()))
         case "serve":
-            runServe(Array(arguments.dropFirst()))
+            serveEntry(Array(arguments.dropFirst()))
         case "selftest":
             // Known-answer crypto vectors — verifies the pure-Swift SHA/PBKDF2/
             // AES produce correct bytes on this platform (used by Linux CI).
             CryptoSelfTest.runOrExit()
         default:
-            runServe(arguments)
+            serveEntry(arguments)
+        }
+    }
+
+    // MARK: - Serve supervision
+    //
+    // `serve` runs as two processes: a tiny supervisor parent that does
+    // nothing but watch, and a child that actually binds the port and serves.
+    // Stream downloads were already isolated in their own worker processes;
+    // this closes the remaining gap — if anything in the serving process
+    // still manages to die (a Swift runtime trap can't be caught in-process),
+    // the supervisor restarts it within seconds instead of the whole service
+    // staying down. Set RESTREAMAIR_NO_SUPERVISOR=1 (or pass --no-supervisor)
+    // to run single-process, e.g. under systemd with Restart=always.
+
+    /// Set on the parent while a serve child is running, so the C signal
+    /// handlers (which can't capture context) can forward SIGTERM/SIGINT.
+    static var supervisedChildPid: pid_t = -1
+    /// Set by the signal handlers so the wait loop knows an exit was a
+    /// requested stop, not a crash to restart.
+    static var supervisorStopping = false
+
+    static func serveEntry(_ arguments: [String]) {
+        // A dropped SSH session sends SIGHUP to the foreground process group;
+        // a panel that's meant to keep serving shouldn't die with the terminal.
+        signal(SIGHUP, SIG_IGN)
+        let environment = ProcessInfo.processInfo.environment
+        let supervised = environment["RESTREAMAIR_SUPERVISED"] == "1"
+        let optOut = environment["RESTREAMAIR_NO_SUPERVISOR"] == "1" || arguments.contains("--no-supervisor")
+        let serveArguments = arguments.filter { $0 != "--no-supervisor" }
+        if supervised || optOut {
+            runServe(serveArguments)
+        } else {
+            superviseServe(serveArguments)
+        }
+    }
+
+    /// The watcher: spawn the serving child, wait, restart on abnormal death
+    /// with capped exponential backoff. Deliberately allocates nothing per
+    /// iteration and handles no requests — the less it does, the less can
+    /// kill it.
+    static func superviseServe(_ arguments: [String]) {
+        signal(SIGTERM, { _ in
+            RestreamAirMain.supervisorStopping = true
+            if RestreamAirMain.supervisedChildPid > 0 { kill(RestreamAirMain.supervisedChildPid, SIGTERM) }
+        })
+        signal(SIGINT, { _ in
+            RestreamAirMain.supervisorStopping = true
+            if RestreamAirMain.supervisedChildPid > 0 { kill(RestreamAirMain.supervisedChildPid, SIGINT) }
+        })
+        let selfBinary = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        var fastFailures = 0
+        var firstAttempt = true
+        while true {
+            let child = Process()
+            child.executableURL = selfBinary
+            child.arguments = ["serve"] + arguments
+            var environment = ProcessInfo.processInfo.environment
+            environment["RESTREAMAIR_SUPERVISED"] = "1"
+            child.environment = environment
+            let startedAt = Date()
+            do {
+                try child.run()
+            } catch {
+                fputs("error: could not start panel process: \(error)\n", stderr)
+                exit(1)
+            }
+            supervisedChildPid = child.processIdentifier
+            child.waitUntilExit()
+            supervisedChildPid = -1
+            let uptime = Date().timeIntervalSince(startedAt)
+            let signaled = child.terminationReason == .uncaughtSignal
+            let status = child.terminationStatus
+            if supervisorStopping || (!signaled && status == 0) { exit(0) }
+            // An immediate nonzero exit on the very first attempt is a
+            // configuration error (port in use, bad flags) — the child
+            // already printed why. Propagate instead of crash-looping on it.
+            if firstAttempt && !signaled && uptime < 5 { exit(status) }
+            firstAttempt = false
+            fastFailures = uptime >= 60 ? 0 : fastFailures + 1
+            let delay = min(30.0, pow(2.0, Double(min(fastFailures, 5))))
+            let cause = signaled ? "signal \(status)" : "exit code \(status)"
+            fputs("panel process died (\(cause)) after \(Int(uptime))s — restarting in \(Int(delay))s\n", stderr)
+            Thread.sleep(forTimeInterval: delay)
         }
     }
 

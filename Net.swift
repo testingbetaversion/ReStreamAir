@@ -183,7 +183,13 @@ enum POSIXServer {
                         accept(serverFD, $0, &length)
                     }
                 }
-                guard clientFD >= 0 else { continue }
+                guard clientFD >= 0 else {
+                    // Persistent accept errors (EMFILE when fds run out, etc.)
+                    // would otherwise spin this loop at 100% CPU. Back off
+                    // briefly; transient EINTR just retries immediately.
+                    if errno != EINTR { usleep(50_000) }
+                    continue
+                }
                 // Bound the request read so an idle client can't pin a worker
                 // thread on read() forever. SSE / direct connections never read
                 // again after their request, so this doesn't affect them.
