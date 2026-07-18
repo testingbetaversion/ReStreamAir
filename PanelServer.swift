@@ -1,7 +1,9 @@
 import Foundation
 #if canImport(Network)
 import Network
-#else
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Glibc)
 import Glibc
 #endif
 

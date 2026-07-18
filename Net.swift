@@ -63,7 +63,11 @@ final class ClientConnection {
 }
 
 #else
+#if canImport(Musl)
+import Musl
+#else
 import Glibc
+#endif
 
 final class ClientConnection {
     private let fd: Int32

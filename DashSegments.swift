@@ -8,9 +8,11 @@ import FoundationXML
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
-#if os(Linux)
+#if canImport(Musl)
+import Musl
+#elseif canImport(Glibc)
 import Glibc
-#else
+#elseif canImport(Darwin)
 import Darwin
 #endif
 
