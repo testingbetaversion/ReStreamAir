@@ -75,7 +75,8 @@ jobs:
           tar -czf "$STAGE.tar.gz" "$STAGE"
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"
       - name: Verify no Swift runtime linked
-        run: if ldd restreamair-linux | grep -qi swift; then echo "ERROR: links Swift runtime"; exit 1; fi
+        run: |
+          if ldd restreamair-linux | grep -qi swift; then echo "links Swift runtime unexpectedly"; exit 1; fi
       - name: Verify the bundle runs on a host WITHOUT libxml2/ICU (the 26.04 failure mode)
         run: |
           docker run --rm -v "$PWD/$STAGE:/app:ro" ubuntu:24.04 bash -c '
