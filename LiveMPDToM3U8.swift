@@ -652,7 +652,23 @@ final class LiveMPDToM3U8 {
         // Sort once after the whole batch rather than after every append: the
         // queue is only ever consumed (pruneOldSegments/writePlaylist) once
         // this returns, and re-sorting per segment made the loop O(n² log n).
-        queue.sort { $0.number < $1.number }
+        //
+        // Order by the media-timeline position (tfdt), NOT the DASH segment
+        // `number`. For $Time$-addressed SegmentTimelines (media="…$Time$…", no
+        // $Number$/startNumber) the number is window-relative and collides —
+        // every segment ends up numbered the same. A sort on colliding keys is
+        // not stable, so it scrambled the queue; `queue.last` then stopped being
+        // the true newest segment, and isTimelineBreak() compared each new
+        // segment against the wrong predecessor, emitting a spurious
+        // EXT-X-DISCONTINUITY on nearly every segment (disc-sequence climbing
+        // ~1/segment → constant player re-buffering). tfdt is the real monotonic
+        // timeline; fall back to `number` only when a segment has no readable tfdt.
+        queue.sort { a, b in
+            switch (a.startTime, b.startTime) {
+            case let (x?, y?) where x != y: return x < y
+            default: return a.number < b.number
+            }
+        }
     }
 
     private func fetchManifestWithRetries(retries: Int = 5, delay: Double = 0.5) throws -> Data {
