@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Musl)
+import Musl
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 // Playlist text parsing/rewriting lives in M3U8Rewriter.swift, and
 // ffmpeg/ffprobe discovery in FFmpegLocator.swift — both split out of this
@@ -132,6 +137,20 @@ struct LiveM3U8ActionRuntime {
     ]
 
     static func run(_ arguments: [String]) {
+        #if os(Linux)
+        // This worker is spawned by the panel via Foundation.Process, so it
+        // inherits the panel's signal mask — and libdispatch blocks most
+        // signals (SIGTERM included) on every thread it touches. With SIGTERM
+        // blocked, the panel's Process.terminate() can never stop us: we'd keep
+        // polling the manifest and writing log lines as an orphan after the
+        // stream is "stopped". Unblock SIGTERM (and SIGINT) so a normal stop
+        // takes effect; the panel still escalates to SIGKILL as a backstop.
+        var mask = sigset_t()
+        sigemptyset(&mask)
+        sigaddset(&mask, SIGTERM)
+        sigaddset(&mask, SIGINT)
+        sigprocmask(SIG_UNBLOCK, &mask, nil)
+        #endif
         do {
             let call = try parseCall(arguments)
             let result = try execute(call)

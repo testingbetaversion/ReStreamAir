@@ -286,8 +286,6 @@
                 </select>
                 <input id="streamsGridSearch" class="quick-search" placeholder="Search streams…">
                 <button id="gridNewStreamBtn" type="button"><span data-icon="plus"></span>New Stream</button>
-                <button id="gridImportChannelsBtn" type="button" class="ghost hidden"><span data-icon="refresh"></span>Import channels</button>
-                <button id="gridImportEventsBtn" type="button" class="ghost hidden"><span data-icon="refresh"></span>Import events</button>
                 <button id="gridProviderSettingsBtn" type="button" class="ghost mini-icon-btn hidden" title="Provider settings"><span data-icon="settings"></span></button>
                 <span id="streamsGridCount" class="field-hint"></span>
               </div>
@@ -295,11 +293,14 @@
             <div class="bulk-action-bar">
               <button id="gridRunningOnlyBtn" type="button" class="ghost bulk-toggle" title="Show only running streams"><span data-icon="broadcast"></span>Running only</button>
               <span class="bulk-spacer"></span>
+              <button id="gridImportChannelsBtn" type="button" class="ghost" disabled title="Filter All Streams to a single provider that has an import script"><span data-icon="refresh"></span>Import channels</button>
+              <button id="gridImportEventsBtn" type="button" class="ghost" disabled title="Filter All Streams to a single provider that has an import script"><span data-icon="refresh"></span>Import events</button>
               <button id="gridStartAllBtn" type="button" class="ghost"><span data-icon="play"></span>Start all</button>
               <button id="gridStopAllBtn" type="button" class="ghost"><span data-icon="stop"></span>Stop all</button>
               <button id="gridDeleteAllBtn" type="button" class="ghost danger-ghost"><span data-icon="trash"></span>Delete all</button>
             </div>
             <div id="streamsGridImportStatus" class="field-hint hidden"></div>
+            <pre id="streamsGridImportOutput" class="script-output hidden" aria-label="Import output"></pre>
             <div id="streamsGrid" class="stream-grid empty-state">No streams yet.</div>
           </div>
         </section>

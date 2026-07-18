@@ -1921,7 +1921,22 @@ final class PanelServer {
         lock.lock()
         let jobsForStream = jobs.removeValue(forKey: stream.id) ?? []
         lock.unlock()
-        for job in jobsForStream { job.process.terminate() }
+        for job in jobsForStream {
+            let pid = job.process.processIdentifier
+            job.process.terminate() // SIGTERM — the clean path for a well-behaved worker.
+            // Worker subprocesses inherit the panel's blocked-signal mask
+            // (libdispatch blocks most signals on Linux, SIGTERM among them), so
+            // the SIGTERM from terminate() is never delivered: the worker keeps
+            // running — orphaned, still fetching the manifest and writing log
+            // lines long after the stream is marked "stopped" (the "logs still
+            // ongoing after stop" bug). SIGKILL can't be blocked or caught, so
+            // escalate to guarantee the worker actually dies. The worker is
+            // stateless (it only writes segment files + an atomically-replaced
+            // playlist), so there's nothing to flush.
+            #if os(Linux)
+            if pid > 0 { kill(pid, SIGKILL) }
+            #endif
+        }
     }
 
     /// Live workers already retry through routine network hiccups on their
