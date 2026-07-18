@@ -26,6 +26,9 @@ jobs:
       - name: Smoke test
         run: ./restreamair dash --help
 
+      - name: Crypto self-test
+        run: ./restreamair selftest
+
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
@@ -37,55 +40,44 @@ jobs:
 
   build-linux:
     runs-on: ubuntu-latest
-    container: swift:6.0
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install curl
-        run: apt-get update && apt-get install -y curl
+      # -static-stdlib bakes the Swift runtime + Foundation into the binary so it
+      # runs on any Linux with no Swift toolchain installed; -O optimizes (the
+      # pure-Swift AES needs it). Built inside the toolchain container.
+      - name: Build restreamair (Linux, static)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src swift:6.0 \
+            bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux'
+          file restreamair-linux
 
-      - name: Swift version
-        run: swift --version
+      # The runner has no Swift installed, so the fact that the binary runs here
+      # at all is the proof it's self-contained.
+      - name: Self-contained + crypto self-test (bare host, no Swift)
+        run: |
+          if ldd restreamair-linux | grep -qi swift; then echo "ERROR: still links the Swift runtime"; exit 1; fi
+          ./restreamair-linux selftest
+          ./restreamair-linux dash --help >/dev/null
 
-      # No menu-bar target on Linux (it needs AppKit). restreamair itself uses
-      # a POSIX-socket server + pure-Swift crypto on Linux (see Net.swift /
-      # Crypto.swift); CENC/HLS internal decryption degrades to ffmpeg mode.
-      - name: Build restreamair (Linux)
-        run: swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair
-
-      - name: CLI smoke test
-        run: ./restreamair dash --help
-
-      # Prove the pure-Swift SHA-256/PBKDF2/AES produce correct bytes on Linux
-      # (known NIST/FIPS vectors) — this is what makes CENC/HLS decryption and
-      # admin login work here without CommonCrypto.
-      - name: Crypto self-test
-        run: ./restreamair selftest
-
-      # Full runtime check: the POSIX server serves, and pure-Swift PBKDF2 lets
-      # an admin account be created and logged into.
       - name: Serve + auth smoke test
         run: |
-          ./restreamair serve --port 8799 --bind 127.0.0.1 &
+          ./restreamair-linux serve --port 8799 --bind 127.0.0.1 &
           sleep 4
           curl -sf -X POST http://127.0.0.1:8799/api/auth/setup \
-            -H 'Content-Type: application/json' \
-            -d '{"username":"admin","password":"pw123456"}'
+            -H 'Content-Type: application/json' -d '{"username":"admin","password":"pw123456"}'
           code=$(curl -s -c /tmp/c.txt -X POST http://127.0.0.1:8799/api/auth/login \
-            -H 'Content-Type: application/json' \
-            -d '{"username":"admin","password":"pw123456","remember":"true"}' \
+            -H 'Content-Type: application/json' -d '{"username":"admin","password":"pw123456","remember":"true"}' \
             -o /dev/null -w '%{http_code}')
-          echo "login HTTP $code"
-          test "$code" = "200"
+          echo "login HTTP $code"; test "$code" = "200"
           state=$(curl -s -b /tmp/c.txt -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/api/state)
-          echo "state HTTP $state"
-          test "$state" = "200"
+          echo "state HTTP $state"; test "$state" = "200"
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: restreamair-linux
-          path: restreamair
+          path: restreamair-linux
           if-no-files-found: error
 
   build-linux-arm64:
@@ -93,12 +85,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
-      # Build and run under arm64 emulation — slower, but works on any runner and
-      # verifies the pure-Swift crypto is byte-correct on arm64 too.
-      - name: Build restreamair (Linux arm64)
+
+      - name: Build restreamair (Linux arm64, static)
         run: |
-          docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src swift:6.0 \
-            bash -c 'swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux-arm64'
+          docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src swift:6.0 \
+            bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux-arm64'
           file restreamair-linux-arm64
-      - name: Crypto self-test (arm64)
-        run: docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src swift:6.0 ./restreamair-linux-arm64 selftest
+
+      # Prove it's self-contained by running it on a bare arm64 Ubuntu (no Swift).
+      - name: Self-contained + crypto self-test (bare arm64, no Swift)
+        run: |
+          if docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 \
+               bash -c 'ldd restreamair-linux-arm64 | grep -qi swift'; then
+            echo "ERROR: still links the Swift runtime"; exit 1; fi
+          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 ./restreamair-linux-arm64 selftest
