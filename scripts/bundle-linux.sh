@@ -15,7 +15,9 @@ set -e
 STAGE="$1"
 BIN="${2:-restreamair-linux}"
 mkdir -p "$STAGE/libs"
-cp "$BIN" "$STAGE/"
+# Normalise the staged binary name so the launcher (which execs
+# ./restreamair-linux) works for every arch — the tarball name carries the arch.
+cp "$BIN" "$STAGE/restreamair-linux"
 
 # Direct deps of the binary.
 for l in $(ldd "$BIN" | grep -oE '/[^ ]+' | grep -E 'libxml2|libicu|liblzma'); do
