@@ -70,6 +70,35 @@ jobs:
           path: restreamair-linux
           if-no-files-found: error
 
+  # Dynamically-linked glibc build (static Swift runtime, system libcurl+libxml
+  # resolved at runtime). Unlike the fully-static musl single file, this uses
+  # the host's OpenSSL/libcurl, so it trusts the system CA store and can fetch
+  # HTTPS manifests. The musl single file bundles BoringSSL, which ships with no
+  # default trust store and no runtime CA override — it serves the embedded UI
+  # but cannot pull upstream streams — so this glibc build is the deployable
+  # Linux server binary until the musl TLS trust gap is closed.
+  build-linux-glibc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (glibc, static Swift runtime)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src swift:6.0 \
+            bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -vE "MenuBarApp.swift|Package.swift") -o restreamair-linux-glibc'
+          file restreamair-linux-glibc
+      - name: Self-contained-ish check + crypto self-test
+        run: |
+          if ldd restreamair-linux-glibc | grep -qi swift; then echo "ERROR: links Swift runtime"; exit 1; fi
+          ./restreamair-linux-glibc selftest
+      - name: Outbound HTTPS works (trusts system CAs)
+        run: |
+          ./restreamair-linux-glibc dash --info https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.mpd | head -3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: restreamair-linux-glibc
+          path: restreamair-linux-glibc
+          if-no-files-found: error
+
   build-linux-arm64:
     runs-on: ubuntu-latest
     steps:
