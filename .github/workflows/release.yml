@@ -81,8 +81,13 @@ jobs:
         run: |
           docker run --rm -v "$PWD/$STAGE:/app:ro" ubuntu:24.04 bash -c '
             set -e
-            # Reproduce a newer distro: strip the exact sonames the binary needs.
-            find / \( -name "libxml2.so.2*" -o -name "libicu*.so.*" -o -name "liblzma.so.*" \) -delete 2>/dev/null || true
+            # A real server has libcurl+OpenSSL (standard); the binary uses the
+            # system copy so it trusts the host CA store. Install it first...
+            apt-get update -qq && apt-get install -y -qq libcurl4 ca-certificates >/dev/null
+            # ...then simulate a NEWER distro whose libxml2/ICU/lzma sonames
+            # differ (Ubuntu 26.04 ships libxml2.so.16) by removing them, so the
+            # ONLY way the binary loads those is via the bundled libs/.
+            find / \( -name "libxml2.so.*" -o -name "libicu*.so.*" -o -name "liblzma.so.*" \) -delete 2>/dev/null || true
             echo "--- bare binary should FAIL to load libs ---"
             /app/restreamair-linux selftest 2>&1 | head -1 || echo "(bare binary failed, as expected)"
             echo "--- launcher should SUCCEED using bundled libs ---"
@@ -128,8 +133,9 @@ jobs:
         run: |
           docker run --rm --platform linux/arm64 -v "$PWD/$STAGE:/app:ro" ubuntu:24.04 bash -c '
             set -e
-            if ldd /app/restreamair-linux-arm64 | grep -qi swift; then echo "ERROR: links Swift runtime"; exit 1; fi
-            find / \( -name "libxml2.so.2*" -o -name "libicu*.so.*" -o -name "liblzma.so.*" \) -delete 2>/dev/null || true
+            if ldd /app/restreamair-linux-arm64 | grep -qi swift; then echo "links Swift runtime unexpectedly"; exit 1; fi
+            apt-get update -qq && apt-get install -y -qq libcurl4 >/dev/null
+            find / \( -name "libxml2.so.*" -o -name "libicu*.so.*" -o -name "liblzma.so.*" \) -delete 2>/dev/null || true
             /app/restreamair selftest
           '
       - uses: actions/upload-artifact@v4
