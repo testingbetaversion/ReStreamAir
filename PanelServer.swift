@@ -3030,6 +3030,13 @@ struct RestreamAirMain {
     static var server: PanelServer?
 
     static func main() {
+        // Ignore SIGPIPE: writing to a socket whose peer has already closed
+        // (a browser tab closing, an SSE client dropping, a stream consumer
+        // disconnecting mid-write) delivers SIGPIPE, whose default action is
+        // to terminate the whole process. Ignoring it turns those writes into
+        // an ordinary EPIPE error on that one call, which the I/O paths handle,
+        // instead of silently killing the server (exit code 141 = 128 + 13).
+        signal(SIGPIPE, SIG_IGN)
         let arguments = Array(CommandLine.arguments.dropFirst())
         switch arguments.first {
         case "dash":
