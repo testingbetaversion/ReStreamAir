@@ -92,12 +92,13 @@ jobs:
           docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src swift:6.0 \
             bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux-arm64'
           file restreamair-linux-arm64
-      - name: Verify self-contained (bare arm64, no Swift)
+      - name: Verify self-contained (bare arm64 Ubuntu, no Swift)
         run: |
-          if docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 \
-               bash -c 'ldd restreamair-linux-arm64 | grep -qi swift'; then
-            echo "ERROR: links Swift runtime"; exit 1; fi
-          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 ./restreamair-linux-arm64 selftest
+          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 bash -c '
+            apt-get update -qq && apt-get install -y -qq libcurl4 libxml2 >/dev/null
+            if ldd restreamair-linux-arm64 | grep -qi swift; then echo "ERROR: links Swift runtime"; exit 1; fi
+            ./restreamair-linux-arm64 selftest
+          '
       - run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-linux-arm64.tar.gz restreamair-linux-arm64
       - uses: actions/upload-artifact@v4
         with:

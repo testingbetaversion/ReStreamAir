@@ -52,13 +52,18 @@ jobs:
             bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux'
           file restreamair-linux
 
-      # The runner has no Swift installed, so the fact that the binary runs here
-      # at all is the proof it's self-contained.
-      - name: Self-contained + crypto self-test (bare host, no Swift)
+      # Prove it runs on a bare Ubuntu with NO Swift toolchain — only the two
+      # common system libs Foundation needs (libcurl4 for URLSession, libxml2
+      # for XML parsing). This is the real target-machine scenario.
+      - name: Self-contained on bare Ubuntu (no Swift, only libcurl4 + libxml2)
         run: |
-          if ldd restreamair-linux | grep -qi swift; then echo "ERROR: still links the Swift runtime"; exit 1; fi
-          ./restreamair-linux selftest
-          ./restreamair-linux dash --help >/dev/null
+          docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 bash -c '
+            apt-get update -qq && apt-get install -y -qq libcurl4 libxml2 >/dev/null
+            echo "--- ldd ---"; ldd restreamair-linux || true
+            if ldd restreamair-linux | grep -qi swift; then echo "ERROR: still links the Swift runtime"; exit 1; fi
+            ./restreamair-linux selftest
+            ./restreamair-linux dash --help >/dev/null && echo "runs on bare Ubuntu: OK"
+          '
 
       - name: Serve + auth smoke test
         run: |
@@ -92,10 +97,12 @@ jobs:
             bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux-arm64'
           file restreamair-linux-arm64
 
-      # Prove it's self-contained by running it on a bare arm64 Ubuntu (no Swift).
-      - name: Self-contained + crypto self-test (bare arm64, no Swift)
+      # Prove it runs on a bare arm64 Ubuntu (no Swift, only libcurl4 + libxml2).
+      - name: Self-contained on bare arm64 Ubuntu (no Swift)
         run: |
-          if docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 \
-               bash -c 'ldd restreamair-linux-arm64 | grep -qi swift'; then
-            echo "ERROR: still links the Swift runtime"; exit 1; fi
-          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 ./restreamair-linux-arm64 selftest
+          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 bash -c '
+            apt-get update -qq && apt-get install -y -qq libcurl4 libxml2 >/dev/null
+            if ldd restreamair-linux-arm64 | grep -qi swift; then echo "ERROR: links the Swift runtime"; exit 1; fi
+            ./restreamair-linux-arm64 selftest
+            echo "runs on bare arm64 Ubuntu: OK"
+          '

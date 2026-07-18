@@ -20,6 +20,12 @@ chmod +x restreamair          # (or restreamair-linux / restreamair-linux-arm64)
 ./restreamair                 # starts the web panel — same as ./restreamair serve
 ```
 
+The Swift runtime is statically linked in, so no toolchain is needed. The Linux binaries do need two common system libraries that Foundation uses — `libcurl4` (HTTP) and `libxml2` (XML). They're already present on most systems; if you hit `error while loading shared libraries: libcurl.so.4`, install them:
+
+```sh
+sudo apt-get update && sudo apt-get install -y libcurl4 libxml2   # Debian/Ubuntu
+```
+
 ## Building from source
 
 **Prerequisites**: a Swift 5.9+ toolchain.
