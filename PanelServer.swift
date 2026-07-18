@@ -651,7 +651,7 @@ final class PanelServer {
         listener?.start(queue: .global(qos: .userInitiated))
         #else
         do {
-            try POSIXServer.listen(bindAddress: bindAddress, port: port) { [weak self] connection in
+            try POSIXServer.serve(bindAddress: bindAddress, port: port) { [weak self] connection in
                 self?.handle(connection)
             }
             let host = boundAddress.isEmpty ? "127.0.0.1" : boundAddress
