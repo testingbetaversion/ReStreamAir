@@ -136,8 +136,14 @@ enum POSIXServer {
     /// message it does on macOS.
     struct BindError: Error { let errnoValue: Int32 }
 
-    static func listen(bindAddress: String, port: UInt16, onConnection: @escaping (ClientConnection) -> Void) throws {
-        let serverFD = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+    static func serve(bindAddress: String, port: UInt16, onConnection: @escaping (ClientConnection) -> Void) throws {
+        // SOCK_STREAM is an enum on Glibc but a plain Int32 on Musl.
+        #if canImport(Glibc)
+        let streamType = Int32(SOCK_STREAM.rawValue)
+        #else
+        let streamType = SOCK_STREAM
+        #endif
+        let serverFD = socket(AF_INET, streamType, 0)
         guard serverFD >= 0 else { throw BindError(errnoValue: errno) }
 
         var reuse: Int32 = 1
@@ -162,7 +168,7 @@ enum POSIXServer {
             close(serverFD)
             throw BindError(errnoValue: code)
         }
-        guard Glibc.listen(serverFD, 128) == 0 else {
+        guard listen(serverFD, 128) == 0 else {
             let code = errno
             close(serverFD)
             throw BindError(errnoValue: code)
