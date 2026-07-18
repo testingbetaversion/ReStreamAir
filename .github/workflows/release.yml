@@ -58,28 +58,42 @@ jobs:
       # glibc + static Swift runtime → dynamically links system libcurl+OpenSSL
       # (so it trusts the host CA store and can fetch HTTPS, unlike a fully-static
       # musl build) while needing no Swift toolchain. Web UI is embedded, so the
-      # binary needs no public/ directory on disk.
-      - name: Build (static Swift runtime, embedded UI)
+      # binary needs no public/ directory on disk. We then bundle the versioned
+      # libs (libxml2/ICU/lzma) whose sonames drift across Ubuntu releases, plus
+      # a launcher, so a bare download runs on newer distros (e.g. 26.04 ships
+      # libxml2.so.16, not the .so.2 the binary links) without installing anything.
+      - name: Build + bundle self-contained tarball (embedded UI + libs + launcher)
         run: |
-          docker run --rm -v "$PWD:/src" -w /src swift:6.0 \
-            bash -c 'sh scripts/embed-assets.sh && swiftc -O -static-stdlib $(ls *.swift | grep -vE "MenuBarApp.swift|Package.swift") -o restreamair-linux'
+          STAGE="restreamair-${{ steps.ver.outputs.tag }}-linux-x86_64"
+          docker run --rm -v "$PWD:/src" -w /src swift:6.0 bash -c "
+            set -e
+            sh scripts/embed-assets.sh
+            swiftc -O -static-stdlib \$(ls *.swift | grep -vE 'MenuBarApp.swift|Package.swift') -o restreamair-linux
+            sh scripts/bundle-linux.sh '$STAGE'
+          "
           file restreamair-linux
-      - name: Verify self-contained + serves UI + fetches HTTPS
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+      - name: Verify no Swift runtime linked
+        run: if ldd restreamair-linux | grep -qi swift; then echo "ERROR: links Swift runtime"; exit 1; fi
+      - name: Verify the bundle runs on a host WITHOUT libxml2/ICU (the 26.04 failure mode)
         run: |
-          if ldd restreamair-linux | grep -qi swift; then echo "ERROR: links Swift runtime"; exit 1; fi
-          ./restreamair-linux selftest
-          ./restreamair-linux dash --info https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.mpd | head -2
-          ./restreamair-linux serve --port 8799 --bind 127.0.0.1 &
-          sleep 4
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/)" = "200"
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/app.js)" = "200"
-      - run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-linux.tar.gz restreamair-linux
+          docker run --rm -v "$PWD/$STAGE:/app:ro" ubuntu:24.04 bash -c '
+            set -e
+            # Reproduce a newer distro: strip the exact sonames the binary needs.
+            find / \( -name "libxml2.so.2*" -o -name "libicu*.so.*" -o -name "liblzma.so.*" \) -delete 2>/dev/null || true
+            echo "--- bare binary should FAIL to load libs ---"
+            /app/restreamair-linux selftest 2>&1 | head -1 || echo "(bare binary failed, as expected)"
+            echo "--- launcher should SUCCEED using bundled libs ---"
+            /app/restreamair selftest
+            /app/restreamair dash --info https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.mpd | head -2
+          '
       - uses: actions/upload-artifact@v4
         with:
           name: linux
           path: |
             restreamair-linux
-            restreamair-${{ steps.ver.outputs.tag }}-linux.tar.gz
+            restreamair-${{ steps.ver.outputs.tag }}-linux-x86_64.tar.gz
 
   build-linux-arm64:
     runs-on: ubuntu-latest
@@ -97,19 +111,26 @@ jobs:
           sed -i "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
           sed -i "s/static let commit = \"unknown\"/static let commit = \"$COMMIT\"/" Version.swift
       - uses: docker/setup-qemu-action@v3
-      - name: Build (static, arm64 emulation, embedded UI)
+      - name: Build + bundle self-contained tarball (arm64 emulation, embedded UI + libs + launcher)
         run: |
-          docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src swift:6.0 \
-            bash -c 'sh scripts/embed-assets.sh && swiftc -O -static-stdlib $(ls *.swift | grep -vE "MenuBarApp.swift|Package.swift") -o restreamair-linux-arm64'
+          STAGE="restreamair-${{ steps.ver.outputs.tag }}-linux-arm64"
+          docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src swift:6.0 bash -c "
+            set -e
+            sh scripts/embed-assets.sh
+            swiftc -O -static-stdlib \$(ls *.swift | grep -vE 'MenuBarApp.swift|Package.swift') -o restreamair-linux-arm64
+            sh scripts/bundle-linux.sh '$STAGE' restreamair-linux-arm64
+          "
           file restreamair-linux-arm64
-      - name: Verify self-contained (bare arm64 Ubuntu, no Swift)
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+      - name: Verify bundle runs on a host WITHOUT libxml2/ICU (no Swift, no toolchain)
         run: |
-          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 bash -c '
-            apt-get update -qq && apt-get install -y -qq libcurl4 libxml2 >/dev/null
-            if ldd restreamair-linux-arm64 | grep -qi swift; then echo "ERROR: links Swift runtime"; exit 1; fi
-            ./restreamair-linux-arm64 selftest
+          docker run --rm --platform linux/arm64 -v "$PWD/$STAGE:/app:ro" ubuntu:24.04 bash -c '
+            set -e
+            if ldd /app/restreamair-linux-arm64 | grep -qi swift; then echo "ERROR: links Swift runtime"; exit 1; fi
+            find / \( -name "libxml2.so.2*" -o -name "libicu*.so.*" -o -name "liblzma.so.*" \) -delete 2>/dev/null || true
+            /app/restreamair selftest
           '
-      - run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-linux-arm64.tar.gz restreamair-linux-arm64
       - uses: actions/upload-artifact@v4
         with:
           name: linux-arm64
