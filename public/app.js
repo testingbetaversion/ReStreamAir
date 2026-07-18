@@ -368,13 +368,14 @@ function renderStreamsGrid() {
   // Adding a stream needs a provider to attach it to — only disabled when
   // there are none at all (create one from the Providers tab first).
   $("#gridNewStreamBtn").disabled = !state.providers.length;
-  // Import needs a specific script provider, not "whichever's first" — only
-  // shown once the grid is filtered down to one that actually has a script
-  // configured, unlike New Stream's more permissive fallback.
+  // Import needs a specific script provider, not "whichever's first". The
+  // buttons live in the bulk bar next to Start all so they're always visible
+  // (discoverable), but only enable once the grid is filtered down to a single
+  // provider that actually has a script configured — the tooltip says so.
   const filteredProvider = state.providers.find((p) => p.id === streamsGridProviderId);
   const showImport = Boolean(filteredProvider?.scriptPath);
-  $("#gridImportChannelsBtn").classList.toggle("hidden", !showImport);
-  $("#gridImportEventsBtn").classList.toggle("hidden", !showImport);
+  $("#gridImportChannelsBtn").disabled = !showImport;
+  $("#gridImportEventsBtn").disabled = !showImport;
   // Unlike import, settings make sense for any filtered provider — script
   // or not.
   $("#gridProviderSettingsBtn").classList.toggle("hidden", !filteredProvider);
@@ -1487,29 +1488,44 @@ async function runProviderScript(action) {
   }, 1000);
 }
 
-// Import Channels/Events from the All Streams toolbar — same backend
-// action as the provider settings dialog's buttons, but there's no dialog
-// open here to hold a live-scrolling output box, so this shows just the
-// latest status line and stops polling once the script reports it's done
-// (rather than running forever until the user navigates away).
+// Import Channels/Events from the All Streams bulk bar — same backend action
+// as the provider settings dialog's buttons. There's no dialog open here, so
+// it renders the script's full output into its own live-scrolling terminal
+// (#streamsGridImportOutput) below the bar, so when channels don't load you can
+// read the script's actual output/error instead of guessing. A one-line status
+// (#streamsGridImportStatus) summarises above it. Polling stops once the script
+// reports it exited.
 let gridImportPollTimer = null;
 
 async function pollGridImportStatus(providerId) {
-  const box = $("#streamsGridImportStatus");
+  const status = $("#streamsGridImportStatus");
+  const term = $("#streamsGridImportOutput");
   try {
-    const result = await request(`/api/logs?streamId=${encodeURIComponent("script:" + providerId)}&limit=5`);
-    const latest = (result.entries || [])[0];
-    if (!latest) return;
-    box.textContent = latest.message || latest.event;
-    box.classList.remove("hidden");
-    if (latest.event === "scriptExit") {
+    const result = await request(`/api/logs?streamId=${encodeURIComponent("script:" + providerId)}&limit=300`);
+    const entries = result.entries || [];
+    // Full transcript, oldest→newest, into the terminal — same rendering as
+    // the provider dialog's terminal (don't rewrite the DOM when unchanged, so
+    // a selection/scroll survives; only auto-scroll if already at the bottom).
+    const text = entries.slice().reverse().map((e) => e.message || e.event).join("\n") || "(no output yet)";
+    if (term.textContent !== text) {
+      const wasAtBottom = term.scrollHeight - term.scrollTop - term.clientHeight < 20;
+      term.textContent = text;
+      if (wasAtBottom) term.scrollTop = term.scrollHeight;
+    }
+    term.classList.remove("hidden");
+    const latest = entries[0];
+    if (latest) {
+      status.textContent = latest.message || latest.event;
+      status.classList.remove("hidden");
+    }
+    if (latest && latest.event === "scriptExit") {
       clearInterval(gridImportPollTimer);
       gridImportPollTimer = null;
       refresh();
     }
   } catch (error) {
-    box.textContent = `Couldn't check import status: ${error.message || error}`;
-    box.classList.remove("hidden");
+    status.textContent = `Couldn't check import status: ${error.message || error}`;
+    status.classList.remove("hidden");
   }
 }
 
@@ -1517,13 +1533,17 @@ async function runProviderScriptForGrid(action) {
   const provider = state.providers.find((p) => p.id === streamsGridProviderId);
   if (!provider) { alert("Filter All Streams to a single provider first."); return; }
   if (!provider.scriptPath) { alert("This provider has no script configured — set one in Provider settings."); return; }
-  const box = $("#streamsGridImportStatus");
-  box.classList.remove("hidden");
-  box.textContent = `Starting ${action}…`;
+  const status = $("#streamsGridImportStatus");
+  const term = $("#streamsGridImportOutput");
+  status.classList.remove("hidden");
+  status.textContent = `Starting ${action}…`;
+  term.classList.remove("hidden");
+  term.textContent = "Starting…";
   try {
     await request(`/api/providers/${provider.id}/script/${action}`, { method: "POST", body: "{}" });
   } catch (error) {
-    box.textContent = `Couldn't start ${action}: ${error.message || error}`;
+    status.textContent = `Couldn't start ${action}: ${error.message || error}`;
+    term.textContent = `Couldn't start ${action}: ${error.message || error}`;
     return;
   }
   clearInterval(gridImportPollTimer);

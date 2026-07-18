@@ -1003,6 +1003,17 @@ pre {
 .script-output {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  background: var(--surface-2, rgba(0, 0, 0, 0.25));
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  color: var(--text);
 }
 
 /* API keys */
