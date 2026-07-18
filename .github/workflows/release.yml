@@ -27,7 +27,9 @@ jobs:
         run: |
           sed -i '' "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
           sed -i '' "s/static let commit = \"unknown\"/static let commit = \"${GITHUB_SHA:0:7}\"/" Version.swift
-      - run: swiftc -O $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair
+      - name: Embed web UI
+        run: sh scripts/embed-assets.sh
+      - run: swiftc -O $(ls *.swift | grep -vE 'MenuBarApp.swift|Package.swift') -o restreamair
       - run: swiftc -O HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKit
       - run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-macos.tar.gz restreamair restreamair-menubar
       - uses: actions/upload-artifact@v4
@@ -53,16 +55,24 @@ jobs:
           COMMIT=$(echo "$GITHUB_SHA" | cut -c1-7)
           sed -i "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
           sed -i "s/static let commit = \"unknown\"/static let commit = \"$COMMIT\"/" Version.swift
-      # Static Swift runtime → runs on any Linux without a toolchain.
-      - name: Build (static)
+      # glibc + static Swift runtime → dynamically links system libcurl+OpenSSL
+      # (so it trusts the host CA store and can fetch HTTPS, unlike a fully-static
+      # musl build) while needing no Swift toolchain. Web UI is embedded, so the
+      # binary needs no public/ directory on disk.
+      - name: Build (static Swift runtime, embedded UI)
         run: |
           docker run --rm -v "$PWD:/src" -w /src swift:6.0 \
-            bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux'
+            bash -c 'sh scripts/embed-assets.sh && swiftc -O -static-stdlib $(ls *.swift | grep -vE "MenuBarApp.swift|Package.swift") -o restreamair-linux'
           file restreamair-linux
-      - name: Verify self-contained (bare host, no Swift)
+      - name: Verify self-contained + serves UI + fetches HTTPS
         run: |
           if ldd restreamair-linux | grep -qi swift; then echo "ERROR: links Swift runtime"; exit 1; fi
           ./restreamair-linux selftest
+          ./restreamair-linux dash --info https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.mpd | head -2
+          ./restreamair-linux serve --port 8799 --bind 127.0.0.1 &
+          sleep 4
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/app.js)" = "200"
       - run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-linux.tar.gz restreamair-linux
       - uses: actions/upload-artifact@v4
         with:
@@ -87,10 +97,10 @@ jobs:
           sed -i "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
           sed -i "s/static let commit = \"unknown\"/static let commit = \"$COMMIT\"/" Version.swift
       - uses: docker/setup-qemu-action@v3
-      - name: Build (static, arm64 emulation)
+      - name: Build (static, arm64 emulation, embedded UI)
         run: |
           docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src swift:6.0 \
-            bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux-arm64'
+            bash -c 'sh scripts/embed-assets.sh && swiftc -O -static-stdlib $(ls *.swift | grep -vE "MenuBarApp.swift|Package.swift") -o restreamair-linux-arm64'
           file restreamair-linux-arm64
       - name: Verify self-contained (bare arm64 Ubuntu, no Swift)
         run: |
