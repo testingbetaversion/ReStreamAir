@@ -6,31 +6,29 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  SWIFT_IMAGE: swift:6.1.2
+  STATIC_SDK_URL: https://download.swift.org/swift-6.1.2-release/static-sdk/swift-6.1.2-RELEASE/swift-6.1.2-RELEASE_static-linux-0.0.1.artifactbundle.tar.gz
+  STATIC_SDK_SHA: df0b40b9b582598e7e3d70c82ab503fd6fbfdff71fd17e7f1ab37115a0665b3b
+
 jobs:
   build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Swift version
         run: swift --version
-
-      # Every .swift source except the optional macOS menu-bar companion
-      # (its own @main / AppKit) — same command the README documents.
+      # Every .swift source except the menu-bar companion and the Package.swift
+      # manifest (which isn't a compilable source).
       - name: Build restreamair
-        run: swiftc $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair
-
+        run: swiftc $(ls *.swift | grep -vE 'MenuBarApp.swift|Package.swift') -o restreamair
       - name: Build restreamair-menubar
         run: swiftc HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKit
-
       - name: Smoke test
         run: ./restreamair dash --help
-
       - name: Crypto self-test
         run: ./restreamair selftest
-
-      - name: Upload binaries
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: restreamair-macos
           path: |
@@ -42,41 +40,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Fully static (musl Static Linux SDK) + embedded web assets → one file
-      # with NO external dependencies: no Swift runtime, no libcurl, no libxml2,
-      # no glibc. Runs on literally any x86-64 Linux.
-      - name: Build restreamair (Linux, fully static + embedded UI)
+      # Fully static via the musl Static Linux SDK + embedded web UI → ONE file
+      # with zero external deps (no Swift runtime, libcurl, libxml2, or glibc).
+      - name: Build restreamair (Linux x86-64, fully static + embedded UI)
         run: |
-          docker run --rm -v "$PWD:/src" -w /src swift:6.0.0 bash -c '
+          docker run --rm -e STATIC_SDK_URL -e STATIC_SDK_SHA -v "$PWD:/src" -w /src "$SWIFT_IMAGE" bash -c '
             set -e
-            swift sdk install \
-              https://download.swift.org/swift-6.0-release/static-sdk/swift-6.0-RELEASE/swift-6.0-RELEASE_static-linux-0.0.1.artifactbundle.tar.gz \
-              --checksum 7984c2cf175bde52ba6ea1fcbe27fc4a148a6237c41c719209c9288ed3ceb652
+            swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_SHA"
             sh scripts/embed-assets.sh
             swift build -c release --swift-sdk x86_64-swift-linux-musl --product restreamair
             cp .build/x86_64-swift-linux-musl/release/restreamair restreamair-linux
           '
           file restreamair-linux
-
-      # The gold standard: run it on a bare ubuntu:24.04 with NOTHING added —
-      # no Swift, no libcurl, no libxml2 — and serve the embedded web UI.
-      - name: Runs on a bare Ubuntu with zero dependencies
+      # Gold standard: run on a bare ubuntu:24.04 with NOTHING installed.
+      - name: Runs on bare Ubuntu with zero dependencies
         run: |
           docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 bash -c '
             echo "--- ldd (expect: not a dynamic executable) ---"; ldd restreamair-linux || true
             ./restreamair-linux selftest
             ./restreamair-linux serve --port 8799 --bind 127.0.0.1 &
             sleep 4
-            root=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8799/)
-            echo "web UI root: HTTP $root"; test "$root" = "200"
-            js=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8799/app.js)
-            echo "app.js: HTTP $js"; test "$js" = "200"
-            echo "single-file binary serves the embedded UI on a bare Ubuntu: OK"
+            root=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8799/); echo "web UI: HTTP $root"; test "$root" = "200"
+            js=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8799/app.js); echo "app.js: HTTP $js"; test "$js" = "200"
+            echo "single-file binary serves the embedded UI on bare Ubuntu: OK"
           '
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: restreamair-linux
           path: restreamair-linux
@@ -87,19 +75,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
-
-      - name: Build restreamair (Linux arm64, static)
+      # The static SDK cross-compiles arm64 from the x86 runner (fast — no
+      # emulation to build); QEMU is only used to run the result for the test.
+      - name: Build restreamair (Linux arm64, fully static + embedded UI)
         run: |
-          docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src swift:6.0 \
-            bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux-arm64'
+          docker run --rm -e STATIC_SDK_URL -e STATIC_SDK_SHA -v "$PWD:/src" -w /src "$SWIFT_IMAGE" bash -c '
+            set -e
+            swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_SHA"
+            sh scripts/embed-assets.sh
+            swift build -c release --swift-sdk aarch64-swift-linux-musl --product restreamair
+            cp .build/aarch64-swift-linux-musl/release/restreamair restreamair-linux-arm64
+          '
           file restreamair-linux-arm64
-
-      # Prove it runs on a bare arm64 Ubuntu (no Swift, only libcurl4 + libxml2).
-      - name: Self-contained on bare arm64 Ubuntu (no Swift)
+      - name: Runs on bare arm64 Ubuntu with zero dependencies
         run: |
           docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 bash -c '
-            apt-get update -qq && apt-get install -y -qq libcurl4 libxml2 >/dev/null
-            if ldd restreamair-linux-arm64 | grep -qi swift; then echo "ERROR: links the Swift runtime"; exit 1; fi
+            ldd restreamair-linux-arm64 || true
             ./restreamair-linux-arm64 selftest
-            echo "runs on bare arm64 Ubuntu: OK"
+            echo "single-file arm64 binary runs on bare Ubuntu: OK"
           '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: restreamair-linux-arm64
+          path: restreamair-linux-arm64
+          if-no-files-found: error
