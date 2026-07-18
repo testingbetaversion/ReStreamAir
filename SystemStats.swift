@@ -1,8 +1,10 @@
 import Foundation
-#if os(macOS)
-import Darwin
-#elseif os(Linux)
+#if canImport(Musl)
+import Musl
+#elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Darwin)
+import Darwin
 #endif
 
 final class SystemStats {
