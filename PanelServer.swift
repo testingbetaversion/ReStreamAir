@@ -2215,8 +2215,15 @@ final class PanelServer {
         }
         let url = publicDir.appendingPathComponent(trimmed).standardizedFileURL
         guard url.path.hasPrefix(publicDir.standardizedFileURL.path) else { throw PanelError.badRequest("Invalid path.") }
-        let data = try Data(contentsOf: url)
-        return response(status: 200, body: data, type: contentType(url.path), noStore: url.lastPathComponent == "sw.js")
+        // Disk first (dev builds serve public/ live), then the copy embedded in
+        // the binary — a standalone single-file build has no public/ on disk.
+        if let data = try? Data(contentsOf: url) {
+            return response(status: 200, body: data, type: contentType(url.path), noStore: url.lastPathComponent == "sw.js")
+        }
+        if let base64 = PublicAssets.files[trimmed], let data = Data(base64Encoded: base64) {
+            return response(status: 200, body: data, type: contentType(trimmed), noStore: trimmed.hasSuffix("sw.js"))
+        }
+        throw PanelError.notFound("Not found.")
     }
 
     func fetchRemote(provider: Provider, stream: StreamConfig, url: URL, category: HeaderCategory) throws -> Data {

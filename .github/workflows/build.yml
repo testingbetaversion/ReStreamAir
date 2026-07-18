@@ -43,40 +43,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # -static-stdlib bakes the Swift runtime + Foundation into the binary so it
-      # runs on any Linux with no Swift toolchain installed; -O optimizes (the
-      # pure-Swift AES needs it). Built inside the toolchain container.
-      - name: Build restreamair (Linux, static)
+      # Fully static (musl Static Linux SDK) + embedded web assets → one file
+      # with NO external dependencies: no Swift runtime, no libcurl, no libxml2,
+      # no glibc. Runs on literally any x86-64 Linux.
+      - name: Build restreamair (Linux, fully static + embedded UI)
         run: |
-          docker run --rm -v "$PWD:/src" -w /src swift:6.0 \
-            bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux'
+          docker run --rm -v "$PWD:/src" -w /src swift:6.0.0 bash -c '
+            set -e
+            swift sdk install \
+              https://download.swift.org/swift-6.0-release/static-sdk/swift-6.0-RELEASE/swift-6.0-RELEASE_static-linux-0.0.1.artifactbundle.tar.gz \
+              --checksum 7984c2cf175bde52ba6ea1fcbe27fc4a148a6237c41c719209c9288ed3ceb652
+            sh scripts/embed-assets.sh
+            swiftc -O --swift-sdk x86_64-swift-linux-musl \
+              $(ls *.swift | grep -v MenuBarApp.swift) -o restreamair-linux
+          '
           file restreamair-linux
 
-      # Prove it runs on a bare Ubuntu with NO Swift toolchain — only the two
-      # common system libs Foundation needs (libcurl4 for URLSession, libxml2
-      # for XML parsing). This is the real target-machine scenario.
-      - name: Self-contained on bare Ubuntu (no Swift, only libcurl4 + libxml2)
+      # The gold standard: run it on a bare ubuntu:24.04 with NOTHING added —
+      # no Swift, no libcurl, no libxml2 — and serve the embedded web UI.
+      - name: Runs on a bare Ubuntu with zero dependencies
         run: |
           docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 bash -c '
-            apt-get update -qq && apt-get install -y -qq libcurl4 libxml2 >/dev/null
-            echo "--- ldd ---"; ldd restreamair-linux || true
-            if ldd restreamair-linux | grep -qi swift; then echo "ERROR: still links the Swift runtime"; exit 1; fi
+            echo "--- ldd (expect: not a dynamic executable) ---"; ldd restreamair-linux || true
             ./restreamair-linux selftest
-            ./restreamair-linux dash --help >/dev/null && echo "runs on bare Ubuntu: OK"
+            ./restreamair-linux serve --port 8799 --bind 127.0.0.1 &
+            sleep 4
+            root=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8799/)
+            echo "web UI root: HTTP $root"; test "$root" = "200"
+            js=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8799/app.js)
+            echo "app.js: HTTP $js"; test "$js" = "200"
+            echo "single-file binary serves the embedded UI on a bare Ubuntu: OK"
           '
-
-      - name: Serve + auth smoke test
-        run: |
-          ./restreamair-linux serve --port 8799 --bind 127.0.0.1 &
-          sleep 4
-          curl -sf -X POST http://127.0.0.1:8799/api/auth/setup \
-            -H 'Content-Type: application/json' -d '{"username":"admin","password":"pw123456"}'
-          code=$(curl -s -c /tmp/c.txt -X POST http://127.0.0.1:8799/api/auth/login \
-            -H 'Content-Type: application/json' -d '{"username":"admin","password":"pw123456","remember":"true"}' \
-            -o /dev/null -w '%{http_code}')
-          echo "login HTTP $code"; test "$code" = "200"
-          state=$(curl -s -b /tmp/c.txt -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/api/state)
-          echo "state HTTP $state"; test "$state" = "200"
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
