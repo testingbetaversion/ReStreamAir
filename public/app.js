@@ -309,6 +309,30 @@ let streamsGridProviderId = "";
 let streamsGridTypeFilter = "";
 let streamsGridSearchQuery = "";
 let streamsGridRunningOnly = false;
+let streamsGridOrderKey = "";
+
+// Update just the live/changing parts of an already-rendered stream card, so
+// the auto-refresh doesn't rebuild (and visually jump) the whole grid.
+function updateStreamCardDynamic(card, stream) {
+  if (!card) return;
+  const badge = card.querySelector(".badge");
+  if (badge) {
+    badge.textContent = stream.status || "stopped";
+    badge.classList.toggle("running", Boolean(stream.running));
+  }
+  const stats = card.querySelectorAll(".stream-stats span");
+  if (stats.length >= 3) {
+    stats[0].textContent = `${stream.activeClients ?? 0} active`;
+    stats[1].textContent = `↓ ${formatBytesPerSecond((stream.inputBandwidth || {}).bytesPerSecond)}`;
+    stats[2].textContent = `↑ ${formatBytesPerSecond((stream.bandwidth || {}).bytesPerSecond)}`;
+  }
+  const toggle = card.querySelector('[data-action="toggle"]');
+  if (toggle) {
+    toggle.className = stream.running ? "danger" : "success";
+    toggle.innerHTML = `<span data-icon="${stream.running ? "stop" : "play"}"></span>${stream.running ? "Stop" : "Start"}`;
+    applyIcons(toggle);
+  }
+}
 
 // The currently-visible stream rows after all filters (provider, type, search,
 // running-only). Shared by the grid render and the bulk actions so "Start all"
@@ -405,6 +429,18 @@ function renderStreamsGrid() {
     return;
   }
   container.className = "stream-grid";
+  // Fast path: when the same streams are shown in the same order (the common
+  // case on the 4s auto-refresh), update just the live bits in place instead of
+  // rebuilding every card. Rebuilding reloaded each logo <img> and reflowed the
+  // grid, so cards visibly flashed and jumped every few seconds.
+  // Key on the static card content (not status/bandwidth — those are the live
+  // bits the fast path updates), so editing a name/logo/url still rebuilds.
+  const orderKey = rows.map(({ provider, stream }) => [stream.id, stream.name, stream.logo, stream.kind, stream.url, provider.name, stream.sourceType].join("|")).join(",");
+  if (orderKey === streamsGridOrderKey && container.children.length === rows.length && !container.classList.contains("empty-state")) {
+    rows.forEach(({ stream }, index) => updateStreamCardDynamic(container.children[index], stream));
+    return;
+  }
+  streamsGridOrderKey = orderKey;
   container.innerHTML = "";
   for (const { provider, stream } of rows) {
     const bandwidth = stream.bandwidth || {};

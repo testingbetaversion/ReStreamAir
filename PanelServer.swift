@@ -2540,6 +2540,14 @@ final class PanelServer {
     }
 
     func servePlay(_ request: HTTPRequest) throws -> Data {
+        var request = request
+        // The copyable play URL uses a friendly name-slug; resolve it to the real
+        // id here so every branch below (and the relative segment requests that
+        // follow) work id-based exactly as before. No-op when it's already an id.
+        if let segment = match(request.path, #"^/play/([^/]+)/"#)?.first, providerAndStream(segment, in: try readState()) == nil,
+           let realId = resolvePlaySegment(segment, in: try readState()) {
+            request.path = request.path.replacingOccurrences(of: "/play/\(segment)/", with: "/play/\(realId)/")
+        }
         // Direct-source streams answer every playlist/manifest request with a
         // 302 to the origin — the player talks to the source directly and the
         // panel never proxies a byte. Segment/runtime paths deliberately fall
@@ -3051,6 +3059,8 @@ final class PanelServer {
 
     func streamView(_ stream: StreamConfig, host: String) -> [String: Any] {
         lock.lock(); let running = !(jobs[stream.id] ?? []).isEmpty || stream.kind == "m3u8" && stream.status == "running"; lock.unlock()
+        // Friendly name-slug for the copyable play URL (falls back to the id).
+        let slug = (try? readState()).map { playSlug(stream, in: $0) } ?? stream.id
         // Per-representation "no m3u8" direct byte-stream links — one
         // persistent connection per representation, tailing new segments as
         // they're downloaded. Only meaningful for live/dash sources, not
@@ -3110,10 +3120,10 @@ final class PanelServer {
             "activeClients": metrics.activeClients(streamId: stream.id),
             "bandwidth": metrics.bandwidthView(streamId: stream.id),
             "inputBandwidth": metrics.inputBandwidthView(streamId: stream.id),
-            "playUrl": "http://\(host)/play/\(stream.id)/index.m3u8",
+            "playUrl": "http://\(host)/play/\(slug)/index.m3u8",
             "directSource": stream.directSource,
             "sourceUrl": "http://\(host)/source/\(stream.id)",
-            "directUrl": stream.kind == "m3u8" ? "http://\(host)/play/\(stream.id)/index.m3u8" : "http://\(host)/restream/\(stream.id)/live.m3u8",
+            "directUrl": stream.kind == "m3u8" ? "http://\(host)/play/\(slug)/index.m3u8" : "http://\(host)/restream/\(stream.id)/live.m3u8",
             "directStreamUrls": directUrls,
             "downloadUrls": downloadUrls,
             "sourceType": stream.sourceType,
@@ -3424,6 +3434,42 @@ final class PanelServer {
     func providerAndStream(_ id: String, in state: PanelState) -> (provider: Provider, stream: StreamConfig)? {
         guard let location = findStream(id, in: state) else { return nil }
         return (state.providers[location.provider], state.providers[location.provider].streams[location.stream])
+    }
+
+    /// A clean, URL-friendly slug from a stream name for the copyable play URL,
+    /// instead of the internal `stream_…` id. Keeps Unicode letters/digits (so
+    /// Arabic names survive), collapses every other run into a single '-',
+    /// trims dashes, lowercases. Empty when the name has nothing usable.
+    func slugify(_ name: String) -> String {
+        var out = ""
+        var pendingDash = false
+        for scalar in name.lowercased().unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) {
+                if pendingDash { out.append("-"); pendingDash = false }
+                out.unicodeScalars.append(scalar)
+            } else if !out.isEmpty {
+                pendingDash = true
+            }
+        }
+        return out
+    }
+
+    /// The path segment used in this stream's play URL: its name-slug when that's
+    /// unambiguous, otherwise the id. Ambiguous (two streams slugging the same)
+    /// falls back to the id so the URL always resolves to the right stream.
+    func playSlug(_ stream: StreamConfig, in state: PanelState) -> String {
+        let slug = slugify(stream.name)
+        guard !slug.isEmpty else { return stream.id }
+        let matches = state.providers.flatMap(\.streams).filter { slugify($0.name) == slug }
+        return matches.count == 1 ? slug : stream.id
+    }
+
+    /// Resolve a play-URL first path segment (an id or a name-slug) to the real
+    /// stream id, so `/play/<slug>/…` and its relative segment requests all work.
+    func resolvePlaySegment(_ segment: String, in state: PanelState) -> String? {
+        if providerAndStream(segment, in: state) != nil { return segment }
+        let matches = state.providers.flatMap(\.streams).filter { slugify($0.name) == segment && !slugify($0.name).isEmpty }
+        return matches.count == 1 ? matches[0].id : nil
     }
 
     func effectiveProxy(provider: Provider, stream: StreamConfig) -> String {
