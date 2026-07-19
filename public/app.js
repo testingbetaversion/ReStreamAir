@@ -682,10 +682,13 @@ function renderEditor() {
   form.elements.outputTarget.value = stream.outputTarget || "";
   form.elements.useCdm.checked = Boolean(stream.useCdm);
   form.elements.cdmType.value = stream.cdmType || "";
+  form.elements.cdmMode.value = stream.cdmMode || "external";
+  form.elements.sessionManifest.checked = Boolean(stream.sessionManifest);
+  form.elements.scriptOverride.value = stream.scriptOverride || "";
   form.elements.heartbeatSeconds.value = stream.heartbeatSeconds || 0;
   form.elements.scriptParams.value = stream.scriptParams || "";
   // Auto-reveal the Scripting & DRM section when it holds saved values.
-  $("#scriptingGroup").classList.toggle("hidden", !(stream.useCdm || stream.heartbeatSeconds || (stream.scriptParams || "").trim() || (stream.cdmType || "")));
+  $("#scriptingGroup").classList.toggle("hidden", !(stream.useCdm || stream.sessionManifest || (stream.scriptOverride || "").trim() || stream.heartbeatSeconds || (stream.scriptParams || "").trim() || (stream.cdmType || "")));
   updatePipelineFieldVisibility();
 
   selectedRepIds = new Set(stream.representations || []);
@@ -781,6 +784,9 @@ function streamPayload() {
     outputTarget: form.elements.outputTarget.value,
     useCdm: form.elements.useCdm.checked,
     cdmType: form.elements.cdmType.value,
+    cdmMode: form.elements.cdmMode.value,
+    sessionManifest: form.elements.sessionManifest.checked,
+    scriptOverride: form.elements.scriptOverride.value,
     heartbeatSeconds: Number(form.elements.heartbeatSeconds.value) || 0,
     scriptParams: form.elements.scriptParams.value,
   };
