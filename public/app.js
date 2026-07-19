@@ -1844,7 +1844,10 @@ async function loadLogs() {
   // reachable from the main Logs tab, not just the provider dialog's own
   // transient terminal.
   const scriptOptions = state.providers.filter((p) => p.scriptPath).map((p) => `<option value="${escapeAttr("script:" + p.id)}" ${("script:" + p.id) === streamId ? "selected" : ""}>${escapeHtml(p.name)} (script)</option>`);
-  $("#logStreamFilter").innerHTML = `<option value="">All streams</option>${options.join("")}${scriptOptions.join("")}`;
+  // Panel-level events (server start, auth, stream start/stop, supervisor) are
+  // recorded under a synthetic "__panel__" id — surface them here too.
+  const panelOption = `<option value="__panel__" ${streamId === "__panel__" ? "selected" : ""}>Panel (server events)</option>`;
+  $("#logStreamFilter").innerHTML = `<option value="">All streams</option>${panelOption}${options.join("")}${scriptOptions.join("")}`;
   $("#logLevelFilter").value = logLevelFilter;
   try {
     const params = new URLSearchParams({ limit: "150" });
