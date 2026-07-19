@@ -221,50 +221,23 @@
               <div class="field-group-title">Scripting &amp; DRM<span class="field-hint">Drives this stream through a provider script (login → session manifest → keys → heartbeat). We're an IPTV restreamer, not a DRM client — the script returns clear keys; we don't run a real CDM.</span></div>
               <label>Script override<span class="field-hint">Path to a .py/.sh/executable that overrides the provider's script for THIS stream. Blank = use the provider script.</span><input name="scriptOverride" placeholder="/path/to/provider.py  (blank = provider script)"></label>
               <label class="check"><input name="sessionManifest" type="checkbox"> <b>Session manifest</b> — fetch a fresh source URL (+ CDNs, headers, heartbeat) from the script's <code>manifest</code> action on every start</label>
-              <label class="check"><input name="useCdm" type="checkbox"> <b>Get keys via script</b> — run the <code>cdm</code> action to obtain clear keys when DRM-protected and no keys were entered above</label>
-              <div class="form-row">
-                <label>CDM mode<span class="field-hint">external = script runs its own CDM and returns keys · internal = panel builds the license challenge, the script only proxies it</span>
-                  <select name="cdmMode">
-                    <option value="external">External (script returns keys)</option>
-                    <option value="internal">Internal (script proxies license)</option>
-                  </select>
-                </label>
-                <label>CDM system<span class="field-hint">Which DRM the script targets</span>
-                  <select name="cdmType">
-                    <option value="">Auto-detect</option>
-                    <option value="widevine">Widevine</option>
-                    <option value="playready">PlayReady</option>
-                    <option value="fairplay">FairPlay</option>
-                    <option value="clearkey">ClearKey</option>
-                  </select>
-                </label>
-              </div>
+              <label class="check"><input name="useCdm" type="checkbox"> <b>Get keys via script</b> — we parse the manifest &amp; init for all DRM info (Widevine/PlayReady PSSH, KIDs) and send it to the <code>cdm</code> action, which returns clear keys. No DRM system to pick — everything found is forwarded.</label>
               <div class="form-row">
                 <label>Heartbeat (seconds)<span class="field-hint">0 = off (auto-set from the manifest's Heartbeat.PeriodMs). Pings the <code>heartbeat</code> action this often while live.</span><input name="heartbeatSeconds" type="number" min="0" step="1" value="0"></label>
                 <label>Script params<span class="field-hint">key=value tokens passed to every action for this stream, e.g. <code>id=123 streamId=456</code></span><input name="scriptParams" placeholder="id=123 streamId=456"></label>
               </div>
-              <details class="script-help">
-                <summary>Script protocol reference</summary>
-                <div class="script-help-body">
-                  <p>A provider script is any <code>.py</code> / <code>.sh</code> / executable. It's invoked once per action with a flat <code>key=value</code> argv. It must print its result to <b>stdout</b> (logs go to stderr).</p>
-                  <p><b>Always passed:</b> <code>action=</code> <code>user=</code> <code>password=</code> <code>bind=</code> <code>proxy=</code> <code>doh=</code> <code>worker=</code>, then this stream's <b>Script params</b> (e.g. <code>id= streamId=</code>).</p>
-                  <p><b>action=manifest</b> → print JSON:</p>
-                  <pre>{
-  "ManifestUrl": "https://…/live.mpd",
-  "Cdn": [ { "Name": "cdn2", "ManifestUrl": "https://…" } ],
-  "Headers": { "Manifest": { "User-Agent": "…" }, "Media": { … } },
-  "Heartbeat": { "Url": "", "Params": "", "PeriodMs": 300000 }
-}</pre>
-                  <p><b>action=cdm</b> (also gets <code>cdm=external|internal</code>, <code>cdmType=</code>; internal also gets <code>kid=</code> <code>pssh=</code>) → print clear keys, one per line — <code>KID:KEY</code> (32 hex : 32 hex). Bare lines, <code>--&gt; KID:KEY</code>, or JSON <code>{"keys":[{"kid","key"}]}</code> all accepted.</p>
-                  <p><b>action=heartbeat</b> → keep the session alive (no output needed). <b>action=login / pair</b> → authenticate (streaming output). <b>action=channels / events</b> → import (JSON list).</p>
-                  <p>Test extraction &amp; a script from the CLI: <code>restreamair cdmprobe mpd=&lt;url&gt; script=&lt;path&gt;</code></p>
-                </div>
-              </details>
+              <p class="field-hint" style="margin:2px 2px 0">See the <b>Help</b> tab for the full script protocol.</p>
             </div>
 
             <label>Manifest headers<span class="field-hint">Manifest/playlist fetch (MPD or M3U8)</span><textarea name="manifestHeaders" placeholder="Name: value"></textarea></label>
             <label>Media headers<span class="field-hint">Segment/init fetch</span><textarea name="mediaHeaders" placeholder="Name: value"></textarea></label>
-            <label>Network override<span class="field-hint">Blank = inherit provider proxy</span><input name="proxy" placeholder="http://127.0.0.1:8888"></label>
+            <label>Proxy<span class="field-hint">Blank = inherit provider proxy. HTTP or SOCKS5 (socks5h://user:pass@host:port).</span><input name="proxy" placeholder="socks5h://127.0.0.1:1080"></label>
+            <div class="proxy-scope" title="Which requests go through the proxy above">
+              <span class="field-hint">Use proxy for:</span>
+              <label class="check"><input name="proxyScript" type="checkbox" checked> Script (login/session/keys/heartbeat)</label>
+              <label class="check"><input name="proxyManifest" type="checkbox" checked> Manifest (MPD/M3U8)</label>
+              <label class="check"><input name="proxyMedia" type="checkbox" checked> Media (segments/init)</label>
+            </div>
 
             <div class="field-group">
               <div class="field-group-title">Input/output pipeline<span class="field-hint">Internal remuxer needs no ffmpeg. FFmpeg modes spawn a resident ffmpeg that reads the source directly (decrypting CENC clearkey itself) and copy-remuxes to HLS, or pushes to SRT/UDP/TCP via the Output target.</span></div>
@@ -397,6 +370,8 @@
                   <button type="button" class="log-mode-btn" data-mode="verbose">Verbose</button>
                 </div>
                 <button id="refreshLogsBtn" class="ghost" type="button"><span data-icon="refresh"></span>Refresh</button>
+                <button id="pauseLogsBtn" class="ghost" type="button" title="Pause/resume auto-refresh"><span data-icon="stop"></span>Pause</button>
+                <button id="clearLogsBtn" class="ghost danger-ghost" type="button" title="Clear the selected stream's logs"><span data-icon="trash"></span>Clear</button>
               </div>
             </div>
             <div id="logList" class="log-list empty-state">No log entries yet — start a stream to see fetch/download activity here.</div>

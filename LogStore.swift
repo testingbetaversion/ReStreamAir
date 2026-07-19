@@ -103,6 +103,13 @@ final class LogStore {
         lock.unlock()
     }
 
+    /// Drop every in-memory entry (persisted per-day files are untouched).
+    func clearAll() {
+        lock.lock()
+        entries.removeAll()
+        lock.unlock()
+    }
+
     func recent(streamId: String?, limit: Int) -> [[String: Any]] {
         lock.lock(); defer { lock.unlock() }
         let filtered = streamId == nil ? entries : entries.filter { $0.streamId == streamId }

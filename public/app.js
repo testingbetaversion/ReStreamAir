@@ -192,7 +192,7 @@ function switchView(view) {
     logsPollTimer = null;
     if (view === "logs") {
       loadLogs();
-      logsPollTimer = setInterval(loadLogs, 2000);
+      if (!logsPaused) logsPollTimer = setInterval(loadLogs, 2000);
     }
   };
   if (document.startViewTransition) {
@@ -686,14 +686,16 @@ function renderEditor() {
   form.elements.outputMode.value = stream.outputMode || "hls";
   form.elements.outputTarget.value = stream.outputTarget || "";
   form.elements.useCdm.checked = Boolean(stream.useCdm);
-  form.elements.cdmType.value = stream.cdmType || "";
-  form.elements.cdmMode.value = stream.cdmMode || "external";
   form.elements.sessionManifest.checked = Boolean(stream.sessionManifest);
   form.elements.scriptOverride.value = stream.scriptOverride || "";
   form.elements.heartbeatSeconds.value = stream.heartbeatSeconds || 0;
   form.elements.scriptParams.value = stream.scriptParams || "";
+  // Proxy scope defaults to all-on when unset (older streams).
+  form.elements.proxyScript.checked = stream.proxyScript !== false;
+  form.elements.proxyManifest.checked = stream.proxyManifest !== false;
+  form.elements.proxyMedia.checked = stream.proxyMedia !== false;
   // Auto-reveal the Scripting & DRM section when it holds saved values.
-  $("#scriptingGroup").classList.toggle("hidden", !(stream.useCdm || stream.sessionManifest || (stream.scriptOverride || "").trim() || stream.heartbeatSeconds || (stream.scriptParams || "").trim() || (stream.cdmType || "")));
+  $("#scriptingGroup").classList.toggle("hidden", !(stream.useCdm || stream.sessionManifest || (stream.scriptOverride || "").trim() || stream.heartbeatSeconds || (stream.scriptParams || "").trim()));
   updatePipelineFieldVisibility();
 
   selectedRepIds = new Set(stream.representations || []);
@@ -788,12 +790,13 @@ function streamPayload() {
     outputMode: form.elements.outputMode.value,
     outputTarget: form.elements.outputTarget.value,
     useCdm: form.elements.useCdm.checked,
-    cdmType: form.elements.cdmType.value,
-    cdmMode: form.elements.cdmMode.value,
     sessionManifest: form.elements.sessionManifest.checked,
     scriptOverride: form.elements.scriptOverride.value,
     heartbeatSeconds: Number(form.elements.heartbeatSeconds.value) || 0,
     scriptParams: form.elements.scriptParams.value,
+    proxyScript: form.elements.proxyScript.checked,
+    proxyManifest: form.elements.proxyManifest.checked,
+    proxyMedia: form.elements.proxyMedia.checked,
   };
 }
 
@@ -1751,6 +1754,7 @@ $("#keyForm").addEventListener("submit", async (event) => {
 
 let logMode = "normal";
 let logLevelFilter = "";
+let logsPaused = false;
 let pendingLogStreamId = null;
 
 // Deep-link from a stream card's Logs button straight into the Logs view,
@@ -1824,11 +1828,19 @@ function logRowHtml(entry) {
       </div>
     `;
   }
+  const detailText = [entry.url, entry.message].filter(Boolean).join(" · ");
+  // Multi-line messages (a script's Python traceback, say) render as one
+  // unreadable jumble in a plain span because HTML collapses newlines. Detect
+  // them and lay them out in a pre-wrap block so each line stays on its own.
+  const isMultiline = /\n/.test(detailText);
+  const detail = isMultiline
+    ? `<pre class="log-detail-multiline">${escapeHtml(detailText)}</pre>`
+    : `<span class="log-detail" title="${escapeAttr(detailText)}">${escapeHtml(detailText)}</span>`;
   return `
-    <div class="log-row ${entry.level === "error" ? "log-error" : ""}">
+    <div class="log-row ${entry.level === "error" ? "log-error" : ""} ${isMultiline ? "log-row-multiline" : ""}">
       <span class="log-time">${time}</span>
       <span class="log-event">${escapeHtml(entry.event)}</span>
-      <span class="log-detail" title="${escapeAttr([entry.url, entry.message].filter(Boolean).join(" · "))}">${escapeHtml([entry.url, entry.message].filter(Boolean).join(" · "))}</span>
+      ${detail}
     </div>
   `;
 }
@@ -1875,6 +1887,33 @@ async function loadLogs() {
 }
 
 $("#refreshLogsBtn").addEventListener("click", loadLogs);
+$("#pauseLogsBtn").addEventListener("click", (event) => {
+  logsPaused = !logsPaused;
+  const button = event.currentTarget;
+  button.innerHTML = logsPaused ? '<span data-icon="play"></span>Resume' : '<span data-icon="stop"></span>Pause';
+  button.classList.toggle("active", logsPaused);
+  applyIcons(button);
+  // Restart or stop the poll to match.
+  clearInterval(logsPollTimer);
+  logsPollTimer = null;
+  if (!logsPaused && currentView === "logs") {
+    loadLogs();
+    logsPollTimer = setInterval(loadLogs, 2000);
+  }
+});
+$("#clearLogsBtn").addEventListener("click", async () => {
+  const streamId = $("#logStreamFilter").value;
+  const label = streamId ? "this stream's" : "all";
+  if (!confirm(`Clear ${label} logs? This removes the in-memory log lines shown here (saved daily files are kept).`)) return;
+  const params = new URLSearchParams();
+  if (streamId) params.set("streamId", streamId);
+  try {
+    await request(`/api/logs?${params.toString()}`, { method: "DELETE" });
+    loadLogs();
+  } catch (error) {
+    alert(`Couldn't clear logs: ${error.message || error}`);
+  }
+});
 $("#providerSearch").addEventListener("input", (event) => {
   providerSearchQuery = event.currentTarget.value;
   renderProviders();
