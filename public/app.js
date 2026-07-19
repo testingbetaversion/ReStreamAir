@@ -650,6 +650,12 @@ function renderEditor() {
   form.elements.inputMode.value = stream.inputMode || "internal";
   form.elements.outputMode.value = stream.outputMode || "hls";
   form.elements.outputTarget.value = stream.outputTarget || "";
+  form.elements.useCdm.checked = Boolean(stream.useCdm);
+  form.elements.cdmType.value = stream.cdmType || "";
+  form.elements.heartbeatSeconds.value = stream.heartbeatSeconds || 0;
+  form.elements.scriptParams.value = stream.scriptParams || "";
+  // Auto-reveal the Scripting & DRM section when it holds saved values.
+  $("#scriptingGroup").classList.toggle("hidden", !(stream.useCdm || stream.heartbeatSeconds || (stream.scriptParams || "").trim() || (stream.cdmType || "")));
   updatePipelineFieldVisibility();
 
   selectedRepIds = new Set(stream.representations || []);
@@ -743,6 +749,10 @@ function streamPayload() {
     inputMode: form.elements.inputMode.value,
     outputMode: form.elements.outputMode.value,
     outputTarget: form.elements.outputTarget.value,
+    useCdm: form.elements.useCdm.checked,
+    cdmType: form.elements.cdmType.value,
+    heartbeatSeconds: Number(form.elements.heartbeatSeconds.value) || 0,
+    scriptParams: form.elements.scriptParams.value,
   };
 }
 
@@ -822,6 +832,7 @@ function newStream() {
   setLinkField($("#directLink"), {});
   renderCdnMirrors([]);
   $("#statusBox").textContent = "New stream.";
+  $("#scriptingGroup").classList.add("hidden");
   clearRepresentationPicker();
   updateKindVisibility();
   updatePipelineFieldVisibility();
@@ -2263,6 +2274,11 @@ $("#showDecryptionKeysBtn").addEventListener("click", () => {
   decryptionKeysManuallyShown = true;
   updateDecryptionKeysVisibility();
   $("#streamForm").elements.decryptionKeys.focus();
+});
+$("#showScriptingBtn").addEventListener("click", () => {
+  const group = $("#scriptingGroup");
+  group.classList.toggle("hidden");
+  if (!group.classList.contains("hidden")) $("#streamForm").elements.useCdm.focus();
 });
 $("#closeProviderSettingsBtn").addEventListener("click", closeProviderSettingsDialog);
 $("#providerSettingsDialog").addEventListener("click", (event) => {
