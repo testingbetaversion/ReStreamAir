@@ -215,6 +215,25 @@
               </div>
             </div>
 
+            <button type="button" id="showScriptingBtn" class="ghost">Scripting &amp; DRM (auto keys / heartbeat)</button>
+            <div id="scriptingGroup" class="key-field-group hidden">
+              <div class="field-group-title">Scripting &amp; DRM<span class="field-hint">Uses this stream's provider script. We're an IPTV restreamer, not a DRM client — the script returns clear keys; we don't run a real CDM.</span></div>
+              <label class="check"><input name="useCdm" type="checkbox"> Auto-fetch keys via provider script when DRM-protected and no keys entered above</label>
+              <div class="form-row">
+                <label>CDM system<span class="field-hint">Which DRM the script should target</span>
+                  <select name="cdmType">
+                    <option value="">Auto-detect</option>
+                    <option value="widevine">Widevine</option>
+                    <option value="playready">PlayReady</option>
+                    <option value="fairplay">FairPlay</option>
+                    <option value="clearkey">ClearKey</option>
+                  </select>
+                </label>
+                <label>Heartbeat (seconds)<span class="field-hint">0 = off. Pings the script's heartbeat action this often while live to keep the session alive.</span><input name="heartbeatSeconds" type="number" min="0" step="1" value="0"></label>
+              </div>
+              <label>Script params<span class="field-hint">Extra key=value tokens passed to every script action for this stream (space-separated), e.g. region=us deviceId=abc</span><input name="scriptParams" placeholder="region=us deviceId=abc"></label>
+            </div>
+
             <label>Manifest headers<span class="field-hint">Manifest/playlist fetch (MPD or M3U8)</span><textarea name="manifestHeaders" placeholder="Name: value"></textarea></label>
             <label>Media headers<span class="field-hint">Segment/init fetch</span><textarea name="mediaHeaders" placeholder="Name: value"></textarea></label>
             <label>Network override<span class="field-hint">Blank = inherit provider proxy</span><input name="proxy" placeholder="http://127.0.0.1:8888"></label>

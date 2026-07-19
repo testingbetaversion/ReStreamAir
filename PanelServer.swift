@@ -302,6 +302,10 @@ struct StreamConfig: Codable {
     var scriptParams: String = ""
     var cdmType: String = ""
     var useCdm: Bool = false
+    /// Periodic provider-script "heartbeat" interval in seconds (0 = off) — some
+    /// providers expire a session unless pinged; the panel runs the script's
+    /// `heartbeat` action this often while the stream is live. See start().
+    var heartbeatSeconds: Int = 0
     var scriptVideoSelector: String = ""  // e.g. "best" — which representation(s) to use, not yet acted on
     var scriptAudioSelector: String = ""  // e.g. "desc:en"
     var onDemand: Bool = false
@@ -398,6 +402,7 @@ struct StreamConfig: Codable {
         scriptParams = try container.decodeIfPresent(String.self, forKey: .scriptParams) ?? ""
         cdmType = try container.decodeIfPresent(String.self, forKey: .cdmType) ?? ""
         useCdm = try container.decodeIfPresent(Bool.self, forKey: .useCdm) ?? false
+        heartbeatSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatSeconds) ?? 0
         scriptVideoSelector = try container.decodeIfPresent(String.self, forKey: .scriptVideoSelector) ?? ""
         scriptAudioSelector = try container.decodeIfPresent(String.self, forKey: .scriptAudioSelector) ?? ""
         onDemand = try container.decodeIfPresent(Bool.self, forKey: .onDemand) ?? false
@@ -1686,9 +1691,9 @@ final class PanelServer {
                 updated.sourceType = existing.sourceType
                 updated.mode = existing.mode
                 updated.sessionManifest = existing.sessionManifest
-                updated.scriptParams = existing.scriptParams
-                updated.cdmType = existing.cdmType
-                updated.useCdm = existing.useCdm
+                // useCdm / cdmType / scriptParams / heartbeatSeconds are now set
+                // by the editor's Scripting & DRM section, so they're read from
+                // the body (streamFromBody) rather than carried over here.
                 updated.scriptVideoSelector = existing.scriptVideoSelector
                 updated.scriptAudioSelector = existing.scriptAudioSelector
                 updated.onDemand = existing.onDemand
@@ -2918,6 +2923,7 @@ final class PanelServer {
             "scriptParams": stream.scriptParams,
             "cdmType": stream.cdmType,
             "useCdm": stream.useCdm,
+            "heartbeatSeconds": stream.heartbeatSeconds,
             "scriptVideoSelector": stream.scriptVideoSelector,
             "scriptAudioSelector": stream.scriptAudioSelector,
             "onDemand": stream.onDemand,
@@ -3098,6 +3104,12 @@ final class PanelServer {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && URL(string: $0)?.scheme?.hasPrefix("http") == true }
         stream.directSource = input["directSource"]?.bool ?? false
+        // Scripting & DRM (editor-controlled — see the update merge, which no
+        // longer carries these over from the existing stream).
+        stream.useCdm = input["useCdm"]?.bool ?? false
+        stream.cdmType = input["cdmType"]?.string ?? ""
+        stream.scriptParams = input["scriptParams"]?.string ?? ""
+        stream.heartbeatSeconds = max(0, input["heartbeatSeconds"]?.int ?? 0)
         return stream
     }
 
