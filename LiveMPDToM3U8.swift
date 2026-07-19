@@ -77,6 +77,12 @@ struct LiveM3U8Options {
     var forceOffline: Bool
     var maxPolls: Int?
     var decryptionKeys: [String: Data] = [:]
+    /// Key rotation: a provider CDM script + the pre-built argv tokens (newline-
+    /// separated) to run it with. When a segment's KID has no key, the worker
+    /// runs `cdmScript` with these args + `kid=<hex>` and merges the KID:KEY it
+    /// prints. Empty = no rotation.
+    var cdmScript: String = ""
+    var cdmFetchArgs: [String] = []
     var manifestHeaders: [(String, String)] = []
     var segmentUrlParams: String = ""
     /// Shifts this representation's segment presentation times by this many
@@ -283,6 +289,8 @@ struct LiveM3U8ActionRuntime {
             forceOffline: try bool("forceOffline", args, defaultValue: false),
             maxPolls: try optionalPositiveInt("maxPolls", args),
             decryptionKeys: CENCDecryptor.parseCENCKeys(args["decryptionKeys"] ?? ""),
+            cdmScript: args["cdmScript"] ?? "",
+            cdmFetchArgs: (args["cdmFetchArgs"] ?? "").split(whereSeparator: { $0 == "\n" || $0 == "\r" }).map(String.init),
             manifestHeaders: try parseHeaders(args["manifestHeader"]),
             segmentUrlParams: args["segmentUrlParams"] ?? "",
             audioDelayMs: try optionalInt("audioDelayMs", args) ?? 0
@@ -448,7 +456,36 @@ final class LiveMPDToM3U8 {
             headers: options.headers,
             proxy: options.proxy
         ))
-        self.cencDecryptor = options.decryptionKeys.isEmpty ? nil : CENCDecryptor(keys: options.decryptionKeys)
+        // A decryptor is needed when there are keys up front OR a CDM script to
+        // fetch them on rotation.
+        let decryptor = (!options.decryptionKeys.isEmpty || !options.cdmScript.isEmpty)
+            ? CENCDecryptor(keys: options.decryptionKeys) : nil
+        self.cencDecryptor = decryptor
+        // `self` is fully initialized past this point, so it's safe to capture in
+        // the rotation closure (a class ref, so setting it after init is fine).
+        if let decryptor, !options.cdmScript.isEmpty {
+            let script = options.cdmScript
+            let baseArgs = options.cdmFetchArgs
+            decryptor.keyFetcher = { [weak self] kidHex in
+                self?.logEvent("cdmRotate", status: "start", message: "new KID \(kidHex) — re-acquiring key via script")
+                do {
+                    let (stdout, _) = try ScriptRunner.runSync(scriptPath: script, args: baseArgs + ["kid=\(kidHex)"], timeout: 25)
+                    let pairs = CDMKeyResolver.parseKeyOutput(stdout)
+                    // Prefer the exact KID; fall back to the first pair the script
+                    // returned (some scripts key everything at once).
+                    let hex = pairs.first(where: { $0.kid == kidHex })?.key ?? pairs.first?.key
+                    guard let hex, let key = CENCDecryptor.dataFromHex(hex) else {
+                        self?.logEvent("cdmRotate", status: "error", message: "script returned no key for \(kidHex)")
+                        return nil
+                    }
+                    self?.logEvent("cdmRotate", status: "success", message: "rotated key for \(kidHex)")
+                    return key
+                } catch {
+                    self?.logEvent("cdmRotate", status: "error", message: "\(error)")
+                    return nil
+                }
+            }
+        }
     }
 
     func run() throws -> [String: Any] {

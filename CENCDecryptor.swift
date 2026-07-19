@@ -88,10 +88,16 @@ enum CENCError: Error, CustomStringConvertible {
 /// video/audio. Widevine/PlayReady and 'cbcs' pattern encryption are not
 /// supported (see README).
 final class CENCDecryptor {
-    private let keys: [String: Data]
+    private var keys: [String: Data]
     private let singleFallbackKey: Data?
     private var defaultKIDHex: String?
     private var defaultIVSize: Int = 8
+    /// Key-rotation hook: when a segment's KID has no key yet, ask this for one
+    /// (hex KID -> raw key). The worker wires it to the provider CDM script, so
+    /// a mid-stream key change re-acquires clear keys live instead of the stream
+    /// silently decrypting to garbage. Result is cached, so it runs at most once
+    /// per new KID. Nil = no rotation (original behavior).
+    var keyFetcher: ((String) -> Data?)?
 
     init(keys: [String: Data]) {
         self.keys = keys
@@ -417,6 +423,17 @@ final class CENCDecryptor {
     }
 
     private func resolveKey() throws -> Data {
+        // Prefer an exact KID match so key rotation is detected: a new KID that
+        // isn't in the map triggers a re-fetch rather than reusing a stale key.
+        if let defaultKIDHex {
+            if let key = keys[defaultKIDHex] { return key }
+            if let fetched = keyFetcher?(defaultKIDHex) {
+                keys[defaultKIDHex] = fetched   // cache — fetch once per new KID
+                return fetched
+            }
+        }
+        // No fetcher, or the fetch failed: fall back to the legacy single-key
+        // behavior (one configured key used regardless of KID).
         if let singleFallbackKey { return singleFallbackKey }
         guard let defaultKIDHex, let key = keys[defaultKIDHex] else {
             throw CENCError.noKey("No decryption key matches this segment's KID, and more than one KID:KEY pair is configured.")

@@ -1884,6 +1884,24 @@ final class PanelServer {
         let keys = resolveDecryptionKeys(provider: provider, stream: stream)
         let segmentParams = effectiveSegmentUrlParams(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
 
+        // Key rotation: give the worker the CDM script + args so it can
+        // re-acquire a key on its own when a segment's KID changes mid-stream
+        // (kid=<hex> is appended per fetch). Same call as resolveDecryptionKeys,
+        // minus the one-shot manifest scrape.
+        var cdmScriptArg = ""
+        var cdmFetchArgs = ""
+        if stream.useCdm {
+            let scriptPath = effectiveScriptPath(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
+            if !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) {
+                cdmScriptArg = scriptPath
+                var a = ScriptRunner.commonArgs(action: "cdm", bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: activeScriptAccount(for: provider))
+                a.append("cdm=\(stream.cdmMode.isEmpty ? "external" : stream.cdmMode)")
+                if !stream.cdmType.isEmpty { a.append("cdmType=\(stream.cdmType)") }
+                a += ScriptRunner.splitParams(stream.scriptParams)
+                cdmFetchArgs = a.joined(separator: "\n")
+            }
+        }
+
         var spawned: [RestreamJob] = []
         for repId in representationIds {
             let tempDir = multi
@@ -1914,6 +1932,10 @@ final class PanelServer {
             if !manifestHeaders.isEmpty { args.append("manifestHeader=\(manifestHeaders)") }
             if !mediaHeaders.isEmpty { args.append("header=\(mediaHeaders)") }
             if !keys.isEmpty { args.append("decryptionKeys=\(keys)") }
+            if !cdmScriptArg.isEmpty {
+                args.append("cdmScript=\(cdmScriptArg)")
+                args.append("cdmFetchArgs=\(cdmFetchArgs)")
+            }
             if !segmentParams.isEmpty { args.append("segmentUrlParams=\(segmentParams)") }
             // CDN mirrors: newline-joined (safe — a valid URL has no literal
             // newline), tried in order when the primary manifest fetch fails.
