@@ -478,11 +478,41 @@ function renderStreamsGrid() {
 // playUrl yet (e.g. the stream has never been started).
 async function copyStreamOutputUrl(stream, button) {
   const url = stream.playUrl || `${location.origin}/play/${stream.id}/index.m3u8`;
-  try {
-    await navigator.clipboard.writeText(url);
+  if (await copyToClipboard(url)) {
     if (button) flashButtonCopied(button);
-  } catch (_) {
+  } else {
     window.prompt("Copy the output URL:", url);
+  }
+}
+
+// Copy text to the clipboard, working on plain-HTTP origins too. The modern
+// navigator.clipboard API only exists in a "secure context" (https or
+// localhost) — the panel is almost always reached over http://<lan-ip>:port,
+// where it's undefined and every copy fell through to a manual prompt() popup.
+// Fall back to a hidden <textarea> + execCommand("copy"), which works on http.
+async function copyToClipboard(text) {
+  try {
+    if (window.isSecureContext && navigator.clipboard) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) { /* fall through to the legacy path */ }
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.top = "-1000px";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.focus();
+    area.select();
+    area.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(area);
+    return ok;
+  } catch (_) {
+    return false;
   }
 }
 
@@ -2310,13 +2340,17 @@ $("#toggleScriptOutputBtn").addEventListener("click", () => {
   $("#scriptOutputBox").classList.toggle("hidden");
   updateScriptOutputToggleLabel();
 });
-$("#copyBtn").addEventListener("click", async () => {
+$("#copyBtn").addEventListener("click", async (event) => {
   const link = $("#playLink").value;
-  if (link) await navigator.clipboard.writeText(link);
+  if (!link) return;
+  if (await copyToClipboard(link)) flashButtonCopied(event.currentTarget);
+  else window.prompt("Copy the output URL:", link);
 });
-$("#copyDirectBtn").addEventListener("click", async () => {
+$("#copyDirectBtn").addEventListener("click", async (event) => {
   const link = $("#directLink").dataset.full;
-  if (link) await navigator.clipboard.writeText(link);
+  if (!link) return;
+  if (await copyToClipboard(link)) flashButtonCopied(event.currentTarget);
+  else window.prompt("Copy the URL:", link);
 });
 $("#qualitySelect").addEventListener("change", (event) => {
   if (hls) hls.currentLevel = Number(event.currentTarget.value);
