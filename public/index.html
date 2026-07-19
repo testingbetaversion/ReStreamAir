@@ -45,6 +45,7 @@
           <button type="button" class="nav-btn" data-view="logs"><span data-icon="logs"></span>Logs</button>
           <button type="button" class="nav-btn" data-view="keys"><span data-icon="keys"></span>API Keys</button>
           <button type="button" class="nav-btn" data-view="settings"><span data-icon="settings"></span>Settings</button>
+          <button type="button" class="nav-btn" data-view="help"><span data-icon="help"></span>Help</button>
         </nav>
         <div class="actions">
           <span id="whoami" class="field-hint"></span>
@@ -434,6 +435,108 @@
                 <div class="actions"><button type="submit"><span data-icon="plus"></span>Add admin</button></div>
               </form>
               <div id="userList" class="key-list empty-state">Loading…</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="helpView" class="hidden">
+          <div class="help-wrap">
+            <nav class="help-toc">
+              <a href="#help-start">Getting started</a>
+              <a href="#help-providers">Providers &amp; streams</a>
+              <a href="#help-playback">Playback &amp; output</a>
+              <a href="#help-scripts">Provider scripts</a>
+              <a href="#help-drm">DRM / keys</a>
+              <a href="#help-session">Session manifest &amp; heartbeat</a>
+              <a href="#help-run">Running the binary</a>
+              <a href="#help-api">API keys &amp; CLI</a>
+            </nav>
+            <div class="help-body">
+              <article id="help-start" class="help-card">
+                <h3>Getting started</h3>
+                <p>ReStreamAir re-streams DASH/HLS sources as clean HLS you can play in any player. Create a <b>Provider</b> (a group of streams that share settings/credentials), add <b>Streams</b> under it, then hit play or copy the output URL.</p>
+                <ol>
+                  <li>Go to <b>Providers → New provider</b>.</li>
+                  <li>Open the provider, add a stream with its source URL (an <code>.mpd</code> or <code>.m3u8</code>).</li>
+                  <li>Press <b>Start</b>, then <b>Copy output URL</b> and open it in VLC / a browser / an IPTV player.</li>
+                </ol>
+              </article>
+
+              <article id="help-providers" class="help-card">
+                <h3>Providers &amp; streams</h3>
+                <p><b>Provider settings</b> hold defaults shared by every stream under them: proxy, generic headers, and a provider <b>script</b> + accounts. A stream inherits these unless it overrides them.</p>
+                <ul>
+                  <li><b>Proxy</b> — set once on the provider; a stream's “Network override” wins if filled.</li>
+                  <li><b>Mixer settings</b> (Playlist count, Keep count, Download ahead, Poll seconds) are per-stream, in the stream editor's DASH options.</li>
+                  <li><b>All Streams</b> tab: bulk start/stop/delete, filter by provider/type, and Import channels/events from a provider script.</li>
+                </ul>
+              </article>
+
+              <article id="help-playback" class="help-card">
+                <h3>Playback &amp; output</h3>
+                <p>Every stream is served at <code>/play/&lt;id&gt;/index.m3u8</code>. The <b>Input/output pipeline</b> section chooses how it's produced:</p>
+                <ul>
+                  <li><b>Internal remuxer</b> (default) — no ffmpeg needed; downloads + remuxes segments itself, decrypting CENC clear keys.</li>
+                  <li><b>FFmpeg modes</b> — spawn a resident ffmpeg that reads the source and copy-remuxes to HLS, or pushes to SRT/UDP/TCP via the Output target.</li>
+                  <li><b>Direct source</b> — <code>/play</code> 302-redirects to the origin instead of proxying.</li>
+                </ul>
+              </article>
+
+              <article id="help-scripts" class="help-card">
+                <h3>Provider scripts</h3>
+                <p>A script is any <code>.py</code> / <code>.sh</code> / executable that owns login/session/DRM logic. It's invoked once per <b>action</b> with a flat <code>key=value</code> argv, and prints its result to <b>stdout</b> (logs to stderr).</p>
+                <p class="help-note">Always passed: <code>action=</code> <code>user=</code> <code>password=</code> <code>bind=</code> <code>proxy=</code> <code>doh=</code> <code>worker=</code>, then the stream's <b>Script params</b> (e.g. <code>id=123 streamId=456</code>).</p>
+                <table class="help-table">
+                  <tr><th>action</th><th>purpose / output</th></tr>
+                  <tr><td><code>login</code> / <code>pair</code></td><td>Authenticate. Streams progress to stderr; tokens cached by the script.</td></tr>
+                  <tr><td><code>channels</code> / <code>events</code> / <code>vod</code></td><td>Print JSON list of items to import as streams (see keys below).</td></tr>
+                  <tr><td><code>manifest</code></td><td>Return a fresh session manifest as JSON (see next section).</td></tr>
+                  <tr><td><code>cdm</code></td><td>Return clear keys. Also gets <code>cdm=external|internal</code>, <code>cdmType=</code>.</td></tr>
+                  <tr><td><code>heartbeat</code></td><td>Keep the session alive. No output needed.</td></tr>
+                </table>
+                <p>Import JSON per item uses keys: <code>Name</code>, <code>Mode</code> (live/vod), <code>SessionManifest</code>, <code>UseCdm</code>, <code>CdmType</code>, <code>CdmMode</code>, <code>Video</code>, <code>Autostart</code>, <code>Start</code>/<code>End</code>, and per-stream params.</p>
+              </article>
+
+              <article id="help-drm" class="help-card">
+                <h3>DRM / keys</h3>
+                <p class="help-callout">ReStreamAir is an IPTV restreamer, <b>not a DRM client</b> — it never runs a real Widevine/PlayReady/FairPlay CDM. For protected streams a script returns <b>clear keys</b> and the remuxer decrypts with them.</p>
+                <ul>
+                  <li><b>Manual keys</b> — paste <code>KID:KEY</code> hex pairs (one per line) in the stream editor's decryption box. These always win.</li>
+                  <li><b>Get keys via script</b> — turn on in Scripting &amp; DRM; the <code>cdm</code> action returns keys when the stream is protected and no keys were pasted.</li>
+                  <li><b>CDM mode</b> — <code>external</code>: the script runs its own CDM and prints <code>KID:KEY</code>. <code>internal</code>: the panel scrapes <code>kid=</code>/<code>pssh=</code> from the manifest and the script proxies the license.</li>
+                </ul>
+                <p>Key output formats accepted: bare <code>KID:KEY</code> lines, <code>--&gt; KID:KEY</code>, or JSON <code>{"keys":[{"kid","key"}]}</code>.</p>
+              </article>
+
+              <article id="help-session" class="help-card">
+                <h3>Session manifest &amp; heartbeat</h3>
+                <p>When a source URL is short-lived (per-session/token), turn on <b>Session manifest</b>. On every start the panel runs the script's <code>manifest</code> action and streams from the fresh URL it returns:</p>
+                <pre class="help-pre">{
+  "ManifestUrl": "https://…/live.mpd",
+  "Cdn": [ { "Name": "cdn2", "ManifestUrl": "https://…" } ],
+  "Headers": { "Manifest": { "User-Agent": "…" }, "Media": { … } },
+  "Heartbeat": { "Url": "", "Params": "", "PeriodMs": 300000 }
+}</pre>
+                <p>CDN mirrors become failover sources, Headers apply per fetch category, and <code>Heartbeat.PeriodMs</code> auto-sets the heartbeat interval (which re-runs the <code>heartbeat</code> action that often to keep the session alive).</p>
+              </article>
+
+              <article id="help-run" class="help-card">
+                <h3>Running the binary</h3>
+                <p>On Linux, download the <code>…-linux-x86_64.tar.gz</code> release, extract, and run the launcher — <b>not</b> the raw binary:</p>
+                <pre class="help-pre">tar -xzf restreamair-vX-linux-x86_64.tar.gz
+cd restreamair-vX-linux-x86_64
+./restreamair --port 8787 --bind 0.0.0.0</pre>
+                <p><code>restreamair</code> is a wrapper that points <code>LD_LIBRARY_PATH</code> at the bundled <code>libs/</code> (so it works on distros that ship a different <code>libxml2</code> soname). To update, replace the folder (or drop the new <code>restreamair-linux</code> over the old one).</p>
+              </article>
+
+              <article id="help-api" class="help-card">
+                <h3>API keys &amp; CLI</h3>
+                <ul>
+                  <li><b>API Keys</b> tab — generate keys to require auth on playback; add <code>?key=…</code> to the play URL.</li>
+                  <li><b>Export playlist</b> — one M3U of every stream, for VLC/Kodi/an IPTV app.</li>
+                  <li><b>CLI:</b> <code>restreamair cdmprobe mpd=&lt;url&gt; [script=&lt;path&gt;]</code> prints the DRM challenge (KIDs/PSSH) and, with a script, the clear keys — handy for testing a CDM script.</li>
+                </ul>
+              </article>
             </div>
           </div>
         </section>
