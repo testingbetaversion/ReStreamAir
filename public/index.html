@@ -215,12 +215,20 @@
               </div>
             </div>
 
-            <button type="button" id="showScriptingBtn" class="ghost">Scripting &amp; DRM (auto keys / heartbeat)</button>
+            <button type="button" id="showScriptingBtn" class="ghost">Scripting &amp; DRM (session manifest / keys / heartbeat)</button>
             <div id="scriptingGroup" class="key-field-group hidden">
-              <div class="field-group-title">Scripting &amp; DRM<span class="field-hint">Uses this stream's provider script. We're an IPTV restreamer, not a DRM client — the script returns clear keys; we don't run a real CDM.</span></div>
-              <label class="check"><input name="useCdm" type="checkbox"> Auto-fetch keys via provider script when DRM-protected and no keys entered above</label>
+              <div class="field-group-title">Scripting &amp; DRM<span class="field-hint">Drives this stream through a provider script (login → session manifest → keys → heartbeat). We're an IPTV restreamer, not a DRM client — the script returns clear keys; we don't run a real CDM.</span></div>
+              <label>Script override<span class="field-hint">Path to a .py/.sh/executable that overrides the provider's script for THIS stream. Blank = use the provider script.</span><input name="scriptOverride" placeholder="/path/to/provider.py  (blank = provider script)"></label>
+              <label class="check"><input name="sessionManifest" type="checkbox"> <b>Session manifest</b> — fetch a fresh source URL (+ CDNs, headers, heartbeat) from the script's <code>manifest</code> action on every start</label>
+              <label class="check"><input name="useCdm" type="checkbox"> <b>Get keys via script</b> — run the <code>cdm</code> action to obtain clear keys when DRM-protected and no keys were entered above</label>
               <div class="form-row">
-                <label>CDM system<span class="field-hint">Which DRM the script should target</span>
+                <label>CDM mode<span class="field-hint">external = script runs its own CDM and returns keys · internal = panel builds the license challenge, the script only proxies it</span>
+                  <select name="cdmMode">
+                    <option value="external">External (script returns keys)</option>
+                    <option value="internal">Internal (script proxies license)</option>
+                  </select>
+                </label>
+                <label>CDM system<span class="field-hint">Which DRM the script targets</span>
                   <select name="cdmType">
                     <option value="">Auto-detect</option>
                     <option value="widevine">Widevine</option>
@@ -229,9 +237,28 @@
                     <option value="clearkey">ClearKey</option>
                   </select>
                 </label>
-                <label>Heartbeat (seconds)<span class="field-hint">0 = off. Pings the script's heartbeat action this often while live to keep the session alive.</span><input name="heartbeatSeconds" type="number" min="0" step="1" value="0"></label>
               </div>
-              <label>Script params<span class="field-hint">Extra key=value tokens passed to every script action for this stream (space-separated), e.g. region=us deviceId=abc</span><input name="scriptParams" placeholder="region=us deviceId=abc"></label>
+              <div class="form-row">
+                <label>Heartbeat (seconds)<span class="field-hint">0 = off (auto-set from the manifest's Heartbeat.PeriodMs). Pings the <code>heartbeat</code> action this often while live.</span><input name="heartbeatSeconds" type="number" min="0" step="1" value="0"></label>
+                <label>Script params<span class="field-hint">key=value tokens passed to every action for this stream, e.g. <code>id=123 streamId=456</code></span><input name="scriptParams" placeholder="id=123 streamId=456"></label>
+              </div>
+              <details class="script-help">
+                <summary>Script protocol reference</summary>
+                <div class="script-help-body">
+                  <p>A provider script is any <code>.py</code> / <code>.sh</code> / executable. It's invoked once per action with a flat <code>key=value</code> argv. It must print its result to <b>stdout</b> (logs go to stderr).</p>
+                  <p><b>Always passed:</b> <code>action=</code> <code>user=</code> <code>password=</code> <code>bind=</code> <code>proxy=</code> <code>doh=</code> <code>worker=</code>, then this stream's <b>Script params</b> (e.g. <code>id= streamId=</code>).</p>
+                  <p><b>action=manifest</b> → print JSON:</p>
+                  <pre>{
+  "ManifestUrl": "https://…/live.mpd",
+  "Cdn": [ { "Name": "cdn2", "ManifestUrl": "https://…" } ],
+  "Headers": { "Manifest": { "User-Agent": "…" }, "Media": { … } },
+  "Heartbeat": { "Url": "", "Params": "", "PeriodMs": 300000 }
+}</pre>
+                  <p><b>action=cdm</b> (also gets <code>cdm=external|internal</code>, <code>cdmType=</code>; internal also gets <code>kid=</code> <code>pssh=</code>) → print clear keys, one per line — <code>KID:KEY</code> (32 hex : 32 hex). Bare lines, <code>--&gt; KID:KEY</code>, or JSON <code>{"keys":[{"kid","key"}]}</code> all accepted.</p>
+                  <p><b>action=heartbeat</b> → keep the session alive (no output needed). <b>action=login / pair</b> → authenticate (streaming output). <b>action=channels / events</b> → import (JSON list).</p>
+                  <p>Test extraction &amp; a script from the CLI: <code>restreamair cdmprobe mpd=&lt;url&gt; script=&lt;path&gt;</code></p>
+                </div>
+              </details>
             </div>
 
             <label>Manifest headers<span class="field-hint">Manifest/playlist fetch (MPD or M3U8)</span><textarea name="manifestHeaders" placeholder="Name: value"></textarea></label>

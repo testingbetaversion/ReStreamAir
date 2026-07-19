@@ -1000,6 +1000,43 @@ pre {
   min-width: 140px;
 }
 
+.script-help {
+  margin-top: 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-2, rgba(0, 0, 0, 0.2));
+  font-size: 12px;
+}
+.script-help > summary {
+  cursor: pointer;
+  padding: 8px 12px;
+  font-weight: 600;
+  user-select: none;
+}
+.script-help-body {
+  padding: 4px 12px 12px;
+  line-height: 1.55;
+  color: var(--text);
+}
+.script-help-body p { margin: 8px 0; }
+.script-help-body code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  background: rgba(127, 127, 127, 0.18);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.script-help-body pre {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  overflow-x: auto;
+  white-space: pre;
+}
+
 .script-output {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 11px;
