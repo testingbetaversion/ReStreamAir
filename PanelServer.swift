@@ -665,11 +665,12 @@ final class PanelServer {
         } else {
             listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         }
-        listener?.stateUpdateHandler = { state in
+        listener?.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
                 let host = boundAddress.isEmpty ? "127.0.0.1" : boundAddress
                 print("ReStreamAir Swift panel running at http://\(host):\(boundPort)")
+                self?.logPanel("info", "server", "panel started on \(host):\(boundPort) (\(AppVersion.version))")
             case .failed(let error):
                 if case .posix(let code) = error, code == .EADDRINUSE {
                     fputs(portInUseMessage, stderr)
@@ -692,6 +693,7 @@ final class PanelServer {
             }
             let host = boundAddress.isEmpty ? "127.0.0.1" : boundAddress
             print("ReStreamAir Swift panel running at http://\(host):\(boundPort)")
+            logPanel("info", "server", "panel started on \(host):\(boundPort) (\(AppVersion.version))")
         } catch let error as POSIXServer.BindError {
             if error.errnoValue == EADDRINUSE {
                 fputs(portInUseMessage, stderr)
@@ -1627,14 +1629,17 @@ final class PanelServer {
             guard let username = input["username"], let password = input["password"],
                   let user = state.adminUsers.first(where: { $0.username == username }),
                   AuthStore.verifyPassword(password, hash: user.passwordHash, salt: user.salt) else {
+                logPanel("warn", "auth", "failed sign-in for '\(input["username"] ?? "?")'")
                 throw PanelError.unauthorized("Invalid username or password.")
             }
             let remember = input["remember"] == "true"
             let token = authStore.createSession(username: username, remember: remember)
+            logPanel("info", "auth", "'\(username)' signed in")
             return response(status: 200, body: Data("{\"ok\":true}".utf8), type: "application/json; charset=utf-8", noStore: true, extraHeaders: ["Set-Cookie": authStore.setCookieHeader(token: token, remember: remember)])
         }
 
         if request.method == "POST", request.path == "/api/auth/logout" {
+            logPanel("info", "auth", "signed out")
             return response(status: 200, body: Data("{\"ok\":true}".utf8), type: "application/json; charset=utf-8", noStore: true, extraHeaders: ["Set-Cookie": authStore.clearCookieHeader()])
         }
 
@@ -1720,20 +1725,25 @@ final class PanelServer {
                 return jsonResponse(status: 200, viewState(state, host: request.headers["host"] ?? "127.0.0.1:\(port)"))
             }
             if request.method == "DELETE" {
+                let streamName = state.providers[location.provider].streams[location.stream].name
                 stop(stream: state.providers[location.provider].streams[location.stream])
                 state.providers[location.provider].streams.remove(at: location.stream)
                 try writeState(state)
+                logPanel("info", "streamControl", "deleted '\(streamName)'")
                 return jsonResponse(status: 200, viewState(state, host: request.headers["host"] ?? "127.0.0.1:\(port)"))
             }
         }
 
         if request.method == "POST", let match = match(request.path, #"^/api/streams/([^/]+)/(start|stop)$"#) {
             guard let location = findStream(match[0], in: state) else { throw PanelError.notFound("Stream not found.") }
+            let streamName = state.providers[location.provider].streams[location.stream].name
             if match[1] == "start" {
                 try start(provider: state.providers[location.provider], stream: &state.providers[location.provider].streams[location.stream])
+                logPanel("info", "streamControl", "started '\(streamName)'")
             } else {
                 stop(stream: state.providers[location.provider].streams[location.stream])
                 state.providers[location.provider].streams[location.stream].status = "stopped"
+                logPanel("info", "streamControl", "stopped '\(streamName)'")
             }
             try writeState(state)
             return jsonResponse(status: 200, viewState(state, host: request.headers["host"] ?? "127.0.0.1:\(port)"))
@@ -1745,6 +1755,12 @@ final class PanelServer {
     func effectiveRepresentationIds(for stream: StreamConfig) -> [String] {
         if !stream.representations.isEmpty { return stream.representations }
         return [stream.representation]
+    }
+
+    /// Record a panel-level (not stream-specific) event — server lifecycle,
+    /// auth, stream control. Shows under the Logs tab's "Panel" filter.
+    func logPanel(_ level: String, _ event: String, _ message: String) {
+        logStore.record(streamId: "__panel__", level: level, event: event, url: nil, message: message)
     }
 
     /// When a stream is CENC-protected and the operator turned on CDM auto-keys
