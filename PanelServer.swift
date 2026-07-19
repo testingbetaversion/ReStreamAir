@@ -305,11 +305,16 @@ struct StreamConfig: Codable {
     /// Per-stream script path that overrides the provider's script for THIS
     /// stream's manifest/cdm/heartbeat actions (blank = use the provider script).
     var scriptOverride: String = ""
-    /// "external" — the script runs its own CDM and returns clear KID:KEY pairs.
-    /// "internal" — the panel builds the license challenge and the script only
-    /// proxies it to the license server, returning the raw license (see the
-    /// script protocol / allenteo.py's `cdm=external|internal`).
+    /// Legacy — kept for decode compat; CDM is always run in "external" mode
+    /// now (the script returns clear keys; the internal-challenge mode was
+    /// removed). Not surfaced in the UI.
     var cdmMode: String = "external"
+    /// Which request categories the proxy applies to (default all). Lets the
+    /// proxy cover, say, only the session-manifest/script calls while the MPD +
+    /// media segments go direct.
+    var proxyScript: Bool = true
+    var proxyManifest: Bool = true
+    var proxyMedia: Bool = true
     /// Periodic provider-script "heartbeat" interval in seconds (0 = off) — some
     /// providers expire a session unless pinged; the panel runs the script's
     /// `heartbeat` action this often while the stream is live. See start().
@@ -412,6 +417,9 @@ struct StreamConfig: Codable {
         useCdm = try container.decodeIfPresent(Bool.self, forKey: .useCdm) ?? false
         scriptOverride = try container.decodeIfPresent(String.self, forKey: .scriptOverride) ?? ""
         cdmMode = try container.decodeIfPresent(String.self, forKey: .cdmMode) ?? "external"
+        proxyScript = try container.decodeIfPresent(Bool.self, forKey: .proxyScript) ?? true
+        proxyManifest = try container.decodeIfPresent(Bool.self, forKey: .proxyManifest) ?? true
+        proxyMedia = try container.decodeIfPresent(Bool.self, forKey: .proxyMedia) ?? true
         heartbeatSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatSeconds) ?? 0
         scriptVideoSelector = try container.decodeIfPresent(String.self, forKey: .scriptVideoSelector) ?? ""
         scriptAudioSelector = try container.decodeIfPresent(String.self, forKey: .scriptAudioSelector) ?? ""
@@ -1588,6 +1596,17 @@ final class PanelServer {
             return jsonResponse(status: 200, ["entries": entries, "availableDates": logStore.availableRunDates()])
         }
 
+        if request.method == "DELETE", request.path == "/api/logs" {
+            // Clear the in-memory entries for one stream (or every stream when no
+            // filter). The persisted per-day files are left alone.
+            if let streamId = request.query["streamId"], !streamId.isEmpty {
+                logStore.clearStream(streamId)
+            } else {
+                logStore.clearAll()
+            }
+            return jsonResponse(status: 200, ["ok": true])
+        }
+
         if request.method == "GET", request.path == "/api/settings" {
             return jsonResponse(status: 200, ["port": state.settings.port, "bindAddress": state.settings.bindAddress])
         }
@@ -1782,30 +1801,20 @@ final class PanelServer {
             return entered
         }
         let account = activeScriptAccount(for: provider)
-        let mode = stream.cdmMode.isEmpty ? "external" : stream.cdmMode
-        // Real script protocol (see allenteo.py): the common user=/password=/
-        // bind=/proxy=/doh=/worker= prefix, cdm=<external|internal>, this
-        // stream's params, then cdm type.
-        var args = ScriptRunner.commonArgs(action: "cdm", bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
-        args.append("cdm=\(mode)")
-        if !stream.cdmType.isEmpty { args.append("cdmType=\(stream.cdmType)") }
+        // Script protocol (see allenteo.py): the common user=/password=/bind=/
+        // proxy=/doh=/worker= prefix, cdm=external (the script returns clear
+        // keys), then this stream's params. We don't pick a DRM system — we
+        // parse the manifest for ALL of it and forward it.
+        var args = ScriptRunner.commonArgs(action: "cdm", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
+        args.append("cdm=external")
         args += ScriptRunner.splitParams(stream.scriptParams)
-        // Bonus DRM material scraped from the manifest — external CDMs that do
-        // their own PSSH/KID extraction (again see allenteo.py) simply ignore
-        // these; simpler key-return scripts can use them.
-        if mode != "external", let url = URL(string: stream.url), url.scheme != nil {
-            let proxy = effectiveProxy(provider: provider, stream: stream)
-            let headers = effectiveHeaders(provider: provider, stream: stream, category: .manifest)
-            if let data = try? HTTPClient(options: HTTPRequestOptions(timeout: 12, headers: headers, proxy: proxy.isEmpty ? nil : proxy)).get(url) {
-                let text = String(data: data, encoding: .utf8) ?? ""
-                let challenge = stream.kind == "m3u8" ? CDMKeyResolver.challengeFromHLS(text) : CDMKeyResolver.challengeFromMPD(text)
-                if !challenge.kids.isEmpty { args.append("kid=\(challenge.kids.joined(separator: ","))") }
-                if let first = challenge.psshAll.first { args.append("pssh=\(first)") }
-                if !challenge.psshWidevine.isEmpty { args.append("psshWidevine=\(challenge.psshWidevine)") }
-            }
-        }
+        // Parse the manifest for every scrap of DRM info and hand it all to the
+        // script (KIDs, Widevine + PlayReady PSSH, the KID from the init
+        // segment). Scripts that do their own extraction ignore what they don't
+        // need; simpler scripts get everything without having to parse anything.
+        args += drmArgsFromManifest(provider: provider, stream: stream)
         do {
-            logStore.record(streamId: stream.id, level: "info", event: "cdm", url: nil, message: "requesting keys via \((scriptPath as NSString).lastPathComponent) (cdm=\(mode), type=\(stream.cdmType.isEmpty ? "auto" : stream.cdmType))")
+            logStore.record(streamId: stream.id, level: "info", event: "cdm", url: nil, message: "requesting keys via \((scriptPath as NSString).lastPathComponent)")
             let (stdout, _) = try ScriptRunner.runSync(scriptPath: scriptPath, args: args, timeout: 60)
             let pairs = CDMKeyResolver.parseKeyOutput(stdout)
             let joined = joinLines(pairs.map { "\($0.kid):\($0.key)" }.joined(separator: "\n"))
@@ -1825,11 +1834,16 @@ final class PanelServer {
     /// is a short-lived per-session URL, ask the script for a fresh one (plus
     /// CDNs / per-category headers / heartbeat cadence) on every start, so
     /// playback never begins from an already-expired URL. Mutates the inout
-    /// stream so the caller's writeState persists it. Best-effort.
-    func refreshSessionManifest(provider: Provider, stream: inout StreamConfig) {
+    /// stream so the caller's writeState persists it. THROWS on failure so the
+    /// caller aborts the start — there's no point spawning a worker (or asking
+    /// for keys) against a URL we couldn't refresh, and letting it fail later
+    /// just makes the supervisor restart-loop the failing script.
+    func refreshSessionManifest(provider: Provider, stream: inout StreamConfig) throws {
         guard stream.sessionManifest else { return }
         let scriptPath = effectiveScriptPath(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
-        guard !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) else { return }
+        guard !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) else {
+            throw PanelError.server("Session manifest is on, but no readable script is configured for this stream.")
+        }
         do {
             let result = try runManifestScript(provider: provider, stream: stream, account: activeScriptAccount(for: provider))
             stream.url = result.manifestUrl
@@ -1840,7 +1854,33 @@ final class PanelServer {
             logStore.record(streamId: stream.id, level: "info", event: "scriptManifest", url: result.manifestUrl, message: "session manifest: fresh source (\(result.cdnUrls.count) CDN mirror(s)\(result.heartbeatSeconds > 0 ? ", heartbeat \(result.heartbeatSeconds)s" : ""))")
         } catch {
             logStore.record(streamId: stream.id, level: "error", event: "scriptManifest", url: nil, message: "session manifest fetch failed: \(error)")
+            throw error
         }
+    }
+
+    /// Parse the stream's manifest for every DRM detail and return them as
+    /// script args: all KIDs (`kid=`), the first + all PSSH boxes (`pssh=`,
+    /// `psshAll=`), the Widevine/PlayReady boxes split out (`psshWidevine=`,
+    /// `psshPlayReady=`), and HLS key URIs (`keyUri=`). We forward whatever we
+    /// find; the script decides what it needs. Best-effort — [] on any failure.
+    func drmArgsFromManifest(provider: Provider, stream: StreamConfig) -> [String] {
+        guard let url = URL(string: stream.url), url.scheme != nil else { return [] }
+        let proxy = manifestProxy(provider: provider, stream: stream)
+        let headers = effectiveHeaders(provider: provider, stream: stream, category: .manifest)
+        guard let data = try? HTTPClient(options: HTTPRequestOptions(timeout: 12, headers: headers, proxy: proxy.isEmpty ? nil : proxy)).get(url),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        let challenge = stream.kind == "m3u8" ? CDMKeyResolver.challengeFromHLS(text) : CDMKeyResolver.challengeFromMPD(text)
+        var args: [String] = []
+        if !challenge.kids.isEmpty { args.append("kid=\(challenge.kids.joined(separator: ","))") }
+        if let first = challenge.psshAll.first { args.append("pssh=\(first)") }
+        if !challenge.psshAll.isEmpty { args.append("psshAll=\(challenge.psshAll.joined(separator: ","))") }
+        if !challenge.psshWidevine.isEmpty { args.append("psshWidevine=\(challenge.psshWidevine)") }
+        if !challenge.psshPlayReady.isEmpty { args.append("psshPlayReady=\(challenge.psshPlayReady)") }
+        if !challenge.keyURIs.isEmpty { args.append("keyUri=\(challenge.keyURIs.joined(separator: ","))") }
+        if !challenge.isEmpty {
+            logStore.record(streamId: stream.id, level: "info", event: "cdm", url: nil, message: "parsed DRM from manifest — KID(s) [\(challenge.kids.joined(separator: ", "))], \(challenge.psshAll.count) PSSH box(es)")
+        }
+        return args
     }
 
     func start(provider: Provider, stream: inout StreamConfig) throws {
@@ -1851,7 +1891,7 @@ final class PanelServer {
         // heartbeat) from the script before anything reads stream.url, so every
         // pipeline — passthrough, internal workers, ffmpeg — starts from a live
         // session URL rather than a stale one.
-        refreshSessionManifest(provider: provider, stream: &stream)
+        try refreshSessionManifest(provider: provider, stream: &stream)
         startHeartbeat(provider: provider, stream: stream)
 
         // A plain HLS passthrough (internal input, no re-mux) is served straight
@@ -1876,7 +1916,10 @@ final class PanelServer {
 
         let representationIds = effectiveRepresentationIds(for: stream)
         let multi = representationIds.count > 1
-        let proxy = effectiveProxy(provider: provider, stream: stream)
+        // Split proxy: the worker's MPD fetch vs its segment/init fetches can use
+        // the proxy independently (per the stream's proxy scope).
+        let proxy = manifestProxy(provider: provider, stream: stream)
+        let mediaProxyValue = mediaProxy(provider: provider, stream: stream)
         let manifestHeaders = swiftHeader(headerText(effectiveHeaders(provider: provider, stream: stream, category: .manifest)))
         let mediaHeaders = swiftHeader(headerText(effectiveHeaders(provider: provider, stream: stream, category: .media)))
         // Keys entered by hand win; otherwise, if CDM auto-keys is on, ask the
@@ -1894,7 +1937,7 @@ final class PanelServer {
             let scriptPath = effectiveScriptPath(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
             if !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) {
                 cdmScriptArg = scriptPath
-                var a = ScriptRunner.commonArgs(action: "cdm", bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: activeScriptAccount(for: provider))
+                var a = ScriptRunner.commonArgs(action: "cdm", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: activeScriptAccount(for: provider))
                 a.append("cdm=\(stream.cdmMode.isEmpty ? "external" : stream.cdmMode)")
                 if !stream.cdmType.isEmpty { a.append("cdmType=\(stream.cdmType)") }
                 a += ScriptRunner.splitParams(stream.scriptParams)
@@ -1928,6 +1971,7 @@ final class PanelServer {
             if !repId.isEmpty { args.append("representation=\(repId)") }
             if !stream.period.isEmpty { args.append("period=\(stream.period)") }
             if !proxy.isEmpty { args.append("proxy=\(proxy)") }
+            if !mediaProxyValue.isEmpty { args.append("mediaProxy=\(mediaProxyValue)") }
             if stream.forceOffline { args.append("forceOffline=true") }
             if !manifestHeaders.isEmpty { args.append("manifestHeader=\(manifestHeaders)") }
             if !mediaHeaders.isEmpty { args.append("header=\(mediaHeaders)") }
@@ -2122,7 +2166,7 @@ final class PanelServer {
         guard !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) else { return }
         let interval = max(5, stream.heartbeatSeconds)
         let account = activeScriptAccount(for: provider)
-        var args = ScriptRunner.commonArgs(action: "heartbeat", bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
+        var args = ScriptRunner.commonArgs(action: "heartbeat", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
         args += ScriptRunner.splitParams(stream.scriptParams)
         let streamId = stream.id
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
@@ -2283,7 +2327,7 @@ final class PanelServer {
     /// Runs `action=manifest` (per the script protocol) and parses its JSON
     /// reply. Blocking — never call while holding stateQueue.
     func runManifestScript(provider: Provider, stream: StreamConfig, account: ScriptAccount) throws -> ScriptManifestResult {
-        var args = ScriptRunner.commonArgs(action: "manifest", bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
+        var args = ScriptRunner.commonArgs(action: "manifest", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
         args += ScriptRunner.splitParams(stream.scriptParams)
         let (stdout, _) = try ScriptRunner.runSync(scriptPath: effectiveScriptPath(provider: provider, stream: stream), args: args, timeout: 45)
         // Tolerate scripts that log a line or two before the JSON blob.
@@ -3078,8 +3122,10 @@ final class PanelServer {
             "scriptParams": stream.scriptParams,
             "cdmType": stream.cdmType,
             "useCdm": stream.useCdm,
-            "cdmMode": stream.cdmMode,
             "scriptOverride": stream.scriptOverride,
+            "proxyScript": stream.proxyScript,
+            "proxyManifest": stream.proxyManifest,
+            "proxyMedia": stream.proxyMedia,
             "heartbeatSeconds": stream.heartbeatSeconds,
             "scriptVideoSelector": stream.scriptVideoSelector,
             "scriptAudioSelector": stream.scriptAudioSelector,
@@ -3264,13 +3310,15 @@ final class PanelServer {
         // Scripting & DRM (editor-controlled — see the update merge, which no
         // longer carries these over from the existing stream).
         stream.useCdm = input["useCdm"]?.bool ?? false
-        stream.cdmType = input["cdmType"]?.string ?? ""
         stream.scriptParams = input["scriptParams"]?.string ?? ""
         stream.heartbeatSeconds = max(0, input["heartbeatSeconds"]?.int ?? 0)
         stream.scriptOverride = input["scriptOverride"]?.string ?? ""
         stream.sessionManifest = input["sessionManifest"]?.bool ?? false
-        let requestedCdmMode = input["cdmMode"]?.string ?? "external"
-        stream.cdmMode = ["external", "internal"].contains(requestedCdmMode) ? requestedCdmMode : "external"
+        stream.cdmMode = "external"   // internal mode removed
+        stream.cdmType = ""            // no longer user-selected — DRM info is auto-parsed
+        stream.proxyScript = input["proxyScript"]?.bool ?? true
+        stream.proxyManifest = input["proxyManifest"]?.bool ?? true
+        stream.proxyMedia = input["proxyMedia"]?.bool ?? true
         return stream
     }
 
@@ -3380,6 +3428,19 @@ final class PanelServer {
 
     func effectiveProxy(provider: Provider, stream: StreamConfig) -> String {
         stream.proxy.isEmpty ? provider.proxy : stream.proxy
+    }
+
+    /// Per-category proxy: the base proxy, but only when that category's scope
+    /// flag is on — so the proxy can cover, say, just the script/session-manifest
+    /// calls while the MPD + media go direct.
+    func scriptProxy(provider: Provider, stream: StreamConfig) -> String {
+        stream.proxyScript ? effectiveProxy(provider: provider, stream: stream) : ""
+    }
+    func manifestProxy(provider: Provider, stream: StreamConfig) -> String {
+        stream.proxyManifest ? effectiveProxy(provider: provider, stream: stream) : ""
+    }
+    func mediaProxy(provider: Provider, stream: StreamConfig) -> String {
+        stream.proxyMedia ? effectiveProxy(provider: provider, stream: stream) : ""
     }
 
     /// When a provider has `inheritUrlParams` enabled, every stream's segment/init

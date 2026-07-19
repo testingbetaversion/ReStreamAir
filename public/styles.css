@@ -1448,6 +1448,23 @@ pre {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Multi-line messages (script tracebacks) — keep each line, don't jumble. */
+.log-row-multiline { align-items: start; }
+.log-detail-multiline {
+  grid-column: 1 / -1;
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow: auto;
+  background: rgba(0, 0, 0, 0.22);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
 
 /* Grouped script output (login/pair/channels/events stdout) — wraps and
    preserves line breaks instead of the single-line ellipsis every other

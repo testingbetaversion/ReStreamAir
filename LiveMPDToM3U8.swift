@@ -57,6 +57,8 @@ struct LiveM3U8Options {
     var timeout: TimeInterval
     var headers: [(String, String)]
     var proxy: String?
+    /// Separate proxy for media (segment/init) fetches; nil = use `proxy`.
+    var mediaProxy: String?
     var baseURLOverride: URL?
     var tempDir: URL
     var outputURL: URL
@@ -276,6 +278,7 @@ struct LiveM3U8ActionRuntime {
             timeout: try positiveDouble("timeout", args, defaultValue: 30),
             headers: try parseHeaders(args["header"]),
             proxy: args["proxy"],
+            mediaProxy: args["mediaProxy"],
             baseURLOverride: baseURLOverride,
             tempDir: tempDir,
             outputURL: outputURL,
@@ -454,7 +457,9 @@ final class LiveMPDToM3U8 {
         self.client = HTTPClient(options: HTTPRequestOptions(
             timeout: options.timeout,
             headers: options.headers,
-            proxy: options.proxy
+            // Media (segment/init) fetches can use a different proxy than the
+            // manifest — or none — per the stream's per-category proxy scope.
+            proxy: options.mediaProxy ?? options.proxy
         ))
         // A decryptor is needed when there are keys up front OR a CDM script to
         // fetch them on rotation.
