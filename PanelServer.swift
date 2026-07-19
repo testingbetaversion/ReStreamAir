@@ -1729,6 +1729,59 @@ final class PanelServer {
         return [stream.representation]
     }
 
+    /// When a stream is CENC-protected and the operator turned on CDM auto-keys
+    /// (useCdm) with a provider script configured but entered no keys of their
+    /// own, fetch the manifest, scrape the DRM challenge (PSSH + KIDs for DASH,
+    /// EXT-X-KEY for HLS), and let the script hand back clear KID:KEY pairs. We
+    /// don't run a real CDM — the script owns the license exchange; we just feed
+    /// it what the manifest advertises. Best-effort: any failure logs and falls
+    /// through to whatever the operator typed (possibly nothing), so a start
+    /// never throws just because key acquisition failed. Runs synchronously
+    /// before the worker spawns because the worker needs the keys up front;
+    /// timeouts are bounded so a hung script can't wedge the start forever.
+    func resolveDecryptionKeys(provider: Provider, stream: StreamConfig) -> String {
+        let entered = joinLines(stream.decryptionKeys)
+        guard entered.isEmpty, stream.useCdm else { return entered }
+        let scriptPath = provider.scriptPath.trimmingCharacters(in: .whitespaces)
+        guard !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) else {
+            if stream.useCdm {
+                logStore.record(streamId: stream.id, level: "warn", event: "cdm", url: nil, message: "CDM auto-keys on, but no readable provider script is configured")
+            }
+            return entered
+        }
+        guard let url = URL(string: stream.url), url.scheme != nil else { return entered }
+
+        let proxy = effectiveProxy(provider: provider, stream: stream)
+        let headers = effectiveHeaders(provider: provider, stream: stream, category: .manifest)
+        do {
+            let opts = HTTPRequestOptions(timeout: 15, headers: headers, proxy: proxy.isEmpty ? nil : proxy)
+            let text = String(data: try HTTPClient(options: opts).get(url), encoding: .utf8) ?? ""
+            let challenge = stream.kind == "m3u8"
+                ? CDMKeyResolver.challengeFromHLS(text)
+                : CDMKeyResolver.challengeFromMPD(text)
+            guard !challenge.isEmpty else {
+                logStore.record(streamId: stream.id, level: "warn", event: "cdm", url: url.absoluteString, message: "no DRM info (PSSH/KID/EXT-X-KEY) found in the manifest — nothing to request keys for")
+                return entered
+            }
+            logStore.record(streamId: stream.id, level: "info", event: "cdm", url: nil, message: "requesting keys via \((scriptPath as NSString).lastPathComponent) for KID(s) [\(challenge.kids.joined(separator: ", "))] cdm=\(stream.cdmType.isEmpty ? "auto" : stream.cdmType)")
+            var extra: [String] = []
+            if !proxy.isEmpty { extra.append("proxy=\(proxy)") }
+            for (name, value) in headers { extra.append("header=\(name): \(value)") }
+            extra.append(contentsOf: ScriptRunner.splitParams(stream.scriptParams))
+            let keys = try CDMKeyResolver.resolveKeys(scriptPath: scriptPath, cdmType: stream.cdmType, challenge: challenge, extraArgs: extra)
+            let joined = joinLines(keys)
+            if joined.isEmpty {
+                logStore.record(streamId: stream.id, level: "warn", event: "cdm", url: nil, message: "script returned no usable KID:KEY pairs")
+                return entered
+            }
+            logStore.record(streamId: stream.id, level: "info", event: "cdm", url: nil, message: "acquired \(joined.split(separator: "|").count) clear key(s) from script")
+            return joined
+        } catch {
+            logStore.record(streamId: stream.id, level: "error", event: "cdm", url: nil, message: "CDM key fetch failed: \(error)")
+            return entered
+        }
+    }
+
     func start(provider: Provider, stream: inout StreamConfig) throws {
         // A plain HLS passthrough (internal input, no re-mux) is served straight
         // from its origin by the m3u8 proxy — no worker to spawn. An ffmpeg
@@ -1755,7 +1808,9 @@ final class PanelServer {
         let proxy = effectiveProxy(provider: provider, stream: stream)
         let manifestHeaders = swiftHeader(headerText(effectiveHeaders(provider: provider, stream: stream, category: .manifest)))
         let mediaHeaders = swiftHeader(headerText(effectiveHeaders(provider: provider, stream: stream, category: .media)))
-        let keys = joinLines(stream.decryptionKeys)
+        // Keys entered by hand win; otherwise, if CDM auto-keys is on, ask the
+        // provider script to acquire clear keys from the manifest's DRM info.
+        let keys = resolveDecryptionKeys(provider: provider, stream: stream)
         let segmentParams = effectiveSegmentUrlParams(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
         logStore.clearStream(stream.id)
 
@@ -3348,9 +3403,20 @@ struct RestreamAirMain {
             LiveM3U8ActionRuntime.run(Array(arguments.dropFirst()))
         case "serve":
             serveEntry(Array(arguments.dropFirst()))
+        case "cdmprobe":
+            // Debug helper: fetch a DASH/HLS manifest and print the DRM
+            // challenge (KIDs + PSSH) we'd hand a CDM script — and, if a
+            // script= is given, run it and print the clear keys it returns.
+            //   restreamair cdmprobe mpd=<url> [script=/path] [proxy=..] [cdmType=..]
+            cdmProbe(Array(arguments.dropFirst()))
         case "selftest":
             // Known-answer crypto vectors — verifies the pure-Swift SHA/PBKDF2/
             // AES produce correct bytes on this platform (used by Linux CI).
+            let cdmFailures = CDMKeyResolver.selfTestFailures()
+            if !cdmFailures.isEmpty {
+                FileHandle.standardError.write(Data("CDM key-resolver self-test FAILED: \(cdmFailures.joined(separator: ", "))\n".utf8))
+                exit(1)
+            }
             CryptoSelfTest.runOrExit()
         default:
             serveEntry(arguments)
@@ -3437,6 +3503,37 @@ struct RestreamAirMain {
             let cause = signaled ? "signal \(status)" : "exit code \(status)"
             fputs("panel process died (\(cause)) after \(Int(uptime))s — restarting in \(Int(delay))s\n", stderr)
             Thread.sleep(forTimeInterval: delay)
+        }
+    }
+
+    static func cdmProbe(_ arguments: [String]) {
+        var args: [String: String] = [:]
+        for token in arguments {
+            guard let eq = token.firstIndex(of: "=") else { continue }
+            args[String(token[..<eq])] = String(token[token.index(after: eq)...])
+        }
+        guard let manifest = args["mpd"] ?? args["url"] ?? args["m3u8"], let url = URL(string: manifest) else {
+            fputs("usage: restreamair cdmprobe mpd=<url> [script=/path] [proxy=..] [cdmType=..]\n", stderr); exit(2)
+        }
+        let isHLS = manifest.contains(".m3u8") || args["m3u8"] != nil
+        do {
+            let opts = HTTPRequestOptions(timeout: 20, headers: [], proxy: args["proxy"])
+            let text = String(data: try HTTPClient(options: opts).get(url), encoding: .utf8) ?? ""
+            let challenge = isHLS ? CDMKeyResolver.challengeFromHLS(text) : CDMKeyResolver.challengeFromMPD(text)
+            print("KIDs:        \(challenge.kids.isEmpty ? "(none)" : challenge.kids.joined(separator: ", "))")
+            print("Widevine:    \(challenge.psshWidevine.isEmpty ? "(none)" : challenge.psshWidevine.prefix(48) + "…")")
+            print("PlayReady:   \(challenge.psshPlayReady.isEmpty ? "(none)" : challenge.psshPlayReady.prefix(48) + "…")")
+            print("FairPlay:    \(challenge.psshFairPlay.isEmpty ? "(none)" : challenge.psshFairPlay)")
+            print("PSSH boxes:  \(challenge.psshAll.count)")
+            if !challenge.keyURIs.isEmpty { print("Key URIs:    \(challenge.keyURIs.joined(separator: ", "))") }
+            if let script = args["script"], !script.isEmpty {
+                var extra: [String] = []
+                if let p = args["proxy"] { extra.append("proxy=\(p)") }
+                let keys = try CDMKeyResolver.resolveKeys(scriptPath: script, cdmType: args["cdmType"] ?? "", challenge: challenge, extraArgs: extra)
+                print("Clear keys:  \(keys.isEmpty ? "(script returned none)" : "\n" + keys)")
+            }
+        } catch {
+            fputs("cdmprobe error: \(error)\n", stderr); exit(1)
         }
     }
 
