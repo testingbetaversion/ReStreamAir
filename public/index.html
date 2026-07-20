@@ -484,16 +484,22 @@
               </article>
 
               <article id="help-scripts" class="help-card">
-                <h3>Provider scripts</h3>
-                <p>A script is any <code>.py</code> / <code>.sh</code> / executable that owns login/session/DRM logic. It's invoked once per <b>action</b> with a flat <code>key=value</code> argv, and prints its result to <b>stdout</b> (logs to stderr).</p>
-                <p class="help-note">Always passed: <code>action=</code> <code>user=</code> <code>password=</code> <code>bind=</code> <code>proxy=</code> <code>doh=</code> <code>worker=</code>, then the stream's <b>Script params</b> (e.g. <code>id=123 streamId=456</code>).</p>
+                <h3>Provider scripts &amp; Protocol</h3>
+                <p>A script is any <code>.py</code> / <code>.sh</code> / executable that owns login, session management, or DRM/key logic. It's invoked with flat <code>key=value</code> arguments and prints its output to <b>stdout</b> (logs/debug to stderr).</p>
+                <p class="help-note"><b>Common Input (always passed to every action):</b><br><code>action=&lt;name&gt; user=&lt;user&gt; password=&lt;pass&gt; bind=&lt;bind&gt; proxy=&lt;proxy&gt; doh=&lt;doh&gt; worker=&lt;worker&gt;</code> plus per-stream <b>Script params</b> (e.g. <code>id=123 streamId=456</code>).</p>
+
                 <table class="help-table">
-                  <tr><th>action</th><th>purpose / output</th></tr>
-                  <tr><td><code>login</code> / <code>pair</code></td><td>Authenticate. Streams progress to stderr; tokens cached by the script.</td></tr>
-                  <tr><td><code>channels</code> / <code>events</code> / <code>vod</code></td><td>Print JSON list of items to import as streams (see keys below).</td></tr>
-                  <tr><td><code>manifest</code></td><td>Return a fresh session manifest as JSON (see next section).</td></tr>
-                  <tr><td><code>cdm</code></td><td>Return clear keys. Also gets <code>cdm=external|internal</code>, <code>cdmType=</code>.</td></tr>
-                  <tr><td><code>heartbeat</code></td><td>Keep the session alive. No output needed.</td></tr>
+                  <tr><th>Action</th><th>Inputs passed</th><th>Expected Output (stdout)</th></tr>
+                  <tr><td><code>login</code> / <code>pair</code></td><td>Common args</td><td>Live text progress to stderr/stdout; script caches session token to disk.</td></tr>
+                  <tr><td><code>channels</code></td><td>Common args</td><td>JSON: <code>{"Channels": [{"Name": "...", "Mode": "live", "SessionManifest": true, "UseCdm": true, "CdmType": "widevine", "ScriptParams": "id=101"}]}</code></td></tr>
+                  <tr><td><code>events</code></td><td>Common args</td><td>JSON: <code>{"Events": [{"Name": "...", "Mode": "live", "SessionManifest": true, "Autostart": true, "Start": 1700000000, "End": 1700007200, "ScriptParams": "eventId=50"}]}</code></td></tr>
+                  <tr><td><code>epg</code></td><td>Common args</td><td>XMLTV XML data string or JSON: <code>{"EPG": [{"ChannelId": "101", "Title": "Show", "Start": 1700000000, "End": 1700003600}]}</code></td></tr>
+                  <tr><td><code>manifest</code></td><td>Common args + Script params</td><td>JSON: <code>{"ManifestUrl": "https://...", "Cdn": [{"Name": "c1", "ManifestUrl": "..."}], "Headers": {"Manifest": {...}, "Media": {...}}, "Heartbeat": {"PeriodMs": 300000}}</code></td></tr>
+                  <tr><td><code>downloadmanifest</code></td><td>Common args + <code>url=&lt;url&gt;</code></td><td>Raw manifest text (MPD/M3U8) or JSON: <code>{"ManifestContent": "..."}</code></td></tr>
+                  <tr><td><code>downloadmedia</code></td><td>Common args + <code>url=&lt;url&gt;</code></td><td>Raw binary segment payload streamed to stdout.</td></tr>
+                  <tr><td><code>pssh</code></td><td>Common args + <code>pssh=&lt;pssh&gt; url=&lt;url&gt;</code></td><td>JSON: <code>{"ProcessedPssh": "AAAA..."}</code></td></tr>
+                  <tr><td><code>cdm</code></td><td>Common args + <code>cdm=external|internal cdmType=widevine|playready pssh=&lt;pssh&gt; kid=&lt;kid&gt;</code></td><td>Clear keys: <code>KID:KEY</code> lines, <code>--&gt; KID:KEY</code> lines, or JSON: <code>{"keys": [{"kid": "...", "key": "..."}]}</code></td></tr>
+                  <tr><td><code>heartbeat</code></td><td>Common args + Script params</td><td>Pings server session. Exit code 0 = success, non-zero = failure. JSON output optional.</td></tr>
                 </table>
                 <p>Import JSON per item uses keys: <code>Name</code>, <code>Mode</code> (live/vod), <code>SessionManifest</code>, <code>UseCdm</code>, <code>CdmType</code>, <code>CdmMode</code>, <code>Video</code>, <code>Autostart</code>, <code>Start</code>/<code>End</code>, and per-stream params.</p>
               </article>

@@ -143,7 +143,24 @@ if action == "channels":
 
 `events()` is the same shape, printing `{"Events": [...]}"` instead, with `Start`/`End` (unix seconds) and `Autostart`/`RecordEvent` set as needed. See the [README's field table](README.md#script-providers) for what every key means.
 
-`ScriptParams` is the important one to get right even though nothing calls `manifest` yet — it's what a future `action=manifest` call will receive for *that specific channel/event*, so put whatever your `manifest` handler will need to look the content back up (an id, a slug, whatever your backend wants).
+`ScriptParams` is the important one to get right — it's what your `manifest`/`cdm`/`heartbeat` handlers will receive for *that specific channel/event*, so put whatever your handler needs to look up the stream (e.g. `id=123` or `slug=stream-name`).
+
+## Complete Action Reference
+
+Every action receives the common argument prefix (`action=<name> user=... password=... bind=... proxy=... doh=... worker=...`). Here are all supported actions, their extra inputs, and expected stdout outputs:
+
+| Action | Extra Inputs Passed | Expected Output Format (stdout) |
+|---|---|---|
+| `login` / `pair` | Common args | Live progress text to stdout/stderr. Script saves session token locally. |
+| `channels` | Common args | JSON: `{"Channels": [{"Name": "...", "Mode": "live", "SessionManifest": true, "UseCdm": true, "CdmType": "widevine", "ScriptParams": "id=101"}]}` |
+| `events` | Common args | JSON: `{"Events": [{"Name": "...", "Mode": "live", "SessionManifest": true, "Autostart": true, "Start": 1700000000, "End": 1700007200, "ScriptParams": "eventId=50"}]}` |
+| `epg` | Common args | XMLTV XML string or JSON: `{"EPG": [{"ChannelId": "101", "Title": "Show Name", "Start": 1700000000, "End": 1700003600}]}` |
+| `manifest` | Common args + `ScriptParams` | JSON: `{"ManifestUrl": "https://...", "Cdn": [{"Name": "c1", "ManifestUrl": "..."}], "Headers": {"Manifest": {...}, "Media": {...}}, "Heartbeat": {"PeriodMs": 300000}}` |
+| `downloadmanifest` | Common args + `url=<manifestUrl>` | Raw manifest text string (MPD or M3U8) or JSON: `{"ManifestContent": "..."}` |
+| `downloadmedia` | Common args + `url=<segmentUrl>` | Raw binary segment payload streamed to stdout. |
+| `pssh` | Common args + `pssh=<pssh> url=<url>` | JSON: `{"ProcessedPssh": "AAAA..."}` |
+| `cdm` | Common args + `cdm=external\|internal cdmType=widevine\|playready pssh=<pssh> kid=<kid>` + `ScriptParams` | Clear keys as `KID:KEY` lines, `--> KID:KEY` lines, or JSON: `{"keys": [{"kid": "...", "key": "..."}]}` |
+| `heartbeat` | Common args + `ScriptParams` | Ping session. Exit code 0 = success, non-zero = error. |
 
 ## Testing a script without the panel
 
