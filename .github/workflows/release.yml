@@ -160,10 +160,12 @@ jobs:
         run: |
           $COMMIT = $env:GITHUB_SHA.Substring(0, 7)
           (Get-Content Version.swift) -replace 'static let version = "dev"', "static let version = `"${{ steps.ver.outputs.version }}`"" -replace 'static let commit = "unknown"', "static let commit = `"$COMMIT`"" | Set-Content Version.swift
+      # 6.1.2 fixes the "cyclic dependency in module 'ucrt'" Swift 6.0 hit on the
+      # MSVC that windows-latest now ships.
       - uses: compnerd/gha-setup-swift@main
         with:
-          branch: swift-6.0-release
-          tag: 6.0-RELEASE
+          swift-version: "6.1.2"
+          swift-build: "6.1.2-RELEASE"
       - name: Build restreamair (Windows x64)
         shell: pwsh
         run: |

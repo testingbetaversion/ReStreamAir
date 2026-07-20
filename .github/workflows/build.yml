@@ -133,10 +133,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # Swift 6.0 hit a "cyclic dependency in module 'ucrt'" against the MSVC
+      # that windows-latest now ships; 6.1.2 (what the Linux builds use) fixes it.
       - uses: compnerd/gha-setup-swift@main
         with:
-          branch: swift-6.0-release
-          tag: 6.0-RELEASE
+          swift-version: "6.1.2"
+          swift-build: "6.1.2-RELEASE"
       - name: Build restreamair (Windows x64)
         shell: pwsh
         run: |
