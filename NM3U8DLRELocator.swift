@@ -1,20 +1,10 @@
 import Foundation
 
 enum NM3U8DLRELocator {
+    // Reuse the shared, cross-platform PATH lookup (handles ';' vs ':' and the
+    // .exe suffix on Windows) rather than duplicating it.
     static func resolve() -> String? {
-        let binary = "N_m3u8DL-RE"
-        if let envPath = ProcessInfo.processInfo.environment["PATH"] {
-            for dir in envPath.split(separator: ":") {
-                let candidate = "\(dir)/\(binary)"
-                if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
-            }
-        }
-        let commonDirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/snap/bin"]
-        for dir in commonDirs {
-            let candidate = "\(dir)/\(binary)"
-            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
-        }
-        return nil
+        FFmpegLocator.resolve("N_m3u8DL-RE")
     }
 }
 

@@ -8,16 +8,40 @@ import Foundation
 /// well-known install locations before giving up.
 enum FFmpegLocator {
     static func resolve(_ binary: String) -> String? {
+        // PATH uses ';' on Windows and ':' elsewhere; on Windows the executable
+        // is <binary>.exe, and the Unix well-known dirs don't apply.
+        #if os(Windows)
+        let pathSeparator: Character = ";"
+        let names = binary.lowercased().hasSuffix(".exe") ? [binary] : [binary + ".exe", binary]
+        let commonDirs: [String] = []
+        #else
+        let pathSeparator: Character = ":"
+        let names = [binary]
+        let commonDirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/snap/bin"]
+        #endif
+
+        func candidate(_ dir: String, _ name: String) -> String? {
+            let path = URL(fileURLWithPath: dir).appendingPathComponent(name).path
+            // isExecutableFile is meaningful on POSIX (mode bits); on Windows a
+            // present .exe is executable by definition, so fall back to exists.
+            #if os(Windows)
+            return FileManager.default.fileExists(atPath: path) ? path : nil
+            #else
+            return FileManager.default.isExecutableFile(atPath: path) ? path : nil
+            #endif
+        }
+
         if let envPath = ProcessInfo.processInfo.environment["PATH"] {
-            for dir in envPath.split(separator: ":") {
-                let candidate = "\(dir)/\(binary)"
-                if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+            for dir in envPath.split(separator: pathSeparator) {
+                for name in names {
+                    if let found = candidate(String(dir), name) { return found }
+                }
             }
         }
-        let commonDirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/snap/bin"]
         for dir in commonDirs {
-            let candidate = "\(dir)/\(binary)"
-            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+            for name in names {
+                if let found = candidate(dir, name) { return found }
+            }
         }
         return nil
     }

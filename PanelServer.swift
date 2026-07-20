@@ -2191,7 +2191,9 @@ final class PanelServer {
             inputMode: stream.inputMode,
             outputMode: stream.outputMode,
             outputTarget: stream.outputTarget,
-            decryptionKeys: stream.decryptionKeys,
+            // Resolved keys: hand-entered OR CDM auto-keys (firstClearKey splits
+            // on '|', '\n' and '\r', so either separator is fine).
+            decryptionKeys: resolveDecryptionKeys(provider: provider, stream: stream),
             headers: headerText(effectiveHeaders(provider: provider, stream: stream, category: .media)),
             proxy: effectiveProxy(provider: provider, stream: stream),
             segmentUrlParams: effectiveSegmentUrlParams(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces),
@@ -2304,13 +2306,15 @@ final class PanelServer {
             arguments += ["--custom-proxy", proxy]
         }
 
-        // CENC decryption keys (KID:KEY format → --key KID:KEY per key)
-        if !stream.decryptionKeys.isEmpty {
-            for key in stream.decryptionKeys.components(separatedBy: "\n") {
-                let trimmed = key.trimmingCharacters(in: .whitespaces)
-                guard !trimmed.isEmpty else { continue }
-                arguments += ["--key", trimmed]
-            }
+        // CENC decryption keys (KID:KEY format → --key KID:KEY per key). Use the
+        // resolved keys so CDM auto-keys (useCdm) reach N_m3u8DL-RE too, not just
+        // hand-entered ones. resolveDecryptionKeys joins with '|'; the editor
+        // field uses newlines — split on both.
+        let keys = resolveDecryptionKeys(provider: provider, stream: stream)
+        for key in keys.split(whereSeparator: { $0 == "|" || $0 == "\n" || $0 == "\r" }) {
+            let trimmed = key.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { continue }
+            arguments += ["--key", trimmed]
         }
 
         // Any extra user-supplied CLI params (free-form key=value or flags)
