@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags: [ 'v*' ]
+    branches: [ 'main' ]
   workflow_dispatch:
     inputs:
       tag:
@@ -21,6 +22,7 @@ jobs:
         id: ver
         run: |
           TAG="${{ github.event.inputs.tag }}"; [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
+          if [ "$TAG" = "main" ]; then TAG="nightly"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
       - name: Stamp version
@@ -48,6 +50,7 @@ jobs:
         id: ver
         run: |
           TAG="${{ github.event.inputs.tag }}"; [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
+          if [ "$TAG" = "main" ]; then TAG="nightly"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
       - name: Stamp version
@@ -109,6 +112,7 @@ jobs:
         id: ver
         run: |
           TAG="${{ github.event.inputs.tag }}"; [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
+          if [ "$TAG" = "main" ]; then TAG="nightly"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
       - name: Stamp version
@@ -154,6 +158,7 @@ jobs:
         run: |
           $TAG = "${{ github.event.inputs.tag }}"
           if ([string]::IsNullOrWhiteSpace($TAG)) { $TAG = $env:GITHUB_REF_NAME }
+          if ($TAG -eq "main") { $TAG = "nightly" }
           "tag=$TAG" >> $env:GITHUB_OUTPUT
           "version=$($TAG.TrimStart('v'))" >> $env:GITHUB_OUTPUT
       - name: Stamp version
@@ -197,6 +202,7 @@ jobs:
         id: ver
         run: |
           TAG="${{ github.event.inputs.tag }}"; [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
+          if [ "$TAG" = "main" ]; then TAG="nightly"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with: { path: dist }
@@ -204,6 +210,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag == 'nightly' && 'Nightly Build' || steps.ver.outputs.tag }}
           generate_release_notes: true
+          prerelease: ${{ steps.ver.outputs.tag == 'nightly' }}
           files: dist/**/*
