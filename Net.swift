@@ -62,6 +62,28 @@ final class ClientConnection {
     }
 }
 
+#elseif os(Windows)
+// Windows has neither Network.framework nor POSIX sockets from Glibc/Musl.
+// Provide minimal stubs so PanelServer.swift compiles; the server will not
+// actually accept connections on Windows (not a supported server platform).
+
+final class ClientConnection {
+    let remoteAddress: String = ""
+    var onClose: (() -> Void)?
+    init() {}
+    func start() {}
+    func receive(_ completion: @escaping (Data?, Bool, Error?) -> Void) { completion(nil, true, nil) }
+    func send(_ data: Data?, completion: ((Error?) -> Void)? = nil) { completion?(nil) }
+    func cancel() { onClose?() }
+}
+
+enum POSIXServer {
+    struct BindError: Error { let errnoValue: Int32 }
+    static func serve(bindAddress: String, port: UInt16, onConnection: @escaping (ClientConnection) -> Void) throws {
+        throw BindError(errnoValue: 1) // not implemented on Windows
+    }
+}
+
 #else
 #if canImport(Musl)
 import Musl

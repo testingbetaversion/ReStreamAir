@@ -702,6 +702,9 @@ final class PanelServer {
             self?.handle(ClientConnection(connection))
         }
         listener?.start(queue: .global(qos: .userInitiated))
+        #elseif os(Windows)
+        fputs("error: Windows is not supported as a server platform — use the macOS or Linux binary.\n", stderr)
+        exit(1)
         #else
         do {
             try POSIXServer.serve(bindAddress: bindAddress, port: port) { [weak self] connection in

@@ -38,10 +38,14 @@ final class SystemStats {
     /// Linux) — shown alongside core count as "x.xx / N cores" rather than a
     /// single CPU% figure, matching what most server monitoring tools show.
     func loadAverage() -> Double {
+        #if os(Windows)
+        return 0
+        #else
         var loads = [Double](repeating: 0, count: 3)
         let count = getloadavg(&loads, 3)
         guard count > 0 else { return 0 }
         return loads[0]
+        #endif
     }
 
     func diskStats() -> (total: Int64, available: Int64) {
