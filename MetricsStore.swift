@@ -99,19 +99,22 @@ final class MetricsStore {
     func activeClients(streamId: String) -> Int {
         lock.lock(); defer { lock.unlock() }
         let now = Date()
-        let identities = activityByStream[streamId] ?? [:]
-        return identities.values.reduce(0) { count, timestamps in
-            count + (timestamps.contains { now.timeIntervalSince($0) <= activityWindow } ? 1 : 0)
-        }
+        return connections.values.filter { $0.streamId == streamId && now.timeIntervalSince($0.lastSeen) <= activityWindow }.count
     }
 
     func bandwidthView(streamId: String) -> [String: Any] {
         lock.lock(); defer { lock.unlock() }
         let now = Date()
-        let recent = (perStreamRecent[streamId] ?? []).filter { now.timeIntervalSince($0.0) <= rateWindow }
-        let recentBytes = recent.reduce(0) { $0 + $1.1 }
+        let activeConns = connections.values.filter { $0.streamId == streamId && now.timeIntervalSince($0.lastSeen) <= activityWindow }
+        let connRate = activeConns.reduce(0.0) { sum, conn in
+            let recent = conn.recentBytes.filter { now.timeIntervalSince($0.0) <= rateWindow }
+            let recentBytes = recent.reduce(0) { $0 + $1.1 }
+            return sum + (Double(recentBytes) / rateWindow)
+        }
+        let streamRecent = (perStreamRecent[streamId] ?? []).filter { now.timeIntervalSince($0.0) <= rateWindow }
+        let streamRate = Double(streamRecent.reduce(0) { $0 + $1.1 }) / rateWindow
         return [
-            "bytesPerSecond": Double(recentBytes) / rateWindow,
+            "bytesPerSecond": max(connRate, streamRate),
             "allTimeBytes": perStreamAllTime[streamId] ?? 0
         ]
     }
