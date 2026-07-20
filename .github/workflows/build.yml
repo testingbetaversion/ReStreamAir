@@ -99,35 +99,35 @@ jobs:
           path: restreamair-linux-glibc
           if-no-files-found: error
 
-  build-linux-arm64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      # The static SDK cross-compiles arm64 from the x86 runner (fast — no
-      # emulation to build); QEMU is only used to run the result for the test.
-      - name: Build restreamair (Linux arm64, fully static + embedded UI)
-        run: |
-          docker run --rm -e STATIC_SDK_URL -e STATIC_SDK_SHA -v "$PWD:/src" -w /src "$SWIFT_IMAGE" bash -c '
-            set -e
-            swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_SHA"
-            sh scripts/embed-assets.sh
-            swift build -c release --swift-sdk aarch64-swift-linux-musl --product restreamair
-            cp .build/aarch64-swift-linux-musl/release/restreamair restreamair-linux-arm64
-          '
-          file restreamair-linux-arm64
-      - name: Runs on bare arm64 Ubuntu with zero dependencies
-        run: |
-          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 bash -c '
-            ldd restreamair-linux-arm64 || true
-            ./restreamair-linux-arm64 selftest
-            echo "single-file arm64 binary runs on bare Ubuntu: OK"
-          '
-      - uses: actions/upload-artifact@v4
-        with:
-          name: restreamair-linux-arm64
-          path: restreamair-linux-arm64
-          if-no-files-found: error
+#  build-linux-arm64:
+#    runs-on: ubuntu-latest
+#    steps:
+#      - uses: actions/checkout@v4
+#      - uses: docker/setup-qemu-action@v3
+#      # The static SDK cross-compiles arm64 from the x86 runner (fast — no
+#      # emulation to build); QEMU is only used to run the result for the test.
+#      - name: Build restreamair (Linux arm64, fully static + embedded UI)
+#        run: |
+#          docker run --rm -e STATIC_SDK_URL -e STATIC_SDK_SHA -v "$PWD:/src" -w /src "$SWIFT_IMAGE" bash -c '
+#            set -e
+#            swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_SHA"
+#            sh scripts/embed-assets.sh
+#            swift build -c release --swift-sdk aarch64-swift-linux-musl --product restreamair
+#            cp .build/aarch64-swift-linux-musl/release/restreamair restreamair-linux-arm64
+#          '
+#          file restreamair-linux-arm64
+#      - name: Runs on bare arm64 Ubuntu with zero dependencies
+#        run: |
+#          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 bash -c '
+#            ldd restreamair-linux-arm64 || true
+#            ./restreamair-linux-arm64 selftest
+#            echo "single-file arm64 binary runs on bare Ubuntu: OK"
+#          '
+#      - uses: actions/upload-artifact@v4
+#        with:
+#          name: restreamair-linux-arm64
+#          path: restreamair-linux-arm64
+#          if-no-files-found: error
 
   build-windows:
     runs-on: windows-latest

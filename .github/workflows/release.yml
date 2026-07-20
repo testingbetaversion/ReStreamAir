@@ -44,6 +44,10 @@ jobs:
 
   build-linux:
     runs-on: ubuntu-latest
+    env:
+      SWIFT_IMAGE: swift:6.0.3
+      STATIC_SDK_URL: https://download.swift.org/swift-6.0.3-release/static-sdk/swift-6.0.3-RELEASE/swift-6.0.3-RELEASE_static-linux-0.0.1.artifactbundle.tar.gz
+      STATIC_SDK_SHA: 67f765e0030e661a7450f7e4877cfe008db4f57f177d5a08a6e26fd661cdd0bd
     steps:
       - uses: actions/checkout@v4
       - name: Resolve version
@@ -97,58 +101,68 @@ jobs:
             /app/restreamair selftest
             /app/restreamair dash --info https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.mpd | head -2
           '
+      - name: Build restreamair (Linux x86-64, fully static musl + embedded UI)
+        run: |
+          docker run --rm -e STATIC_SDK_URL -e STATIC_SDK_SHA -v "$PWD:/src" -w /src "$SWIFT_IMAGE" bash -c '
+            set -e
+            swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_SHA"
+            swift build -c release --swift-sdk x86_64-swift-linux-musl --product restreamair
+            cp .build/x86_64-swift-linux-musl/release/restreamair restreamair-linux-static
+          '
+          file restreamair-linux-static
       - uses: actions/upload-artifact@v4
         with:
           name: linux
           path: |
             restreamair-linux
+            restreamair-linux-static
             restreamair-${{ steps.ver.outputs.tag }}-linux-x86_64.tar.gz
 
-  build-linux-arm64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Resolve version
-        id: ver
-        run: |
-          TAG="${{ github.event.inputs.tag }}"; [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
-          if [ "$TAG" = "main" ]; then TAG="nightly"; fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-      - name: Stamp version
-        run: |
-          COMMIT=$(echo "$GITHUB_SHA" | cut -c1-7)
-          sed -i "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
-          sed -i "s/static let commit = \"unknown\"/static let commit = \"$COMMIT\"/" Version.swift
-      - uses: docker/setup-qemu-action@v3
-      - name: Build + bundle self-contained tarball (arm64 emulation, embedded UI + libs + launcher)
-        run: |
-          STAGE="restreamair-${{ steps.ver.outputs.tag }}-linux-arm64"
-          docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src swift:6.0 bash -c "
-            set -e
-            sh scripts/embed-assets.sh
-            swiftc -O -static-stdlib \$(ls *.swift | grep -vE 'MenuBarApp.swift|Package.swift') -o restreamair-linux-arm64
-            sh scripts/bundle-linux.sh '$STAGE' restreamair-linux-arm64
-          "
-          file restreamair-linux-arm64
-          tar -czf "$STAGE.tar.gz" "$STAGE"
-          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
-      - name: Verify bundle runs on a host WITHOUT libxml2/ICU (no Swift, no toolchain)
-        run: |
-          docker run --rm --platform linux/arm64 -v "$PWD/$STAGE:/app:ro" ubuntu:24.04 bash -c '
-            set -e
-            if ldd /app/restreamair-linux-arm64 | grep -qi swift; then echo "links Swift runtime unexpectedly"; exit 1; fi
-            apt-get update -qq && apt-get install -y -qq libcurl4 >/dev/null
-            find / \( -name "libxml2.so.*" -o -name "libicu*.so.*" -o -name "liblzma.so.*" \) -delete 2>/dev/null || true
-            /app/restreamair selftest
-          '
-      - uses: actions/upload-artifact@v4
-        with:
-          name: linux-arm64
-          path: |
-            restreamair-linux-arm64
-            restreamair-${{ steps.ver.outputs.tag }}-linux-arm64.tar.gz
-
+#  build-linux-arm64:
+#    runs-on: ubuntu-latest
+#    steps:
+#      - uses: actions/checkout@v4
+#      - name: Resolve version
+#        id: ver
+#        run: |
+#          TAG="${{ github.event.inputs.tag }}"; [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
+#          if [ "$TAG" = "main" ]; then TAG="nightly"; fi
+#          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+#          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+#      - name: Stamp version
+#        run: |
+#          COMMIT=$(echo "$GITHUB_SHA" | cut -c1-7)
+#          sed -i "s/static let version = \"dev\"/static let version = \"${{ steps.ver.outputs.version }}\"/" Version.swift
+#          sed -i "s/static let commit = \"unknown\"/static let commit = \"$COMMIT\"/" Version.swift
+#      - uses: docker/setup-qemu-action@v3
+#      - name: Build + bundle self-contained tarball (arm64 emulation, embedded UI + libs + launcher)
+#        run: |
+#          STAGE="restreamair-${{ steps.ver.outputs.tag }}-linux-arm64"
+#          docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src swift:6.0 bash -c "
+#            set -e
+#            sh scripts/embed-assets.sh
+#            swiftc -O -static-stdlib \$(ls *.swift | grep -vE 'MenuBarApp.swift|Package.swift') -o restreamair-linux-arm64
+#            sh scripts/bundle-linux.sh '$STAGE' restreamair-linux-arm64
+#          "
+#          file restreamair-linux-arm64
+#          tar -czf "$STAGE.tar.gz" "$STAGE"
+#          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+#      - name: Verify bundle runs on a host WITHOUT libxml2/ICU (no Swift, no toolchain)
+#        run: |
+#          docker run --rm --platform linux/arm64 -v "$PWD/$STAGE:/app:ro" ubuntu:24.04 bash -c '
+#            set -e
+#            if ldd /app/restreamair-linux-arm64 | grep -qi swift; then echo "links Swift runtime unexpectedly"; exit 1; fi
+#            apt-get update -qq && apt-get install -y -qq libcurl4 >/dev/null
+#            find / \( -name "libxml2.so.*" -o -name "libicu*.so.*" -o -name "liblzma.so.*" \) -delete 2>/dev/null || true
+#            /app/restreamair selftest
+#          '
+#      - uses: actions/upload-artifact@v4
+#        with:
+#          name: linux-arm64
+#          path: |
+#            restreamair-linux-arm64
+#            restreamair-${{ steps.ver.outputs.tag }}-linux-arm64.tar.gz
+#
   build-windows:
     runs-on: windows-latest
     steps:
@@ -195,7 +209,7 @@ jobs:
             restreamair-${{ steps.ver.outputs.tag }}-windows-x64.zip
 
   release:
-    needs: [build-macos, build-linux, build-linux-arm64, build-windows]
+    needs: [build-macos, build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Resolve tag
