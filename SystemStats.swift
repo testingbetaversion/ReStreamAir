@@ -49,7 +49,12 @@ final class SystemStats {
     }
 
     func diskStats() -> (total: Int64, available: Int64) {
-        guard let values = try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeTotalCapacityKey, .volumeAvailableCapacityKey]) else {
+        #if os(Windows)
+        let rootPath = FileManager.default.currentDirectoryPath
+        #else
+        let rootPath = "/"
+        #endif
+        guard let values = try? URL(fileURLWithPath: rootPath).resourceValues(forKeys: [.volumeTotalCapacityKey, .volumeAvailableCapacityKey]) else {
             return (0, 0)
         }
         return (Int64(values.volumeTotalCapacity ?? 0), Int64(values.volumeAvailableCapacity ?? 0))
