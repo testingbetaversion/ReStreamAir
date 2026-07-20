@@ -135,14 +135,14 @@ enum POSIXServer {
         guard serverSocket != INVALID_SOCKET else { throw BindError(errnoValue: WSAGetLastError()) }
 
         var reuse: Int32 = 1
-        setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, UnsafeRawPointer(&reuse).assumingMemoryBound(to: CChar.self), socklen_t(MemoryLayout<Int32>.size))
+        _ = withUnsafeBytes(of: &reuse) { ptr in
+            setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, ptr.baseAddress?.assumingMemoryBound(to: CChar.self), Int32(MemoryLayout<Int32>.size))
+        }
 
         var addr = sockaddr_in()
         addr.sin_family = ADDRESS_FAMILY(AF_INET)
         addr.sin_port = port.bigEndian
-        if bindAddress.isEmpty {
-            addr.sin_addr.s_addr = in_addr_t(0)
-        } else {
+        if !bindAddress.isEmpty {
             _ = bindAddress.withCString { inet_pton(Int32(AF_INET), $0, &addr.sin_addr) }
         }
 
@@ -176,7 +176,7 @@ enum POSIXServer {
                     continue
                 }
                 var timeout: DWORD = 30000
-                withUnsafeBytes(of: &timeout) { ptr in
+                _ = withUnsafeBytes(of: &timeout) { ptr in
                     setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, ptr.baseAddress?.assumingMemoryBound(to: CChar.self), Int32(MemoryLayout<DWORD>.size))
                 }
                 onConnection(ClientConnection(socket: clientSocket, remoteAddress: ipString(clientAddr)))
