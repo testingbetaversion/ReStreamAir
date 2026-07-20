@@ -315,9 +315,13 @@ struct StreamConfig: Codable {
     var proxyScript: Bool = true
     var proxyManifest: Bool = true
     var proxyMedia: Bool = true
-    /// Periodic provider-script "heartbeat" interval in seconds (0 = off) — some
-    /// providers expire a session unless pinged; the panel runs the script's
-    /// `heartbeat` action this often while the stream is live. See start().
+    /// Master on/off for the heartbeat (default on). When off, no heartbeat runs
+    /// even if the manifest advertises one. When on, the interval is
+    /// heartbeatSeconds (or the manifest's Heartbeat.PeriodMs when that's 0).
+    var heartbeatEnabled: Bool = true
+    /// Periodic provider-script "heartbeat" interval in seconds (0 = auto from
+    /// the manifest) — some providers expire a session unless pinged; the panel
+    /// runs the script's `heartbeat` action this often while live. See start().
     var heartbeatSeconds: Int = 0
     var scriptVideoSelector: String = ""  // e.g. "best" — which representation(s) to use, not yet acted on
     var scriptAudioSelector: String = ""  // e.g. "desc:en"
@@ -343,6 +347,8 @@ struct StreamConfig: Codable {
     /// with whichever responds). Segments resolve against the active mirror, so
     /// a mirror only has to serve the same content under its own host/path.
     var cdnUrls: [String] = []
+
+    var nm3u8dlreParams: String = ""
 
     /// When set, `/play/<id>/index.m3u8` (and `.mpd`) answer with a 302
     /// straight to the origin source URL (or current CDN mirror) instead of
@@ -420,6 +426,7 @@ struct StreamConfig: Codable {
         proxyScript = try container.decodeIfPresent(Bool.self, forKey: .proxyScript) ?? true
         proxyManifest = try container.decodeIfPresent(Bool.self, forKey: .proxyManifest) ?? true
         proxyMedia = try container.decodeIfPresent(Bool.self, forKey: .proxyMedia) ?? true
+        heartbeatEnabled = try container.decodeIfPresent(Bool.self, forKey: .heartbeatEnabled) ?? true
         heartbeatSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatSeconds) ?? 0
         scriptVideoSelector = try container.decodeIfPresent(String.self, forKey: .scriptVideoSelector) ?? ""
         scriptAudioSelector = try container.decodeIfPresent(String.self, forKey: .scriptAudioSelector) ?? ""
@@ -434,6 +441,7 @@ struct StreamConfig: Codable {
         outputTarget = try container.decodeIfPresent(String.self, forKey: .outputTarget) ?? ""
         cdnUrls = try container.decodeIfPresent([String].self, forKey: .cdnUrls) ?? []
         directSource = try container.decodeIfPresent(Bool.self, forKey: .directSource) ?? false
+        nm3u8dlreParams = try container.decodeIfPresent(String.self, forKey: .nm3u8dlreParams) ?? ""
     }
 
     private enum LegacyCodingKeys: String, CodingKey {
@@ -1267,6 +1275,51 @@ final class PanelServer {
             ])
         }
 
+        if request.method == "GET", request.path == "/api/nm3u8dlre-status" {
+            let binaryPath = NM3U8DLRELocator.resolve()
+            let plan = NM3U8DLREInstaller.plan()
+            return jsonResponse(status: 200, [
+                "available": binaryPath != nil,
+                "binaryPath": binaryPath as Any,
+                "installCommand": plan?.displayCommand ?? NM3U8DLREInstaller.manualCommand,
+                "canAutoInstall": plan != nil
+            ])
+        }
+
+        if request.method == "POST", request.path == "/api/nm3u8dlre-install" {
+            guard let plan = NM3U8DLREInstaller.plan() else {
+                throw PanelError.badRequest("Can't install automatically here — run `\(NM3U8DLREInstaller.manualCommand)` yourself.")
+            }
+            let logStreamId = "nm3u8dlre-install"
+            let logStore = self.logStore
+            logStore.record(streamId: logStreamId, level: "info", event: "installStart", url: nil, message: plan.displayCommand)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: plan.executable)
+            process.arguments = plan.arguments
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
+            let forward: (FileHandle) -> Void = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                    logStore.record(streamId: logStreamId, level: "info", event: "install", url: nil, message: String(line))
+                }
+            }
+            stdoutPipe.fileHandleForReading.readabilityHandler = forward
+            stderrPipe.fileHandleForReading.readabilityHandler = forward
+            process.terminationHandler = { proc in
+                stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                stderrPipe.fileHandleForReading.readabilityHandler = nil
+                try? stdoutPipe.fileHandleForReading.close()
+                try? stderrPipe.fileHandleForReading.close()
+                logStore.record(streamId: logStreamId, level: proc.terminationStatus == 0 ? "info" : "error", event: "installExit", url: nil, message: "exit \(proc.terminationStatus)")
+            }
+            try process.run()
+            return jsonResponse(status: 202, ["started": true, "logStreamId": logStreamId])
+        }
+
         // Kicks off the platform's package-manager install in the
         // background and returns immediately, same fire-and-poll shape as
         // the script login/pair endpoints — output streams into logStore
@@ -1573,6 +1626,34 @@ final class PanelServer {
             return jsonResponse(status: 202, ["started": true, "logStreamId": logStreamId])
         }
 
+        if request.method == "POST", let match = match(request.path, #"^/api/providers/([^/]+)/script/run$"#) {
+            guard let providerIndex = state.providers.firstIndex(where: { $0.id == match[0] }) else {
+                throw PanelError.notFound("Provider not found.")
+            }
+            let provider = state.providers[providerIndex]
+            guard !provider.scriptPath.trimmingCharacters(in: .whitespaces).isEmpty else {
+                throw PanelError.badRequest("This provider has no script configured.")
+            }
+            guard let account = try resolveScriptAccount(providerIndex: providerIndex, state: &state) else {
+                throw PanelError.badRequest("Add or enable an account before running a script action.")
+            }
+            
+            let input = try decodeJSON([String: JSONValue].self, request.body)
+            let action = input["action"]?.string ?? "run"
+            
+            var args = ScriptRunner.commonArgs(action: action, bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
+            
+            for (k, v) in input {
+                if k != "action" {
+                    args.append("\(k)=\(v.string ?? v.description)")
+                }
+            }
+            
+            let scriptPath = provider.scriptPath
+            let (stdout, stderr) = try ScriptRunner.runSync(scriptPath: scriptPath, args: args, timeout: 60)
+            return jsonResponse(status: 200, ["stdout": stdout, "stderr": stderr])
+        }
+
         if request.method == "POST", request.path == "/api/probe" {
             let input = try decodeJSON([String: JSONValue].self, request.body)
             guard let urlString = input["url"]?.string, let url = URL(string: urlString), url.scheme?.hasPrefix("http") == true else {
@@ -1731,6 +1812,15 @@ final class PanelServer {
                 // scriptParams / heartbeatSeconds are set by the editor's
                 // Scripting & DRM section, so they're read from the body
                 // (streamFromBody) rather than carried over from the existing.
+                let rawInput = try? decodeJSON([String: JSONValue].self, request.body)
+                if existing.sourceType != "" && updated.scriptOverride.trimmingCharacters(in: .whitespaces).isEmpty {
+                    if rawInput?["sessionManifest"] == nil { updated.sessionManifest = existing.sessionManifest }
+                    if rawInput?["useCdm"] == nil { updated.useCdm = existing.useCdm }
+                    if rawInput?["heartbeatEnabled"] == nil { updated.heartbeatEnabled = existing.heartbeatEnabled }
+                    if rawInput?["scriptParams"] == nil { updated.scriptParams = existing.scriptParams }
+                    if rawInput?["cdmType"] == nil { updated.cdmType = existing.cdmType }
+                    if rawInput?["cdmMode"] == nil { updated.cdmMode = existing.cdmMode }
+                }
                 updated.scriptVideoSelector = existing.scriptVideoSelector
                 updated.scriptAudioSelector = existing.scriptAudioSelector
                 updated.onDemand = existing.onDemand
@@ -1904,6 +1994,11 @@ final class PanelServer {
         }
         lock.lock(); let alreadyRunning = !(jobs[stream.id] ?? []).isEmpty; lock.unlock()
         if alreadyRunning { stream.status = "running"; return }
+
+        if stream.inputMode == "nm3u8dlre" {
+            try startNM3U8DLREResident(provider: provider, stream: &stream)
+            return
+        }
 
         if stream.inputMode != "internal" {
             try startFfmpegResident(provider: provider, stream: &stream)
@@ -2142,6 +2237,92 @@ final class PanelServer {
             try? stdoutPipe.fileHandleForReading.close()
             try? stderrPipe.fileHandleForReading.close()
             self?.logStore.recordWorkerLine(#"{"event":"ffmpegExit","status":"\#(proc.terminationStatus == 0 ? "success" : "error")","message":"exit \#(proc.terminationStatus)"}"#, streamId: streamId)
+            self?.lock.lock()
+            self?.jobs[streamId]?.removeAll { $0.process === job.process }
+            self?.lock.unlock()
+            self?.persistWorkerPids()
+        }
+        try process.run()
+
+        lock.lock(); jobs[stream.id] = [job]; lock.unlock()
+        persistWorkerPids()
+        stream.status = "running"
+        stream.lastError = nil
+    }
+
+    func startNM3U8DLREResident(provider: Provider, stream: inout StreamConfig) throws {
+        guard let binaryPath = NM3U8DLRELocator.resolve() else {
+            throw PanelError.server("N_m3u8DL-RE isn't installed. Install it or switch the stream input mode.")
+        }
+        let tempDir = runtimeDir.appendingPathComponent(stream.id, isDirectory: true)
+        try? FileManager.default.removeItem(at: tempDir)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        let sources = [stream.url] + stream.cdnUrls
+        lock.lock(); let rotation = cdnRotation[stream.id, default: 0]; cdnRotation[stream.id] = rotation + 1; lock.unlock()
+        let sourceURL = sources[rotation % sources.count]
+        if sources.count > 1 {
+            logStore.recordWorkerLine(#"{"event":"cdnFailover","status":"info","message":\#(jsonString("source: " + sourceURL))}"#, streamId: stream.id)
+        }
+
+        var arguments = [sourceURL, "--live-real-time-merge", "--live-pipe-mux", "--tmp-dir", tempDir.path]
+        let headers = effectiveHeaders(provider: provider, stream: stream, category: .media)
+        for (k, v) in headers {
+            arguments.append("-H")
+            arguments.append("\(k): \(v)")
+        }
+        let proxy = effectiveProxy(provider: provider, stream: stream)
+        if !proxy.isEmpty {
+            arguments.append("--custom-proxy")
+            arguments.append(proxy)
+        }
+        if !stream.decryptionKeys.isEmpty {
+            for key in stream.decryptionKeys.components(separatedBy: ",") {
+                arguments.append("--key")
+                arguments.append(key.trimmingCharacters(in: .whitespaces))
+            }
+        }
+
+        let extraParams = ScriptRunner.splitParams(stream.nm3u8dlreParams)
+        arguments.append(contentsOf: extraParams)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: binaryPath)
+        process.arguments = arguments
+        logStore.recordWorkerLine(#"{"event":"nm3u8dlreStart","status":"start","message":\#(jsonString("N_m3u8DL-RE " + arguments.joined(separator: " ")))}"#, streamId: stream.id)
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        let job = RestreamJob(process: process, representationId: "")
+        let streamId = stream.id
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            job.stdout.append(data)
+        }
+
+        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            job.stderr.append(data)
+            if let text = String(data: data, encoding: .utf8) {
+                for line in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    guard !trimmed.isEmpty else { continue }
+                    self?.logStore.recordWorkerLine(#"{"event":"nm3u8dlre","status":"info","message":\#(self?.jsonString(trimmed) ?? "\"\"")}"#, streamId: streamId)
+                }
+            }
+        }
+
+        process.terminationHandler = { [weak self] proc in
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+            self?.logStore.recordWorkerLine(#"{"event":"nm3u8dlreExit","status":"\#(proc.terminationStatus == 0 ? "success" : "error")","message":"exit \#(proc.terminationStatus)"}"#, streamId: streamId)
             self?.lock.lock()
             self?.jobs[streamId]?.removeAll { $0.process === job.process }
             self?.lock.unlock()
@@ -3136,6 +3317,7 @@ final class PanelServer {
             "proxyScript": stream.proxyScript,
             "proxyManifest": stream.proxyManifest,
             "proxyMedia": stream.proxyMedia,
+            "heartbeatEnabled": stream.heartbeatEnabled,
             "heartbeatSeconds": stream.heartbeatSeconds,
             "scriptVideoSelector": stream.scriptVideoSelector,
             "scriptAudioSelector": stream.scriptAudioSelector,
@@ -3298,7 +3480,7 @@ final class PanelServer {
             hlsKeyHeaders: input["hlsKeyHeaders"]?.string ?? "",
             audioDelayMs: input["audioDelayMs"]?.int ?? 0
         )
-        let validInputModes = ["internal", "ffmpegResident", "ffmpegTsHls", "ffmpegMultiTsHls", "ffmpegFmp4Hls"]
+        let validInputModes = ["internal", "ffmpegResident", "ffmpegTsHls", "ffmpegMultiTsHls", "ffmpegFmp4Hls", "nm3u8dlre"]
         let requestedInputMode = input["inputMode"]?.string ?? "internal"
         stream.inputMode = validInputModes.contains(requestedInputMode) ? requestedInputMode : "internal"
         let validOutputModes = ["hls", "srtServer", "udpSrt", "custom"]
@@ -3317,10 +3499,12 @@ final class PanelServer {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && URL(string: $0)?.scheme?.hasPrefix("http") == true }
         stream.directSource = input["directSource"]?.bool ?? false
+        stream.nm3u8dlreParams = input["nm3u8dlreParams"]?.string ?? ""
         // Scripting & DRM (editor-controlled — see the update merge, which no
         // longer carries these over from the existing stream).
         stream.useCdm = input["useCdm"]?.bool ?? false
         stream.scriptParams = input["scriptParams"]?.string ?? ""
+        stream.heartbeatEnabled = input["heartbeatEnabled"]?.bool ?? true
         stream.heartbeatSeconds = max(0, input["heartbeatSeconds"]?.int ?? 0)
         stream.scriptOverride = input["scriptOverride"]?.string ?? ""
         stream.sessionManifest = input["sessionManifest"]?.bool ?? false

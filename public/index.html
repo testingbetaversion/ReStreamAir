@@ -219,13 +219,32 @@
             <button type="button" id="showScriptingBtn" class="ghost">Scripting &amp; DRM (session manifest / keys / heartbeat)</button>
             <div id="scriptingGroup" class="key-field-group hidden">
               <div class="field-group-title">Scripting &amp; DRM<span class="field-hint">Drives this stream through a provider script (login → session manifest → keys → heartbeat). We're an IPTV restreamer, not a DRM client — the script returns clear keys; we don't run a real CDM.</span></div>
-              <label>Script override<span class="field-hint">Path to a .py/.sh/executable that overrides the provider's script for THIS stream. Blank = use the provider script.</span><input name="scriptOverride" placeholder="/path/to/provider.py  (blank = provider script)"></label>
-              <label class="check"><input name="sessionManifest" type="checkbox"> <b>Session manifest</b> — fetch a fresh source URL (+ CDNs, headers, heartbeat) from the script's <code>manifest</code> action on every start</label>
-              <label class="check"><input name="useCdm" type="checkbox"> <b>Get keys via script</b> — we parse the manifest &amp; init for all DRM info (Widevine/PlayReady PSSH, KIDs) and send it to the <code>cdm</code> action, which returns clear keys. No DRM system to pick — everything found is forwarded.</label>
-              <div class="form-row">
-                <label>Heartbeat (seconds)<span class="field-hint">0 = off (auto-set from the manifest's Heartbeat.PeriodMs). Pings the <code>heartbeat</code> action this often while live.</span><input name="heartbeatSeconds" type="number" min="0" step="1" value="0"></label>
-                <label>Script params<span class="field-hint">key=value tokens passed to every action for this stream, e.g. <code>id=123 streamId=456</code></span><input name="scriptParams" placeholder="id=123 streamId=456"></label>
+              <div id="importedScriptHint" class="field-hint hidden" style="margin-top:-8px; margin-bottom:8px; color:var(--accent);">Imported from channel/event script — params auto-filled</div>
+              <label>Script override<span class="field-hint">Path to a .py/.sh/executable for THIS stream. Blank = use the provider's script.</span><input name="scriptOverride" placeholder="blank = provider script"></label>
+
+              <div class="script-toggle">
+                <label class="check"><input name="sessionManifest" type="checkbox"> Session manifest</label>
+                <p class="field-hint sub">Fetch a fresh source URL (+ CDNs, headers, heartbeat) from the script's <code>manifest</code> action on every start.</p>
               </div>
+              <div class="script-toggle">
+                <label class="check"><input name="useCdm" type="checkbox"> DRM keys via script</label>
+                <p class="field-hint sub">Parse the manifest &amp; init for all DRM (Widevine/PlayReady PSSH, KIDs) and send it to the <code>cdm</code> action, which returns clear keys. Nothing to pick — everything found is forwarded.</p>
+              </div>
+              <div class="script-toggle">
+                <label class="check"><input name="heartbeatEnabled" type="checkbox"> Heartbeat</label>
+                <p class="field-hint sub">Ping the <code>heartbeat</code> action periodically to keep the session alive.</p>
+              </div>
+
+              <div class="form-row">
+                <label>Heartbeat (seconds)<span class="field-hint">0 = auto from the manifest's Heartbeat.PeriodMs</span><input name="heartbeatSeconds" type="number" min="0" step="1" value="0"></label>
+                <label>Script params<span class="field-hint">Auto-filled on channel import. key=value tokens sent to every action, e.g. <code>id=123 streamId=456</code></span><input name="scriptParams" placeholder="id=123 streamId=456"></label>
+              </div>
+              <div class="actions" style="margin-top: 4px;">
+                <button type="button" class="ghost" id="scriptRunPsshBtn"><span data-icon="play"></span>Run pssh</button>
+                <button type="button" class="ghost" id="scriptRunManifestBtn"><span data-icon="play"></span>Run manifest</button>
+                <button type="button" class="ghost" id="scriptRunMediaBtn"><span data-icon="play"></span>Run media</button>
+              </div>
+              <pre id="streamScriptOutputBox" class="script-output hidden"></pre>
               <p class="field-hint" style="margin:2px 2px 0">See the <b>Help</b> tab for the full script protocol.</p>
             </div>
 
@@ -249,6 +268,7 @@
                     <option value="ffmpegTsHls" data-needs-ffmpeg>FFmpeg TS HLS/Direct</option>
                     <option value="ffmpegMultiTsHls" data-needs-ffmpeg>FFmpeg MultiTS HLS</option>
                     <option value="ffmpegFmp4Hls" data-needs-ffmpeg>FMP4 HLS</option>
+                    <option value="nm3u8dlre" data-needs-nm3u8dlre>N_m3u8DL-RE (live)</option>
                   </select>
                 </label>
                 <label>Output
@@ -260,12 +280,18 @@
                   </select>
                 </label>
               </div>
+              <label id="nm3u8dlreParamsField" class="hidden">N_m3u8DL-RE Params<span class="field-hint">Command-line arguments appended to the N_m3u8DL-RE execution</span><input name="nm3u8dlreParams"></label>
               <label id="outputTargetField" class="hidden">Output target<span class="field-hint" id="outputTargetHint"></span><input name="outputTarget"></label>
               <div id="ffmpegNotice" class="field-hint hidden"></div>
               <div id="ffmpegInstallRow" class="actions hidden">
                 <button type="button" class="ghost" id="ffmpegInstallBtn"><span data-icon="download"></span>Install ffmpeg</button>
               </div>
               <pre id="ffmpegInstallOutput" class="script-output hidden"></pre>
+              <div id="nm3u8dlreNotice" class="field-hint hidden"></div>
+              <div id="nm3u8dlreInstallRow" class="actions hidden">
+                <button type="button" class="ghost" id="nm3u8dlreInstallBtn"><span data-icon="download"></span>Install N_m3u8DL-RE</button>
+              </div>
+              <pre id="nm3u8dlreInstallOutput" class="script-output hidden"></pre>
             </div>
 
             <div class="actions">
