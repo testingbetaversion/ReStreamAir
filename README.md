@@ -7,13 +7,14 @@ A local DASH → HLS restreaming toolkit written in Swift, with a web control pa
 
 ## Install
 
-The quickest path is a prebuilt binary — no toolchain needed. Grab the one for your platform from the [latest release](https://github.com/testingbetaversion/ReStreamAir/releases/latest):
+The quickest path is a prebuilt binary — no toolchain needed. Grab the one for your platform from the [latest release](https://github.com/testingbetaversion/ReStreamAir/releases/latest) (or download the latest [Nightly Build](https://github.com/testingbetaversion/ReStreamAir/releases/tag/nightly) for the absolute newest features):
 
 | Platform | Asset |
 |----------|-------|
-| macOS (Apple Silicon) | `restreamair` |
-| Linux x86-64 | `restreamair-linux` |
-| Linux arm64 | `restreamair-linux-arm64` |
+| macOS (Apple Silicon/Intel) | `restreamair-macos.tar.gz` |
+| Linux x86-64 (Dynamic) | `restreamair-linux-x86_64.tar.gz` |
+| Linux x86-64 (Static) | `restreamair-linux-static` |
+| Windows x64 | `restreamair-windows-x64.zip` |
 
 ```sh
 chmod +x restreamair          # (or restreamair-linux / restreamair-linux-arm64)

@@ -176,7 +176,9 @@ enum POSIXServer {
                     continue
                 }
                 var timeout: DWORD = 30000
-                setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, UnsafeRawPointer(&timeout).assumingMemoryBound(to: CChar.self), socklen_t(MemoryLayout<DWORD>.size))
+                withUnsafeBytes(of: &timeout) { ptr in
+                    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, ptr.baseAddress?.assumingMemoryBound(to: CChar.self), Int32(MemoryLayout<DWORD>.size))
+                }
                 onConnection(ClientConnection(socket: clientSocket, remoteAddress: ipString(clientAddr)))
             }
         }
@@ -188,7 +190,7 @@ enum POSIXServer {
         var source = addr.sin_addr
         let length = 16
         var buffer = [CChar](repeating: 0, count: length)
-        inet_ntop(Int32(AF_INET), &source, &buffer, socklen_t(length))
+        inet_ntop(Int32(AF_INET), &source, &buffer, length)
         return String(cString: buffer)
     }
 }
