@@ -173,7 +173,15 @@ jobs:
           $sources = (Get-ChildItem *.swift |
             Where-Object { $_.Name -notmatch 'MenuBarApp\.swift|Package\.swift' }).Name
           swiftc -O $sources -o restreamair.exe
-          Compress-Archive -Path restreamair.exe -DestinationPath "$STAGE.zip"
+          New-Item -ItemType Directory -Path $STAGE -Force
+          Copy-Item restreamair.exe -Destination "$STAGE\restreamair.exe"
+          $swiftBin = Split-Path (Get-Command swiftc).Path
+          $swiftRoot = Split-Path (Split-Path (Split-Path $swiftBin -Parent) -Parent) -Parent
+          if (-not (Test-Path $swiftRoot)) { $swiftRoot = Split-Path $swiftBin -Parent }
+          Get-ChildItem -Path $swiftBin, $swiftRoot -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item $_.FullName -Destination "$STAGE\" -Force
+          }
+          Compress-Archive -Path "$STAGE" -DestinationPath "$STAGE.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: windows
