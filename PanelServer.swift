@@ -6,6 +6,12 @@ import Musl
 #elseif canImport(Glibc)
 import Glibc
 #endif
+#if os(Windows)
+// Windows has no POSIX pid_t/kill/SIGPIPE/SIGHUP; the process-supervisor and
+// signal handling that use them are #if-guarded off below (Windows runs the
+// server single-process). This alias just lets those signatures compile.
+typealias pid_t = Int32
+#endif
 
 struct PanelState: Codable {
     var providers: [Provider] = []
@@ -2442,7 +2448,9 @@ final class PanelServer {
             // PIDs get reused by the OS — only kill if the process actually
             // looks like one of ours, never blindly.
             guard commandLooksLikeWorker(pid) else { continue }
+            #if !os(Windows)
             kill(pid, SIGTERM)
+            #endif
             #if os(Linux)
             // Workers inherit a blocked SIGTERM mask (see stop()) — escalate.
             kill(pid, SIGKILL)
@@ -3880,7 +3888,9 @@ struct RestreamAirMain {
         // to terminate the whole process. Ignoring it turns those writes into
         // an ordinary EPIPE error on that one call, which the I/O paths handle,
         // instead of silently killing the server (exit code 141 = 128 + 13).
+        #if !os(Windows)
         signal(SIGPIPE, SIG_IGN)
+        #endif
         let arguments = Array(CommandLine.arguments.dropFirst())
         switch arguments.first {
         case "dash":
@@ -3930,22 +3940,30 @@ struct RestreamAirMain {
     static func serveEntry(_ arguments: [String]) {
         // A dropped SSH session sends SIGHUP to the foreground process group;
         // a panel that's meant to keep serving shouldn't die with the terminal.
+        #if !os(Windows)
         signal(SIGHUP, SIG_IGN)
+        #endif
+        let serveArguments = arguments.filter { $0 != "--no-supervisor" }
+        #if os(Windows)
+        // The supervisor is POSIX signal/fork based; Windows runs single-process.
+        runServe(serveArguments)
+        #else
         let environment = ProcessInfo.processInfo.environment
         let supervised = environment["RESTREAMAIR_SUPERVISED"] == "1"
         let optOut = environment["RESTREAMAIR_NO_SUPERVISOR"] == "1" || arguments.contains("--no-supervisor")
-        let serveArguments = arguments.filter { $0 != "--no-supervisor" }
         if supervised || optOut {
             runServe(serveArguments)
         } else {
             superviseServe(serveArguments)
         }
+        #endif
     }
 
     /// The watcher: spawn the serving child, wait, restart on abnormal death
     /// with capped exponential backoff. Deliberately allocates nothing per
     /// iteration and handles no requests — the less it does, the less can
     /// kill it.
+    #if !os(Windows)
     static func superviseServe(_ arguments: [String]) {
         signal(SIGTERM, { _ in
             RestreamAirMain.supervisorStopping = true
@@ -3991,6 +4009,7 @@ struct RestreamAirMain {
             Thread.sleep(forTimeInterval: delay)
         }
     }
+    #endif
 
     static func cdmProbe(_ arguments: [String]) {
         var args: [String: String] = [:]
