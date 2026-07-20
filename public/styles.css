@@ -797,6 +797,20 @@ label {
   width: auto;
 }
 
+/* Scripting & DRM toggles: a short bold checkbox label with its explanation on
+   its own line below (long text inside a flex .check label wrapped horribly). */
+.script-toggle { margin: 8px 0; }
+.script-toggle > .check { font-weight: 600; }
+.field-hint.sub { display: block; margin: 3px 0 0 26px; line-height: 1.5; }
+.proxy-scope {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  margin-top: 4px;
+}
+.proxy-scope .check { font-weight: normal; }
+
 .actions, .link-row {
   display: flex;
   gap: 8px;

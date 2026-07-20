@@ -631,6 +631,7 @@ function renderEditor() {
   // some paths and left ffmpegStatus stuck at null, which the ffmpeg-gated
   // option-disabling logic below treats as "unavailable" forever.
   fetchFfmpegStatus();
+  fetchNM3U8DLREStatus();
   const stream = selectedStream();
   const form = $("#streamForm");
   const disabled = !selectedProvider();
@@ -721,6 +722,9 @@ function renderEditor() {
   form.elements.inputMode.value = stream.inputMode || "internal";
   form.elements.outputMode.value = stream.outputMode || "hls";
   form.elements.outputTarget.value = stream.outputTarget || "";
+  if (form.elements.nm3u8dlreParams) {
+    form.elements.nm3u8dlreParams.value = stream.nm3u8dlreParams || "";
+  }
   form.elements.useCdm.checked = Boolean(stream.useCdm);
   form.elements.sessionManifest.checked = Boolean(stream.sessionManifest);
   form.elements.scriptOverride.value = stream.scriptOverride || "";
@@ -731,7 +735,10 @@ function renderEditor() {
   form.elements.proxyManifest.checked = stream.proxyManifest !== false;
   form.elements.proxyMedia.checked = stream.proxyMedia !== false;
   // Auto-reveal the Scripting & DRM section when it holds saved values.
-  $("#scriptingGroup").classList.toggle("hidden", !(stream.useCdm || stream.sessionManifest || (stream.scriptOverride || "").trim() || stream.heartbeatSeconds || (stream.scriptParams || "").trim()));
+  const isImported = stream.sourceType === "channel" || stream.sourceType === "event";
+  $("#scriptingGroup").classList.toggle("hidden", !(stream.useCdm || stream.sessionManifest || (stream.scriptOverride || "").trim() || stream.heartbeatSeconds || (stream.scriptParams || "").trim() || isImported));
+  const importedHint = $("#importedScriptHint");
+  if (importedHint) importedHint.classList.toggle("hidden", !isImported);
   updatePipelineFieldVisibility();
 
   selectedRepIds = new Set(stream.representations || []);
@@ -825,6 +832,7 @@ function streamPayload() {
     inputMode: form.elements.inputMode.value,
     outputMode: form.elements.outputMode.value,
     outputTarget: form.elements.outputTarget.value,
+    nm3u8dlreParams: form.elements.nm3u8dlreParams?.value || "",
     useCdm: form.elements.useCdm.checked,
     sessionManifest: form.elements.sessionManifest.checked,
     scriptOverride: form.elements.scriptOverride.value,
@@ -1213,6 +1221,18 @@ function fetchFfmpegStatus() {
   return ffmpegStatusPromise;
 }
 
+let nm3u8dlreStatus = null;
+let nm3u8dlreStatusPromise = null;
+
+function fetchNM3U8DLREStatus() {
+  if (!nm3u8dlreStatusPromise) {
+    nm3u8dlreStatusPromise = request("/api/nm3u8dlre-status")
+      .then((result) => { nm3u8dlreStatus = result; updatePipelineFieldVisibility(); return result; })
+      .catch(() => { nm3u8dlreStatus = { available: false, installCommand: "", canAutoInstall: false }; });
+  }
+  return nm3u8dlreStatusPromise;
+}
+
 const OUTPUT_TARGET_HINTS = {
   srtServer: "Port to listen on, e.g. 9000 — other tools connect to this panel to pull the stream via SRT.",
   udpSrt: "Destination to push to, e.g. udp://host:1234 or srt://host:1234 — this panel connects out.",
@@ -1226,26 +1246,51 @@ function updatePipelineFieldVisibility() {
   document.querySelectorAll('#streamForm option[data-needs-ffmpeg]').forEach((option) => {
     option.disabled = !available;
   });
+  const nmAvailable = Boolean(nm3u8dlreStatus?.available);
+  document.querySelectorAll('#streamForm option[data-needs-nm3u8dlre]').forEach((option) => {
+    option.disabled = !nmAvailable;
+  });
+
+  const inputMode = form.elements.inputMode.value;
   const outputMode = form.elements.outputMode.value;
   const targetField = $("#outputTargetField");
   targetField.classList.toggle("hidden", outputMode === "hls");
   $("#outputTargetHint").textContent = OUTPUT_TARGET_HINTS[outputMode] || "";
 
-  const needsFfmpeg = form.elements.inputMode.value !== "internal" || outputMode !== "hls";
+  const nmParamsField = $("#nm3u8dlreParamsField");
+  if (nmParamsField) nmParamsField.classList.toggle("hidden", inputMode !== "nm3u8dlre");
+
+  const needsFfmpeg = (inputMode !== "internal" && inputMode !== "nm3u8dlre") || outputMode !== "hls";
   const notice = $("#ffmpegNotice");
   const installRow = $("#ffmpegInstallRow");
   if (!ffmpegStatus || available) {
     notice.classList.add("hidden");
     installRow.classList.add("hidden");
-    return;
+  } else {
+    notice.classList.remove("hidden");
+    notice.textContent = needsFfmpeg
+      ? `ffmpeg isn't installed — required for the option${(inputMode !== "internal" && inputMode !== "nm3u8dlre") && outputMode !== "hls" ? "s" : ""} selected above.`
+      : `ffmpeg isn't installed. Only Internal remuxer → HLS/Direct works without it.`;
+    installRow.classList.toggle("hidden", !ffmpegStatus.canAutoInstall);
+    if (!ffmpegStatus.canAutoInstall && ffmpegStatus.installCommand) {
+      notice.textContent += ` Install it yourself: ${ffmpegStatus.installCommand}`;
+    }
   }
-  notice.classList.remove("hidden");
-  notice.textContent = needsFfmpeg
-    ? `ffmpeg isn't installed — required for the option${form.elements.inputMode.value !== "internal" && outputMode !== "hls" ? "s" : ""} selected above.`
-    : `ffmpeg isn't installed. Only Internal remuxer → HLS/Direct works without it.`;
-  installRow.classList.toggle("hidden", !ffmpegStatus.canAutoInstall);
-  if (!ffmpegStatus.canAutoInstall && ffmpegStatus.installCommand) {
-    notice.textContent += ` Install it yourself: ${ffmpegStatus.installCommand}`;
+
+  const nmNotice = $("#nm3u8dlreNotice");
+  const nmInstallRow = $("#nm3u8dlreInstallRow");
+  if (nmNotice && nmInstallRow) {
+    if (!nm3u8dlreStatus || nmAvailable || inputMode !== "nm3u8dlre") {
+      nmNotice.classList.add("hidden");
+      nmInstallRow.classList.add("hidden");
+    } else {
+      nmNotice.classList.remove("hidden");
+      nmNotice.textContent = `N_m3u8DL-RE isn't installed — required for the selected input mode.`;
+      nmInstallRow.classList.toggle("hidden", !nm3u8dlreStatus.canAutoInstall);
+      if (!nm3u8dlreStatus.canAutoInstall && nm3u8dlreStatus.installCommand) {
+        nmNotice.textContent += ` Install it yourself: ${nm3u8dlreStatus.installCommand}`;
+      }
+    }
   }
 }
 
@@ -1289,6 +1334,48 @@ $("#ffmpegInstallBtn").addEventListener("click", async () => {
   stopFfmpegInstallPoll();
   pollFfmpegInstallOutput();
   ffmpegInstallPollTimer = setInterval(pollFfmpegInstallOutput, 1000);
+});
+
+let nm3u8dlreInstallPollTimer = null;
+
+function stopNm3u8dlreInstallPoll() {
+  clearInterval(nm3u8dlreInstallPollTimer);
+  nm3u8dlreInstallPollTimer = null;
+}
+
+async function pollNm3u8dlreInstallOutput() {
+  const box = $("#nm3u8dlreInstallOutput");
+  try {
+    const result = await request(`/api/logs?streamId=${encodeURIComponent("nm3u8dlre-install")}&limit=300`);
+    const lines = (result.entries || []).slice().reverse().map((entry) => entry.message || entry.event).join("\n");
+    const text = lines || "(no output yet)";
+    if (box.textContent === text) return;
+    const wasAtBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 20;
+    box.textContent = text;
+    if (wasAtBottom) box.scrollTop = box.scrollHeight;
+    const latest = (result.entries || [])[0];
+    if (latest && latest.event === "installExit") {
+      stopNm3u8dlreInstallPoll();
+      nm3u8dlreStatusPromise = null;
+      await fetchNM3U8DLREStatus();
+    }
+  } catch (error) {
+    box.textContent = `Couldn't load install output: ${error.message || error}`;
+  }
+}
+
+$("#nm3u8dlreInstallBtn")?.addEventListener("click", async () => {
+  $("#nm3u8dlreInstallOutput").classList.remove("hidden");
+  $("#nm3u8dlreInstallOutput").textContent = "Starting…";
+  try {
+    await request("/api/nm3u8dlre-install", { method: "POST", body: "{}" });
+  } catch (error) {
+    $("#nm3u8dlreInstallOutput").textContent = `Couldn't start install: ${error.message || error}`;
+    return;
+  }
+  stopNm3u8dlreInstallPoll();
+  pollNm3u8dlreInstallOutput();
+  nm3u8dlreInstallPollTimer = setInterval(pollNm3u8dlreInstallOutput, 1000);
 });
 
 $("#streamForm").elements.inputMode.addEventListener("change", updatePipelineFieldVisibility);
@@ -2153,7 +2240,11 @@ function applyMetrics(payload) {
   ].join("");
 
   const streams = payload.streams || {};
-  const streamIds = Object.keys(streams);
+  const streamIds = Object.keys(streams).sort((a, b) => {
+    const nameA = findStreamName(a) || a;
+    const nameB = findStreamName(b) || b;
+    return nameA.localeCompare(nameB);
+  });
   const container = $("#streamTiles");
   if (!streamIds.length) {
     container.className = "tile-grid empty-state";
@@ -2449,6 +2540,33 @@ $("#audioTrackSelect").addEventListener("change", (event) => {
 });
 document.querySelectorAll(".tab").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));
 document.querySelectorAll(".nav-btn").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
+
+async function runStreamScriptAction(action, button) {
+  const stream = selectedStream();
+  if (!stream) return;
+  const provider = selectedProvider();
+  if (!provider) return;
+  const box = $("#streamScriptOutputBox");
+  if (!box) return;
+  box.classList.remove("hidden");
+  box.textContent = "Running...";
+  button.disabled = true;
+  try {
+    const result = await request(`/api/providers/${provider.id}/script/run`, {
+      method: "POST",
+      body: JSON.stringify({ action, streamId: stream.id })
+    });
+    box.textContent = result.output || "No output";
+  } catch (err) {
+    box.textContent = `Error: ${err.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$("#scriptRunPsshBtn")?.addEventListener("click", (e) => runStreamScriptAction("pssh", e.currentTarget));
+$("#scriptRunManifestBtn")?.addEventListener("click", (e) => runStreamScriptAction("downloadmanifest", e.currentTarget));
+$("#scriptRunMediaBtn")?.addEventListener("click", (e) => runStreamScriptAction("downloadmedia", e.currentTarget));
 
 applyIcons();
 const savedTheme = localStorage.getItem("restreamair-theme");

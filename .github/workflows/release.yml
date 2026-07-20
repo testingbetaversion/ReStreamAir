@@ -145,8 +145,42 @@ jobs:
             restreamair-linux-arm64
             restreamair-${{ steps.ver.outputs.tag }}-linux-arm64.tar.gz
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: ver
+        run: |
+          $TAG = "${{ github.event.inputs.tag }}"
+          if ([string]::IsNullOrWhiteSpace($TAG)) { $TAG = $env:GITHUB_REF_NAME }
+          "tag=$TAG" >> $env:GITHUB_OUTPUT
+          "version=$($TAG.TrimStart('v'))" >> $env:GITHUB_OUTPUT
+      - name: Stamp version
+        run: |
+          $COMMIT = $env:GITHUB_SHA.Substring(0, 7)
+          (Get-Content Version.swift) -replace 'static let version = "dev"', "static let version = `"${{ steps.ver.outputs.version }}`"" -replace 'static let commit = "unknown"', "static let commit = `"$COMMIT`"" | Set-Content Version.swift
+      - uses: compnerd/gha-setup-swift@main
+        with:
+          branch: swift-6.0-release
+          tag: 6.0-RELEASE
+      - name: Build restreamair (Windows x64)
+        shell: pwsh
+        run: |
+          $STAGE = "restreamair-${{ steps.ver.outputs.tag }}-windows-x64"
+          $sources = (Get-ChildItem *.swift |
+            Where-Object { $_.Name -notmatch 'MenuBarApp\.swift|Package\.swift' }).Name
+          swiftc -O $sources -o restreamair.exe
+          Compress-Archive -Path restreamair.exe -DestinationPath "$STAGE.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            restreamair.exe
+            restreamair-${{ steps.ver.outputs.tag }}-windows-x64.zip
+
   release:
-    needs: [build-macos, build-linux, build-linux-arm64]
+    needs: [build-macos, build-linux, build-linux-arm64, build-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Resolve tag
