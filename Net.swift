@@ -63,24 +63,133 @@ final class ClientConnection {
 }
 
 #elseif os(Windows)
-// Windows has neither Network.framework nor POSIX sockets from Glibc/Musl.
-// Provide minimal stubs so PanelServer.swift compiles; the server will not
-// actually accept connections on Windows (not a supported server platform).
+import WinSDK
 
 final class ClientConnection {
-    let remoteAddress: String = ""
+    private let socket: SOCKET
+    let remoteAddress: String
     var onClose: (() -> Void)?
-    init() {}
+    private let ioQueue: DispatchQueue
+    private var closed = false
+    private let closeLock = NSLock()
+
+    init(socket: SOCKET, remoteAddress: String) {
+        self.socket = socket
+        self.remoteAddress = remoteAddress
+        self.ioQueue = DispatchQueue(label: "restreamair.conn")
+    }
+
     func start() {}
-    func receive(_ completion: @escaping (Data?, Bool, Error?) -> Void) { completion(nil, true, nil) }
-    func send(_ data: Data?, completion: ((Error?) -> Void)? = nil) { completion?(nil) }
-    func cancel() { onClose?() }
+
+    func receive(_ completion: @escaping (Data?, _ isComplete: Bool, _ error: Error?) -> Void) {
+        ioQueue.async { [socket] in
+            var buffer = [UInt8](repeating: 0, count: 65_536)
+            let count = buffer.withUnsafeMutableBufferPointer { ptr in
+                recv(socket, UnsafeMutableRawPointer(ptr.baseAddress)?.assumingMemoryBound(to: CChar.self), Int32(ptr.count), 0)
+            }
+            if count > 0 {
+                completion(Data(buffer[0..<Int(count)]), false, nil)
+            } else if count == 0 {
+                completion(nil, true, nil)
+            } else {
+                completion(nil, true, POSIXError(.EIO))
+            }
+        }
+    }
+
+    func send(_ data: Data?, completion: ((Error?) -> Void)? = nil) {
+        ioQueue.async { [socket] in
+            guard let data = data, !data.isEmpty else { completion?(nil); return }
+            let ok = data.withUnsafeBytes { raw -> Bool in
+                guard var pointer = raw.bindMemory(to: CChar.self).baseAddress else { return false }
+                var remaining = Int32(data.count)
+                while remaining > 0 {
+                    let written = WinSDK.send(socket, pointer, remaining, 0)
+                    if written <= 0 { return false }
+                    pointer += Int(written)
+                    remaining -= written
+                }
+                return true
+            }
+            completion?(ok ? nil : POSIXError(.EIO))
+        }
+    }
+
+    func cancel() {
+        closeLock.lock(); let already = closed; closed = true; closeLock.unlock()
+        guard !already else { return }
+        closesocket(socket)
+        onClose?()
+    }
 }
 
 enum POSIXServer {
     struct BindError: Error { let errnoValue: Int32 }
+
     static func serve(bindAddress: String, port: UInt16, onConnection: @escaping (ClientConnection) -> Void) throws {
-        throw BindError(errnoValue: 1) // not implemented on Windows
+        var wsaData = WSADATA()
+        let wsaRes = WSAStartup(WORD(2 | (2 << 8)), &wsaData)
+        guard wsaRes == 0 else { throw BindError(errnoValue: wsaRes) }
+
+        let serverSocket = WinSDK.socket(AF_INET, Int32(SOCK_STREAM), Int32(IPPROTO_TCP.rawValue))
+        guard serverSocket != INVALID_SOCKET else { throw BindError(errnoValue: WSAGetLastError()) }
+
+        var reuse: Int32 = 1
+        setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, UnsafeRawPointer(&reuse).assumingMemoryBound(to: CChar.self), socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_family = ADDRESS_FAMILY(AF_INET)
+        addr.sin_port = port.bigEndian
+        if bindAddress.isEmpty {
+            addr.sin_addr.s_addr = in_addr_t(0)
+        } else {
+            _ = bindAddress.withCString { inet_pton(Int32(AF_INET), $0, &addr.sin_addr) }
+        }
+
+        let bindResult = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                WinSDK.bind(serverSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            let code = WSAGetLastError()
+            closesocket(serverSocket)
+            throw BindError(errnoValue: code)
+        }
+        guard listen(serverSocket, SOMAXCONN) == 0 else {
+            let code = WSAGetLastError()
+            closesocket(serverSocket)
+            throw BindError(errnoValue: code)
+        }
+
+        let thread = Thread {
+            while true {
+                var clientAddr = sockaddr_in()
+                var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let clientSocket = withUnsafeMutablePointer(to: &clientAddr) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        accept(serverSocket, $0, &length)
+                    }
+                }
+                guard clientSocket != INVALID_SOCKET else {
+                    Thread.sleep(forTimeInterval: 0.05)
+                    continue
+                }
+                var timeout: DWORD = 30000
+                setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, UnsafeRawPointer(&timeout).assumingMemoryBound(to: CChar.self), socklen_t(MemoryLayout<DWORD>.size))
+                onConnection(ClientConnection(socket: clientSocket, remoteAddress: ipString(clientAddr)))
+            }
+        }
+        thread.stackSize = 512 * 1024
+        thread.start()
+    }
+
+    private static func ipString(_ addr: sockaddr_in) -> String {
+        var source = addr.sin_addr
+        let length = 16
+        var buffer = [CChar](repeating: 0, count: length)
+        inet_ntop(Int32(AF_INET), &source, &buffer, socklen_t(length))
+        return String(cString: buffer)
     }
 }
 

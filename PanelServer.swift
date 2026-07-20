@@ -708,9 +708,6 @@ final class PanelServer {
             self?.handle(ClientConnection(connection))
         }
         listener?.start(queue: .global(qos: .userInitiated))
-        #elseif os(Windows)
-        fputs("error: Windows is not supported as a server platform — use the macOS or Linux binary.\n", stderr)
-        exit(1)
         #else
         do {
             try POSIXServer.serve(bindAddress: bindAddress, port: port) { [weak self] connection in
@@ -723,7 +720,7 @@ final class PanelServer {
             if error.errnoValue == EADDRINUSE {
                 fputs(portInUseMessage, stderr)
             } else {
-                fputs("error: Could not bind port \(boundPort): \(String(cString: strerror(error.errnoValue)))\n", stderr)
+                fputs("error: Could not bind port \(boundPort): error code \(error.errnoValue)\n", stderr)
             }
             exit(1)
         }
@@ -2463,6 +2460,8 @@ final class PanelServer {
         #if os(Linux)
         guard let raw = try? Data(contentsOf: URL(fileURLWithPath: "/proc/\(pid)/cmdline")) else { return false }
         let command = String(decoding: raw, as: UTF8.self).replacingOccurrences(of: "\0", with: " ")
+        #elseif os(Windows)
+        return false
         #else
         let ps = Process()
         ps.executableURL = URL(fileURLWithPath: "/bin/ps")
@@ -3447,19 +3446,19 @@ final class PanelServer {
                     stream.logo = logo
                 }
                 stream.sourceType = sourceType
-                stream.mode = (dict["Mode"] as? String) ?? "live"
-                stream.sessionManifest = (dict["SessionManifest"] as? Bool) ?? false
-                stream.scriptParams = (dict["ScriptParams"] as? String) ?? ""
-                stream.cdmType = (dict["CdmType"] as? String) ?? ""
-                stream.useCdm = (dict["UseCdm"] as? Bool) ?? false
-                stream.scriptVideoSelector = (dict["Video"] as? String) ?? ""
-                stream.scriptAudioSelector = (dict["Audio"] as? String) ?? ""
-                stream.onDemand = (dict["OnDemand"] as? Bool) ?? false
-                stream.speedUp = (dict["SpeedUp"] as? Bool) ?? false
-                stream.autostart = (dict["Autostart"] as? Bool) ?? false
-                stream.scriptStart = (dict["Start"] as? NSNumber)?.intValue
-                stream.scriptEnd = (dict["End"] as? NSNumber)?.intValue
-                stream.recordEvent = (dict["RecordEvent"] as? Bool) ?? false
+                stream.mode = (dict["Mode"] as? String) ?? (dict["mode"] as? String) ?? "live"
+                stream.sessionManifest = (dict["SessionManifest"] as? Bool) ?? (dict["sessionManifest"] as? Bool) ?? false
+                stream.scriptParams = (dict["ScriptParams"] as? String) ?? (dict["scriptParams"] as? String) ?? ""
+                stream.cdmType = (dict["CdmType"] as? String) ?? (dict["cdmType"] as? String) ?? ""
+                stream.useCdm = (dict["UseCdm"] as? Bool) ?? (dict["useCdm"] as? Bool) ?? false
+                stream.scriptVideoSelector = (dict["Video"] as? String) ?? (dict["video"] as? String) ?? ""
+                stream.scriptAudioSelector = (dict["Audio"] as? String) ?? (dict["audio"] as? String) ?? ""
+                stream.onDemand = (dict["OnDemand"] as? Bool) ?? (dict["onDemand"] as? Bool) ?? false
+                stream.speedUp = (dict["SpeedUp"] as? Bool) ?? (dict["speedUp"] as? Bool) ?? false
+                stream.autostart = (dict["Autostart"] as? Bool) ?? (dict["autostart"] as? Bool) ?? false
+                stream.scriptStart = (dict["Start"] as? NSNumber)?.intValue ?? (dict["start"] as? NSNumber)?.intValue
+                stream.scriptEnd = (dict["End"] as? NSNumber)?.intValue ?? (dict["end"] as? NSNumber)?.intValue
+                stream.recordEvent = (dict["RecordEvent"] as? Bool) ?? (dict["recordEvent"] as? Bool) ?? false
                 if let existingIndex = state.providers[providerIndex].streams.firstIndex(where: { $0.name == name && $0.sourceType == sourceType }) {
                     state.providers[providerIndex].streams[existingIndex] = stream
                 } else {
