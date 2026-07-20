@@ -1645,7 +1645,7 @@ final class PanelServer {
             
             for (k, v) in input {
                 if k != "action" {
-                    args.append("\(k)=\(v.string ?? v.description)")
+                    args.append("\(k)=\(v.string ?? "")")
                 }
             }
             
@@ -2250,59 +2250,79 @@ final class PanelServer {
         stream.lastError = nil
     }
 
+    /// Starts N_m3u8DL-RE as a download-mixer for a DASH/HLS source. It runs
+    /// N_m3u8DL-RE with --live-real-time-merge which continuously downloads
+    /// segments and muxes them into an HLS playlist on disk under runtimeDir/<id>/.
+    /// The server's /play route is then rewritten to serve that on-disk playlist
+    /// directly — i.e. it acts as a drop-in mixer just like the internal remuxer
+    /// but delegates all the DASH→HLS conversion to N_m3u8DL-RE.
     func startNM3U8DLREResident(provider: Provider, stream: inout StreamConfig) throws {
         guard let binaryPath = NM3U8DLRELocator.resolve() else {
-            throw PanelError.server("N_m3u8DL-RE isn't installed. Install it or switch the stream input mode.")
+            throw PanelError.server("N_m3u8DL-RE isn't installed. Install it via the stream editor's Install button, or switch the stream back to the Internal remuxer.")
         }
-        let tempDir = runtimeDir.appendingPathComponent(stream.id, isDirectory: true)
-        try? FileManager.default.removeItem(at: tempDir)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        // Work dir: a fresh subdirectory per stream under runtimeDir.
+        // N_m3u8DL-RE writes the output playlist + segments here.
+        let workDir = runtimeDir.appendingPathComponent(stream.id, isDirectory: true)
+        try? FileManager.default.removeItem(at: workDir)
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
 
         let sources = [stream.url] + stream.cdnUrls
         lock.lock(); let rotation = cdnRotation[stream.id, default: 0]; cdnRotation[stream.id] = rotation + 1; lock.unlock()
         let sourceURL = sources[rotation % sources.count]
         if sources.count > 1 {
-            logStore.recordWorkerLine(#"{"event":"cdnFailover","status":"info","message":\#(jsonString("source: " + sourceURL))}"#, streamId: stream.id)
+            logStore.recordWorkerLine(#"{"event":"cdnFailover","status":"info","message":\#(jsonString("N_m3u8DL-RE source: " + sourceURL))}"#, streamId: stream.id)
         }
 
-        var arguments = [sourceURL, "--live-real-time-merge", "--live-pipe-mux", "--tmp-dir", tempDir.path]
-        let headers = effectiveHeaders(provider: provider, stream: stream, category: .media)
-        for (k, v) in headers {
-            arguments.append("-H")
-            arguments.append("\(k): \(v)")
+        // Core flags:
+        //   --live-real-time-merge  — process live DASH/HLS at real-time speed
+        //   --save-dir              — write playlist + segments here
+        //   --save-name             — output basename (we use the stream id)
+        //   --mux-after-done hls    — produce an HLS .m3u8 output file
+        var arguments = [
+            sourceURL,
+            "--live-real-time-merge",
+            "--save-dir", workDir.path,
+            "--save-name", stream.id,
+            "--mux-after-done", "hls"
+        ]
+
+        // Pass manifest + media headers (N_m3u8DL-RE accepts -H "Name: value")
+        let manifestHeaders = effectiveHeaders(provider: provider, stream: stream, category: .manifest)
+        for (k, v) in manifestHeaders {
+            arguments += ["-H", "\(k): \(v)"]
         }
+
+        // Proxy
         let proxy = effectiveProxy(provider: provider, stream: stream)
         if !proxy.isEmpty {
-            arguments.append("--custom-proxy")
-            arguments.append(proxy)
+            arguments += ["--custom-proxy", proxy]
         }
+
+        // CENC decryption keys (KID:KEY format → --key KID:KEY per key)
         if !stream.decryptionKeys.isEmpty {
-            for key in stream.decryptionKeys.components(separatedBy: ",") {
-                arguments.append("--key")
-                arguments.append(key.trimmingCharacters(in: .whitespaces))
+            for key in stream.decryptionKeys.components(separatedBy: "\n") {
+                let trimmed = key.trimmingCharacters(in: .whitespaces)
+                guard !trimmed.isEmpty else { continue }
+                arguments += ["--key", trimmed]
             }
         }
 
+        // Any extra user-supplied CLI params (free-form key=value or flags)
         let extraParams = ScriptRunner.splitParams(stream.nm3u8dlreParams)
         arguments.append(contentsOf: extraParams)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binaryPath)
         process.arguments = arguments
+        process.currentDirectoryURL = workDir
         logStore.recordWorkerLine(#"{"event":"nm3u8dlreStart","status":"start","message":\#(jsonString("N_m3u8DL-RE " + arguments.joined(separator: " ")))}"#, streamId: stream.id)
 
-        let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
+        process.standardOutput = Pipe() // suppress direct stdout — output goes to save-dir files
         process.standardError = stderrPipe
+
         let job = RestreamJob(process: process, representationId: "")
         let streamId = stream.id
-
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            job.stdout.append(data)
-        }
 
         stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
@@ -2318,9 +2338,7 @@ final class PanelServer {
         }
 
         process.terminationHandler = { [weak self] proc in
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
-            try? stdoutPipe.fileHandleForReading.close()
             try? stderrPipe.fileHandleForReading.close()
             self?.logStore.recordWorkerLine(#"{"event":"nm3u8dlreExit","status":"\#(proc.terminationStatus == 0 ? "success" : "error")","message":"exit \#(proc.terminationStatus)"}"#, streamId: streamId)
             self?.lock.lock()
@@ -2335,6 +2353,7 @@ final class PanelServer {
         stream.status = "running"
         stream.lastError = nil
     }
+
 
     /// (Re)start the per-stream heartbeat loop if the stream asks for one. Fires
     /// the provider script's `heartbeat` action every `heartbeatSeconds` (from
