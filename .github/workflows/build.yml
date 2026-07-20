@@ -149,9 +149,9 @@ jobs:
           New-Item -ItemType Directory -Path $STAGE -Force
           Copy-Item restreamair.exe -Destination "$STAGE\restreamair.exe"
           $swiftBin = Split-Path (Get-Command swiftc).Path
-          $swiftRoot = Split-Path (Split-Path (Split-Path $swiftBin -Parent) -Parent) -Parent
-          if (-not (Test-Path $swiftRoot)) { $swiftRoot = Split-Path $swiftBin -Parent }
-          Get-ChildItem -Path $swiftBin, $swiftRoot -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
+          $swiftParent = Split-Path (Split-Path (Split-Path (Split-Path $swiftBin -Parent) -Parent) -Parent)
+          $searchPaths = @($swiftBin, $swiftParent, "$env:LOCALAPPDATA\Programs\Swift", "C:\Users\runneradmin\AppData\Local\Programs\Swift") | Where-Object { $_ -and (Test-Path $_) }
+          Get-ChildItem -Path $searchPaths -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
               Copy-Item $_.FullName -Destination "$STAGE\" -Force
           }
           Compress-Archive -Path "$STAGE" -DestinationPath "restreamair-windows.zip"
