@@ -2461,7 +2461,7 @@ final class PanelServer {
         guard let raw = try? Data(contentsOf: URL(fileURLWithPath: "/proc/\(pid)/cmdline")) else { return false }
         let command = String(decoding: raw, as: UTF8.self).replacingOccurrences(of: "\0", with: " ")
         #elseif os(Windows)
-        return false
+        let command = ""
         #else
         let ps = Process()
         ps.executableURL = URL(fileURLWithPath: "/bin/ps")
