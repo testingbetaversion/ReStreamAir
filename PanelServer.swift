@@ -1989,6 +1989,11 @@ final class PanelServer {
         // session URL rather than a stale one.
         try refreshSessionManifest(provider: provider, stream: &stream)
         startHeartbeat(provider: provider, stream: stream)
+        // Script lifecycle hooks (best-effort, async): `init` lets the script do
+        // one-time session setup, `start` marks the stream going live (e.g. to
+        // claim a concurrent-stream slot). No-ops for non-script streams.
+        runScriptAction("init", provider: provider, stream: stream)
+        runScriptAction("start", provider: provider, stream: stream)
 
         // A plain HLS passthrough (internal input, no re-mux) is served straight
         // from its origin by the m3u8 proxy — no worker to spawn. An ffmpeg
@@ -2369,6 +2374,40 @@ final class PanelServer {
     /// the provider script's `heartbeat` action every `heartbeatSeconds` (from
     /// the manifest's Heartbeat block or the editor) so providers that expire a
     /// session without periodic pings stay alive. No-op when heartbeat is off.
+    /// A stream that runs through its provider script (session manifest / CDM
+    /// keys / heartbeat / params / override). The start/stop/init lifecycle
+    /// hooks only fire for these, so plain streams that happen to sit under a
+    /// script provider don't invoke it.
+    func isScriptDriven(_ stream: StreamConfig) -> Bool {
+        stream.sessionManifest || stream.useCdm
+            || !stream.scriptParams.trimmingCharacters(in: .whitespaces).isEmpty
+            || !stream.scriptOverride.trimmingCharacters(in: .whitespaces).isEmpty
+            || (stream.heartbeatEnabled && stream.heartbeatSeconds > 0)
+    }
+
+    /// Fire a one-shot provider-script lifecycle action (`init` / `start` /
+    /// `stop`) for a script-driven stream. Best-effort and async: it runs on a
+    /// background queue with a short timeout, logs the result under
+    /// `script:<action>`, and never blocks or fails the caller. Scripts that
+    /// don't implement the action just log a benign "invalid action" line.
+    func runScriptAction(_ action: String, provider: Provider, stream: StreamConfig) {
+        guard isScriptDriven(stream) else { return }
+        let scriptPath = effectiveScriptPath(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
+        guard !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) else { return }
+        var args = ScriptRunner.commonArgs(action: action, bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: activeScriptAccount(for: provider))
+        args += ScriptRunner.splitParams(stream.scriptParams)
+        let streamId = stream.id
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            do {
+                let (stdout, _) = try ScriptRunner.runSync(scriptPath: scriptPath, args: args, timeout: 20)
+                let trimmed = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                self?.logStore.record(streamId: streamId, level: "info", event: "script:\(action)", url: nil, message: trimmed.isEmpty ? "ok" : String(trimmed.prefix(200)))
+            } catch {
+                self?.logStore.record(streamId: streamId, level: "warn", event: "script:\(action)", url: nil, message: "\(error)")
+            }
+        }
+    }
+
     func startHeartbeat(provider: Provider, stream: StreamConfig) {
         stopHeartbeat(streamId: stream.id)
         guard stream.heartbeatSeconds > 0 else { return }
@@ -2400,6 +2439,12 @@ final class PanelServer {
     }
 
     func stop(stream: StreamConfig) {
+        // Script `stop` hook (best-effort) before we tear anything down, so a
+        // script can end its session / release a slot. Resolve the provider from
+        // state since callers only hand us the stream.
+        if let state = try? readState(), let location = findStream(stream.id, in: state) {
+            runScriptAction("stop", provider: state.providers[location.provider], stream: stream)
+        }
         stopHeartbeat(streamId: stream.id)
         lock.lock()
         let jobsForStream = jobs.removeValue(forKey: stream.id) ?? []
