@@ -501,27 +501,32 @@
 
               <article id="help-scripts" class="help-card">
                 <h3>Provider scripts &amp; Protocol</h3>
-                <p>A script is any <code>.py</code> / <code>.sh</code> / executable that owns login, session management, or DRM/key logic. It's invoked with flat <code>key=value</code> arguments and prints its output to <b>stdout</b> (logs/debug to stderr).</p>
-                <p class="help-note"><b>Common Input (always passed to every action):</b><br><code>action=&lt;name&gt; user=&lt;user&gt; password=&lt;pass&gt; bind=&lt;bind&gt; proxy=&lt;proxy&gt; doh=&lt;doh&gt; worker=&lt;worker&gt;</code> plus per-stream <b>Script params</b> (e.g. <code>id=123 streamId=456</code>).</p>
+                <p>A script is any <code>.py</code> / <code>.sh</code> / executable that owns login, session management, or DRM/key logic. It's invoked with flat <code>key=value</code> arguments and prints its output to <b>stdout</b> (logs/debug to stderr). See <b>SCRIPTING.md</b> for the full guide with worked examples.</p>
+
+                <p class="help-callout"><b>Script actions are opt-in.</b> Each provider declares which actions its script implements, as a checkbox grid in <b>Provider settings → Script actions</b>. ReStreamAir only ever calls the ticked ones — a script that only does <code>channels</code> is never handed a <code>start</code> it can't answer. A stream inherits its provider's set and can override it (including to nothing).</p>
+
+                <p class="help-note"><b>Common input (every action):</b><br><code>action=&lt;name&gt; bind= proxy= doh= worker= sessiondir=&lt;dir&gt; cookies=&lt;file&gt;</code>, then <code>user=</code>/<code>password=</code> <b>only when non-empty</b>, then per-stream <b>Script params</b> (e.g. <code>id=123</code>). <code>sessiondir</code>/<code>cookies</code> point at a durable per-provider folder the script keeps its login in.</p>
+
+                <p class="help-note"><b>Values may be base64.</b> A value containing whitespace, a quote, a backslash or non-ASCII — and <b>always</b> a <code>password</code> — is base64-encoded and prefixed <code>b64:</code>, so secrets never appear in <code>ps</code> and spaces don't split. URLs and <code>? &amp; ; *</code> stay plain (there's no shell). <b>Decode every arg</b> (strip a leading <code>b64:</code>); output you print is auto-detected the same way.</p>
 
                 <table class="help-table">
-                  <tr><th>Action</th><th>Inputs passed</th><th>Expected Output (stdout)</th></tr>
-                  <tr><td><code>login</code> / <code>pair</code></td><td>Common args</td><td>Live text progress to stderr/stdout; script caches session token to disk.</td></tr>
-                  <tr><td><code>channels</code></td><td>Common args</td><td>JSON: <code>{"Channels": [{"Name": "...", "Mode": "live", "SessionManifest": true, "UseCdm": true, "CdmType": "widevine", "ScriptParams": "id=101"}]}</code></td></tr>
-                  <tr><td><code>events</code></td><td>Common args</td><td>JSON: <code>{"Events": [{"Name": "...", "Mode": "live", "SessionManifest": true, "Autostart": true, "Start": 1700000000, "End": 1700007200, "ScriptParams": "eventId=50"}]}</code></td></tr>
-                  <tr><td><code>epg</code></td><td>Common args</td><td>XMLTV XML data string or JSON: <code>{"EPG": [{"ChannelId": "101", "Title": "Show", "Start": 1700000000, "End": 1700003600}]}</code></td></tr>
-                  <tr><td><code>manifest</code></td><td>Common args + Script params</td><td>JSON: <code>{"ManifestUrl": "https://...", "Cdn": [{"Name": "c1", "ManifestUrl": "..."}], "Headers": {"Manifest": {...}, "Media": {...}}, "Heartbeat": {"PeriodMs": 300000}}</code></td></tr>
-                  <tr><td><code>downloadmanifest</code></td><td>Common args + <code>url=&lt;url&gt;</code></td><td>Raw manifest text (MPD/M3U8) or JSON: <code>{"ManifestContent": "..."}</code></td></tr>
-                  <tr><td><code>downloadmedia</code></td><td>Common args + <code>url=&lt;url&gt;</code></td><td>Raw binary segment payload streamed to stdout.</td></tr>
-                  <tr><td><code>pssh</code></td><td>Common args + <code>pssh=&lt;pssh&gt; url=&lt;url&gt;</code></td><td>JSON: <code>{"ProcessedPssh": "AAAA..."}</code></td></tr>
-                  <tr><td><code>cdm</code></td><td>Common args + <code>cdm=external|internal cdmType=widevine|playready pssh=&lt;pssh&gt; kid=&lt;kid&gt;</code></td><td>Clear keys: <code>KID:KEY</code> lines, <code>--&gt; KID:KEY</code> lines, or JSON: <code>{"keys": [{"kid": "...", "key": "..."}]}</code></td></tr>
-                  <tr><td><code>heartbeat</code></td><td>Common args + Script params</td><td>Pings server session. Exit code 0 = success, non-zero = failure. JSON output optional.</td></tr>
-                  <tr><td><code>init</code></td><td>Common args + Script params</td><td>One-time session setup when a stream starts (best-effort). Output logged. Optional.</td></tr>
-                  <tr><td><code>start</code></td><td>Common args + Script params</td><td>Fired when a stream goes live — e.g. claim a concurrent-stream slot (best-effort). Optional.</td></tr>
-                  <tr><td><code>stop</code></td><td>Common args + Script params</td><td>Fired when a stream stops — end the session / release a slot (best-effort). Optional.</td></tr>
+                  <tr><th>Action</th><th>Wired</th><th>Inputs passed</th><th>Expected output (stdout)</th></tr>
+                  <tr><td><code>login</code> / <code>pair</code></td><td>yes</td><td>Common args</td><td>Live progress text; the script persists its own session.</td></tr>
+                  <tr><td><code>channels</code></td><td>yes</td><td>Common args</td><td>JSON: <code>{"Channels": [{"Name": "...", "Mode": "live", "SessionManifest": true, "UseCdm": true, "ScriptParams": "id=101"}]}</code></td></tr>
+                  <tr><td><code>events</code></td><td>yes</td><td>Common args</td><td>JSON: <code>{"Events": [{"Name": "...", "Autostart": true, "Start": 1700000000, "End": 1700007200, "ScriptParams": "eventId=50"}]}</code></td></tr>
+                  <tr><td><code>epg</code></td><td>yes</td><td>Common args</td><td>XMLTV, or JSON <code>{"EPG": [{"ChannelId": "101", "Title": "Show", "Start": ..., "End": ...}]}</code>. Stored; read back at <code>/api/providers/&lt;id&gt;/epg</code>.</td></tr>
+                  <tr><td><code>start</code> / <code>stop</code></td><td>yes</td><td>Common args + Script params</td><td>Fired when a stream goes live / stops (claim or release a slot). Exit 0. Optional.</td></tr>
+                  <tr><td><code>manifest</code></td><td>yes</td><td>Common args + Script params</td><td>JSON: <code>{"ManifestUrl": "...", "Cdn": [...], "Headers": {"manifest": {...}, "media": {...}}, "Heartbeat": {"PeriodMs": 300000}}</code></td></tr>
+                  <tr><td><code>url</code></td><td>yes</td><td>Common args + <code>url=&lt;url&gt;</code></td><td>The rewritten URL, or <code>{"Url": "..."}</code>. Print nothing to leave it unchanged.</td></tr>
+                  <tr><td><code>downloadmanifest</code></td><td>yes</td><td>Common args + <code>url=&lt;url&gt;</code></td><td>Raw manifest text (MPD/M3U8), or JSON <code>{"ManifestContent": "..."}</code>.</td></tr>
+                  <tr><td><code>pssh</code></td><td>yes</td><td>Common args + <code>pssh=&lt;pssh&gt; url=&lt;url&gt;</code></td><td>JSON: <code>{"ProcessedPssh": "AAAA..."}</code>. Print nothing to keep the original.</td></tr>
+                  <tr><td><code>initparse</code></td><td>yes</td><td>Common args + <code>url=</code> <code>init=&lt;base64&gt;</code></td><td>JSON with any of <code>Kid</code>/<code>Pssh</code>/<code>PsshWidevine</code>/<code>PsshPlayReady</code> — folded into the next <code>cdm</code> call.</td></tr>
+                  <tr><td><code>cdm</code></td><td>yes</td><td>Common args + <code>cdm=external cdmType= pssh= kid= keyUri=</code></td><td>Clear keys: <code>KID:KEY</code> lines, <code>--&gt; KID:KEY</code> lines, or JSON <code>{"keys": [{"kid": "...", "key": "..."}]}</code>.</td></tr>
+                  <tr><td><code>heartbeat</code></td><td>yes</td><td>Common args + <code>heartbeaturl= heartbeatparams=</code></td><td>Pings the session. Exit 0 = success.</td></tr>
+                  <tr><td><code>downloadinit</code> / <code>downloadmedia</code></td><td><b>not yet</b></td><td>Common args + <code>url=</code></td><td>Raw segment bytes. Configurable now, but not invoked yet (a subprocess per segment needs a persistent worker).</td></tr>
                 </table>
-                <p class="field-hint">Lifecycle hooks (<code>init</code>/<code>start</code>/<code>stop</code>/<code>heartbeat</code>) only fire for script-driven streams (session manifest, CDM keys, heartbeat, or script params set), and never block the panel — a script that doesn't implement one just logs a benign line.</p>
-                <p>Import JSON per item uses keys: <code>Name</code>, <code>Mode</code> (live/vod), <code>SessionManifest</code>, <code>UseCdm</code>, <code>CdmType</code>, <code>CdmMode</code>, <code>Video</code>, <code>Autostart</code>, <code>Start</code>/<code>End</code>, and per-stream params.</p>
+                <p class="field-hint">Timeouts: <code>channels</code>/<code>events</code> 60s, <code>epg</code> 120s, <code>manifest</code> 45s, <code>cdm</code> 60s, pipeline hooks 15–20s, lifecycle 20s; <code>login</code>/<code>pair</code> run in the background with none. Pipeline hooks fail soft — a hook that errors or times out is logged and ReStreamAir falls back to its built-in behaviour.</p>
+                <p>Channel/event import per item uses keys: <code>Name</code>, <code>Mode</code> (live/vod), <code>SessionManifest</code>, <code>UseCdm</code>, <code>CdmType</code>, <code>Video</code>, <code>Autostart</code>, <code>Start</code>/<code>End</code>, and <code>ScriptParams</code>. Re-running an import updates matching streams in place.</p>
               </article>
 
               <article id="help-drm" class="help-card">
@@ -529,15 +534,15 @@
                 <p class="help-callout">ReStreamAir is an IPTV restreamer, <b>not a DRM client</b> — it never runs a real Widevine/PlayReady/FairPlay CDM. For protected streams a script returns <b>clear keys</b> and the remuxer decrypts with them.</p>
                 <ul>
                   <li><b>Manual keys</b> — paste <code>KID:KEY</code> hex pairs (one per line) in the stream editor's decryption box. These always win.</li>
-                  <li><b>Get keys via script</b> — turn on in Scripting &amp; DRM; the <code>cdm</code> action returns keys when the stream is protected and no keys were pasted.</li>
-                  <li><b>CDM mode</b> — <code>external</code>: the script runs its own CDM and prints <code>KID:KEY</code>. <code>internal</code>: the panel scrapes <code>kid=</code>/<code>pssh=</code> from the manifest and the script proxies the license.</li>
+                  <li><b>Get keys via script</b> — tick <b>CDM keys</b> in the stream's Script actions. When the stream is protected and no keys were pasted, ReStreamAir parses the manifest for every DRM detail (all KIDs, Widevine + PlayReady PSSH, HLS key URIs) and hands it to the <code>cdm</code> action, which returns clear <code>KID:KEY</code> pairs. The script always runs the license exchange itself — ReStreamAir has no embedded CDM, so <code>challenge=</code> is passed empty.</li>
+                  <li><b>Refine what's sent</b> — the optional <b>PSSH parsing</b> and <b>Init parsing</b> actions let the script rewrite the PSSH or pull extra KIDs/PSSH out of the init segment before the <code>cdm</code> call.</li>
                 </ul>
-                <p>Key output formats accepted: bare <code>KID:KEY</code> lines, <code>--&gt; KID:KEY</code>, or JSON <code>{"keys":[{"kid","key"}]}</code>.</p>
+                <p>Key output formats accepted: bare <code>KID:KEY</code> lines, <code>--&gt; KID:KEY</code>, or JSON <code>{"keys":[{"kid","key"}]}</code>. This decrypts <code>cenc</code> (AES-CTR) directly; <code>cbcs</code> pattern encryption isn't supported.</p>
               </article>
 
               <article id="help-session" class="help-card">
                 <h3>Session manifest &amp; heartbeat</h3>
-                <p>When a source URL is short-lived (per-session/token), turn on <b>Session manifest</b>. On every start the panel runs the script's <code>manifest</code> action and streams from the fresh URL it returns:</p>
+                <p>When a source URL is short-lived (per-session/token), tick <b>Session manifest</b> (the <code>manifest</code> action) in the stream's Script actions. On every start the panel runs it and streams from the fresh URL it returns:</p>
                 <pre class="help-pre">{
   "ManifestUrl": "https://…/live.mpd",
   "Cdn": [ { "Name": "cdn2", "ManifestUrl": "https://…" } ],
