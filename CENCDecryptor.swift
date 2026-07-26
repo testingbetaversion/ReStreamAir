@@ -1,7 +1,5 @@
 import Foundation
-#if canImport(CommonCrypto)
-import CommonCrypto
-#endif
+import restream_core
 
 // MARK: - Minimal MP4 box parser (shared by init-segment patching and media-segment decryption)
 
@@ -446,8 +444,6 @@ final class CENCDecryptor {
     /// shift every following byte and force a rewrite of the enclosing
     /// traf/moof sizes *and* each trun's moof-relative data_offset. Retyping
     /// keeps the size and every offset identical, so nothing needs fixing up.
-    /// Pure box edit (no crypto) — patchInitSegment uses it on every platform,
-    /// so it lives outside the CommonCrypto guard.
     private func retypeToFree(_ bytes: inout [UInt8], _ box: MP4Box) {
         let free = Array("free".utf8)
         // Box layout is [4-byte size][4-byte type], so the type starts at +4.
@@ -547,34 +543,19 @@ final class CENCDecryptor {
         // no player could play the audio track.
         let clearSubsamples = subsamples.isEmpty ? [(0, sampleSize)] : subsamples
 
-        #if canImport(CommonCrypto)
-        var cryptorRef: CCCryptorRef?
-        let status = key.withUnsafeBytes { keyPtr -> CCCryptorStatus in
+        // AES-CTR from the C core. The cryptor is created once per sample and
+        // its keystream continues across subsamples — the behaviour both
+        // implementations this replaces had, and what CommonCrypto's
+        // kCCModeOptionCTR_BE gave us on macOS.
+        var ctr = rs_aes_ctr()
+        let status = key.withUnsafeBytes { keyPtr in
             counterBlock.withUnsafeBytes { ivPtr in
-                CCCryptorCreateWithMode(
-                    CCOperation(kCCEncrypt), CCMode(kCCModeCTR), CCAlgorithm(kCCAlgorithmAES),
-                    CCPadding(ccNoPadding), ivPtr.baseAddress, keyPtr.baseAddress, keyPtr.count,
-                    nil, 0, 0, CCModeOptions(kCCModeOptionCTR_BE), &cryptorRef
-                )
+                rs_aes_ctr_init(&ctr,
+                                keyPtr.bindMemory(to: UInt8.self).baseAddress, keyPtr.count,
+                                ivPtr.bindMemory(to: UInt8.self).baseAddress, ivPtr.count)
             }
         }
-        guard status == kCCSuccess, let cryptor = cryptorRef else {
-            throw CENCError.cryptoFailed("Could not initialize AES-CTR cryptor (status \(status)).")
-        }
-        defer { CCCryptorRelease(cryptor) }
-        var cursor = sampleStart
-        for (clear, encrypted) in clearSubsamples {
-            cursor += clear
-            if encrypted > 0 {
-                try decryptRange(&bytes, start: cursor, length: encrypted, cryptor: cryptor)
-                cursor += encrypted
-            }
-        }
-        #else
-        // Linux: pure-Swift AES-CTR (AES.swift). The cryptor is created once per
-        // sample and its keystream continues across subsamples, matching
-        // CommonCrypto's kCCModeOptionCTR_BE.
-        guard let ctr = AESCTR(key: Array(key), iv: counterBlock) else {
+        guard status == 0 else {
             throw CENCError.cryptoFailed("Could not initialize AES-CTR cryptor.")
         }
         var cursor = sampleStart
@@ -584,23 +565,11 @@ final class CENCDecryptor {
                 guard cursor >= 0, cursor + encrypted <= bytes.count else {
                     throw CENCError.parseFailed("Subsample range out of bounds.")
                 }
-                ctr.process(&bytes, start: cursor, length: encrypted)
+                bytes.withUnsafeMutableBufferPointer {
+                    rs_aes_ctr_process(&ctr, $0.baseAddress! + cursor, encrypted)
+                }
                 cursor += encrypted
             }
         }
-        #endif
     }
-
-    #if canImport(CommonCrypto)
-    private func decryptRange(_ bytes: inout [UInt8], start: Int, length: Int, cryptor: CCCryptorRef) throws {
-        guard length > 0 else { return }
-        guard start >= 0, start + length <= bytes.count else { throw CENCError.parseFailed("Subsample range out of bounds.") }
-        var moved = 0
-        let status = bytes.withUnsafeMutableBufferPointer { buffer -> CCCryptorStatus in
-            let base = buffer.baseAddress! + start
-            return CCCryptorUpdate(cryptor, base, length, base, length, &moved)
-        }
-        guard status == kCCSuccess else { throw CENCError.cryptoFailed("AES-CTR decrypt failed (status \(status)).") }
-    }
-    #endif
 }

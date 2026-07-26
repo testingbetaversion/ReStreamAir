@@ -1,11 +1,14 @@
 import Foundation
 
 /// Pure-Swift SHA-256 / HMAC-SHA256 / PBKDF2-HMAC-SHA256, with no platform
-/// crypto dependency. macOS uses CommonCrypto for password hashing (see
-/// AuthStore); Linux has no CommonCrypto, so it uses this instead. Kept
-/// unconditionally compiled (not behind an #if) so its output can be checked
-/// against CommonCrypto on macOS — the two must produce identical PBKDF2
-/// digests for a hash created on one platform to verify on the other.
+/// crypto dependency.
+///
+/// Nothing in the app calls this any more — AuthStore hashes passwords with the
+/// C core's rs_crypto, on every platform. It stays as the reference the port is
+/// measured against: CoreParitySelfTest runs both over the same inputs on every
+/// `restreamair selftest` and fails on any difference, which is what keeps a
+/// password hashed by an older build (by this code on Linux, or by CommonCrypto
+/// on macOS) verifying against the C implementation today.
 enum PureCrypto {
     // MARK: SHA-256 (FIPS 180-4)
 

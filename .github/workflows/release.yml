@@ -3,7 +3,10 @@ name: Release
 on:
   push:
     tags: [ 'v*' ]
-    branches: [ 'main' ]
+    # Nightly releases on every push to main are DISABLED to save Actions
+    # minutes — re-enable by uncommenting the line below. Tag pushes (v*) and
+    # manual runs (workflow_dispatch) still cut a release.
+    # branches: [ 'main' ]
   workflow_dispatch:
     inputs:
       tag:

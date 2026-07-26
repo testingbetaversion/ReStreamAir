@@ -66,14 +66,106 @@ enum ScriptRunner {
         }
     }
 
+    /// Marker for a base64-encoded value. Explicit rather than relying purely
+    /// on detection: plenty of ordinary short strings ("test", "abcd") are
+    /// coincidentally valid base64, so an unmarked value can't be classified
+    /// with certainty. Scripts check for this prefix and decode; anything
+    /// without it is plain text.
+    static let base64Prefix = "b64:"
+
+    /// Whether a value can't be handed over as literal argv.
+    ///
+    /// Deliberately narrow. Process spawns the interpreter directly with no
+    /// shell in between, so `? & * ; |` and friends are never *interpreted* —
+    /// encoding them would only make every ordinary URL (`…?token=x&region=eu`)
+    /// arrive as an unreadable blob, for no gain. What genuinely can't survive
+    /// is whitespace (which is the token separator `splitParams` splits on),
+    /// control characters, non-ASCII (argv encoding isn't guaranteed), and
+    /// quotes or backslashes (the characters a script most often mangles when
+    /// it re-quotes a value into a command of its own).
+    ///
+    /// Secrets are handled separately, by `force` — those are encoded whatever
+    /// they contain, so a password never appears in `ps` output.
+    private static func needsEncoding(_ value: String) -> Bool {
+        for scalar in value.unicodeScalars {
+            if scalar.value < 0x21 || scalar.value > 0x7e { return true }
+            switch Character(scalar) {
+            case "\"", "'", "\\": return true
+            default: continue
+            }
+        }
+        // A plain value that happens to start with the marker would decode into
+        // something else entirely on the far side, so encode it to escape it.
+        return value.hasPrefix(base64Prefix)
+    }
+
+    /// Prepares a value to cross the argv boundary: base64 (marked with
+    /// `b64:`) when it can't be passed literally, otherwise unchanged. Most
+    /// values — ids, actions, plain usernames — go through untouched, so a
+    /// script that never sees an awkward value sees no change at all.
+    ///
+    /// `force` is for secrets: a password has no business appearing in `ps`
+    /// output even when its characters are harmless.
+    static func encodeValue(_ value: String, force: Bool = false) -> String {
+        guard !value.isEmpty else { return value }
+        guard force || needsEncoding(value) else { return value }
+        return base64Prefix + Data(value.utf8).base64EncodedString()
+    }
+
+    /// The inverse, for values *arriving* from a script. Accepts an explicitly
+    /// marked `b64:` value, or bare base64 — but only when that reading is
+    /// unambiguous: it must decode to valid UTF-8 *and* re-encode to exactly
+    /// the input. Without that round-trip check a plain four-letter word would
+    /// silently decode to binary garbage. Anything else is plain text.
+    static func decodeValue(_ value: String) -> String {
+        if value.hasPrefix(base64Prefix) {
+            let encoded = String(value.dropFirst(base64Prefix.count))
+            if let data = Data(base64Encoded: encoded), let text = String(data: data, encoding: .utf8) {
+                return text
+            }
+            return value
+        }
+        guard value.count >= 4, value.count % 4 == 0 else { return value }
+        guard value.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "+" || $0 == "/" || $0 == "=" }),
+              value.allSatisfy({ $0.isASCII }) else { return value }
+        guard let data = Data(base64Encoded: value),
+              let text = String(data: data, encoding: .utf8),
+              data.base64EncodedString() == value else { return value }
+        // An all-printable decode of an all-printable input is exactly the
+        // ambiguous case ("test" -> three control bytes decodes, but "dGVzdA=="
+        // -> "test" is what a script actually meant). Requiring the decoded
+        // text to be printable keeps the useful direction and drops the noise.
+        guard !text.isEmpty, text.unicodeScalars.allSatisfy({ $0.value >= 0x20 || $0 == "\n" || $0 == "\t" }) else {
+            return value
+        }
+        return text
+    }
+
     /// Splits a free-text "key=value key2=value2" string (a ScriptAccount's
     /// `params`, or any other extra-params field) into individual argv
     /// tokens. Whitespace is the token separator — matches how `sys.argv`
     /// tokens arrive on the script side, so values can't contain spaces, but
     /// can contain their own '=' (o11.parse_params splits only on the first
     /// '=').
+    ///
+    /// Each token's value is run through `encodeValue`, which is also what
+    /// stops a value from being torn apart: it can't contain a space by the
+    /// time it reaches the script, because a value with a space is base64 by
+    /// then. (The split itself still happens on the raw text, so a param whose
+    /// value contains a space must be written `key=b64:…` by hand — the field
+    /// is space-separated by definition.)
     static func splitParams(_ text: String) -> [String] {
-        text.split(separator: " ").map(String.init).filter { !$0.isEmpty }
+        text.split(separator: " ").map(String.init).filter { !$0.isEmpty }.map { token in
+            guard let equals = token.firstIndex(of: "=") else { return token }
+            let key = String(token[token.startIndex..<equals])
+            let value = String(token[token.index(after: equals)...])
+            return "\(key)=\(encodeValue(value))"
+        }
+    }
+
+    /// Builds one `key=value` argv token with the value encoded if it needs it.
+    static func arg(_ key: String, _ value: String, force: Bool = false) -> String {
+        "\(key)=\(encodeValue(value, force: force))"
     }
 
     /// The "common to all scripts" argument prefix per the shared protocol,
@@ -83,16 +175,28 @@ enum ScriptRunner {
     /// account might carry — extra params (region, device id, ...) are for
     /// actions that look up content, not for the credential exchange
     /// itself, so they're left out there.
-    static func commonArgs(action: String, bind: String, proxy: String, doh: String, worker: String, account: ScriptAccount) -> [String] {
-        var args = ["action=\(action)", "bind=\(bind)", "proxy=\(proxy)", "doh=\(doh)", "worker=\(worker)"]
+    /// `sessionDir`, when non-empty, is this provider's durable cookie/session
+    /// directory — passed as `sessiondir=` plus a `cookies=` file inside it, so
+    /// a script has a stable place to keep a login that survives a restart.
+    /// ReStreamAir creates the directory and never reads what goes in it.
+    static func commonArgs(action: String, bind: String, proxy: String, doh: String, worker: String,
+                           account: ScriptAccount, sessionDir: String = "") -> [String] {
+        var args = [arg("action", action), arg("bind", bind), arg("proxy", proxy),
+                    arg("doh", doh), arg("worker", worker)]
+        if !sessionDir.isEmpty {
+            args.append(arg("sessiondir", sessionDir))
+            args.append(arg("cookies", sessionDir + "/cookies.txt"))
+        }
         // Falls back to the account's Name when Username is left blank —
         // accounts are so often named after the login itself (e.g. an
         // account named "user" meant to log in as "user") that requiring
         // the same value typed twice just produced silently-empty user=
         // for people who only filled in Name.
         let user = account.username.isEmpty ? account.name : account.username
-        if !user.isEmpty { args.append("user=\(user)") }
-        if !account.password.isEmpty { args.append("password=\(account.password)") }
+        if !user.isEmpty { args.append(arg("user", user)) }
+        // Always encoded: a password should never be readable in `ps` output,
+        // whatever characters it happens to contain.
+        if !account.password.isEmpty { args.append(arg("password", account.password, force: true)) }
         if action == "login" { return args }
         return args + splitParams(account.params)
     }

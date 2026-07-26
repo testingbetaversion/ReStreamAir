@@ -1,10 +1,13 @@
 import Foundation
 
-/// Pure-Swift AES (no platform crypto), so the internal CENC/HLS decryptors —
-/// the whole point of which is to be independent of ffmpeg — work on Linux too,
-/// not just macOS/CommonCrypto. Provides the AES block cipher plus the two
-/// modes the decryptors use: streaming CTR (CENC) and CBC decrypt (HLS AES-128).
-/// Verified byte-for-byte against CommonCrypto (see the CI/crypto self-test).
+/// Pure-Swift AES (no platform crypto): the block cipher plus the two modes the
+/// CENC/HLS decryptors use — streaming CTR (CENC) and CBC decrypt (HLS AES-128).
+///
+/// The decryptors themselves now call the C core's rs_aes instead, on every
+/// platform. This stays as the reference that port is measured against, and as
+/// the home of the known-answer vectors below; CoreParitySelfTest compares the
+/// two on every `restreamair selftest`. Verified byte-for-byte against
+/// CommonCrypto, which is what the macOS build used before the port.
 struct AES {
     private let roundKeys: [UInt8]
     private let rounds: Int

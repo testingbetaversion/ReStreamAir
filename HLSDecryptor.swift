@@ -1,7 +1,5 @@
 import Foundation
-#if canImport(CommonCrypto)
-import CommonCrypto
-#endif
+import restream_core
 
 enum HLSDecryptError: Error, CustomStringConvertible {
     case invalidKey(String)
@@ -20,7 +18,6 @@ enum HLSDecryptError: Error, CustomStringConvertible {
 /// to players that don't handle encrypted HLS themselves.
 enum HLSDecryptor {
     static func decryptSegment(_ data: Data, keyHex: String, ivHex: String, sequence: Int) throws -> Data {
-        #if canImport(CommonCrypto)
         guard let key = CENCDecryptor.dataFromHex(keyHex), key.count == 16 else {
             throw HLSDecryptError.invalidKey("HLS key must be 32 hex characters (16 bytes).")
         }
@@ -33,43 +30,32 @@ enum HLSDecryptor {
             throw HLSDecryptError.invalidKey("HLS IV must be 32 hex characters (16 bytes) when provided.")
         }
 
-        var outBuffer = [UInt8](repeating: 0, count: data.count + kCCBlockSizeAES128)
-        var outMoved = 0
-        let status = data.withUnsafeBytes { dataPtr -> CCCryptorStatus in
+        var outBuffer = [UInt8](repeating: 0, count: data.count)
+        var outLength = 0
+        let status = data.withUnsafeBytes { dataPtr in
             key.withUnsafeBytes { keyPtr in
                 iv.withUnsafeBytes { ivPtr in
-                    CCCrypt(
-                        CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), CCOptions(kCCOptionPKCS7Padding),
-                        keyPtr.baseAddress, keyPtr.count, ivPtr.baseAddress,
-                        dataPtr.baseAddress, dataPtr.count,
-                        &outBuffer, outBuffer.count, &outMoved
-                    )
+                    rs_aes_cbc_decrypt(keyPtr.bindMemory(to: UInt8.self).baseAddress, keyPtr.count,
+                                       ivPtr.bindMemory(to: UInt8.self).baseAddress, ivPtr.count,
+                                       dataPtr.bindMemory(to: UInt8.self).baseAddress, dataPtr.count,
+                                       &outBuffer, &outLength)
                 }
             }
         }
-        guard status == kCCSuccess else {
-            throw HLSDecryptError.cryptoFailed("AES-128-CBC decrypt failed (status \(status)).")
-        }
-        return Data(outBuffer.prefix(outMoved))
-        #else
-        // Linux: pure-Swift AES-128-CBC (no CommonCrypto). Same result, verified
-        // against CommonCrypto's CCCrypt(kCCDecrypt, kCCOptionPKCS7Padding).
-        guard let key = CENCDecryptor.dataFromHex(keyHex), key.count == 16 else {
-            throw HLSDecryptError.invalidKey("HLS key must be 32 hex characters (16 bytes).")
-        }
-        let iv: [UInt8]
-        if ivHex.trimmingCharacters(in: .whitespaces).isEmpty {
-            iv = Array(sequenceIV(sequence))
-        } else if let parsed = CENCDecryptor.dataFromHex(ivHex), parsed.count == 16 {
-            iv = Array(parsed)
-        } else {
-            throw HLSDecryptError.invalidKey("HLS IV must be 32 hex characters (16 bytes) when provided.")
-        }
-        guard let clear = AESCBC.decrypt(key: Array(key), iv: iv, ciphertext: Array(data)) else {
+        guard status == 0 else {
             throw HLSDecryptError.cryptoFailed("AES-128-CBC decrypt failed.")
         }
-        return Data(clear)
-        #endif
+        // rs_aes_cbc_decrypt is deliberately lenient about a malformed final
+        // block: it hands back the whole buffer rather than failing, which is
+        // what the pure-Swift AESCBC it was ported from does. A valid PKCS7 pad
+        // always removes between 1 and 16 bytes, so an unshortened result means
+        // the padding was bad — reject it, the way CommonCrypto's
+        // kCCOptionPKCS7Padding always has here, instead of serving a segment
+        // already known to be corrupt.
+        guard outLength < data.count else {
+            throw HLSDecryptError.cryptoFailed("AES-128-CBC decrypt produced invalid PKCS7 padding.")
+        }
+        return Data(outBuffer.prefix(outLength))
     }
 
     /// Per RFC 8216 §5.2: when no IV attribute is present, the IV is the

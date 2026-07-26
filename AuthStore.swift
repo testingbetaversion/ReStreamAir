@@ -1,7 +1,5 @@
 import Foundation
-#if canImport(CommonCrypto)
-import CommonCrypto
-#endif
+import restream_core
 
 struct AdminUser: Codable {
     var id: String
@@ -24,9 +22,9 @@ enum AuthError: Error, CustomStringConvertible {
 
 /// Session tokens live in memory only (cleared on restart, which simply
 /// requires signing in again — acceptable for a LAN admin tool). Password
-/// hashing uses PBKDF2-HMAC-SHA256 via CommonCrypto, so account creation and
-/// login only work on Apple platforms; the rest of the app still runs
-/// elsewhere, it just can't gate itself with real auth there.
+/// hashing uses PBKDF2-HMAC-SHA256 from the C core, which works identically on
+/// every platform and produces digests interchangeable with the CommonCrypto
+/// and pure-Swift implementations earlier builds used.
 final class AuthStore {
     private let lock = NSLock()
     private var sessions: [String: (username: String, expiresAt: Date)] = [:]
@@ -47,27 +45,24 @@ final class AuthStore {
         return computed.base64EncodedString() == hash
     }
 
-    /// PBKDF2-HMAC-SHA256, 100k iterations, 32-byte key. CommonCrypto on macOS,
-    /// the pure-Swift implementation everywhere else (Linux) — both produce the
-    /// same digest, verified against each other, so an account created on one
-    /// platform still logs in on the other.
+    /// PBKDF2-HMAC-SHA256, 100k iterations, 32-byte key — one implementation on
+    /// every platform now, from the C core. It produces the same digest the two
+    /// implementations it replaces did (CommonCrypto on macOS, pure Swift on
+    /// Linux), so an account created by any earlier build still logs in.
+    /// `restreamair selftest` re-checks that equality at exactly these
+    /// parameters on every run; see CoreParityTest.swift.
     private static func pbkdf2(password: String, salt: Data) throws -> Data {
-        #if canImport(CommonCrypto)
         var derived = [UInt8](repeating: 0, count: 32)
         let passwordBytes = Array(password.utf8)
-        let status = salt.withUnsafeBytes { saltPtr -> Int32 in
-            CCKeyDerivationPBKDF(
-                CCPBKDFAlgorithm(kCCPBKDF2), passwordBytes, passwordBytes.count,
-                saltPtr.baseAddress, saltPtr.count,
-                CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256), 100_000,
-                &derived, derived.count
-            )
+        let status = passwordBytes.withUnsafeBufferPointer { passwordPtr in
+            salt.withUnsafeBytes { saltPtr in
+                rs_pbkdf2_sha256(passwordPtr.baseAddress, passwordBytes.count,
+                                 saltPtr.bindMemory(to: UInt8.self).baseAddress, saltPtr.count,
+                                 100_000, &derived, derived.count)
+            }
         }
-        guard status == kCCSuccess else { throw AuthError.unsupportedPlatform("PBKDF2 derivation failed (status \(status)).") }
+        guard status == 0 else { throw AuthError.unsupportedPlatform("PBKDF2 derivation failed.") }
         return Data(derived)
-        #else
-        return Data(PureCrypto.pbkdf2SHA256(password: Array(password.utf8), salt: Array(salt), iterations: 100_000, keyLength: 32))
-        #endif
     }
 
     func createSession(username: String, remember: Bool) -> String {

@@ -9,6 +9,7 @@ scripts/*_user.json
 
 # Build products — binaries are published on GitHub Releases, never committed
 .build/
+build/
 *.dSYM/
 restreamair
 restreamair-menubar

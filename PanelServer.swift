@@ -88,6 +88,54 @@ struct RepresentationMetaEntry: Codable {
 // account's credentials outright. ReStreamAir never inspects or persists
 // session state itself — the script is entirely responsible for its own
 // session/cookie file, keyed off whatever's in here.
+/// The provider-script actions ReStreamAir is willing to invoke. A provider
+/// declares which ones its script actually implements (and a stream may
+/// override that), so the panel never calls an action a script doesn't handle —
+/// the previous behaviour, where any script-shaped stream got `init`/`start`/
+/// `stop` fired at it regardless, produced a stream of "invalid action" noise
+/// in the logs for scripts that only did, say, `channels`.
+///
+/// Raw values are exactly what goes out as `action=`, so they're also the
+/// protocol names in SCRIPTING.md.
+enum ScriptAction: String, CaseIterable, Codable {
+    case start, stop
+    case login, pair
+    case channels, events, epg
+    case manifest              // session manifest — a fresh source URL per start
+    case downloadmanifest      // the script fetches the manifest itself
+    case url                   // the script rewrites a URL before it's fetched
+    case pssh                  // the script post-processes extracted PSSH boxes
+    case initparse             // the script inspects a fetched init segment
+    case downloadinit          // not wired — see `isWired`
+    case downloadmedia         // not wired — see `isWired`
+    case cdm, heartbeat
+
+    /// Whether ReStreamAir calls this action today. The two download hooks are
+    /// configurable but inert: routing every segment through a spawned
+    /// subprocess needs a persistent worker rather than one process per fetch,
+    /// which is a separate change. Storing the choice now means enabling them
+    /// later doesn't require reconfiguring anything.
+    var isWired: Bool {
+        switch self {
+        case .downloadinit, .downloadmedia: return false
+        default: return true
+        }
+    }
+
+    /// Actions a provider runs on its own behalf, rather than for one stream.
+    var isProviderLevel: Bool {
+        switch self {
+        case .login, .pair, .channels, .events, .epg: return true
+        default: return false
+        }
+    }
+
+    /// What a brand-new provider gets: the account and catalogue actions that
+    /// nearly every script implements. The per-stream playback hooks stay off
+    /// until they're asked for.
+    static let providerDefaults: [ScriptAction] = [.login, .pair, .channels, .events]
+}
+
 struct ScriptAccount: Codable {
     var id: String
     var name: String
@@ -224,6 +272,10 @@ struct Provider: Codable {
     // Rotation pointer only — not meaningful across installs, so it's
     // deliberately left out of ExportedProvider/export-import.
     var lastRotatedAccountId: String = ""
+    /// Which ScriptAction raw values this provider's script implements. The
+    /// default for every stream underneath it, overridable per stream via
+    /// StreamConfig.scriptActionsOverride.
+    var scriptActions: [String] = ScriptAction.providerDefaults.map(\.rawValue)
 
     init(id: String, name: String, logo: String, streams: [StreamConfig], proxy: String = "", headers: String = "", segmentUrlParams: String = "", inheritUrlParams: Bool = false, scriptPath: String = "", scriptBind: String = "", scriptDoh: String = "", scriptWorker: String = "", scriptAccounts: [ScriptAccount] = [], activeScriptAccountId: String = "", accountSelectionMode: String = "fixed") {
         self.id = id
@@ -263,6 +315,16 @@ struct Provider: Codable {
         activeScriptAccountId = try container.decodeIfPresent(String.self, forKey: .activeScriptAccountId) ?? ""
         accountSelectionMode = try container.decodeIfPresent(String.self, forKey: .accountSelectionMode) ?? "fixed"
         lastRotatedAccountId = try container.decodeIfPresent(String.self, forKey: .lastRotatedAccountId) ?? ""
+        // Predates per-action gating: a provider that already has a script was
+        // being called for all of these, so keep doing that rather than
+        // silently switching its behaviour off on upgrade.
+        if let stored = try container.decodeIfPresent([String].self, forKey: .scriptActions) {
+            scriptActions = stored
+        } else {
+            scriptActions = scriptPath.trimmingCharacters(in: .whitespaces).isEmpty
+                ? []
+                : ScriptAction.providerDefaults.map(\.rawValue)
+        }
     }
 }
 
@@ -311,6 +373,10 @@ struct StreamConfig: Codable {
     /// Per-stream script path that overrides the provider's script for THIS
     /// stream's manifest/cdm/heartbeat actions (blank = use the provider script).
     var scriptOverride: String = ""
+    /// Which ScriptAction raw values run for this stream. `nil` — the normal
+    /// case — inherits the provider's set; a non-nil array replaces it wholesale
+    /// (an empty array therefore means "run nothing for this stream").
+    var scriptActionsOverride: [String]? = nil
     /// Legacy — kept for decode compat; CDM is always run in "external" mode
     /// now (the script returns clear keys; the internal-challenge mode was
     /// removed). Not surfaced in the UI.
@@ -448,6 +514,28 @@ struct StreamConfig: Codable {
         cdnUrls = try container.decodeIfPresent([String].self, forKey: .cdnUrls) ?? []
         directSource = try container.decodeIfPresent(Bool.self, forKey: .directSource) ?? false
         nm3u8dlreParams = try container.decodeIfPresent(String.self, forKey: .nm3u8dlreParams) ?? ""
+        if let stored = try container.decodeIfPresent([String].self, forKey: .scriptActionsOverride) {
+            scriptActionsOverride = stored
+        } else if container.contains(.sessionManifest) || container.contains(.useCdm) {
+            // Predates per-action gating. The three legacy toggles were the
+            // only gate a stream had, so rebuild the equivalent action set from
+            // them — otherwise upgrading would silently stop resolving keys or
+            // refreshing session manifests for streams that relied on them.
+            var synthesized: [ScriptAction] = []
+            if sessionManifest { synthesized.append(.manifest) }
+            if useCdm { synthesized += [.cdm, .pssh, .initparse] }
+            if heartbeatEnabled && heartbeatSeconds > 0 { synthesized.append(.heartbeat) }
+            // isScriptDriven's old definition — anything that made the stream
+            // script-shaped also got the lifecycle actions.
+            let driven = sessionManifest || useCdm
+                || !scriptParams.trimmingCharacters(in: .whitespaces).isEmpty
+                || !scriptOverride.trimmingCharacters(in: .whitespaces).isEmpty
+                || (heartbeatEnabled && heartbeatSeconds > 0)
+            if driven { synthesized += [.start, .stop] }
+            scriptActionsOverride = synthesized.isEmpty ? nil : synthesized.map(\.rawValue)
+        } else {
+            scriptActionsOverride = nil
+        }
     }
 
     private enum LegacyCodingKeys: String, CodingKey {
@@ -1419,6 +1507,22 @@ final class PanelServer {
             state.providers[providerIndex].activeScriptAccountId = accountIds.contains(requestedActiveId) ? requestedActiveId : (state.providers[providerIndex].scriptAccounts.first?.id ?? "")
             let requestedMode = input["accountSelectionMode"]?.string ?? "fixed"
             state.providers[providerIndex].accountSelectionMode = ["fixed", "rotate", "random"].contains(requestedMode) ? requestedMode : "fixed"
+            // Unknown names are dropped rather than stored: the set is a
+            // whitelist the rest of the panel gates on, so it should only ever
+            // hold actions this build understands.
+            if let requestedActions = raw?["scriptActions"] as? [Any] {
+                state.providers[providerIndex].scriptActions = requestedActions
+                    .compactMap { $0 as? String }
+                    .filter { ScriptAction(rawValue: $0) != nil }
+            } else if state.providers[providerIndex].scriptActions.isEmpty,
+                      !state.providers[providerIndex].scriptPath.trimmingCharacters(in: .whitespaces).isEmpty {
+                // A provider that had no script until now starts with an empty
+                // set. Seeding it the first time a script path appears keeps the
+                // obvious next click (Login) from failing with "doesn't declare
+                // the 'login' action". Only when the request said nothing about
+                // actions — unticking them all is a real choice, and it stays.
+                state.providers[providerIndex].scriptActions = ScriptAction.providerDefaults.map(\.rawValue)
+            }
             try writeState(state)
             return jsonResponse(status: 200, viewState(state, host: request.headers["host"] ?? "127.0.0.1:\(port)"))
         }
@@ -1428,9 +1532,25 @@ final class PanelServer {
                 throw PanelError.notFound("Provider not found.")
             }
             for stream in state.providers[providerIndex].streams { stop(stream: stream) }
+            // The script's session/cookie jar goes with the provider that owned
+            // it — leaving a stale login behind under runtime/scripts/ would
+            // outlive the credentials it was made with.
+            try? FileManager.default.removeItem(atPath: scriptSessionDir(providerId: match[0], create: false))
             state.providers.remove(at: providerIndex)
             try writeState(state)
             return jsonResponse(status: 200, viewState(state, host: request.headers["host"] ?? "127.0.0.1:\(port)"))
+        }
+
+        // Wipes the script's stored session/cookies for this provider, so the
+        // next login starts clean. The directory is recreated on demand by the
+        // next invocation.
+        if request.method == "POST", let match = match(request.path, #"^/api/providers/([^/]+)/script/clear-session$"#) {
+            guard state.providers.contains(where: { $0.id == match[0] }) else {
+                throw PanelError.notFound("Provider not found.")
+            }
+            try? FileManager.default.removeItem(atPath: scriptSessionDir(providerId: match[0], create: false))
+            logPanel("info", "scriptSession", "cleared session store for provider \(match[0])")
+            return jsonResponse(status: 200, ["cleared": true])
         }
 
         // M3U playlists for external players (VLC, Kodi, TiviMate, ...) —
@@ -1570,13 +1690,16 @@ final class PanelServer {
                 throw PanelError.badRequest("Add or enable an account before running \(match[1]).")
             }
             let action = match[1]
+            guard let known = ScriptAction(rawValue: action), scriptAllows(known, provider: provider) else {
+                throw PanelError.badRequest("This provider's script doesn't declare the '\(action)' action — enable it in Provider settings first.")
+            }
             // Not every login is username+password (some scripts only need
             // a token already sitting in extra params, or nothing at all
             // beyond re-checking an existing session) — send whatever the
             // account has and let the script itself decide what's missing,
             // the same way it already would if run by hand.
             let logStreamId = "script:\(provider.id)"
-            let args = ScriptRunner.commonArgs(action: action, bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
+            let args = ScriptRunner.commonArgs(action: action, bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account, sessionDir: scriptSessionDir(providerId: provider.id))
             logStore.record(streamId: logStreamId, level: "info", event: "scriptStart", url: nil, message: "\(action) · \(provider.scriptPath) \(args.joined(separator: " "))")
             let logStore = self.logStore
             ScriptRunner.runStreaming(scriptPath: provider.scriptPath, args: args, onLine: { line in
@@ -1601,6 +1724,59 @@ final class PanelServer {
         // panel (every other request, the metrics timer) for that whole
         // window. importScriptEntries re-acquires stateQueue itself once
         // the script is done and there's an actual (fast) write to make.
+        // EPG: same fire-and-poll shape as channels/events, but the reply isn't
+        // imported as streams — it's guide data, so it's stored verbatim next to
+        // the provider's session and served back from there. XMLTV or the JSON
+        // form both go through untouched; ReStreamAir doesn't parse either, it
+        // just holds onto what the script produced for a player to fetch.
+        if request.method == "POST", let match = match(request.path, #"^/api/providers/([^/]+)/script/epg$"#) {
+            guard let providerIndex = state.providers.firstIndex(where: { $0.id == match[0] }) else {
+                throw PanelError.notFound("Provider not found.")
+            }
+            let provider = state.providers[providerIndex]
+            guard !provider.scriptPath.trimmingCharacters(in: .whitespaces).isEmpty else {
+                throw PanelError.badRequest("This provider has no script configured.")
+            }
+            guard scriptAllows(.epg, provider: provider) else {
+                throw PanelError.badRequest("This provider's script doesn't declare the 'epg' action — enable it in Provider settings first.")
+            }
+            guard let account = try resolveScriptAccount(providerIndex: providerIndex, state: &state) else {
+                throw PanelError.badRequest("Add or enable an account before running epg.")
+            }
+            let scriptPath = provider.scriptPath
+            let logStreamId = "script:\(provider.id)"
+            let destination = scriptSessionDir(providerId: provider.id) + "/epg.xml"
+            let args = ScriptRunner.commonArgs(action: "epg", bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account, sessionDir: scriptSessionDir(providerId: provider.id))
+            logStore.record(streamId: logStreamId, level: "info", event: "scriptStart", url: nil, message: "epg · \(scriptPath) \(args.joined(separator: " "))")
+            let logStore = self.logStore
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    let (stdout, _) = try ScriptRunner.runSync(scriptPath: scriptPath, args: args, timeout: 120)
+                    let guide = ScriptRunner.decodeValue(stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+                    guard !guide.isEmpty else {
+                        logStore.record(streamId: logStreamId, level: "warn", event: "scriptExit", url: nil, message: "epg returned nothing")
+                        return
+                    }
+                    try Data(guide.utf8).write(to: URL(fileURLWithPath: destination), options: .atomic)
+                    logStore.record(streamId: logStreamId, level: "info", event: "scriptExit", url: nil, message: "epg stored · \(guide.utf8.count) bytes")
+                } catch {
+                    logStore.record(streamId: logStreamId, level: "error", event: "scriptExit", url: nil, message: "\(error)")
+                }
+            }
+            return jsonResponse(status: 202, ["started": true, "logStreamId": logStreamId])
+        }
+
+        // Serves whatever the last `epg` run stored. Admin-gated like the rest
+        // of /api/*; players that need it can be pointed here with a key.
+        if request.method == "GET", let match = match(request.path, #"^/api/providers/([^/]+)/epg$"#) {
+            let path = scriptSessionDir(providerId: match[0], create: false) + "/epg.xml"
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+                throw PanelError.notFound("No EPG stored for this provider yet — run the epg action first.")
+            }
+            let isXML = data.first == UInt8(ascii: "<")
+            return response(status: 200, body: data, type: isXML ? "application/xml; charset=utf-8" : "application/json; charset=utf-8", noStore: true)
+        }
+
         if request.method == "POST", let match = match(request.path, #"^/api/providers/([^/]+)/script/(channels|events)$"#) {
             guard let providerIndex = state.providers.firstIndex(where: { $0.id == match[0] }) else {
                 throw PanelError.notFound("Provider not found.")
@@ -1613,10 +1789,13 @@ final class PanelServer {
                 throw PanelError.badRequest("Add or enable an account before running \(match[1]).")
             }
             let action = match[1]
+            guard let known = ScriptAction(rawValue: action), scriptAllows(known, provider: provider) else {
+                throw PanelError.badRequest("This provider's script doesn't declare the '\(action)' action — enable it in Provider settings first.")
+            }
             let providerId = provider.id
             let scriptPath = provider.scriptPath
             let logStreamId = "script:\(provider.id)"
-            let args = ScriptRunner.commonArgs(action: action, bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
+            let args = ScriptRunner.commonArgs(action: action, bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account, sessionDir: scriptSessionDir(providerId: provider.id))
             logStore.record(streamId: logStreamId, level: "info", event: "scriptStart", url: nil, message: "\(action) · \(scriptPath) \(args.joined(separator: " "))")
             let logStore = self.logStore
             DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -1647,11 +1826,11 @@ final class PanelServer {
             let input = try decodeJSON([String: JSONValue].self, request.body)
             let action = input["action"]?.string ?? "run"
             
-            var args = ScriptRunner.commonArgs(action: action, bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
+            var args = ScriptRunner.commonArgs(action: action, bind: provider.scriptBind, proxy: provider.proxy, doh: provider.scriptDoh, worker: provider.scriptWorker, account: account, sessionDir: scriptSessionDir(providerId: provider.id))
             
             for (k, v) in input {
                 if k != "action" {
-                    args.append("\(k)=\(v.string ?? "")")
+                    args.append(ScriptRunner.arg(k, v.string ?? ""))
                 }
             }
             
@@ -1890,7 +2069,7 @@ final class PanelServer {
     /// timeouts are bounded so a hung script can't wedge the start forever.
     func resolveDecryptionKeys(provider: Provider, stream: StreamConfig) -> String {
         let entered = joinLines(stream.decryptionKeys)
-        guard entered.isEmpty, stream.useCdm else { return entered }
+        guard entered.isEmpty, stream.useCdm, scriptAllows(.cdm, provider: provider, stream: stream) else { return entered }
         let scriptPath = effectiveScriptPath(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
         guard !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) else {
             logStore.record(streamId: stream.id, level: "warn", event: "cdm", url: nil, message: "CDM auto-keys on, but no readable script is configured for this stream")
@@ -1901,7 +2080,7 @@ final class PanelServer {
         // proxy=/doh=/worker= prefix, cdm=external (the script returns clear
         // keys), then this stream's params. We don't pick a DRM system — we
         // parse the manifest for ALL of it and forward it.
-        var args = ScriptRunner.commonArgs(action: "cdm", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
+        var args = ScriptRunner.commonArgs(action: "cdm", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: account, sessionDir: scriptSessionDir(providerId: provider.id))
         args.append("cdm=external")
         args += ScriptRunner.splitParams(stream.scriptParams)
         // Parse the manifest for every scrap of DRM info and hand it all to the
@@ -1935,7 +2114,7 @@ final class PanelServer {
     /// for keys) against a URL we couldn't refresh, and letting it fail later
     /// just makes the supervisor restart-loop the failing script.
     func refreshSessionManifest(provider: Provider, stream: inout StreamConfig) throws {
-        guard stream.sessionManifest else { return }
+        guard stream.sessionManifest, scriptAllows(.manifest, provider: provider, stream: stream) else { return }
         let scriptPath = effectiveScriptPath(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
         guard !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) else {
             throw PanelError.server("Session manifest is on, but no readable script is configured for this stream.")
@@ -1967,16 +2146,67 @@ final class PanelServer {
               let text = String(data: data, encoding: .utf8) else { return [] }
         let challenge = stream.kind == "m3u8" ? CDMKeyResolver.challengeFromHLS(text) : CDMKeyResolver.challengeFromMPD(text)
         var args: [String] = []
-        if !challenge.kids.isEmpty { args.append("kid=\(challenge.kids.joined(separator: ","))") }
-        if let first = challenge.psshAll.first { args.append("pssh=\(first)") }
-        if !challenge.psshAll.isEmpty { args.append("psshAll=\(challenge.psshAll.joined(separator: ","))") }
-        if !challenge.psshWidevine.isEmpty { args.append("psshWidevine=\(challenge.psshWidevine)") }
-        if !challenge.psshPlayReady.isEmpty { args.append("psshPlayReady=\(challenge.psshPlayReady)") }
-        if !challenge.keyURIs.isEmpty { args.append("keyUri=\(challenge.keyURIs.joined(separator: ","))") }
+        if !challenge.kids.isEmpty { args.append(ScriptRunner.arg("kid", challenge.kids.joined(separator: ","))) }
+        // `pssh` hook: the script gets first refusal on the box we extracted and
+        // may hand back a different one to license against.
+        if let first = challenge.psshAll.first {
+            let processed = scriptProcessedPssh(first, url: url.absoluteString, provider: provider, stream: stream) ?? first
+            args.append(ScriptRunner.arg("pssh", processed))
+        }
+        if !challenge.psshAll.isEmpty { args.append(ScriptRunner.arg("psshAll", challenge.psshAll.joined(separator: ","))) }
+        if !challenge.psshWidevine.isEmpty { args.append(ScriptRunner.arg("psshWidevine", challenge.psshWidevine)) }
+        if !challenge.psshPlayReady.isEmpty { args.append(ScriptRunner.arg("psshPlayReady", challenge.psshPlayReady)) }
+        if !challenge.keyURIs.isEmpty { args.append(ScriptRunner.arg("keyUri", challenge.keyURIs.joined(separator: ","))) }
         if !challenge.isEmpty {
             logStore.record(streamId: stream.id, level: "info", event: "cdm", url: nil, message: "parsed DRM from manifest — KID(s) [\(challenge.kids.joined(separator: ", "))], \(challenge.psshAll.count) PSSH box(es)")
         }
+        // `initparse` hook: some DRM details only live in the init segment, and
+        // a script may recognise ones this parser doesn't.
+        if scriptAllows(.initparse, provider: provider, stream: stream),
+           let (initURL, initData) = firstInitSegment(manifest: text, manifestURL: url, headers: headers, proxy: proxy) {
+            args += scriptParsedInit(initData, url: initURL, provider: provider, stream: stream)
+        }
         return args
+    }
+
+    /// Fetches the first video init segment a manifest points at, the same way
+    /// the stream editor's auto-detect already does (DashSegmentsCLI.probe) —
+    /// via the MPD's initialization template for DASH, or `#EXT-X-MAP` for HLS.
+    /// Best-effort: nil whenever the manifest has no init to speak of.
+    func firstInitSegment(manifest text: String, manifestURL url: URL,
+                          headers: [(String, String)], proxy: String) -> (url: String, data: Data)? {
+        let client = HTTPClient(options: HTTPRequestOptions(timeout: 12, headers: headers, proxy: proxy.isEmpty ? nil : proxy))
+        if text.contains("#EXTM3U") {
+            // HLS: the init is whatever #EXT-X-MAP names, resolved against the
+            // playlist it appeared in.
+            for line in text.split(separator: "\n") where line.hasPrefix("#EXT-X-MAP") {
+                guard let range = line.range(of: #"URI="([^"]+)""#, options: .regularExpression) else { continue }
+                let uri = String(line[range]).dropFirst(5).dropLast()
+                guard let initURL = URL(string: String(uri), relativeTo: url)?.absoluteURL,
+                      let data = try? client.get(initURL) else { continue }
+                return (initURL.absoluteString, data)
+            }
+            return nil
+        }
+        guard let mpd = try? MPDParser(sourceURL: url).parse(data: Data(text.utf8)) else { return nil }
+        for period in mpd.periods {
+            for adaptation in period.adaptationSets where DashSegmentsCLI.adaptationType(adaptation) == "video" {
+                for representation in adaptation.representations {
+                    var options = Options(mode: .list)
+                    options.mpdURL = url
+                    options.count = 1
+                    options.includeInitialization = true
+                    options.headers = headers
+                    options.proxy = proxy.isEmpty ? nil : proxy
+                    options.representationID = representation.id
+                    guard let segments = try? DashSegmentsCLI.expandSegments(mpd: mpd, options: options),
+                          let initSegment = segments.first(where: { $0.isInitialization }),
+                          let data = try? client.get(initSegment.url) else { continue }
+                    return (initSegment.url.absoluteString, data)
+                }
+            }
+        }
+        return nil
     }
 
     func start(provider: Provider, stream: inout StreamConfig) throws {
@@ -2039,11 +2269,11 @@ final class PanelServer {
         // minus the one-shot manifest scrape.
         var cdmScriptArg = ""
         var cdmFetchArgs = ""
-        if stream.useCdm {
+        if stream.useCdm, scriptAllows(.cdm, provider: provider, stream: stream) {
             let scriptPath = effectiveScriptPath(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
             if !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) {
                 cdmScriptArg = scriptPath
-                var a = ScriptRunner.commonArgs(action: "cdm", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: activeScriptAccount(for: provider))
+                var a = ScriptRunner.commonArgs(action: "cdm", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: activeScriptAccount(for: provider), sessionDir: scriptSessionDir(providerId: provider.id))
                 a.append("cdm=\(stream.cdmMode.isEmpty ? "external" : stream.cdmMode)")
                 if !stream.cdmType.isEmpty { a.append("cdmType=\(stream.cdmType)") }
                 a += ScriptRunner.splitParams(stream.scriptParams)
@@ -2385,16 +2615,54 @@ final class PanelServer {
             || (stream.heartbeatEnabled && stream.heartbeatSeconds > 0)
     }
 
+    /// The action set in effect for a stream: its own override when it has one,
+    /// otherwise its provider's.
+    func effectiveScriptActions(provider: Provider, stream: StreamConfig) -> Set<String> {
+        Set(stream.scriptActionsOverride ?? provider.scriptActions)
+    }
+
+    /// Whether `action` may run for this stream. Everything that spawns a
+    /// provider script goes through here, so an action a provider hasn't
+    /// declared is never invoked — and an action ReStreamAir doesn't call yet
+    /// (`isWired == false`) is never invoked either, whatever the config says.
+    func scriptAllows(_ action: ScriptAction, provider: Provider, stream: StreamConfig) -> Bool {
+        guard action.isWired else { return false }
+        return effectiveScriptActions(provider: provider, stream: stream).contains(action.rawValue)
+    }
+
+    /// Provider-level actions (login/pair/channels/events/epg) have no stream
+    /// to inherit from, so they consult the provider's own set directly.
+    func scriptAllows(_ action: ScriptAction, provider: Provider) -> Bool {
+        guard action.isWired else { return false }
+        return provider.scriptActions.contains(action.rawValue)
+    }
+
+    /// The durable per-provider directory a script keeps its session and
+    /// cookies in, created on demand. Passed as `sessiondir=`/`cookies=` on
+    /// every invocation; ReStreamAir never reads what ends up in it. Lives
+    /// under runtime/, which is already gitignored and never served statically.
+    func scriptSessionDir(providerId: String, create: Bool = true) -> String {
+        let path = runtimeDir.appendingPathComponent("scripts").appendingPathComponent(providerId)
+        if create {
+            try? FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        }
+        return path.path
+    }
+
     /// Fire a one-shot provider-script lifecycle action (`init` / `start` /
     /// `stop`) for a script-driven stream. Best-effort and async: it runs on a
     /// background queue with a short timeout, logs the result under
     /// `script:<action>`, and never blocks or fails the caller. Scripts that
     /// don't implement the action just log a benign "invalid action" line.
     func runScriptAction(_ action: String, provider: Provider, stream: StreamConfig) {
-        guard isScriptDriven(stream) else { return }
+        // The provider (or stream) has to have declared this action. Replaces
+        // the old isScriptDriven heuristic, which fired these at any
+        // script-shaped stream whether or not its script implemented them.
+        guard let known = ScriptAction(rawValue: action),
+              scriptAllows(known, provider: provider, stream: stream) else { return }
         let scriptPath = effectiveScriptPath(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
         guard !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) else { return }
-        var args = ScriptRunner.commonArgs(action: action, bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: activeScriptAccount(for: provider))
+        var args = ScriptRunner.commonArgs(action: action, bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: activeScriptAccount(for: provider), sessionDir: scriptSessionDir(providerId: provider.id))
         args += ScriptRunner.splitParams(stream.scriptParams)
         let streamId = stream.id
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -2410,12 +2678,12 @@ final class PanelServer {
 
     func startHeartbeat(provider: Provider, stream: StreamConfig) {
         stopHeartbeat(streamId: stream.id)
-        guard stream.heartbeatSeconds > 0 else { return }
+        guard stream.heartbeatSeconds > 0, scriptAllows(.heartbeat, provider: provider, stream: stream) else { return }
         let scriptPath = effectiveScriptPath(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
         guard !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) else { return }
         let interval = max(5, stream.heartbeatSeconds)
         let account = activeScriptAccount(for: provider)
-        var args = ScriptRunner.commonArgs(action: "heartbeat", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
+        var args = ScriptRunner.commonArgs(action: "heartbeat", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: account, sessionDir: scriptSessionDir(providerId: provider.id))
         args += ScriptRunner.splitParams(stream.scriptParams)
         let streamId = stream.id
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
@@ -2586,7 +2854,7 @@ final class PanelServer {
     /// Runs `action=manifest` (per the script protocol) and parses its JSON
     /// reply. Blocking — never call while holding stateQueue.
     func runManifestScript(provider: Provider, stream: StreamConfig, account: ScriptAccount) throws -> ScriptManifestResult {
-        var args = ScriptRunner.commonArgs(action: "manifest", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: account)
+        var args = ScriptRunner.commonArgs(action: "manifest", bind: provider.scriptBind, proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh, worker: provider.scriptWorker, account: account, sessionDir: scriptSessionDir(providerId: provider.id))
         args += ScriptRunner.splitParams(stream.scriptParams)
         let (stdout, _) = try ScriptRunner.runSync(scriptPath: effectiveScriptPath(provider: provider, stream: stream), args: args, timeout: 45)
         // Tolerate scripts that log a line or two before the JSON blob.
@@ -3070,9 +3338,124 @@ final class PanelServer {
     }
 
     func fetchRemote(provider: Provider, stream: StreamConfig, url: URL, category: HeaderCategory) throws -> Data {
+        // `url` and `downloadmanifest` hooks: the script may rewrite the URL
+        // before it's fetched, and may do the manifest fetch itself. Both are
+        // no-ops unless the provider (or stream) declared the action, so an
+        // ordinary stream pays nothing but a Set lookup.
+        let target = scriptProcessedURL(url, provider: provider, stream: stream) ?? url
+        if category == .manifest, let text = scriptDownloadedManifest(target, provider: provider, stream: stream) {
+            return Data(text.utf8)
+        }
         let proxy = effectiveProxy(provider: provider, stream: stream)
         let headers = effectiveHeaders(provider: provider, stream: stream, category: category)
-        return try HTTPClient(options: HTTPRequestOptions(timeout: 30, headers: headers, proxy: proxy.isEmpty ? nil : proxy)).get(url)
+        return try HTTPClient(options: HTTPRequestOptions(timeout: 30, headers: headers, proxy: proxy.isEmpty ? nil : proxy)).get(target)
+    }
+
+    // MARK: - Script pipeline hooks
+    //
+    // Each of these runs the provider script for one step of the fetch/decrypt
+    // pipeline, and each is inert unless its ScriptAction is enabled. They all
+    // fail soft: a script that errors, times out or returns nothing leaves the
+    // pipeline exactly as it was, because a broken hook should degrade to the
+    // built-in behaviour rather than take the stream down with it.
+
+    /// Runs one pipeline action and returns its trimmed stdout, or nil when the
+    /// action is disabled, no script is configured, or the run failed.
+    private func runPipelineScript(_ action: ScriptAction, provider: Provider, stream: StreamConfig,
+                                   extra: [String], timeout: Double = 20) -> String? {
+        guard scriptAllows(action, provider: provider, stream: stream) else { return nil }
+        let scriptPath = effectiveScriptPath(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
+        guard !scriptPath.isEmpty, ScriptRunner.scriptExists(ScriptRunner.normalizePath(scriptPath)) else { return nil }
+        var args = ScriptRunner.commonArgs(
+            action: action.rawValue, bind: provider.scriptBind,
+            proxy: scriptProxy(provider: provider, stream: stream), doh: provider.scriptDoh,
+            worker: provider.scriptWorker, account: activeScriptAccount(for: provider),
+            sessionDir: scriptSessionDir(providerId: provider.id))
+        args += ScriptRunner.splitParams(stream.scriptParams)
+        args += extra
+        do {
+            let (stdout, _) = try ScriptRunner.runSync(scriptPath: scriptPath, args: args, timeout: timeout)
+            let trimmed = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        } catch {
+            logStore.record(streamId: stream.id, level: "warn", event: "script:\(action.rawValue)", url: nil, message: "\(error)")
+            return nil
+        }
+    }
+
+    /// `url` — lets the script rewrite a URL (sign it, swap a CDN host, ...)
+    /// before ReStreamAir fetches it. Returns nil to leave the URL alone.
+    func scriptProcessedURL(_ url: URL, provider: Provider, stream: StreamConfig) -> URL? {
+        guard let output = runPipelineScript(.url, provider: provider, stream: stream,
+                                             extra: [ScriptRunner.arg("url", url.absoluteString)], timeout: 15)
+        else { return nil }
+        let candidate = ScriptRunner.decodeValue(scriptJSONField(output, "Url") ?? output)
+        guard let rewritten = URL(string: candidate), rewritten.scheme?.hasPrefix("http") == true,
+              rewritten != url else { return nil }
+        logStore.record(streamId: stream.id, level: "info", event: "script:url", url: rewritten.absoluteString, message: "url rewritten by script")
+        return rewritten
+    }
+
+    /// `downloadmanifest` — the script fetches the manifest itself and prints
+    /// it, for origins that need a request ReStreamAir can't reproduce.
+    func scriptDownloadedManifest(_ url: URL, provider: Provider, stream: StreamConfig) -> String? {
+        guard let output = runPipelineScript(.downloadmanifest, provider: provider, stream: stream,
+                                             extra: [ScriptRunner.arg("url", url.absoluteString)], timeout: 45)
+        else { return nil }
+        let text = ScriptRunner.decodeValue(scriptJSONField(output, "ManifestContent") ?? output)
+        guard !text.isEmpty else { return nil }
+        logStore.record(streamId: stream.id, level: "info", event: "script:downloadmanifest", url: url.absoluteString, message: "manifest supplied by script · \(text.utf8.count) bytes")
+        return text
+    }
+
+    /// `pssh` — hands the PSSH boxes parsed out of the manifest/init to the
+    /// script, which may return a replacement to use for the licence exchange.
+    func scriptProcessedPssh(_ pssh: String, url: String, provider: Provider, stream: StreamConfig) -> String? {
+        guard !pssh.isEmpty,
+              let output = runPipelineScript(.pssh, provider: provider, stream: stream,
+                                             extra: [ScriptRunner.arg("pssh", pssh), ScriptRunner.arg("url", url)])
+        else { return nil }
+        let processed = ScriptRunner.decodeValue(scriptJSONField(output, "ProcessedPssh") ?? output)
+        guard !processed.isEmpty, processed != pssh else { return nil }
+        logStore.record(streamId: stream.id, level: "info", event: "script:pssh", url: nil, message: "pssh rewritten by script")
+        return processed
+    }
+
+    /// `initparse` — shows the script a fetched init segment so it can report
+    /// DRM details ReStreamAir's own parser missed. Returns extra `key=value`
+    /// argv tokens (`kid=`, `pssh=`, ...) to fold into the `cdm` call.
+    func scriptParsedInit(_ initData: Data, url: String, provider: Provider, stream: StreamConfig) -> [String] {
+        guard let output = runPipelineScript(.initparse, provider: provider, stream: stream,
+                                             extra: [ScriptRunner.arg("url", url),
+                                                     ScriptRunner.arg("init", initData.base64EncodedString())])
+        else { return [] }
+        var extras: [String] = []
+        for key in ["kid", "pssh", "psshWidevine", "psshPlayReady"] {
+            if let value = scriptJSONField(output, key.prefix(1).uppercased() + key.dropFirst()) ?? scriptJSONField(output, key) {
+                extras.append(ScriptRunner.arg(key, ScriptRunner.decodeValue(value)))
+            }
+        }
+        if !extras.isEmpty {
+            logStore.record(streamId: stream.id, level: "info", event: "script:initparse", url: nil, message: "init parsed by script · \(extras.count) field(s)")
+        }
+        return extras
+    }
+
+    /// Pulls one string field out of a script's JSON reply, tolerating the
+    /// log lines scripts habitually print before the blob. Returns nil when the
+    /// output isn't JSON at all, so callers can fall back to treating it as a
+    /// bare value.
+    func scriptJSONField(_ output: String, _ field: String) -> String? {
+        guard let brace = output.firstIndex(of: "{"),
+              let object = (try? JSONSerialization.jsonObject(with: Data(output[brace...].utf8))) as? [String: Any]
+        else { return nil }
+        if let value = object[field] as? String { return value }
+        // Accept a lowercase spelling too — scripts are inconsistent about it.
+        let lowered = field.lowercased()
+        for (key, value) in object where key.lowercased() == lowered {
+            if let text = value as? String { return text }
+        }
+        return nil
     }
 
     // MARK: - Stream editor probing
@@ -3291,6 +3674,8 @@ final class PanelServer {
             },
             "activeScriptAccountId": provider.activeScriptAccountId,
             "accountSelectionMode": provider.accountSelectionMode,
+            "scriptActions": provider.scriptActions,
+            "scriptSessionDir": scriptSessionDir(providerId: provider.id, create: false),
             "streams": provider.streams.map { stream in streamView(stream, host: host) }
         ]
     }
@@ -3388,6 +3773,7 @@ final class PanelServer {
             "sourceType": stream.sourceType,
             "mode": stream.mode,
             "sessionManifest": stream.sessionManifest,
+            "scriptActionsOverride": stream.scriptActionsOverride as Any,
             "scriptParams": stream.scriptParams,
             "cdmType": stream.cdmType,
             "useCdm": stream.useCdm,
@@ -3586,6 +3972,16 @@ final class PanelServer {
         stream.heartbeatSeconds = max(0, input["heartbeatSeconds"]?.int ?? 0)
         stream.scriptOverride = input["scriptOverride"]?.string ?? ""
         stream.sessionManifest = input["sessionManifest"]?.bool ?? false
+        // Absent (or explicitly null) means inherit the provider's set; an
+        // array overrides it wholesale, including an empty one — "run nothing
+        // for this stream" has to be expressible.
+        if let requestedActions = raw?["scriptActionsOverride"] as? [Any] {
+            stream.scriptActionsOverride = requestedActions
+                .compactMap { $0 as? String }
+                .filter { ScriptAction(rawValue: $0) != nil }
+        } else {
+            stream.scriptActionsOverride = nil
+        }
         stream.cdmMode = "external"   // internal mode removed
         stream.cdmType = ""            // no longer user-selected — DRM info is auto-parsed
         stream.proxyScript = input["proxyScript"]?.bool ?? true
@@ -3962,6 +4358,10 @@ struct RestreamAirMain {
                 exit(1)
             }
             CryptoSelfTest.runOrExit()
+            // The same comparison for the C core in core/, which nothing calls
+            // in production yet — this is what proves each port before its call
+            // sites switch over.
+            CoreParitySelfTest.runOrExit()
         default:
             serveEntry(arguments)
         }
