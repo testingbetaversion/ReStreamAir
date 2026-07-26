@@ -527,6 +527,50 @@
                 </table>
                 <p class="field-hint">Timeouts: <code>channels</code>/<code>events</code> 60s, <code>epg</code> 120s, <code>manifest</code> 45s, <code>cdm</code> 60s, pipeline hooks 15–20s, lifecycle 20s; <code>login</code>/<code>pair</code> run in the background with none. Pipeline hooks fail soft — a hook that errors or times out is logged and ReStreamAir falls back to its built-in behaviour.</p>
                 <p>Channel/event import per item uses keys: <code>Name</code>, <code>Mode</code> (live/vod), <code>SessionManifest</code>, <code>UseCdm</code>, <code>CdmType</code>, <code>Video</code>, <code>Autostart</code>, <code>Start</code>/<code>End</code>, and <code>ScriptParams</code>. Re-running an import updates matching streams in place.</p>
+
+                <h4 class="help-subhead">Expected output — worked examples</h4>
+                <p class="field-hint">The <code>//</code> comments below are explanation only. Your script must print <b>valid JSON</b> (no comments) to stdout — put logs/debug on stderr. ReStreamAir tolerates a few log lines before the JSON blob, and reads the first <code>{ … }</code>.</p>
+
+                <p class="help-note"><code>channels</code> — one entry becomes one stream under the provider:</p>
+                <pre class="help-pre">{
+  "Channels": [
+    {
+      "Name": "Channel One",     // stream name (also the match key on re-import)
+      "Mode": "live",            // "live" or "vod"
+      "ScriptParams": "id=101",  // passed to manifest/cdm/heartbeat for THIS stream
+      "SessionManifest": true,   // fetch a fresh URL from `manifest` on every start
+      "UseCdm": true,            // resolve DRM keys via the `cdm` action
+      "CdmType": "widevine",     // hint only; ReStreamAir forwards all DRM it finds
+      "Video": "best",           // preferred quality (optional)
+      "Autostart": false         // start automatically after import (events use Start/End)
+    }
+  ]
+}</pre>
+
+                <p class="help-note"><code>manifest</code> — a fresh, per-session source (Session manifest):</p>
+                <pre class="help-pre">{
+  "ManifestUrl": "https://cdn1.example.com/live/abc123.mpd",  // the source to stream from
+  "Cdn": [                                                    // failover mirrors, tried in order
+    { "Name": "cdn2", "ManifestUrl": "https://cdn2.example.com/live/abc123.mpd" }
+  ],
+  "Headers": {                          // sent per fetch category
+    "manifest": { "User-Agent": "MyApp/1.0", "Authorization": "Bearer eyJ…" },
+    "media":    { "User-Agent": "MyApp/1.0" }
+  },
+  "Heartbeat": {                        // keep the session alive (optional)
+    "Url": "https://example.com/keepalive",
+    "Params": ["id=101"],
+    "PeriodMs": 300000                  // run the `heartbeat` action every 5 min
+  }
+}</pre>
+
+                <p class="help-note"><code>cdm</code> — clear keys for a protected stream. Print one pair per line, or JSON:</p>
+                <pre class="help-pre">// simplest: one KID:KEY hex pair per line (KID and key are 32 hex chars)
+c3d43de9ff5b5a45cdc9f4e7f177a1a5:11223344556677889900aabbccddeeff
+
+// or JSON:
+{ "keys": [ { "kid": "c3d43de9ff5b5a45cdc9f4e7f177a1a5",
+              "key": "11223344556677889900aabbccddeeff" } ] }</pre>
               </article>
 
               <article id="help-drm" class="help-card">

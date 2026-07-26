@@ -1097,6 +1097,7 @@ pre {
   scroll-margin-top: 16px;
 }
 .help-card h3 { margin: 0 0 10px; font-size: 16px; }
+.help-subhead { margin: 18px 0 8px; font-size: 14px; font-weight: 700; color: var(--text); }
 .help-card p { margin: 9px 0; line-height: 1.6; color: var(--text); }
 .help-card ul, .help-card ol { margin: 9px 0; padding-left: 20px; line-height: 1.7; }
 .help-card li { margin: 3px 0; }
