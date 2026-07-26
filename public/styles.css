@@ -802,6 +802,54 @@ label {
 .script-toggle { margin: 8px 0; }
 .script-toggle > .check { font-weight: 600; }
 .field-hint.sub { display: block; margin: 3px 0 0 26px; line-height: 1.5; }
+
+/* Script action grid — two columns on desktop, one on narrow screens. Each
+   entry is a checkbox with its own hint underneath, so it reads as a list of
+   capabilities rather than a wall of unlabelled toggles. */
+.script-actions-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 6px 18px;
+  margin: 8px 0 12px;
+}
+.script-actions-grid .script-action {
+  /* Checkbox in its own column so the hint can sit under the name rather than
+     beside it, which forced longer names to wrap mid-label. */
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 2px 8px;
+  font-weight: 600;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.script-actions-grid .script-action .field-hint.sub {
+  grid-column: 2;
+  margin: 0;
+  font-weight: 400;
+}
+/* Configurable but not yet invoked — dimmed so it's clear ticking it does
+   nothing today. */
+.script-actions-grid .script-action.unwired { opacity: 0.55; }
+
+.session-store-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 6px 0 12px;
+}
+.session-path {
+  flex: 1 1 260px;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 12px;
+}
 .proxy-scope {
   display: flex;
   flex-wrap: wrap;

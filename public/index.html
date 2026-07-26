@@ -125,6 +125,15 @@
                 <label>Worker<span class="field-hint">Passed through as worker=</span><input name="scriptWorker" placeholder="optional"></label>
               </div>
 
+              <div class="field-group-title">Script actions<span class="field-hint">Which actions this script implements. ReStreamAir only ever calls the ones ticked here — anything else is never invoked, so a script that only does channels never sees a start/stop it can't handle. Streams inherit this and can override it individually.</span></div>
+              <div id="providerScriptActions" class="script-actions-grid"></div>
+
+              <div class="field-group-title">Session store<span class="field-hint">Where this provider's script keeps its login and cookies. Passed on every call as sessiondir= and cookies=; ReStreamAir creates the folder and never reads what's in it.</span></div>
+              <div class="session-store-row">
+                <code id="providerSessionDir" class="session-path">—</code>
+                <button type="button" class="ghost" id="clearScriptSessionBtn"><span data-icon="trash"></span>Clear session</button>
+              </div>
+
               <div class="field-group-title">Accounts<span class="field-hint">Sent as user=/password= — leave Password blank if your script only needs a username, or leave both blank for a credential-less pairing flow</span></div>
               <label>Account selection<span class="field-hint">Which account Login/Pair/Load channels/Load events uses each time</span>
                 <select name="accountSelectionMode">
@@ -145,6 +154,7 @@
                 <button type="button" class="ghost" id="scriptPairBtn"><span data-icon="play"></span>Pair</button>
                 <button type="button" class="ghost" id="scriptLoadChannelsBtn"><span data-icon="refresh"></span>Load channels</button>
                 <button type="button" class="ghost" id="scriptLoadEventsBtn"><span data-icon="refresh"></span>Load events</button>
+                <button type="button" class="ghost" id="scriptLoadEpgBtn"><span data-icon="refresh"></span>Load EPG</button>
                 <button type="button" class="ghost" id="toggleScriptOutputBtn"><span data-icon="logs"></span>Show terminal</button>
               </div>
               <pre id="scriptOutputBox" class="script-output hidden"></pre>
@@ -234,6 +244,12 @@
                 <label class="check"><input name="heartbeatEnabled" type="checkbox"> Heartbeat</label>
                 <p class="field-hint sub">Ping the <code>heartbeat</code> action periodically to keep the session alive.</p>
               </div>
+
+              <div class="script-toggle">
+                <label class="check"><input id="overrideScriptActions" type="checkbox"> Override provider script actions</label>
+                <p class="field-hint sub">Off, this stream runs whatever its provider declares. On, it runs exactly what's ticked below and nothing else — untick everything to keep the script away from this stream entirely.</p>
+              </div>
+              <div id="streamScriptActions" class="script-actions-grid hidden"></div>
 
               <div class="form-row">
                 <label>Heartbeat (seconds)<span class="field-hint">0 = auto from the manifest's Heartbeat.PeriodMs</span><input name="heartbeatSeconds" type="number" min="0" step="1" value="0"></label>

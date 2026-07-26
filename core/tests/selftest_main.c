@@ -1,0 +1,795 @@
+// Known-answer self-test for the C core. Two kinds of check live here:
+//
+//   * Published NIST/FIPS/RFC vectors for the crypto, so a build proves its
+//     SHA-256, PBKDF2 and AES produce the right bytes on that platform rather
+//     than merely compiling. These mirror CryptoSelfTest in AES.swift and add
+//     the multi-block and streaming cases the Swift version does not cover.
+//   * Goldens captured from the Swift implementations (goldens.h) for the URL
+//     resolver, playlist rewriter and ffmpeg argument builder, so the C port is
+//     measured against the behaviour the app ships today.
+//
+// No test framework: a failure prints what broke and exits non-zero, which is
+// all ctest and CI need.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "rs_aes.h"
+#include "rs_auth.h"
+#include "rs_crypto.h"
+#include "rs_ffargs.h"
+#include "rs_json.h"
+#include "rs_m3u8.h"
+#include "rs_panel.h"
+#include "rs_state.h"
+#include "rs_url.h"
+
+#include "fixtures.h"
+#include "goldens.h"
+
+static int checks_run = 0;
+static int failures = 0;
+
+static void fail(const char *name, const char *detail) {
+    failures++;
+    fprintf(stderr, "FAIL %s\n", name);
+    if (detail && detail[0]) fprintf(stderr, "     %s\n", detail);
+}
+
+static void check(const char *name, bool condition) {
+    checks_run++;
+    if (!condition) fail(name, NULL);
+}
+
+static void check_str(const char *name, const char *actual, const char *expected) {
+    checks_run++;
+    if (!actual || strcmp(actual, expected) != 0) {
+        failures++;
+        fprintf(stderr, "FAIL %s\n     expected: %s\n     actual:   %s\n",
+                name, expected, actual ? actual : "(null)");
+    }
+}
+
+// --- hex helpers ------------------------------------------------------------
+
+static size_t from_hex(const char *hex, uint8_t *out, size_t out_cap) {
+    size_t len = strlen(hex) / 2;
+    if (len > out_cap) {
+        fprintf(stderr, "internal error: hex literal too long\n");
+        exit(2);
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned value = 0;
+        sscanf(hex + i * 2, "%2x", &value);
+        out[i] = (uint8_t)value;
+    }
+    return len;
+}
+
+static void to_hex(const uint8_t *bytes, size_t len, char *out) {
+    for (size_t i = 0; i < len; i++) sprintf(out + i * 2, "%02x", bytes[i]);
+    out[len * 2] = '\0';
+}
+
+static void check_hex(const char *name, const uint8_t *bytes, size_t len, const char *expected) {
+    char actual[256];
+    if (len * 2 + 1 > sizeof(actual)) {
+        fail(name, "digest too long for the comparison buffer");
+        return;
+    }
+    to_hex(bytes, len, actual);
+    check_str(name, actual, expected);
+}
+
+// Values captured from the Swift implementations. A missing key means the
+// goldens and this file have drifted apart, which is a broken test rather than
+// a failing one.
+static const char *golden(const char *key) {
+    for (size_t i = 0; i < sizeof(rs_goldens) / sizeof(rs_goldens[0]); i++) {
+        if (strcmp(rs_goldens[i].key, key) == 0) return rs_goldens[i].value;
+    }
+    fprintf(stderr, "internal error: no golden named '%s' — rerun scripts/gen-goldens.py\n", key);
+    exit(2);
+}
+
+// --- crypto -----------------------------------------------------------------
+
+static void test_sha256(void) {
+    uint8_t digest[RS_SHA256_DIGEST_LEN];
+
+    rs_sha256((const uint8_t *)"abc", 3, digest);
+    check_hex("sha256/abc", digest, sizeof(digest),
+              "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+    rs_sha256((const uint8_t *)"", 0, digest);
+    check_hex("sha256/empty", digest, sizeof(digest),
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+    // 448 bits, so padding spills into a second block.
+    const char *two_block = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    rs_sha256((const uint8_t *)two_block, strlen(two_block), digest);
+    check_hex("sha256/two-block", digest, sizeof(digest),
+              "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+
+    // The same input fed in awkward chunks must land on the same digest — the
+    // streaming path has no counterpart in the Swift one-shot implementation.
+    rs_sha256_ctx ctx;
+    rs_sha256_init(&ctx);
+    size_t offsets[] = {1, 13, 64, 65};
+    size_t position = 0;
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]) && position < strlen(two_block); i++) {
+        size_t take = offsets[i];
+        if (position + take > strlen(two_block)) take = strlen(two_block) - position;
+        rs_sha256_update(&ctx, (const uint8_t *)two_block + position, take);
+        position += take;
+    }
+    if (position < strlen(two_block)) {
+        rs_sha256_update(&ctx, (const uint8_t *)two_block + position, strlen(two_block) - position);
+    }
+    rs_sha256_final(&ctx, digest);
+    check_hex("sha256/streaming", digest, sizeof(digest),
+              "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+
+    // Exactly one block, and one byte past it: the boundary the padding gets
+    // wrong most easily.
+    uint8_t block[65];
+    memset(block, 'a', sizeof(block));
+    rs_sha256(block, 64, digest);
+    check_hex("sha256/64-bytes", digest, sizeof(digest),
+              "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb");
+    rs_sha256(block, 65, digest);
+    check_hex("sha256/65-bytes", digest, sizeof(digest),
+              "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0");
+}
+
+static void test_hmac(void) {
+    uint8_t digest[RS_SHA256_DIGEST_LEN];
+    uint8_t key[200];
+
+    // RFC 4231 case 1
+    memset(key, 0x0b, 20);
+    rs_hmac_sha256(key, 20, (const uint8_t *)"Hi There", 8, digest);
+    check_hex("hmac/rfc4231-1", digest, sizeof(digest),
+              "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+
+    // RFC 4231 case 2 — a key shorter than the digest.
+    rs_hmac_sha256((const uint8_t *)"Jefe", 4, (const uint8_t *)"what do ya want for nothing?", 28, digest);
+    check_hex("hmac/rfc4231-2", digest, sizeof(digest),
+              "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+
+    // RFC 4231 case 6 — a 131-byte key, which must be hashed down first.
+    memset(key, 0xaa, 131);
+    rs_hmac_sha256(key, 131, (const uint8_t *)"Test Using Larger Than Block-Size Key - Hash Key First", 54,
+                   digest);
+    check_hex("hmac/rfc4231-6", digest, sizeof(digest),
+              "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+
+    // A key of exactly one block, where the "hash it first" branch must not
+    // fire. Value from Python's hmac, an implementation unrelated to this one.
+    memset(key, 0x0c, 64);
+    rs_hmac_sha256(key, 64, (const uint8_t *)"block-sized key", 15, digest);
+    check_hex("hmac/block-sized-key", digest, sizeof(digest),
+              "b8f2ae281ed73e99880decadfae4c149bcd78c9d7360cd2f07e5ddf8f44e1e72");
+}
+
+static void test_pbkdf2(void) {
+    uint8_t derived[64];
+
+    // RFC 7914 section 11: P="passwd", S="salt", c=1, dkLen=64.
+    check("pbkdf2/rfc7914-1",
+          rs_pbkdf2_sha256((const uint8_t *)"passwd", 6, (const uint8_t *)"salt", 4, 1, derived, 64) == 0);
+    check_hex("pbkdf2/rfc7914-1-first-32", derived, 32,
+              "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc");
+
+    // A derived length that is not a multiple of the digest exercises the
+    // partial final block.
+    check("pbkdf2/40-bytes",
+          rs_pbkdf2_sha256((const uint8_t *)"passwd", 6, (const uint8_t *)"salt", 4, 2, derived, 40) == 0);
+    check_hex("pbkdf2/40-bytes-value", derived, 40,
+              "2d412f896e76685e30df569f0a740634e31f031f749d607d9e44210b"
+              "ffb91a6ab670f500c7886200");
+    check("pbkdf2/rejects-zero-iterations",
+          rs_pbkdf2_sha256((const uint8_t *)"p", 1, (const uint8_t *)"s", 1, 0, derived, 32) == -1);
+    check("pbkdf2/rejects-zero-length",
+          rs_pbkdf2_sha256((const uint8_t *)"p", 1, (const uint8_t *)"s", 1, 1, derived, 0) == -1);
+
+    // RFC 6070 vector re-keyed to SHA-256 (the widely published value), which
+    // also proves the many-iteration loop.
+    check("pbkdf2/4096",
+          rs_pbkdf2_sha256((const uint8_t *)"password", 8, (const uint8_t *)"salt", 4, 4096, derived, 32) == 0);
+    check_hex("pbkdf2/4096-value", derived, 32,
+              "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+}
+
+static void test_aes_blocks(void) {
+    uint8_t key[32], in[16], out[16];
+    rs_aes aes;
+
+    // FIPS-197 appendix C
+    from_hex("000102030405060708090a0b0c0d0e0f", key, sizeof(key));
+    check("aes128/init", rs_aes_init(&aes, key, 16) == 0);
+    from_hex("00112233445566778899aabbccddeeff", in, sizeof(in));
+    rs_aes_encrypt_block(&aes, in, out);
+    check_hex("aes128/encrypt", out, 16, "69c4e0d86a7b0430d8cdb78070b4c55a");
+    rs_aes_decrypt_block(&aes, out, in);
+    check_hex("aes128/decrypt", in, 16, "00112233445566778899aabbccddeeff");
+
+    // AES-192 has no vector in AES.swift's own self-test, so the expected
+    // values come from running that implementation (see goldens.h).
+    from_hex("000102030405060708090a0b0c0d0e0f1011121314151617", key, sizeof(key));
+    check("aes192/init", rs_aes_init(&aes, key, 24) == 0);
+    from_hex("00112233445566778899aabbccddeeff", in, sizeof(in));
+    rs_aes_encrypt_block(&aes, in, out);
+    check_hex("aes192/encrypt", out, 16, golden("aes:192-encrypt"));
+    rs_aes_decrypt_block(&aes, out, in);
+    check_hex("aes192/decrypt", in, 16, golden("aes:192-decrypt"));
+
+    from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", key, sizeof(key));
+    check("aes256/init", rs_aes_init(&aes, key, 32) == 0);
+    from_hex("00112233445566778899aabbccddeeff", in, sizeof(in));
+    rs_aes_encrypt_block(&aes, in, out);
+    check_hex("aes256/encrypt", out, 16, "8ea2b7ca516745bfeafc49904b496089");
+    rs_aes_decrypt_block(&aes, out, in);
+    check_hex("aes256/decrypt", in, 16, "00112233445566778899aabbccddeeff");
+
+    check("aes/rejects-bad-key-length", rs_aes_init(&aes, key, 17) == -1);
+}
+
+static void test_aes_ctr(void) {
+    uint8_t key[16], iv[16], data[64];
+    from_hex("2b7e151628aed2a6abf7158809cf4f3c", key, sizeof(key));
+    from_hex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff", iv, sizeof(iv));
+
+    // NIST SP 800-38A F.5.1 block 1 — the vector AES.swift's own self-test
+    // carries, so it is checked here as a literal too.
+    rs_aes_ctr ctr;
+    uint8_t block[16];
+    from_hex("6bc1bee22e409f96e93d7e117393172a", block, sizeof(block));
+    check("ctr/init", rs_aes_ctr_init(&ctr, key, 16, iv, 16) == 0);
+    rs_aes_ctr_process(&ctr, block, 16);
+    check_hex("ctr/f5.1-block-1", block, 16, "874d6191b620e3261bef6864990db6ce");
+
+    // Four blocks of keystream, from the Swift AESCTR.
+    for (size_t i = 0; i < sizeof(data); i++) data[i] = (uint8_t)i;
+    rs_aes_ctr_init(&ctr, key, 16, iv, 16);
+    rs_aes_ctr_process(&ctr, data, 64);
+    check_hex("ctr/64-bytes", data, 64, golden("aes:ctr-64"));
+
+    // The same keystream produced across ragged calls: the continuity CENC's
+    // per-subsample decryption depends on.
+    for (size_t i = 0; i < sizeof(data); i++) data[i] = (uint8_t)i;
+    rs_aes_ctr_init(&ctr, key, 16, iv, 16);
+    size_t chunks[] = {1, 15, 33, 15};
+    size_t offset = 0;
+    for (size_t i = 0; i < sizeof(chunks) / sizeof(chunks[0]); i++) {
+        rs_aes_ctr_process(&ctr, data + offset, chunks[i]);
+        offset += chunks[i];
+    }
+    check("ctr/split-covers-input", offset == 64);
+    check_hex("ctr/64-bytes-split", data, 64, golden("aes:ctr-64"));
+
+    // A short IV is zero-padded rather than rejected, as AESCTR does.
+    uint8_t short_iv[4] = {0xf0, 0xf1, 0xf2, 0xf3};
+    uint8_t short_data[32];
+    for (size_t i = 0; i < sizeof(short_data); i++) short_data[i] = (uint8_t)i;
+    check("ctr/short-iv", rs_aes_ctr_init(&ctr, key, 16, short_iv, 4) == 0);
+    rs_aes_ctr_process(&ctr, short_data, sizeof(short_data));
+    check_hex("ctr/short-iv-value", short_data, sizeof(short_data), golden("aes:ctr-short-iv"));
+    check("ctr/rejects-bad-key", rs_aes_ctr_init(&ctr, key, 7, iv, 16) == -1);
+
+    // Counter carry across the 128-bit boundary.
+    uint8_t max_iv[16];
+    from_hex("ffffffffffffffffffffffffffffffff", max_iv, sizeof(max_iv));
+    rs_aes_ctr_init(&ctr, key, 16, max_iv, 16);
+    uint8_t two_blocks[32];
+    memset(two_blocks, 0, sizeof(two_blocks));
+    rs_aes_ctr_process(&ctr, two_blocks, 32);
+    uint8_t expected_first[16], expected_second[16];
+    rs_aes wrapped;
+    rs_aes_init(&wrapped, key, 16);
+    rs_aes_encrypt_block(&wrapped, max_iv, expected_first);
+    uint8_t zero_block[16];
+    memset(zero_block, 0, sizeof(zero_block));
+    rs_aes_encrypt_block(&wrapped, zero_block, expected_second);
+    check("ctr/counter-wraps",
+          memcmp(two_blocks, expected_first, 16) == 0 &&
+              memcmp(two_blocks + 16, expected_second, 16) == 0);
+}
+
+static void test_aes_cbc(void) {
+    uint8_t key[16], iv[16], ct[64], out[64];
+    size_t out_len = 0;
+
+    from_hex("2b7e151628aed2a6abf7158809cf4f3c", key, sizeof(key));
+    from_hex("000102030405060708090a0b0c0d0e0f", iv, sizeof(iv));
+
+    // 48 bytes of content plus a full block of PKCS7 padding, so a correct
+    // decrypt hands back 48. Ciphertext and plaintext both from AESCBC.
+    size_t ct_len = from_hex(golden("aes:cbc-padded-cipher"), ct, sizeof(ct));
+    check("cbc/padded", rs_aes_cbc_decrypt(key, 16, iv, 16, ct, ct_len, out, &out_len) == 0);
+    check("cbc/padded-strips-a-full-block", ct_len == 64 && out_len == 48);
+    check_hex("cbc/padded-plaintext", out, out_len, golden("aes:cbc-padded-plain"));
+
+    // A plaintext whose final byte is not a valid pad comes back whole rather
+    // than as an error — deliberate, and load-bearing for existing streams.
+    ct_len = from_hex(golden("aes:cbc-unpadded-cipher"), ct, sizeof(ct));
+    check("cbc/invalid-pad", rs_aes_cbc_decrypt(key, 16, iv, 16, ct, ct_len, out, &out_len) == 0);
+    check("cbc/invalid-pad-keeps-everything", out_len == 32);
+    check_hex("cbc/invalid-pad-plaintext", out, out_len, golden("aes:cbc-unpadded-plain"));
+
+    check("cbc/rejects-empty", rs_aes_cbc_decrypt(key, 16, iv, 16, ct, 0, out, &out_len) == -1);
+    check("cbc/rejects-misaligned", rs_aes_cbc_decrypt(key, 16, iv, 16, ct, 31, out, &out_len) == -1);
+    check("cbc/rejects-short-iv", rs_aes_cbc_decrypt(key, 16, iv, 12, ct, 32, out, &out_len) == -1);
+    check("cbc/rejects-bad-key", rs_aes_cbc_decrypt(key, 13, iv, 16, ct, 32, out, &out_len) == -1);
+}
+
+// --- goldens ----------------------------------------------------------------
+
+static const char UNIT_SEP[] = "\x1f";
+static const char RECORD_SEP[] = "\x1e";
+static const char GROUP_SEP[] = "\x1d";
+
+static const rs_playlist_fixture *find_playlist(const char *name) {
+    for (size_t i = 0; i < sizeof(rs_playlist_fixtures) / sizeof(rs_playlist_fixtures[0]); i++) {
+        if (strcmp(rs_playlist_fixtures[i].name, name) == 0) return &rs_playlist_fixtures[i];
+    }
+    return NULL;
+}
+
+static const rs_ffargs_inputs *find_ffargs(const char *name) {
+    for (size_t i = 0; i < sizeof(rs_ffargs_cases) / sizeof(rs_ffargs_cases[0]); i++) {
+        if (strcmp(rs_ffargs_case_names[i], name) == 0) return &rs_ffargs_cases[i];
+    }
+    return NULL;
+}
+
+// The transform scripts/dump-goldens.swift uses, so the two sides can be
+// compared line for line.
+static char *media_transform(void *userdata, const char *uri, rs_m3u8_line_kind kind, int64_t seq) {
+    (void)userdata;
+    const char *kind_name = kind == RS_M3U8_LINE_KEY ? "key" : (kind == RS_M3U8_LINE_MAP ? "map" : "seg");
+    size_t size = strlen(uri) + 64;
+    char *out = (char *)malloc(size);
+    if (!out) return NULL;
+    if (seq >= 0) {
+        snprintf(out, size, "/p/%s?u=%s&s=%lld", kind_name, uri, (long long)seq);
+    } else {
+        snprintf(out, size, "/p/%s?u=%s", kind_name, uri);
+    }
+    return out;
+}
+
+static char *master_transform(void *userdata, const char *uri) {
+    (void)userdata;
+    size_t size = strlen(uri) + 8;
+    char *out = (char *)malloc(size);
+    if (out) snprintf(out, size, "/m?u=%s", uri);
+    return out;
+}
+
+static void append_field(char **buffer, size_t *cap, size_t *len, const char *text) {
+    size_t needed = *len + strlen(text) + 1;
+    if (needed > *cap) {
+        while (*cap < needed) *cap = *cap ? *cap * 2 : 256;
+        *buffer = (char *)realloc(*buffer, *cap);
+        if (!*buffer) {
+            fprintf(stderr, "out of memory building a golden comparison\n");
+            exit(2);
+        }
+    }
+    memcpy(*buffer + *len, text, strlen(text) + 1);
+    *len += strlen(text);
+}
+
+static void append_int(char **buffer, size_t *cap, size_t *len, int64_t value) {
+    char text[32];
+    snprintf(text, sizeof(text), "%lld", (long long)value);
+    append_field(buffer, cap, len, text);
+}
+
+// Serialises a probe result the way the Swift dumper does.
+static char *serialize_probe(const rs_m3u8_probe *probe) {
+    char *buffer = NULL;
+    size_t cap = 0, len = 0;
+    append_field(&buffer, &cap, &len, "");
+    for (size_t i = 0; i < probe->variant_count; i++) {
+        const rs_m3u8_variant *v = &probe->variants[i];
+        if (i > 0) append_field(&buffer, &cap, &len, RECORD_SEP);
+        append_field(&buffer, &cap, &len, v->uri);
+        append_field(&buffer, &cap, &len, UNIT_SEP);
+        if (v->bandwidth >= 0) append_int(&buffer, &cap, &len, v->bandwidth);
+        else append_field(&buffer, &cap, &len, "<nil>");
+        append_field(&buffer, &cap, &len, UNIT_SEP);
+        if (v->width >= 0) append_int(&buffer, &cap, &len, v->width);
+        else append_field(&buffer, &cap, &len, "<nil>");
+        append_field(&buffer, &cap, &len, UNIT_SEP);
+        if (v->height >= 0) append_int(&buffer, &cap, &len, v->height);
+        else append_field(&buffer, &cap, &len, "<nil>");
+        append_field(&buffer, &cap, &len, UNIT_SEP);
+        append_field(&buffer, &cap, &len, v->codecs ? v->codecs : "<nil>");
+    }
+    append_field(&buffer, &cap, &len, GROUP_SEP);
+    for (size_t i = 0; i < probe->audio_count; i++) {
+        const rs_m3u8_audio_track *t = &probe->audio_tracks[i];
+        if (i > 0) append_field(&buffer, &cap, &len, RECORD_SEP);
+        append_field(&buffer, &cap, &len, t->group_id);
+        append_field(&buffer, &cap, &len, UNIT_SEP);
+        append_field(&buffer, &cap, &len, t->name);
+        append_field(&buffer, &cap, &len, UNIT_SEP);
+        append_field(&buffer, &cap, &len, t->language ? t->language : "<nil>");
+        append_field(&buffer, &cap, &len, UNIT_SEP);
+        append_field(&buffer, &cap, &len, t->uri ? t->uri : "<nil>");
+    }
+    return buffer;
+}
+
+static char *serialize_command(const rs_ffargs_command *command) {
+    char *buffer = NULL;
+    size_t cap = 0, len = 0;
+    append_field(&buffer, &cap, &len, "");
+    for (size_t i = 0; i < command->argc; i++) {
+        if (i > 0) append_field(&buffer, &cap, &len, UNIT_SEP);
+        append_field(&buffer, &cap, &len, command->argv[i]);
+    }
+    append_field(&buffer, &cap, &len, GROUP_SEP);
+    // The Swift dumper sorts environment keys; http_proxy precedes https_proxy
+    // in that order, which is the order rs_ffargs_build emits them in anyway.
+    for (size_t i = 0; i < command->env_count; i++) {
+        if (i > 0) append_field(&buffer, &cap, &len, UNIT_SEP);
+        append_field(&buffer, &cap, &len, command->env_keys[i]);
+        append_field(&buffer, &cap, &len, "=");
+        append_field(&buffer, &cap, &len, command->env_values[i]);
+    }
+    return buffer;
+}
+
+static void run_golden(const rs_golden *entry) {
+    const char *key = entry->key;
+
+    // The AES goldens are consumed directly by test_aes_* above.
+    if (strncmp(key, "aes:", 4) == 0) return;
+
+    if (strncmp(key, "resolve:", 8) == 0) {
+        // The key is "resolve:<base><unit separator><ref>".
+        const char *base_start = key + 8;
+        const char *separator = strchr(base_start, '\x1f');
+        if (!separator) { fail(key, "malformed resolve golden"); return; }
+        char base[512];
+        size_t base_len = (size_t)(separator - base_start);
+        if (base_len >= sizeof(base)) { fail(key, "base too long"); return; }
+        memcpy(base, base_start, base_len);
+        base[base_len] = '\0';
+
+        char *resolved = rs_url_resolve(base, separator + 1);
+        check_str(key, resolved ? resolved : "<nil>", entry->value);
+        rs_free(resolved);
+        return;
+    }
+
+    if (strncmp(key, "mediaseq:", 9) == 0) {
+        const rs_playlist_fixture *fixture = find_playlist(key + 9);
+        if (!fixture) { fail(key, "unknown playlist fixture"); return; }
+        char actual[32];
+        snprintf(actual, sizeof(actual), "%lld", (long long)rs_m3u8_media_sequence(fixture->text));
+        check_str(key, actual, entry->value);
+        return;
+    }
+
+    if (strncmp(key, "ismaster:", 9) == 0) {
+        const rs_playlist_fixture *fixture = find_playlist(key + 9);
+        if (!fixture) { fail(key, "unknown playlist fixture"); return; }
+        check_str(key, rs_m3u8_is_master(fixture->text) ? "1" : "0", entry->value);
+        return;
+    }
+
+    if (strncmp(key, "rewrite:", 8) == 0) {
+        char name[64];
+        const char *rest = key + 8;
+        const char *colon = strrchr(rest, ':');
+        if (!colon || (size_t)(colon - rest) >= sizeof(name)) { fail(key, "malformed rewrite golden"); return; }
+        memcpy(name, rest, (size_t)(colon - rest));
+        name[colon - rest] = '\0';
+        const rs_playlist_fixture *fixture = find_playlist(name);
+        if (!fixture) { fail(key, "unknown playlist fixture"); return; }
+
+        char *actual = rs_m3u8_rewrite(fixture->text, fixture->base, colon[1] == '1',
+                                       media_transform, NULL);
+        check_str(key, actual, entry->value);
+        rs_free(actual);
+        return;
+    }
+
+    if (strncmp(key, "master:", 7) == 0) {
+        const rs_playlist_fixture *fixture = find_playlist(key + 7);
+        if (!fixture) { fail(key, "unknown playlist fixture"); return; }
+        char *actual = rs_m3u8_rewrite_master(fixture->text, fixture->base, master_transform, NULL);
+        check_str(key, actual, entry->value);
+        rs_free(actual);
+        return;
+    }
+
+    if (strncmp(key, "probe:", 6) == 0) {
+        const rs_playlist_fixture *fixture = find_playlist(key + 6);
+        if (!fixture) { fail(key, "unknown playlist fixture"); return; }
+        rs_m3u8_probe probe;
+        if (rs_m3u8_probe_master(fixture->text, fixture->base, &probe) != 0) {
+            fail(key, "probe failed");
+            return;
+        }
+        char *actual = serialize_probe(&probe);
+        check_str(key, actual, entry->value);
+        free(actual);
+        rs_m3u8_probe_dispose(&probe);
+        return;
+    }
+
+    if (strncmp(key, "ffargs:", 7) == 0) {
+        const rs_ffargs_inputs *inputs = find_ffargs(key + 7);
+        if (!inputs) { fail(key, "unknown ffmpeg fixture"); return; }
+        rs_ffargs_command command;
+        if (rs_ffargs_build(inputs, &command) != 0) {
+            fail(key, "build failed");
+            return;
+        }
+        char *actual = serialize_command(&command);
+        check_str(key, actual, entry->value);
+        free(actual);
+        rs_ffargs_command_dispose(&command);
+        return;
+    }
+
+    fail(key, "no handler for this golden key");
+}
+
+// --- helpers that have no Swift counterpart to compare against --------------
+
+static void test_ffargs_helpers(void) {
+    char *key = rs_ffargs_first_clear_key("\n  \nkid1:abc123\nkid2:def\n");
+    check_str("ffargs/first-clear-key", key ? key : "(null)", "abc123");
+    rs_free(key);
+
+    key = rs_ffargs_first_clear_key("bareKeyOnly");
+    check_str("ffargs/bare-key", key ? key : "(null)", "bareKeyOnly");
+    rs_free(key);
+
+    key = rs_ffargs_first_clear_key("");
+    check("ffargs/no-key", key == NULL);
+    rs_free(key);
+
+    char *block = rs_ffargs_header_block(" A: 1 \n\n B: 2 ");
+    check_str("ffargs/header-block", block ? block : "(null)", "A: 1\r\nB: 2\r\n");
+    rs_free(block);
+
+    block = rs_ffargs_header_block("   \n  ");
+    check("ffargs/no-headers", block == NULL);
+    rs_free(block);
+
+    char **tokens = NULL;
+    size_t count = 0;
+    check("ffargs/tokenize", rs_ffargs_tokenize("-f flv 'a b' \"c d\" e", &tokens, &count) == 0);
+    check("ffargs/tokenize-count", count == 5);
+    if (count == 5) {
+        check_str("ffargs/tokenize-0", tokens[0], "-f");
+        check_str("ffargs/tokenize-2", tokens[2], "a b");
+        check_str("ffargs/tokenize-3", tokens[3], "c d");
+        check_str("ffargs/tokenize-4", tokens[4], "e");
+    }
+    rs_free_strv(tokens, count);
+}
+
+// --- JSON DOM ---------------------------------------------------------------
+
+static void test_json(void) {
+    // Round-trip every type, compact.
+    const char *sample =
+        "{\"a\":1,\"b\":-2.5,\"c\":\"hi\",\"d\":true,\"e\":null,"
+        "\"f\":[1,2,3],\"g\":{\"nested\":\"x\"},\"h\":\"\\u00e9\\n\\t\\\"\"}";
+    rs_json *v = rs_json_parse(sample, strlen(sample));
+    check("json/parse", v != NULL);
+    if (v) {
+        check("json/type", rs_json_type_of(v) == RS_JSON_OBJ);
+        check("json/num-int", rs_json_as_num(rs_json_obj_get(v, "a"), 0) == 1.0);
+        check("json/num-real", rs_json_as_num(rs_json_obj_get(v, "b"), 0) == -2.5);
+        check_str("json/str", rs_json_as_str(rs_json_obj_get(v, "c"), ""), "hi");
+        check("json/bool", rs_json_as_bool(rs_json_obj_get(v, "d"), false) == true);
+        check("json/null", rs_json_type_of(rs_json_obj_get(v, "e")) == RS_JSON_NULL);
+        check("json/arr-len", rs_json_arr_len(rs_json_obj_get(v, "f")) == 3);
+        // The escaped string decodes to é (UTF-8), a newline, a tab and a quote.
+        check_str("json/unescape", rs_json_as_str(rs_json_obj_get(v, "h"), ""), "\xc3\xa9\n\t\"");
+
+        // Integers stay integers; a re-serialize+parse is stable.
+        char *out = rs_json_serialize(v, false);
+        rs_json *again = out ? rs_json_parse(out, strlen(out)) : NULL;
+        check("json/reparse", again != NULL);
+        char *out2 = again ? rs_json_serialize(again, false) : NULL;
+        check_str("json/round-trip-stable", out2 ? out2 : "", out ? out : "");
+        rs_free(out);
+        rs_free(out2);
+        rs_json_free(again);
+    }
+    rs_json_free(v);
+
+    // The load-bearing property: mutating one key must not disturb fields the
+    // code never touched — this is what keeps state.json intact.
+    const char *stored =
+        "{\"providers\":[{\"id\":\"p1\",\"secretField\":42,\"nested\":{\"deep\":[1,2]}}],"
+        "\"adminUsers\":[],\"unknownTopLevel\":\"keep me\"}";
+    rs_json *state = rs_json_parse(stored, strlen(stored));
+    check("json/state-parse", state != NULL);
+    if (state) {
+        rs_json *users = rs_json_new_arr();
+        rs_json *admin = rs_json_new_obj();
+        rs_json_obj_set(admin, "username", rs_json_new_str("me"));
+        rs_json_arr_push(users, admin);
+        rs_json_obj_set(state, "adminUsers", users);  // replace only adminUsers
+
+        char *out = rs_json_serialize(state, false);
+        check("json/preserve-unknown-toplevel", out && strstr(out, "\"unknownTopLevel\":\"keep me\"") != NULL);
+        check("json/preserve-nested", out && strstr(out, "\"secretField\":42") != NULL);
+        check("json/preserve-deep", out && strstr(out, "\"deep\":[1,2]") != NULL);
+        check("json/mutation-applied", out && strstr(out, "\"username\":\"me\"") != NULL);
+        rs_free(out);
+    }
+    rs_json_free(state);
+
+    // Malformed input is rejected, not half-parsed.
+    check("json/reject-trailing", rs_json_parse("{}x", 3) == NULL);
+    check("json/reject-unclosed", rs_json_parse("{\"a\":", 5) == NULL);
+    check("json/reject-bare", rs_json_parse("nope", 4) == NULL);
+
+    // clone is independent of its source.
+    rs_json *orig = rs_json_parse("{\"x\":[1,{\"y\":2}]}", 17);
+    rs_json *copy = rs_json_clone(orig);
+    rs_json_free(orig);
+    char *copied = copy ? rs_json_serialize(copy, false) : NULL;
+    check_str("json/clone", copied ? copied : "", "{\"x\":[1,{\"y\":2}]}");
+    rs_free(copied);
+    rs_json_free(copy);
+}
+
+// --- auth -------------------------------------------------------------------
+
+static void test_auth(void) {
+    // A hash verifies with the right password and rejects the wrong one, and a
+    // fresh salt each time means two hashes of the same password differ.
+    char *hash1 = NULL, *salt1 = NULL, *hash2 = NULL, *salt2 = NULL;
+    check("auth/hash", rs_auth_hash_password("correct horse", &hash1, &salt1) == 0);
+    check("auth/hash-again", rs_auth_hash_password("correct horse", &hash2, &salt2) == 0);
+    check("auth/salted", hash1 && hash2 && strcmp(hash1, hash2) != 0);
+    check("auth/verify-ok", rs_auth_verify_password("correct horse", hash1, salt1));
+    check("auth/verify-wrong-password", !rs_auth_verify_password("wrong", hash1, salt1));
+    check("auth/verify-wrong-salt", !rs_auth_verify_password("correct horse", hash1, salt2));
+
+    // Interop with the AuthStore encoding: verifying against a hash+salt pair
+    // computed independently (Python's hashlib.pbkdf2_hmac) proves the base64
+    // framing and PBKDF2 parameters match what Swift persists. password
+    // "hunter2", salt = base64("0123456789abcdef").
+    check("auth/known-vector",
+          rs_auth_verify_password("hunter2",
+                                  "+wwwi9gM/eAJl7udbNFuJKYu39MDjh1mH7qtv6nNiFw=",
+                                  "MDEyMzQ1Njc4OWFiY2RlZg=="));
+    rs_free(hash1); rs_free(salt1); rs_free(hash2); rs_free(salt2);
+
+    // Sessions: a created token resolves to its user, logout invalidates it, and
+    // an unknown token resolves to nothing.
+    rs_auth *auth = rs_auth_create();
+    char *token = rs_auth_create_session(auth, "alice", false);
+    check("auth/token", token != NULL);
+    char *who = rs_auth_username_for_token(auth, token);
+    check_str("auth/session-user", who ? who : "", "alice");
+    rs_free(who);
+    check("auth/unknown-token", rs_auth_username_for_token(auth, "nope") == NULL);
+    rs_auth_end_session(auth, token);
+    check("auth/logout", rs_auth_username_for_token(auth, token) == NULL);
+    rs_free(token);
+    rs_auth_destroy(auth);
+
+    // Cookie parsing pulls the session out of a realistic Cookie header.
+    char *t = rs_auth_cookie_token("theme=dark; restreamair_session=abc123; other=1");
+    check_str("auth/cookie-parse", t ? t : "", "abc123");
+    rs_free(t);
+    check("auth/cookie-absent", rs_auth_cookie_token("theme=dark; other=1") == NULL);
+
+    // Set-Cookie matches AuthStore.setCookieHeader byte for byte.
+    char *set = rs_auth_set_cookie("TOK", false);
+    check_str("auth/set-cookie", set ? set : "",
+              "restreamair_session=TOK; HttpOnly; Path=/; SameSite=Lax");
+    rs_free(set);
+    char *set_remember = rs_auth_set_cookie("TOK", true);
+    check_str("auth/set-cookie-remember", set_remember ? set_remember : "",
+              "restreamair_session=TOK; HttpOnly; Path=/; SameSite=Lax; Max-Age=2592000");
+    rs_free(set_remember);
+
+    // Basic auth decode.
+    char *u = NULL, *p = NULL;
+    check("auth/basic", rs_auth_parse_basic("Basic YWRtaW46c2VjcmV0", &u, &p) == 0);
+    check_str("auth/basic-user", u ? u : "", "admin");
+    check_str("auth/basic-pass", p ? p : "", "secret");
+    rs_free(u); rs_free(p);
+}
+
+// --- panel control plane ----------------------------------------------------
+
+// Parses a JSON literal by its own length, so a miscounted constant can't
+// silently break a test.
+static rs_json *parse_json(const char *text) { return rs_json_parse(text, strlen(text)); }
+
+static void test_panel(void) {
+    // Slug: alphanumeric runs joined by single dashes, lowercased.
+    char *slug = rs_panel_slugify("My Cool Stream! (HD)");
+    check_str("panel/slugify", slug ? slug : "", "my-cool-stream-hd");
+    free(slug);
+    slug = rs_panel_slugify("   ");
+    check_str("panel/slugify-empty", slug ? slug : "x", "");
+    free(slug);
+
+    // A create/update/delete round-trip over an in-memory state, asserting the
+    // DOM ends where it should and unknown fields are never disturbed.
+    rs_state st;
+    st.root = parse_json("{\"providers\":[],\"keepThis\":\"untouched\"}");
+    st.path = NULL;
+    check("panel/state-seed", st.root != NULL);
+
+    const char *err = NULL;
+    rs_json *pbody = parse_json("{\"name\":\"P1\"}");
+    check("panel/create-provider", rs_panel_create_provider(&st, pbody, &err) == 0);
+    rs_json_free(pbody);
+    const rs_json *providers = rs_json_obj_get(st.root, "providers");
+    check("panel/provider-count", rs_json_arr_len(providers) == 1);
+    const char *pid = rs_json_obj_str(rs_json_arr_at(providers, 0), "id", "");
+
+    // A stream with a sub-floor playlistSegments must clamp to 3.
+    rs_json *sbody = parse_json(
+        "{\"name\":\"S1\",\"kind\":\"mpd\",\"url\":\"https://e.com/a.mpd\",\"playlistSegments\":1}");
+    check("panel/create-stream", rs_panel_create_stream(&st, pid, sbody, &err) == 0);
+    rs_json_free(sbody);
+    const rs_json *streams = rs_json_obj_get(rs_json_arr_at(providers, 0), "streams");
+    check("panel/stream-count", rs_json_arr_len(streams) == 1);
+    check("panel/clamp", rs_json_obj_int(rs_json_arr_at(streams, 0), "playlistSegments", 0) == 3);
+
+    // A bad URL is rejected with a 400.
+    rs_json *bad = parse_json("{\"name\":\"S2\",\"url\":\"ftp://nope\"}");
+    check("panel/reject-bad-url", rs_panel_create_stream(&st, pid, bad, &err) == -400);
+    rs_json_free(bad);
+
+    // The view exposes computed fields and a slug-based play URL.
+    rs_json *view = rs_panel_view(&st, "host:1");
+    char *rendered = rs_json_serialize(view, false);
+    check("panel/view-playurl", rendered && strstr(rendered, "http://host:1/play/s1/index.m3u8") != NULL);
+    check("panel/view-running", rendered && strstr(rendered, "\"running\":false") != NULL);
+    rs_free(rendered);
+    rs_json_free(view);
+
+    // Delete leaves an empty provider list but keeps the unknown top-level key.
+    check("panel/delete-provider", rs_panel_delete_provider(&st, pid, &err) == 0);
+    check("panel/empty-after-delete", rs_json_arr_len(rs_json_obj_get(st.root, "providers")) == 0);
+    char *final = rs_json_serialize(st.root, false);
+    check("panel/preserve-unknown", final && strstr(final, "\"keepThis\":\"untouched\"") != NULL);
+    rs_free(final);
+    rs_json_free(st.root);
+}
+
+int main(void) {
+    test_sha256();
+    test_hmac();
+    test_pbkdf2();
+    test_aes_blocks();
+    test_aes_ctr();
+    test_aes_cbc();
+    test_ffargs_helpers();
+    test_json();
+    test_auth();
+    test_panel();
+
+    for (size_t i = 0; i < sizeof(rs_goldens) / sizeof(rs_goldens[0]); i++) {
+        run_golden(&rs_goldens[i]);
+    }
+
+    if (failures > 0) {
+        fprintf(stderr, "\nself-test FAILED: %d of %d checks\n", failures, checks_run);
+        return 1;
+    }
+    printf("self-test: all %d checks PASS\n", checks_run);
+    return 0;
+}

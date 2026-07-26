@@ -727,6 +727,14 @@ function renderEditor() {
   }
   form.elements.useCdm.checked = Boolean(stream.useCdm);
   form.elements.sessionManifest.checked = Boolean(stream.sessionManifest);
+  // null/absent override means "inherit the provider"; an array (even an empty
+  // one) means this stream decides for itself.
+  const providerActions = selectedProvider()?.scriptActions || [];
+  const override = stream.scriptActionsOverride;
+  const hasOverride = Array.isArray(override);
+  $("#overrideScriptActions").checked = hasOverride;
+  $("#streamScriptActions").classList.toggle("hidden", !hasOverride);
+  renderScriptActions($("#streamScriptActions"), hasOverride ? override : providerActions);
   form.elements.scriptOverride.value = stream.scriptOverride || "";
   form.elements.heartbeatSeconds.value = stream.heartbeatSeconds || 0;
   form.elements.scriptParams.value = stream.scriptParams || "";
@@ -836,6 +844,9 @@ function streamPayload() {
     useCdm: form.elements.useCdm.checked,
     sessionManifest: form.elements.sessionManifest.checked,
     scriptOverride: form.elements.scriptOverride.value,
+    scriptActionsOverride: $("#overrideScriptActions").checked
+      ? readScriptActions($("#streamScriptActions"))
+      : null,
     heartbeatSeconds: Number(form.elements.heartbeatSeconds.value) || 0,
     scriptParams: form.elements.scriptParams.value,
     proxyScript: form.elements.proxyScript.checked,
@@ -1550,6 +1561,60 @@ async function detectSource() {
   }
 }
 
+// MARK: - Script actions
+//
+// One catalogue, rendered into both the provider grid (which actions the
+// script implements) and the stream grid (this stream's override). Order and
+// grouping follow the pipeline rather than the alphabet, so the list reads like
+// the sequence it actually runs in. `wired: false` entries are stored and
+// respected but never invoked yet — see ScriptAction.isWired in PanelServer.
+const SCRIPT_ACTIONS = [
+  { id: "login", label: "Login", hint: "Authenticate and persist a session." },
+  { id: "pair", label: "Pair", hint: "Device-pairing flow — prints a code and waits." },
+  { id: "channels", label: "Channels", hint: "Bulk-import channels as streams." },
+  { id: "events", label: "Events", hint: "Bulk-import events as streams." },
+  { id: "epg", label: "EPG", hint: "Fetch guide data (XMLTV or JSON), stored per provider." },
+  { id: "start", label: "Start", hint: "Called when a stream starts." },
+  { id: "stop", label: "Stop", hint: "Called when a stream stops." },
+  { id: "manifest", label: "Session manifest", hint: "Fresh source URL, CDNs and headers on every start." },
+  { id: "url", label: "URL processing", hint: "Rewrite a URL before it's fetched." },
+  { id: "downloadmanifest", label: "Manifest download", hint: "The script fetches the manifest itself." },
+  { id: "pssh", label: "PSSH parsing", hint: "Post-process the PSSH boxes before the licence call." },
+  { id: "initparse", label: "Init parsing", hint: "Inspect the init segment for extra KIDs/PSSH." },
+  { id: "cdm", label: "CDM keys", hint: "Return clear KID:KEY pairs." },
+  { id: "heartbeat", label: "Heartbeat", hint: "Periodic ping to keep the session alive." },
+  { id: "downloadinit", label: "Init download", hint: "Not wired yet — a subprocess per fetch needs a persistent worker.", wired: false },
+  { id: "downloadmedia", label: "Segment download", hint: "Not wired yet — a subprocess per segment needs a persistent worker.", wired: false },
+];
+
+// Renders the grid into `container`, ticking whatever's in `selected`.
+function renderScriptActions(container, selected) {
+  const chosen = new Set(selected || []);
+  container.innerHTML = "";
+  for (const action of SCRIPT_ACTIONS) {
+    const label = document.createElement("label");
+    label.className = "check script-action" + (action.wired === false ? " unwired" : "");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = action.id;
+    box.checked = chosen.has(action.id);
+    label.appendChild(box);
+    label.appendChild(document.createTextNode(` ${action.label}`));
+    const hint = document.createElement("span");
+    hint.className = "field-hint sub";
+    hint.textContent = action.hint;
+    label.appendChild(hint);
+    container.appendChild(label);
+  }
+}
+
+// The ticked ids, in catalogue order so the stored array is stable.
+function readScriptActions(container) {
+  return Array.from(container.querySelectorAll("input[type=checkbox]"))
+    .filter((box) => box.checked)
+    .map((box) => box.value);
+}
+
 // MARK: - Provider settings
 
 function updateSegmentUrlParamsVisibility() {
@@ -1750,6 +1815,8 @@ function openProviderSettingsDialog() {
   form.elements.scriptDoh.value = provider.scriptDoh || "";
   form.elements.scriptWorker.value = provider.scriptWorker || "";
   form.elements.accountSelectionMode.value = provider.accountSelectionMode || "fixed";
+  renderScriptActions($("#providerScriptActions"), provider.scriptActions || []);
+  $("#providerSessionDir").textContent = provider.scriptSessionDir || "—";
   scriptAccountsDraft = (provider.scriptAccounts || []).map((a) => ({ ...a }));
   activeScriptAccountIdDraft = provider.activeScriptAccountId || scriptAccountsDraft[0]?.id || "";
   renderScriptAccountsList();
@@ -1815,6 +1882,7 @@ async function saveProviderSettings() {
       scriptDoh: form.elements.scriptDoh.value, scriptWorker: form.elements.scriptWorker.value,
       scriptAccounts: scriptAccountsDraft, activeScriptAccountId: activeScriptAccountIdDraft,
       accountSelectionMode: form.elements.accountSelectionMode.value,
+      scriptActions: readScriptActions($("#providerScriptActions")),
     }),
   });
 }
@@ -2516,6 +2584,25 @@ $("#scriptLoginBtn").addEventListener("click", () => runProviderScript("login"))
 $("#scriptPairBtn").addEventListener("click", () => runProviderScript("pair"));
 $("#scriptLoadChannelsBtn").addEventListener("click", () => runProviderScript("channels"));
 $("#scriptLoadEventsBtn").addEventListener("click", () => runProviderScript("events"));
+$("#scriptLoadEpgBtn").addEventListener("click", () => runProviderScript("epg"));
+$("#overrideScriptActions").addEventListener("change", (event) => {
+  const grid = $("#streamScriptActions");
+  grid.classList.toggle("hidden", !event.target.checked);
+  if (event.target.checked && !readScriptActions(grid).length) {
+    renderScriptActions(grid, selectedProvider()?.scriptActions || []);
+  }
+});
+$("#clearScriptSessionBtn").addEventListener("click", async () => {
+  const provider = selectedProvider();
+  if (!provider) return;
+  if (!confirm("Delete this provider's stored session and cookies? The script will have to log in again.")) return;
+  try {
+    await request(`/api/providers/${provider.id}/script/clear-session`, { method: "POST" });
+    alert("Session store cleared.");
+  } catch (error) {
+    alert(`Couldn't clear the session store: ${error.message || error}`);
+  }
+});
 $("#toggleScriptOutputBtn").addEventListener("click", () => {
   $("#scriptOutputBox").classList.toggle("hidden");
   updateScriptOutputToggleLabel();
