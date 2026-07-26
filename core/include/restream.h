@@ -38,6 +38,19 @@ typedef char *(*restream_probe_fn)(const char *url, const char *proxy, const cha
                                    char *errbuf, size_t errbuf_len);
 void restream_server_set_probe_handler(restream_probe_fn handler);
 
+// A URL fetch handler, used by the playback routes to pull remote playlists and
+// segments. `range` (e.g. "bytes=0-1023", or NULL) is forwarded so byte-range
+// HLS and seeking work without downloading whole files. Fills *out/*out_len
+// (caller frees *out with free); and, when non-NULL, *status (the upstream HTTP
+// code), *content_type and *content_range (malloc'd or NULL). Returns 0 on
+// success, negative on failure with a message in errbuf. Registered by the C++
+// app (libcurl); when unset, the fetch-based playback routes return 501.
+typedef int (*restream_fetch_fn)(const char *url, const char *proxy, const char *headers,
+                                 const char *range, char **out, size_t *out_len,
+                                 long *status, char **content_type, char **content_range,
+                                 char *errbuf, size_t errbuf_len);
+void restream_server_set_fetch_handler(restream_fetch_fn handler);
+
 // Start the server (non-blocking, or spawns a background thread in C,
 // or the Swift app just loops over a poll function).
 // For simplicity in C-Swift integration, we can have a poll function.

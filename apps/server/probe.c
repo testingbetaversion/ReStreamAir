@@ -6,91 +6,13 @@
 #include <string.h>
 #include <strings.h>  // strcasecmp — on Linux it lives here, not in <string.h>
 
-#include <curl/curl.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 
+#include "net.h"
 #include "rs_common.h"
 #include "rs_json.h"
 #include "rs_m3u8.h"
-
-// --- HTTP fetch (libcurl) --------------------------------------------------
-
-typedef struct {
-    char *data;
-    size_t len;
-    size_t cap;
-} http_buf;
-
-static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
-    http_buf *buf = (http_buf *)userdata;
-    size_t incoming = size * nmemb;
-    // Cap at ~16 MB — a manifest is small; anything huge is a wrong URL.
-    if (buf->len + incoming > 16 * 1024 * 1024) return 0;
-    if (buf->len + incoming + 1 > buf->cap) {
-        size_t cap = buf->cap ? buf->cap * 2 : 8192;
-        while (cap < buf->len + incoming + 1) cap *= 2;
-        char *grown = (char *)realloc(buf->data, cap);
-        if (!grown) return 0;
-        buf->data = grown;
-        buf->cap = cap;
-    }
-    memcpy(buf->data + buf->len, ptr, incoming);
-    buf->len += incoming;
-    buf->data[buf->len] = '\0';
-    return incoming;
-}
-
-// Fetches `url` into *out/*out_len (caller frees *out). Returns 0 on success.
-static int http_get(const char *url, const char *proxy, const char *headers,
-                    char **out, size_t *out_len, char *err, size_t errlen) {
-    CURL *curl = curl_easy_init();
-    if (!curl) { snprintf(err, errlen, "Could not initialise HTTP client."); return -1; }
-
-    http_buf buf = {NULL, 0, 0};
-    struct curl_slist *header_list = NULL;
-    if (headers && headers[0]) {
-        // Split the "Name: value" lines and add each non-empty one.
-        char *copy = rs_strdup(headers);
-        for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n")) {
-            while (*line == ' ' || *line == '\t') line++;
-            if (*line) header_list = curl_slist_append(header_list, line);
-        }
-        free(copy);
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ReStreamAir/1.0");
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");  // handle gzip transparently
-    if (proxy && proxy[0]) curl_easy_setopt(curl, CURLOPT_PROXY, proxy);
-    if (header_list) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
-
-    CURLcode rc = curl_easy_perform(curl);
-    long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-    if (header_list) curl_slist_free_all(header_list);
-    curl_easy_cleanup(curl);
-
-    if (rc != CURLE_OK) {
-        snprintf(err, errlen, "Fetch failed: %s", curl_easy_strerror(rc));
-        free(buf.data);
-        return -1;
-    }
-    if (status < 200 || status >= 400) {
-        snprintf(err, errlen, "Source returned HTTP %ld.", status);
-        free(buf.data);
-        return -1;
-    }
-    *out = buf.data;
-    *out_len = buf.len;
-    return 0;
-}
 
 // --- MPD parsing (libxml2) -------------------------------------------------
 
@@ -297,7 +219,8 @@ char *rs_probe_source(const char *url, const char *proxy, const char *headers,
 
     char *data = NULL;
     size_t len = 0;
-    if (http_get(url, proxy, headers, &data, &len, errbuf, errbuf_len) != 0) return NULL;
+    if (rs_fetch_url(url, proxy, headers, NULL, &data, &len, NULL, NULL, NULL, errbuf, errbuf_len) != 0)
+        return NULL;
 
     char *result = NULL;
     bool is_hls = path_ends_with(url, ".m3u8") ||

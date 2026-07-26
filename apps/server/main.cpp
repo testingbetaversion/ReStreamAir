@@ -25,6 +25,7 @@
 
 #include <curl/curl.h>
 
+#include "net.h"
 #include "probe.h"
 #include "restream.h"
 
@@ -133,6 +134,7 @@ int main(int argc, char **argv) {
     // MPD parsing. Both are initialised once here; the handler lives in probe.c.
     curl_global_init(CURL_GLOBAL_DEFAULT);
     restream_server_set_probe_handler(rs_probe_source);
+    restream_server_set_fetch_handler(rs_fetch_url);
 
     restream_server_t *server = restream_server_create();
     if (!server) {

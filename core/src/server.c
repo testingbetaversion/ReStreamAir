@@ -2,6 +2,7 @@
 #include "rs_common.h"
 #include "rs_auth.h"
 #include "rs_json.h"
+#include "rs_m3u8.h"
 #include "rs_panel.h"
 #include "rs_state.h"
 #include "rs_sysstats.h"
@@ -25,10 +26,11 @@ struct restream_server {
 // scratch space, so the broadcast timer can find them.
 #define RS_SSE_MARKER 'S'
 
-// The probe handler is registered by the C++ app; the core only calls through
-// it, so libcurl/libxml2 never reach the Swift build. Declared here so the
-// router (below) can reference it before the setter is defined.
+// The probe/fetch handlers are registered by the C++ app; the core only calls
+// through them, so libcurl/libxml2 never reach the Swift build. Declared here so
+// the router (below) can reference them before their setters are defined.
 static restream_probe_fn g_probe_handler = NULL;
+static restream_fetch_fn g_fetch_handler = NULL;
 
 // --- small response helpers ------------------------------------------------
 
@@ -535,21 +537,240 @@ static char *playback_key(struct mg_http_message *hm) {
     return NULL;
 }
 
-// Handles the playback routes that need no fetch: the /source redirect and a
-// direct-source stream's /play redirect. Returns true if handled. The
-// fetch/proxy/worker paths (HLS passthrough, DASH live) are not in the C server
-// yet and fall through to an honest 501.
+// Reads a query variable into a fresh string sized to the query (a proxied
+// segment URL can be long). NULL when absent.
+static char *query_var(struct mg_http_message *hm, const char *name) {
+    if (hm->query.len == 0) return NULL;
+    char *buf = (char *)malloc(hm->query.len + 1);
+    if (!buf) return NULL;
+    int n = mg_http_get_var(&hm->query, name, buf, hm->query.len + 1);
+    if (n <= 0) { free(buf); return NULL; }
+    return buf;
+}
+
+// Percent-encodes for embedding a URL inside a query value, so its own
+// '?'/'&'/'=' can't corrupt the /proxy or ?variant= query. Everything outside
+// the RFC 3986 unreserved set is escaped.
+static char *query_encode(const char *s) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t n = strlen(s);
+    char *out = (char *)malloc(n * 3 + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 0xf];
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
+// Content-Type for a proxied item, preferring the upstream value and falling
+// back to the URL's extension.
+static const char *content_type_from_ext(const char *url) {
+    const char *q = strchr(url, '?');
+    size_t path_len = q ? (size_t)(q - url) : strlen(url);
+    const char *dot = NULL;
+    for (size_t i = 0; i < path_len; i++) {
+        if (url[i] == '/') dot = NULL;
+        else if (url[i] == '.') dot = url + i;
+    }
+    if (!dot) return "application/octet-stream";
+    const char *ext = dot + 1;
+    size_t elen = path_len - (size_t)(ext - url);
+    struct { const char *ext; const char *type; } map[] = {
+        {"ts", "video/mp2t"}, {"m4s", "video/mp4"}, {"mp4", "video/mp4"}, {"m4v", "video/mp4"},
+        {"m4a", "audio/mp4"}, {"aac", "audio/aac"}, {"mp3", "audio/mpeg"}, {"vtt", "text/vtt"},
+        {"webvtt", "text/vtt"}, {"m3u8", "application/vnd.apple.mpegurl"},
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        if (strlen(map[i].ext) == elen && strncmp(ext, map[i].ext, elen) == 0) return map[i].type;
+    }
+    return "application/octet-stream";
+}
+
+// Finds the provider object that owns `stream`.
+static const rs_json *provider_of(rs_state *st, const rs_json *stream) {
+    const rs_json *providers = rs_json_obj_get(st->root, "providers");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *p = rs_json_arr_at(providers, i);
+        const rs_json *streams = rs_json_obj_get(p, "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+            if (rs_json_arr_at(streams, j) == stream) return p;
+        }
+    }
+    return NULL;
+}
+
+// Effective proxy for a fetch: the stream's override, else the provider's, or
+// empty when the per-category toggle is off. Caller frees.
+static char *effective_proxy(const rs_json *provider, const rs_json *stream, bool category_on) {
+    if (!category_on) return rs_strdup("");
+    const char *sp = rs_json_obj_str(stream, "proxy", "");
+    if (sp[0]) return rs_strdup(sp);
+    return rs_strdup(rs_json_obj_str(provider, "proxy", ""));
+}
+
+// Provider generic headers plus the stream's category headers, newline-joined.
+static char *effective_headers(const rs_json *provider, const rs_json *stream, const char *stream_field) {
+    const char *generic = rs_json_obj_str(provider, "headers", "");
+    const char *specific = rs_json_obj_str(stream, stream_field, "");
+    size_t need = strlen(generic) + strlen(specific) + 2;
+    char *out = (char *)malloc(need);
+    if (!out) return NULL;
+    out[0] = '\0';
+    if (generic[0]) { strcat(out, generic); }
+    if (specific[0]) { if (out[0]) strcat(out, "\n"); strcat(out, specific); }
+    return out;
+}
+
+// The rewrite transforms need the stream id to build proxy/variant paths.
+static char *media_transform(void *ud, const char *abs_uri, rs_m3u8_line_kind kind, int64_t seq) {
+    (void)seq;
+    const char *stream_id = (const char *)ud;
+    const char *kindstr = kind == RS_M3U8_LINE_KEY ? "key" : (kind == RS_M3U8_LINE_MAP ? "map" : "segment");
+    char *enc = query_encode(abs_uri);
+    if (!enc) return NULL;
+    size_t need = strlen(stream_id) + strlen(enc) + 64;
+    char *out = (char *)malloc(need);
+    if (out) snprintf(out, need, "/proxy/%s/item?u=%s&kind=%s", stream_id, enc, kindstr);
+    free(enc);
+    return out;
+}
+
+static char *master_transform(void *ud, const char *abs_uri) {
+    const char *stream_id = (const char *)ud;
+    char *enc = query_encode(abs_uri);
+    if (!enc) return NULL;
+    size_t need = strlen(stream_id) + strlen(enc) + 48;
+    char *out = (char *)malloc(need);
+    if (out) snprintf(out, need, "/play/%s/index.m3u8?variant=%s", stream_id, enc);
+    free(enc);
+    return out;
+}
+
+static void send_redirect(struct mg_connection *c, const char *location) {
+    mg_printf(c, "HTTP/1.1 302 Found\r\nLocation: %s\r\nCache-Control: no-store\r\n"
+                 "Content-Length: 0\r\n\r\n", location);
+}
+
+// Serves an HLS passthrough playlist: fetch the remote playlist (the configured
+// URL, or a ?variant= link from an already-rewritten master), rewrite every URI
+// to loop back through this server, and return it.
+static void serve_hls_playlist(restream_server_t *server, struct mg_connection *c,
+                               struct mg_http_message *hm, const rs_json *stream) {
+    const char *stream_id = rs_json_obj_str(stream, "id", "");
+    const rs_json *provider = provider_of(&server->state, stream);
+
+    char *variant = query_var(hm, "variant");
+    const char *manifest_url = variant ? variant : stream_source_target(stream);
+    if (!manifest_url[0]) { free(variant); reply_error(c, 400, "Stream has no source URL."); return; }
+
+    char *proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    char *headers = effective_headers(provider, stream, "manifestHeaders");
+    char *body = NULL;
+    size_t body_len = 0;
+    char err[256] = {0};
+    int rc = g_fetch_handler(manifest_url, proxy, headers, NULL, &body, &body_len,
+                             NULL, NULL, NULL, err, sizeof(err));
+    free(proxy);
+    free(headers);
+    if (rc != 0) { free(variant); reply_error(c, 502, err[0] ? err : "Could not fetch the playlist."); return; }
+
+    char *rewritten;
+    if (rs_m3u8_is_master(body)) {
+        rewritten = rs_m3u8_rewrite_master(body, manifest_url, master_transform, (void *)stream_id);
+    } else {
+        // The player fetches (and, if encrypted, decrypts with) the key itself,
+        // so keys are proxied through rather than dropped — server-side HLS
+        // decryption is a later increment.
+        rewritten = rs_m3u8_rewrite(body, manifest_url, false, media_transform, (void *)stream_id);
+    }
+    free(body);
+    free(variant);
+    if (!rewritten) { reply_error(c, 500, "Out of memory rewriting the playlist."); return; }
+    mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
+                          "Cache-Control: no-store\r\n", "%s", rewritten);
+    rs_free(rewritten);
+}
+
+// Proxies one segment/key/init: fetch ?u= through the stream's media settings
+// and stream the bytes back.
+static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
+                             struct mg_http_message *hm, const char *stream_id) {
+    const rs_json *stream = rs_panel_find_stream(&server->state, stream_id);
+    if (!stream) { reply_error(c, 404, "Stream not found."); return; }
+    char *url = query_var(hm, "u");
+    if (!url) { reply_error(c, 400, "Missing ?u= target."); return; }
+    const rs_json *provider = provider_of(&server->state, stream);
+
+    // Forward the player's Range so byte-range segments and seeking fetch only
+    // the requested slice (and never a whole huge file).
+    char *range = header_dup(hm, "Range");
+    char *proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
+    char *headers = effective_headers(provider, stream, "mediaHeaders");
+    char *body = NULL, *ct = NULL, *cr = NULL;
+    size_t body_len = 0;
+    long status = 0;
+    char err[256] = {0};
+    int rc = g_fetch_handler(url, proxy, headers, range, &body, &body_len, &status, &ct, &cr,
+                             err, sizeof(err));
+    free(proxy);
+    free(headers);
+    free(range);
+    if (rc != 0) { free(url); free(ct); free(cr); reply_error(c, 502, err[0] ? err : "Segment fetch failed."); return; }
+
+    const char *type = (ct && ct[0]) ? ct : content_type_from_ext(url);
+    // Relay the upstream's 206 + Content-Range so the player's byte-range
+    // request is answered as a partial response, not a 200 of the wrong length.
+    if (status == 206 && cr && cr[0]) {
+        mg_printf(c, "HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\nContent-Range: %s\r\n"
+                     "Content-Length: %lu\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\n"
+                     "Access-Control-Allow-Origin: *\r\n\r\n",
+                  type, cr, (unsigned long)body_len);
+    } else {
+        mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
+                     "Accept-Ranges: bytes\r\nCache-Control: no-store\r\n"
+                     "Access-Control-Allow-Origin: *\r\n\r\n",
+                  type, (unsigned long)body_len);
+    }
+    mg_send(c, body, body_len);
+    free(url);
+    free(ct);
+    free(cr);
+    free(body);
+}
+
+// Playback routes. Direct-source streams redirect; HLS passthrough is proxied
+// live. DASH (mpd) and ffmpeg modes still need the worker layer and 501.
 static bool handle_playback(restream_server_t *server, struct mg_connection *c,
                             struct mg_http_message *hm) {
     bool is_source = mg_match(hm->uri, mg_str("/source/*"), NULL);
     bool is_play = mg_match(hm->uri, mg_str("/play/#"), NULL);
-    if (!is_source && !is_play) return false;
+    bool is_proxy = mg_match(hm->uri, mg_str("/proxy/#"), NULL);
+    if (!is_source && !is_play && !is_proxy) return false;
 
     // Playback auth: an API key is required only once at least one exists.
     char *key = playback_key(hm);
     bool allowed = rs_panel_playback_allowed(&server->state, key);
     free(key);
     if (!allowed) { reply_error(c, 401, "A valid playback key is required."); return true; }
+
+    if (is_proxy) {
+        if (!g_fetch_handler) { reply_error(c, 501, "Proxy playback isn't in this build."); return true; }
+        char *id = capture(hm, "/proxy/*/#");
+        if (id) serve_proxy_item(server, c, hm, id);
+        else reply_error(c, 400, "Bad proxy path.");
+        free(id);
+        return true;
+    }
 
     if (is_source) {
         char *id = capture(hm, "/source/*");
@@ -558,31 +779,40 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
         if (!stream) { reply_error(c, 404, "Stream not found."); return true; }
         const char *target = stream_source_target(stream);
         if (!target[0]) { reply_error(c, 400, "Stream has no source URL."); return true; }
-        mg_printf(c, "HTTP/1.1 302 Found\r\nLocation: %s\r\nCache-Control: no-store\r\n"
-                     "Content-Length: 0\r\n\r\n", target);
+        send_redirect(c, target);
         return true;
     }
 
-    // /play/<segment>/index.m3u8 or index.mpd — only the direct-source redirect
-    // works without the fetch/worker layer.
-    if (mg_match(hm->uri, mg_str("/play/*/index.m3u8"), NULL) ||
-        mg_match(hm->uri, mg_str("/play/*/index.mpd"), NULL)) {
+    // /play/<segment>/index.m3u8 or index.mpd
+    bool is_m3u8 = mg_match(hm->uri, mg_str("/play/*/index.m3u8"), NULL);
+    bool is_mpd = mg_match(hm->uri, mg_str("/play/*/index.mpd"), NULL);
+    if (is_m3u8 || is_mpd) {
         char *segment = capture(hm, "/play/*/#");
-        const rs_json *stream = rs_panel_find_stream(&server->state, segment);
+        const rs_json *stream = segment ? rs_panel_find_stream(&server->state, segment) : NULL;
         free(segment);
         if (!stream) { reply_error(c, 404, "Stream not found."); return true; }
+
         if (rs_json_obj_bool(stream, "directSource", false)) {
             const char *target = stream_source_target(stream);
             if (!target[0]) { reply_error(c, 400, "Stream has no source URL."); return true; }
-            mg_printf(c, "HTTP/1.1 302 Found\r\nLocation: %s\r\nCache-Control: no-store\r\n"
-                         "Content-Length: 0\r\n\r\n", target);
+            send_redirect(c, target);
+            return true;
+        }
+
+        const char *kind = rs_json_obj_str(stream, "kind", "mpd");
+        const char *input_mode = rs_json_obj_str(stream, "inputMode", "internal");
+        // HLS passthrough is the one live path in C so far: a kind=m3u8 stream on
+        // the internal remuxer, fetched and rewritten per request.
+        if (is_m3u8 && strcmp(kind, "m3u8") == 0 && strcmp(input_mode, "internal") == 0) {
+            if (!g_fetch_handler) { reply_error(c, 501, "Proxy playback isn't in this build."); return true; }
+            serve_hls_playlist(server, c, hm, stream);
             return true;
         }
     }
 
     reply_error(c, 501,
-                "Playback of this stream isn't in the C server yet — it needs the fetch/worker "
-                "layer. Use the Swift 'restreamair' binary, or enable Direct source on the stream.");
+                "This stream needs the DASH/worker layer, which isn't in the C server yet. "
+                "Enable Direct source, or use an HLS (.m3u8) source for live proxying.");
     return true;
 }
 
@@ -598,9 +828,11 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         return;
     }
 
-    // Playback routes (redirect-only for now).
+    // Playback routes: /source and direct-source /play redirect; HLS
+    // passthrough is proxied live; /proxy streams the segments.
     if (server && (mg_match(hm->uri, mg_str("/source/#"), NULL) ||
-                   mg_match(hm->uri, mg_str("/play/#"), NULL))) {
+                   mg_match(hm->uri, mg_str("/play/#"), NULL) ||
+                   mg_match(hm->uri, mg_str("/proxy/#"), NULL))) {
         if (handle_playback(server, c, hm)) return;
     }
 
@@ -665,6 +897,10 @@ void restream_server_set_verbose(bool verbose) {
 
 void restream_server_set_probe_handler(restream_probe_fn handler) {
     g_probe_handler = handler;
+}
+
+void restream_server_set_fetch_handler(restream_fetch_fn handler) {
+    g_fetch_handler = handler;
 }
 
 bool restream_server_start(restream_server_t* server, uint16_t port, const char* bind_address) {
