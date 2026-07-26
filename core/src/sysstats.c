@@ -34,7 +34,9 @@ typedef struct {
     unsigned long long disk_total;
     unsigned long long disk_available;
     long long uptime_seconds;
-    char os_version[128];
+    // Large enough that "%s %s" of two utsname fields can't overflow — GCC's
+    // -Wformat-truncation flags a tighter buffer even though it never would.
+    char os_version[288];
 } raw_stats;
 
 // Reads cumulative CPU ticks (total and idle). Returns false if unavailable.

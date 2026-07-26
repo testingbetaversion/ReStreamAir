@@ -1,6 +1,5 @@
 #include "rs_json.h"
 
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -365,8 +364,10 @@ static rs_json *parse_number(parser *ps) {
     rs_json *node = alloc_node(RS_JSON_NUM);
     if (!node) return NULL;
     node->as.num.number = value;
-    // Only integer syntax and a value that fits exactly stays integer on output.
-    node->as.num.is_integer = is_integer && value == floor(value) && fabs(value) < 9.0e15;
+    // Integer syntax (no '.', 'e' or 'E') already means no fractional part, so
+    // the value stays integer on output as long as it's within the range a
+    // double represents exactly — no libm floor()/fabs() needed.
+    node->as.num.is_integer = is_integer && value >= -9.0e15 && value <= 9.0e15;
     return node;
 }
 
