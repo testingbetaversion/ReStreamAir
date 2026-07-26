@@ -595,9 +595,10 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     // No web root: explain, rather than a bare 404.
     mg_http_reply(c, 404, "Content-Type: text/plain\r\n",
-                  "restreamair-server: this is the C core. It answers /ping, the auth and "
-                  "read-only state API, and (with --root pointing at public/) the panel's "
-                  "static files. Editing and playback aren't in the C server yet.\n");
+                  "restreamair-server: this is the C core. It answers /ping, the panel API "
+                  "(auth, management, monitoring, direct-source playback) and, with --root "
+                  "pointing at public/, the panel's static files. Proxied/DASH streaming "
+                  "isn't in the C server yet.\n");
 }
 
 restream_server_t* restream_server_create(void) {

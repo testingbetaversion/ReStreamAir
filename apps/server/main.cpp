@@ -146,7 +146,8 @@ int main(int argc, char **argv) {
     if (web_root.empty()) {
         std::printf("  no web root — serving /ping only. Pass --root public/ to serve the panel's files.\n");
     } else {
-        std::printf("  serving static files from %s (the panel API is not implemented in C yet)\n",
+        std::printf("  serving %s + the panel API: auth, provider/stream/user/key management,\n"
+                    "  live monitoring, and direct-source playback. Proxied/DASH streaming isn't in C yet.\n",
                     web_root.c_str());
     }
     std::fflush(stdout);
