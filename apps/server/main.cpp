@@ -23,6 +23,9 @@
 #define RS_PATH_MAX PATH_MAX
 #endif
 
+#include <curl/curl.h>
+
+#include "probe.h"
 #include "restream.h"
 
 namespace {
@@ -125,6 +128,11 @@ int main(int argc, char **argv) {
     if (!web_root.empty()) web_root = absolute_path(web_root);
 
     restream_server_set_verbose(verbose);
+
+    // Enable source auto-detect (/api/probe): libcurl for the fetch, libxml2 for
+    // MPD parsing. Both are initialised once here; the handler lives in probe.c.
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    restream_server_set_probe_handler(rs_probe_source);
 
     restream_server_t *server = restream_server_create();
     if (!server) {

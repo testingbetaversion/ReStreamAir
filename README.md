@@ -76,10 +76,16 @@ Ported so far: SHA-256/HMAC/PBKDF2, AES (block, CTR, CBC), RFC 3986 URL resoluti
 
 Ports are not merely tested, they are **proven equal** to the Swift code they replace: `restreamair selftest` runs both implementations over the same inputs and fails on any difference. That is what keeps a password hashed by an older build still verifying today, so `Crypto.swift` and `AES.swift` stay as the reference.
 
+The C server links **libcurl** (outbound HTTPS) and **libxml2** (MPD parsing) for source auto-detect. Install the dev headers first:
+
+```sh
+sudo apt-get install -y cmake build-essential libcurl4-openssl-dev libxml2-dev   # Debian/Ubuntu
+```
+
 ```sh
 cmake -S . -B build && cmake --build build
 ./build/restream_selftest                 # NIST/FIPS vectors + goldens captured from Swift
-./build/restreamair-server --port 8080    # serves public/ statically; the panel API is not in C yet
+./build/restreamair-server --port 8080    # serves the panel + the ported API
 ```
 
 `restreamair-server` accepts an optional `serve` subcommand (so its argv matches the Swift binary), `-p`/`--port`, `-b`/`--bind`, and `--root`. It auto-detects `public/` and serves the panel's static files. The control API is being ported to C incrementally. Working in C today:
@@ -87,9 +93,10 @@ cmake -S . -B build && cmake --build build
 - **Admin auth** — create an account, sign in, sign out.
 - **Full management** — create, edit and delete providers, streams, users and API keys, all through the real panel UI.
 - **Live monitoring** — the Server view's `/api/events` SSE stream with real host stats (CPU, memory, disk, load, uptime, OS).
+- **Source auto-detect** — `/api/probe` fetches a DASH/HLS source and lists its qualities, audio tracks and any DRM KIDs, so the stream editor's paste-to-detect works.
 - **Direct-source playback** — `/source/<id>` and a direct-source stream's `/play` link redirect to the origin, gated by the same API-key rule as the Swift server.
 
-Not ported yet: proxied/DASH **playback** (fetching and rewriting remote playlists, the live worker, `/direct`, `/download`, `/proxy`) and the **logs** history — those need the outbound-HTTP and worker layer and return an honest `501`. The Swift binary remains the fully working one for those. Password hashes and `state.json` are shared, so an account or provider created by either server is seen by the other, and the C server never drops fields it doesn't model.
+Not ported yet: proxied/DASH **playback** (the live worker that downloads, decrypts and remuxes — `/play` for non-direct streams, `/restream`, `/direct`, `/download`, `/proxy`), **script providers**, and the **logs** history — those return an honest `501`, and the Swift binary remains the fully working one for them. Password hashes and `state.json` are shared, so an account or provider created by either server is seen by the other, and the C server never drops fields it doesn't model.
 
 This produces `librestream_base.a` (portable logic, no sockets), `librestream_core.a` (that plus the [mongoose](https://github.com/cesanta/mongoose) HTTP server), and both executables, under GCC, Clang and MSVC. `Package.swift` compiles the same C sources into the Swift app, so the two build systems must be kept in step. Test fixtures and goldens are generated — rerun `scripts/gen-parity-fixtures.py`, and see the header comment in `scripts/gen-goldens.py`.
 

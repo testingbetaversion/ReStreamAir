@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +25,18 @@ void restream_server_set_web_root(restream_server_t* server, const char* path);
 // anyone just running the binary. This turns it down to errors only (verbose =
 // false, the default once main sets it) or restores the full trace (true).
 void restream_server_set_verbose(bool verbose);
+
+// A source-probe handler: given a source URL (with optional proxy and
+// newline-separated "Name: value" headers), it fetches and inspects the source
+// and returns a malloc'd JSON string (freed with rs_free) describing its
+// representations — or NULL on failure, with a message written to errbuf.
+//
+// The handler lives in the C++ server (which links libcurl/libxml2); the core
+// only holds the function pointer, so the Swift build never pulls in those
+// libraries. When no handler is registered, /api/probe returns 501.
+typedef char *(*restream_probe_fn)(const char *url, const char *proxy, const char *headers,
+                                   char *errbuf, size_t errbuf_len);
+void restream_server_set_probe_handler(restream_probe_fn handler);
 
 // Start the server (non-blocking, or spawns a background thread in C,
 // or the Swift app just loops over a poll function).

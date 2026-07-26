@@ -25,6 +25,11 @@ struct restream_server {
 // scratch space, so the broadcast timer can find them.
 #define RS_SSE_MARKER 'S'
 
+// The probe handler is registered by the C++ app; the core only calls through
+// it, so libcurl/libxml2 never reach the Swift build. Declared here so the
+// router (below) can reference it before the setter is defined.
+static restream_probe_fn g_probe_handler = NULL;
+
 // --- small response helpers ------------------------------------------------
 
 static const char *JSON_HEADERS = "Content-Type: application/json\r\n";
@@ -373,6 +378,30 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     if (mg_match(hm->uri, mg_str("/api/logs"), NULL) && method_is(hm, "GET")) {
         handle_logs(c); return true;
     }
+    if (mg_match(hm->uri, mg_str("/api/probe"), NULL) && method_is(hm, "POST")) {
+        if (!g_probe_handler) {
+            reply_error(c, 501, "Source auto-detect isn't in the C server build. "
+                                "Add a representation manually, or use the Swift binary.");
+            return true;
+        }
+        rs_json *body = parse_body(hm);
+        char *url = body_str(body, "url");
+        char *proxy = body_str(body, "proxy");
+        char *headers = body_str(body, "headers");
+        rs_json_free(body);
+        char errbuf[256] = {0};
+        char *result = g_probe_handler(url, proxy, headers, errbuf, sizeof(errbuf));
+        free(url); free(proxy); free(headers);
+        if (!result) {
+            reply_error(c, 400, errbuf[0] ? errbuf : "Could not probe the source.");
+            return true;
+        }
+        char headers_out[128];
+        snprintf(headers_out, sizeof(headers_out), "%sCache-Control: no-store\r\n", JSON_HEADERS);
+        mg_http_reply(c, 200, headers_out, "%s", result);
+        rs_free(result);
+        return true;
+    }
 
     // --- provider CRUD ---
     if (mg_match(hm->uri, mg_str("/api/providers"), NULL) && method_is(hm, "POST")) {
@@ -632,6 +661,10 @@ void restream_server_set_web_root(restream_server_t* server, const char* path) {
 
 void restream_server_set_verbose(bool verbose) {
     mg_log_set(verbose ? MG_LL_DEBUG : MG_LL_ERROR);
+}
+
+void restream_server_set_probe_handler(restream_probe_fn handler) {
+    g_probe_handler = handler;
 }
 
 bool restream_server_start(restream_server_t* server, uint16_t port, const char* bind_address) {
