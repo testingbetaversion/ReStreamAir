@@ -11,6 +11,8 @@
 
 #include "rs_common.h"
 #include "rs_url.h"
+#include "rs_json.h"
+#include "net.h"
 
 // A live-DASH SegmentTemplate/SegmentTimeline expander — the C port of the
 // pieces of DashSegments.swift / LiveMPDToM3U8.swift needed to turn one MPD poll
@@ -363,4 +365,120 @@ void rs_dash_plan_dispose(rs_dash_plan *plan) {
     for (size_t i = 0; i < plan->count; i++) free(plan->segments[i].url);
     free(plan->segments);
     memset(plan, 0, sizeof(*plan));
+}
+
+// --- describe (fetch + enumerate + expand) ---------------------------------
+
+// Picks the default video/audio renditions: the highest-bandwidth video
+// Representation and the first audio Representation, with their codecs.
+static void pick_default_reps(xmlNode *root,
+                              char **video_id, char **video_codecs, long long *video_bw,
+                              char **audio_id, char **audio_codecs) {
+    *video_id = *video_codecs = *audio_id = *audio_codecs = NULL;
+    *video_bw = -1;
+    for (xmlNode *period = root->children; period; period = period->next) {
+        if (!node_is(period, "Period")) continue;
+        for (xmlNode *adap = period->children; adap; adap = adap->next) {
+            if (!node_is(adap, "AdaptationSet")) continue;
+            char *mime = attr(adap, "mimeType");
+            char *ctype = attr(adap, "contentType");
+            char *adap_codecs = attr(adap, "codecs");
+            const char *type = classify(mime, ctype);
+            for (xmlNode *rep = adap->children; rep; rep = rep->next) {
+                if (!node_is(rep, "Representation")) continue;
+                char *rid = attr(rep, "id");
+                if (!rid) continue;
+                char *codecs = attr(rep, "codecs");
+                if (!codecs && adap_codecs) codecs = rs_strdup(adap_codecs);
+                char *bw = attr(rep, "bandwidth");
+                long long bwv = bw ? strtoll(bw, NULL, 10) : 0;
+                if (strcmp(type, "video") == 0) {
+                    if (bwv > *video_bw) {
+                        free(*video_id); free(*video_codecs);
+                        *video_id = rs_strdup(rid);
+                        *video_codecs = codecs ? rs_strdup(codecs) : NULL;
+                        *video_bw = bwv;
+                    }
+                } else if (strcmp(type, "audio") == 0 && !*audio_id) {
+                    *audio_id = rs_strdup(rid);
+                    *audio_codecs = codecs ? rs_strdup(codecs) : NULL;
+                }
+                free(codecs); free(bw); free(rid);
+            }
+            free(mime); free(ctype); free(adap_codecs);
+        }
+    }
+}
+
+char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
+                       const char *downloader, const char *dl_params,
+                       const char *rep, int want, char *errbuf, size_t errbuf_len) {
+    // Fetch the MPD via libcurl (downloader forced internal so we get the final
+    // URL after any redirect — segment URLs must resolve against it).
+    (void)downloader; (void)dl_params;
+    char *xml = NULL; size_t len = 0; char *effurl = NULL;
+    if (rs_fetch_url(url, proxy, headers, NULL, NULL, NULL, &xml, &len,
+                     NULL, NULL, NULL, &effurl, errbuf, errbuf_len) != 0)
+        return NULL;
+    const char *base = (effurl && effurl[0]) ? effurl : url;
+
+    xmlDoc *doc = xmlReadMemory(xml, (int)len, "mpd.xml", NULL,
+                                XML_PARSE_NOERROR | XML_PARSE_NOWARNING | XML_PARSE_RECOVER);
+    if (!doc) { free(xml); free(effurl); snprintf(errbuf, errbuf_len, "Could not parse the MPD."); return NULL; }
+    xmlNode *root = xmlDocGetRootElement(doc);
+    if (!root || !node_is(root, "MPD")) { xmlFreeDoc(doc); free(xml); free(effurl); snprintf(errbuf, errbuf_len, "Not an MPD."); return NULL; }
+
+    rs_json *obj = rs_json_new_obj();
+    char *mtype = attr(root, "type");
+    rs_json_obj_set_bool(obj, "dynamic", mtype && strcmp(mtype, "dynamic") == 0);
+    free(mtype);
+    char *mup = attr(root, "minimumUpdatePeriod"); rs_json_obj_set(obj, "mup", rs_json_new_num(parse_duration(mup))); free(mup);
+    char *tsb = attr(root, "timeShiftBufferDepth"); rs_json_obj_set(obj, "tsb", rs_json_new_num(parse_duration(tsb))); free(tsb);
+
+    char *vid, *vcodecs, *aid, *acodecs; long long vbw;
+    pick_default_reps(root, &vid, &vcodecs, &vbw, &aid, &acodecs);
+    if (vid) {
+        rs_json *v = rs_json_new_obj();
+        rs_json_obj_set_str(v, "id", vid);
+        if (vcodecs) rs_json_obj_set_str(v, "codecs", vcodecs); else rs_json_obj_set(v, "codecs", rs_json_new_null());
+        rs_json_obj_set_int(v, "bandwidth", vbw > 0 ? vbw : 0);
+        rs_json_obj_set(obj, "video", v);
+    } else rs_json_obj_set(obj, "video", rs_json_new_null());
+    if (aid) {
+        rs_json *a = rs_json_new_obj();
+        rs_json_obj_set_str(a, "id", aid);
+        if (acodecs) rs_json_obj_set_str(a, "codecs", acodecs); else rs_json_obj_set(a, "codecs", rs_json_new_null());
+        rs_json_obj_set(obj, "audio", a);
+    } else rs_json_obj_set(obj, "audio", rs_json_new_null());
+    xmlFreeDoc(doc);
+
+    // Expand the requested representation's segment window.
+    if (rep && rep[0]) {
+        rs_dash_plan plan; char perr[256] = {0};
+        if (rs_dash_plan_build(xml, len, base, rep, want, &plan, perr, sizeof(perr)) == 0) {
+            rs_json *p = rs_json_new_obj();
+            rs_json_obj_set_str(p, "repId", plan.representation_id ? plan.representation_id : rep);
+            rs_json_obj_set_str(p, "type", plan.adaptation_type ? plan.adaptation_type : "video");
+            rs_json_obj_set_int(p, "timescale", (long long)plan.timescale);
+            if (plan.init_url) rs_json_obj_set_str(p, "initUrl", plan.init_url); else rs_json_obj_set(p, "initUrl", rs_json_new_null());
+            rs_json *segs = rs_json_new_arr();
+            for (size_t i = 0; i < plan.count; i++) {
+                rs_json *s = rs_json_new_obj();
+                rs_json_obj_set_str(s, "url", plan.segments[i].url);
+                rs_json_obj_set_int(s, "time", plan.segments[i].time);
+                rs_json_obj_set(s, "duration", rs_json_new_num(plan.segments[i].duration));
+                rs_json_arr_push(segs, s);
+            }
+            rs_json_obj_set(p, "segments", segs);
+            rs_json_obj_set(obj, "plan", p);
+            rs_dash_plan_dispose(&plan);
+        }
+    }
+
+    free(vid); free(vcodecs); free(aid); free(acodecs);
+    free(xml); free(effurl);
+    char *json = rs_json_serialize(obj, false);
+    rs_json_free(obj);
+    if (!json) snprintf(errbuf, errbuf_len, "Out of memory building the DASH description.");
+    return json;
 }
