@@ -45,8 +45,12 @@ void restream_server_set_probe_handler(restream_probe_fn handler);
 // code), *content_type and *content_range (malloc'd or NULL). Returns 0 on
 // success, negative on failure with a message in errbuf. Registered by the C++
 // app (libcurl); when unset, the fetch-based playback routes return 501.
+// `downloader`/`dl_params` pick the per-provider download mechanism: NULL or ""
+// means the in-process libcurl fetch; "curl"/"wget"/"aria2c" run that external
+// tool with `dl_params` appended (and fall back to libcurl if it is missing).
 typedef int (*restream_fetch_fn)(const char *url, const char *proxy, const char *headers,
-                                 const char *range, char **out, size_t *out_len,
+                                 const char *range, const char *downloader, const char *dl_params,
+                                 char **out, size_t *out_len,
                                  long *status, char **content_type, char **content_range,
                                  char *errbuf, size_t errbuf_len);
 void restream_server_set_fetch_handler(restream_fetch_fn handler);

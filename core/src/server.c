@@ -631,6 +631,16 @@ static char *effective_headers(const rs_json *provider, const rs_json *stream, c
     return out;
 }
 
+// The provider's chosen download tool ("curl" default) and its extra params.
+// Applied to this provider's manifest/segment fetches; see rs_fetch_url.
+static const char *effective_downloader(const rs_json *provider) {
+    const char *d = rs_json_obj_str(provider, "downloader", "");
+    return d[0] ? d : "curl";
+}
+static const char *effective_downloader_params(const rs_json *provider) {
+    return rs_json_obj_str(provider, "downloaderParams", "");
+}
+
 // The rewrite transforms need the stream id to build proxy/variant paths.
 static char *media_transform(void *ud, const char *abs_uri, rs_m3u8_line_kind kind, int64_t seq) {
     (void)seq;
@@ -678,8 +688,9 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     char *body = NULL;
     size_t body_len = 0;
     char err[256] = {0};
-    int rc = g_fetch_handler(manifest_url, proxy, headers, NULL, &body, &body_len,
-                             NULL, NULL, NULL, err, sizeof(err));
+    int rc = g_fetch_handler(manifest_url, proxy, headers, NULL,
+                             effective_downloader(provider), effective_downloader_params(provider),
+                             &body, &body_len, NULL, NULL, NULL, err, sizeof(err));
     free(proxy);
     free(headers);
     if (rc != 0) { free(variant); reply_error(c, 502, err[0] ? err : "Could not fetch the playlist."); return; }
@@ -720,8 +731,9 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
     size_t body_len = 0;
     long status = 0;
     char err[256] = {0};
-    int rc = g_fetch_handler(url, proxy, headers, range, &body, &body_len, &status, &ct, &cr,
-                             err, sizeof(err));
+    int rc = g_fetch_handler(url, proxy, headers, range,
+                             effective_downloader(provider), effective_downloader_params(provider),
+                             &body, &body_len, &status, &ct, &cr, err, sizeof(err));
     free(proxy);
     free(headers);
     free(range);

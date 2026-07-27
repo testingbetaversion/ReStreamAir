@@ -219,7 +219,8 @@ char *rs_probe_source(const char *url, const char *proxy, const char *headers,
 
     char *data = NULL;
     size_t len = 0;
-    if (rs_fetch_url(url, proxy, headers, NULL, &data, &len, NULL, NULL, NULL, errbuf, errbuf_len) != 0)
+    if (rs_fetch_url(url, proxy, headers, NULL, NULL, NULL, &data, &len,
+                     NULL, NULL, NULL, errbuf, errbuf_len) != 0)
         return NULL;
 
     char *result = NULL;

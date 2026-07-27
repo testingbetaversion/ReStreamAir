@@ -412,6 +412,14 @@ rs_json *rs_panel_keys_view(const rs_state *st) {
 
 // --- provider mutations ----------------------------------------------------
 
+// The download tool for a provider's manifest/segment fetches. Only curl, wget
+// and aria2c are supported; anything else (including empty) becomes "curl".
+static const char *normalize_downloader(const char *d) {
+    if (strcmp(d, "wget") == 0) return "wget";
+    if (strcmp(d, "aria2c") == 0) return "aria2c";
+    return "curl";
+}
+
 int rs_panel_create_provider(rs_state *st, const rs_json *body, const char **err) {
     const char *name = rs_json_obj_str(body, "name", "");
     const char *trimmed = NULL;
@@ -425,6 +433,8 @@ int rs_panel_create_provider(rs_state *st, const rs_json *body, const char **err
     rs_json_obj_set_str(p, "logo", rs_json_obj_str(body, "logo", ""));
     rs_json_obj_set_str(p, "proxy", rs_json_obj_str(body, "proxy", ""));
     rs_json_obj_set_str(p, "headers", rs_json_obj_str(body, "headers", ""));
+    rs_json_obj_set_str(p, "downloader", normalize_downloader(rs_json_obj_str(body, "downloader", "")));
+    rs_json_obj_set_str(p, "downloaderParams", rs_json_obj_str(body, "downloaderParams", ""));
     rs_json_obj_set_str(p, "segmentUrlParams", rs_json_obj_str(body, "segmentUrlParams", ""));
     rs_json_obj_set_bool(p, "inheritUrlParams", rs_json_obj_bool(body, "inheritUrlParams", false));
     rs_json_obj_set(p, "streams", rs_json_new_arr());
@@ -459,6 +469,8 @@ int rs_panel_update_provider(rs_state *st, const char *id, const rs_json *body, 
     if (rs_json_obj_get(body, "logo")) set_str_from(p, "logo", body, "");
     set_str_from(p, "proxy", body, "");
     set_str_from(p, "headers", body, "");
+    rs_json_obj_set_str(p, "downloader", normalize_downloader(rs_json_obj_str(body, "downloader", "")));
+    set_str_from(p, "downloaderParams", body, "");
     set_str_from(p, "segmentUrlParams", body, "");
     rs_json_obj_set_bool(p, "inheritUrlParams", rs_json_obj_bool(body, "inheritUrlParams", false));
     set_str_from(p, "scriptPath", body, "");

@@ -85,7 +85,7 @@ static char* url_encode(const char *s) {
     return rs_buf_take(&b);
 }
 
-char* rs_logo_lookup(rs_logo_cache *lc, const char *name, restream_fetch_fn fetch, void *fetch_ctx) {
+char* rs_logo_lookup(rs_logo_cache *lc, const char *name, rs_logo_fetch_fn fetch, void *fetch_ctx) {
     if (!lc || !name || !fetch) return NULL;
     
     // Trim whitespaces

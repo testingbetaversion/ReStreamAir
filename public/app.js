@@ -1808,6 +1808,8 @@ function openProviderSettingsDialog() {
   form.elements.name.value = provider.name || "";
   form.elements.proxy.value = provider.proxy || "";
   form.elements.headers.value = provider.headers || "";
+  form.elements.downloader.value = provider.downloader || "curl";
+  form.elements.downloaderParams.value = provider.downloaderParams || "";
   form.elements.segmentUrlParams.value = provider.segmentUrlParams || "";
   form.elements.inheritUrlParams.checked = Boolean(provider.inheritUrlParams);
   form.elements.scriptPath.value = provider.scriptPath || "";
@@ -1877,6 +1879,7 @@ async function saveProviderSettings() {
     body: JSON.stringify({
       name: form.elements.name.value, logo: provider.logo,
       proxy: form.elements.proxy.value, headers: form.elements.headers.value, segmentUrlParams: form.elements.segmentUrlParams.value,
+      downloader: form.elements.downloader.value, downloaderParams: form.elements.downloaderParams.value,
       inheritUrlParams: form.elements.inheritUrlParams.checked,
       scriptPath: form.elements.scriptPath.value, scriptBind: form.elements.scriptBind.value,
       scriptDoh: form.elements.scriptDoh.value, scriptWorker: form.elements.scriptWorker.value,

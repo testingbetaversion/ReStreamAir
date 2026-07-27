@@ -3,8 +3,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
+#include <errno.h>
 
 #include <curl/curl.h>
+
+#ifndef _WIN32
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <fcntl.h>
+extern char **environ;
+#endif
 
 #include "rs_common.h"
 
@@ -53,9 +63,9 @@ static size_t header_cb(char *buffer, size_t size, size_t nitems, void *userdata
     return len;
 }
 
-int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
-                 char **out, size_t *out_len, long *status, char **content_type,
-                 char **content_range, char *errbuf, size_t errbuf_len) {
+static int fetch_libcurl(const char *url, const char *proxy, const char *headers, const char *range,
+                         char **out, size_t *out_len, long *status, char **content_type,
+                         char **content_range, char *errbuf, size_t errbuf_len) {
     if (content_type) *content_type = NULL;
     if (content_range) *content_range = NULL;
     if (status) *status = 0;
@@ -130,4 +140,239 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
     *out = buf.data;
     *out_len = buf.len;
     return 0;
+}
+
+// --- External downloader (curl / wget / aria2c) -----------------------------
+//
+// A provider can choose to have its manifest and segment downloads run through
+// an external tool instead of the in-process libcurl fetch, with a free-form
+// extra-params string. curl gives us the response status + Content-Range /
+// Content-Type back (via -D), so byte-range relay stays correct; wget's
+// --server-response gives the same from stderr; aria2c is best-effort (headers
+// aren't recoverable) so it reports no status and suits whole-segment
+// downloads. If the chosen tool is missing, the caller falls back to libcurl.
+
+#ifndef _WIN32
+
+typedef struct { char **v; int n; int cap; } argv_b;
+static void ab_push(argv_b *a, const char *s) {
+    if (a->n + 2 >= a->cap) { a->cap = a->cap ? a->cap * 2 : 32; a->v = realloc(a->v, (size_t)a->cap * sizeof(char *)); }
+    a->v[a->n++] = s ? rs_strdup(s) : NULL;
+}
+static void ab_free(argv_b *a) { for (int i = 0; i < a->n; i++) free(a->v[i]); free(a->v); }
+
+static int read_whole_file(const char *path, char **out, size_t *out_len) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    size_t cap = 65536, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { close(fd); return -1; }
+    ssize_t n;
+    while ((n = read(fd, buf + len, cap - len - 1)) > 0) {
+        len += (size_t)n;
+        if (len + 1 >= cap) { cap *= 2; char *g = realloc(buf, cap); if (!g) { free(buf); close(fd); return -1; } buf = g; }
+    }
+    close(fd);
+    if (n < 0) { free(buf); return -1; }
+    buf[len] = '\0';
+    *out = buf; *out_len = len;
+    return 0;
+}
+
+// Push each "Name: value" header line as an argv entry, styled per tool:
+// curl wants "-H" then the value (two args); wget/aria2c want one "--header=…".
+static void push_headers(argv_b *a, const char *headers, bool curl_style) {
+    if (!headers || !headers[0]) return;
+    char *copy = rs_strdup(headers);
+    for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (!*line) continue;
+        if (curl_style) { ab_push(a, "-H"); ab_push(a, line); }
+        else { char *h = malloc(strlen(line) + 10); sprintf(h, "--header=%s", line); ab_push(a, h); free(h); }
+    }
+    free(copy);
+}
+
+// Split free-form extra params on whitespace into argv tokens.
+static void push_extra_params(argv_b *a, const char *params) {
+    if (!params || !params[0]) return;
+    char *copy = rs_strdup(params);
+    for (char *tok = strtok(copy, " \t\r\n"); tok; tok = strtok(NULL, " \t\r\n"))
+        if (*tok) ab_push(a, tok);
+    free(copy);
+}
+
+// Parse an HTTP header dump (curl -D output, or wget --server-response stderr).
+// Keeps the last status line (so redirects resolve to the final response) and
+// the Content-Range / Content-Type of that response.
+static void parse_meta(const char *meta, long *status, char **content_type, char **content_range) {
+    char *copy = rs_strdup(meta ? meta : "");
+    for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (strncasecmp(line, "HTTP/", 5) == 0) {
+            const char *sp = strchr(line, ' ');
+            if (sp && status) *status = strtol(sp + 1, NULL, 10);
+        } else if (strncasecmp(line, "content-range:", 14) == 0 && content_range) {
+            const char *v = line + 14; while (*v == ' ' || *v == '\t') v++;
+            free(*content_range); *content_range = rs_strdup(v);
+        } else if (strncasecmp(line, "content-type:", 13) == 0 && content_type) {
+            const char *v = line + 13; while (*v == ' ' || *v == '\t') v++;
+            free(*content_type); *content_type = rs_strdup(v);
+        }
+    }
+    free(copy);
+}
+
+// Spawn argv (searching PATH), redirecting stdout to /dev/null and stderr to
+// `err_path` (for wget). Returns the exit code, -2 if the binary is missing,
+// -1 on spawn failure.
+static int spawn_wait(char *const argv[], const char *err_path) {
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    if (err_path) posix_spawn_file_actions_addopen(&fa, 2, err_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    else posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    pid_t pid;
+    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) return rc == ENOENT ? -2 : -1;
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int fetch_external(const char *tool, const char *dl_params,
+                          const char *url, const char *proxy, const char *headers, const char *range,
+                          char **out, size_t *out_len, long *status, char **content_type,
+                          char **content_range, char *errbuf, size_t errbuf_len) {
+    if (content_type) *content_type = NULL;
+    if (content_range) *content_range = NULL;
+    if (status) *status = 0;
+
+    const char *tmpdir = getenv("TMPDIR"); if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
+    char body_tmpl[1024], meta_tmpl[1024];
+    snprintf(body_tmpl, sizeof(body_tmpl), "%s/rsdl_body_XXXXXX", tmpdir);
+    snprintf(meta_tmpl, sizeof(meta_tmpl), "%s/rsdl_meta_XXXXXX", tmpdir);
+    int bfd = mkstemp(body_tmpl); if (bfd < 0) { snprintf(errbuf, errbuf_len, "Could not create temp file."); return -1; }
+    close(bfd);
+    int mfd = mkstemp(meta_tmpl); if (mfd < 0) { unlink(body_tmpl); snprintf(errbuf, errbuf_len, "Could not create temp file."); return -1; }
+    close(mfd);
+
+    const char *range_spec = range && range[0]
+        ? (strncasecmp(range, "bytes=", 6) == 0 ? range + 6 : range) : NULL;
+
+    argv_b a = {0};
+    bool is_wget = strcasecmp(tool, "wget") == 0;
+    bool is_aria = strcasecmp(tool, "aria2c") == 0 || strcasecmp(tool, "aria2") == 0 || strcasecmp(tool, "aria") == 0;
+    const char *err_redirect = NULL;
+
+    if (is_wget) {
+        ab_push(&a, "wget"); ab_push(&a, "--server-response"); ab_push(&a, "-O"); ab_push(&a, body_tmpl);
+        ab_push(&a, "--timeout=60"); ab_push(&a, "--tries=2"); ab_push(&a, "-U"); ab_push(&a, "ReStreamAir/1.0");
+        if (proxy && proxy[0]) {
+            char e[1200];
+            ab_push(&a, "-e"); ab_push(&a, "use_proxy=yes");
+            snprintf(e, sizeof(e), "http_proxy=%s", proxy); ab_push(&a, "-e"); ab_push(&a, e);
+            snprintf(e, sizeof(e), "https_proxy=%s", proxy); ab_push(&a, "-e"); ab_push(&a, e);
+        }
+        push_headers(&a, headers, false);
+        if (range_spec) { char r[128]; snprintf(r, sizeof(r), "--header=Range: bytes=%s", range_spec); ab_push(&a, r); }
+        push_extra_params(&a, dl_params);
+        ab_push(&a, url);
+        err_redirect = meta_tmpl;  // wget prints response headers to stderr
+    } else if (is_aria) {
+        char basebuf[1024]; snprintf(basebuf, sizeof(basebuf), "%s", body_tmpl);
+        char *base = strrchr(basebuf, '/'); base = base ? base + 1 : basebuf;
+        ab_push(&a, "aria2c"); ab_push(&a, "--quiet=true"); ab_push(&a, "--allow-overwrite=true");
+        ab_push(&a, "--auto-file-renaming=false"); ab_push(&a, "-x1"); ab_push(&a, "-s1");
+        ab_push(&a, "--connect-timeout=10"); ab_push(&a, "--timeout=60"); ab_push(&a, "-U"); ab_push(&a, "ReStreamAir/1.0");
+        ab_push(&a, "-d"); ab_push(&a, tmpdir); ab_push(&a, "-o"); ab_push(&a, base);
+        if (proxy && proxy[0]) { char p[1200]; snprintf(p, sizeof(p), "--all-proxy=%s", proxy); ab_push(&a, p); }
+        push_headers(&a, headers, false);
+        if (range_spec) { char r[128]; snprintf(r, sizeof(r), "--header=Range: bytes=%s", range_spec); ab_push(&a, r); }
+        push_extra_params(&a, dl_params);
+        ab_push(&a, url);
+    } else {  // curl (default)
+        ab_push(&a, "curl"); ab_push(&a, "-sS"); ab_push(&a, "-L"); ab_push(&a, "--max-time"); ab_push(&a, "60");
+        ab_push(&a, "--connect-timeout"); ab_push(&a, "10"); ab_push(&a, "-A"); ab_push(&a, "ReStreamAir/1.0");
+        ab_push(&a, "-o"); ab_push(&a, body_tmpl); ab_push(&a, "-D"); ab_push(&a, meta_tmpl);
+        if (proxy && proxy[0]) { ab_push(&a, "-x"); ab_push(&a, proxy); }
+        push_headers(&a, headers, true);
+        if (range_spec) { ab_push(&a, "--range"); ab_push(&a, range_spec); }
+        push_extra_params(&a, dl_params);
+        ab_push(&a, url);
+    }
+    ab_push(&a, NULL);
+
+    int code = spawn_wait(a.v, err_redirect);
+    ab_free(&a);
+
+    if (code == -2) {
+        snprintf(errbuf, errbuf_len, "Downloader '%s' is not installed.", tool);
+        unlink(body_tmpl); unlink(meta_tmpl);
+        return -2;  // signal "missing tool" so the caller can fall back
+    }
+    if (code != 0) {
+        snprintf(errbuf, errbuf_len, "%s exited with code %d.", tool, code);
+        unlink(body_tmpl); unlink(meta_tmpl);
+        return -1;
+    }
+
+    char *meta = NULL; size_t meta_len = 0;
+    if (read_whole_file(meta_tmpl, &meta, &meta_len) == 0) {
+        parse_meta(meta, status, content_type, content_range);
+        free(meta);
+    }
+    unlink(meta_tmpl);
+
+    char *body = NULL; size_t body_len = 0;
+    if (read_whole_file(body_tmpl, &body, &body_len) != 0) {
+        unlink(body_tmpl);
+        snprintf(errbuf, errbuf_len, "Could not read %s output.", tool);
+        if (content_type) { free(*content_type); *content_type = NULL; }
+        if (content_range) { free(*content_range); *content_range = NULL; }
+        return -1;
+    }
+    unlink(body_tmpl);
+
+    long st = status ? *status : 0;
+    if (st != 0 && (st < 200 || st >= 400)) {
+        snprintf(errbuf, errbuf_len, "Upstream returned HTTP %ld.", st);
+        free(body);
+        if (content_type) { free(*content_type); *content_type = NULL; }
+        if (content_range) { free(*content_range); *content_range = NULL; }
+        return -1;
+    }
+    if (body_len == 0) {
+        snprintf(errbuf, errbuf_len, "%s produced no data.", tool);
+        free(body);
+        if (content_type) { free(*content_type); *content_type = NULL; }
+        if (content_range) { free(*content_range); *content_range = NULL; }
+        return -1;
+    }
+    *out = body; *out_len = body_len;
+    return 0;
+}
+
+#endif  // !_WIN32
+
+int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
+                 const char *downloader, const char *dl_params,
+                 char **out, size_t *out_len, long *status, char **content_type,
+                 char **content_range, char *errbuf, size_t errbuf_len) {
+    // NULL / "" / "internal" / "libcurl" → in-process libcurl. Otherwise run the
+    // chosen external tool, falling back to libcurl if it isn't installed so a
+    // missing binary never dead-ends a stream.
+    bool internal = !downloader || !downloader[0] ||
+                    strcasecmp(downloader, "internal") == 0 || strcasecmp(downloader, "libcurl") == 0;
+#ifndef _WIN32
+    if (!internal) {
+        int rc = fetch_external(downloader, dl_params, url, proxy, headers, range,
+                                out, out_len, status, content_type, content_range, errbuf, errbuf_len);
+        if (rc != -2) return rc;  // -2 = tool missing → fall through to libcurl
+    }
+#else
+    (void)dl_params;
+#endif
+    return fetch_libcurl(url, proxy, headers, range, out, out_len, status, content_type, content_range, errbuf, errbuf_len);
 }
