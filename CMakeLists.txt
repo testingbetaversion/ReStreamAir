@@ -35,6 +35,15 @@ add_library(restream_base STATIC
     core/src/auth.c
     core/src/panel.c
     core/src/sysstats.c
+    core/src/cenc.c
+    core/src/hls_decrypt.c
+    core/src/audio_delay.c
+    core/src/script.c
+    core/src/cdm.c
+    core/src/metrics.c
+    core/src/logo.c
+    core/src/nm3u8dlre.c
+    core/deps/cJSON.c
 )
 target_include_directories(restream_base PUBLIC core/include)
 target_compile_options(restream_base PRIVATE ${RS_WARNINGS})
