@@ -370,7 +370,8 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
     // chosen external tool, falling back to libcurl if it isn't installed so a
     // missing binary never dead-ends a stream.
     bool internal = !downloader || !downloader[0] ||
-                    strcasecmp(downloader, "internal") == 0 || strcasecmp(downloader, "libcurl") == 0;
+                    strcasecmp(downloader, "internal") == 0 || strcasecmp(downloader, "libcurl") == 0 ||
+                    strcasecmp(downloader, "native") == 0;
 #ifndef _WIN32
     if (!internal) {
         int rc = fetch_external(downloader, dl_params, url, proxy, headers, range,

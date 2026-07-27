@@ -1,10 +1,13 @@
 #include "restream.h"
 #include "rs_common.h"
 #include "rs_auth.h"
+#include "rs_cdm.h"
 #include "rs_cenc.h"
 #include "rs_json.h"
 #include "rs_m3u8.h"
+#include "rs_metrics.h"
 #include "rs_panel.h"
+#include "rs_script.h"
 #include "rs_state.h"
 #include "rs_sysstats.h"
 #include "../deps/mongoose.h"
@@ -12,6 +15,25 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#ifndef _WIN32
+#include <sys/stat.h>   // mkdir for the script session dir
+#endif
+
+// In-memory log ring buffer. Each entry is a panel/stream event the Logs tab
+// renders: the synthetic stream id "__panel__" holds server/auth/start-stop and
+// access lines, "script:<providerId>" holds script output, and real stream ids
+// hold per-stream fetch/download activity.
+#define RS_LOG_CAP 4000
+typedef struct {
+    double ts_ms;     // milliseconds since the epoch (what the UI's Date() wants)
+    char *level;      // "info" | "error"
+    char *sid;        // stream id / "__panel__" / "script:<id>"
+    char *event;
+    char *message;    // optional detail
+    char *url;        // optional
+    long status;      // optional HTTP status (0 = none)
+    long long bytes;  // optional byte count (-1 = none)
+} rs_log_entry;
 
 struct restream_server {
     struct mg_mgr mgr;
@@ -21,6 +43,10 @@ struct restream_server {
     rs_state state;         // state.json as a preserved DOM
     rs_auth *auth;          // admin accounts + sessions
     rs_sysstats *sysstats;  // live host stats for the monitoring view
+    rs_metrics *metrics;    // per-stream client/bytes network monitor
+    rs_log_entry log_ring[RS_LOG_CAP];
+    size_t log_head;        // next write slot
+    size_t log_count;       // entries in use (<= RS_LOG_CAP)
 };
 
 // A live Server-Sent Events subscriber is marked in mongoose's per-connection
@@ -33,6 +59,79 @@ struct restream_server {
 static restream_probe_fn g_probe_handler = NULL;
 static restream_fetch_fn g_fetch_handler = NULL;
 static restream_dash_fn g_dash_handler = NULL;
+
+// --- log store -------------------------------------------------------------
+
+static double now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6;
+}
+
+// Records one log entry (ring buffer overwrites the oldest). url/message may be
+// NULL; status 0 and bytes -1 mean "absent". Never blocks; single-threaded.
+static void log_record(restream_server_t *s, const char *sid, const char *level,
+                       const char *event, const char *url, long status, long long bytes,
+                       const char *message) {
+    rs_log_entry *e = &s->log_ring[s->log_head];
+    if (s->log_count == RS_LOG_CAP) {
+        // Overwriting the oldest live entry — free its strings first.
+        free(e->level); free(e->sid); free(e->event); free(e->message); free(e->url);
+    }
+    e->ts_ms = now_ms();
+    e->level = rs_strdup(level ? level : "info");
+    e->sid = rs_strdup(sid ? sid : "__panel__");
+    e->event = rs_strdup(event ? event : "");
+    e->message = message ? rs_strdup(message) : NULL;
+    e->url = url ? rs_strdup(url) : NULL;
+    e->status = status;
+    e->bytes = bytes;
+    s->log_head = (s->log_head + 1) % RS_LOG_CAP;
+    if (s->log_count < RS_LOG_CAP) s->log_count++;
+}
+
+// Builds the {entries:[...],availableDates:[]} response, oldest→newest, keeping
+// at most `limit` of the newest that match `sid` (NULL/"" = all).
+static rs_json *log_view(restream_server_t *s, const char *sid, int limit) {
+    rs_json *entries = rs_json_new_arr();
+    if (limit <= 0) limit = 150;
+    // Walk newest→oldest, collect up to `limit` matches, then reverse.
+    rs_json *tmp[RS_LOG_CAP]; int n = 0;
+    for (size_t i = 0; i < s->log_count && n < limit; i++) {
+        size_t idx = (s->log_head + RS_LOG_CAP - 1 - i) % RS_LOG_CAP;
+        rs_log_entry *e = &s->log_ring[idx];
+        if (sid && sid[0] && strcmp(sid, e->sid) != 0) continue;
+        rs_json *o = rs_json_new_obj();
+        rs_json_obj_set(o, "timestamp", rs_json_new_num(e->ts_ms));
+        rs_json_obj_set_str(o, "level", e->level);
+        rs_json_obj_set_str(o, "streamId", e->sid);
+        rs_json_obj_set_str(o, "event", e->event);
+        if (e->url) rs_json_obj_set_str(o, "url", e->url);
+        if (e->message) rs_json_obj_set_str(o, "message", e->message);
+        if (e->status) rs_json_obj_set_int(o, "status", e->status);
+        if (e->bytes >= 0) rs_json_obj_set_int(o, "bytes", e->bytes);
+        tmp[n++] = o;
+    }
+    for (int i = n - 1; i >= 0; i--) rs_json_arr_push(entries, tmp[i]);
+    rs_json *out = rs_json_new_obj();
+    rs_json_obj_set(out, "entries", entries);
+    rs_json_obj_set(out, "availableDates", rs_json_new_arr());
+    return out;
+}
+
+static void log_clear(restream_server_t *s, const char *sid) {
+    if (!sid || !sid[0]) {
+        for (size_t i = 0; i < s->log_count; i++) {
+            size_t idx = (s->log_head + RS_LOG_CAP - 1 - i) % RS_LOG_CAP;
+            rs_log_entry *e = &s->log_ring[idx];
+            free(e->level); free(e->sid); free(e->event); free(e->message); free(e->url);
+            memset(e, 0, sizeof(*e));
+        }
+        s->log_count = 0; s->log_head = 0;
+    }
+    // Per-stream clear is a no-op on the ring (entries age out on their own);
+    // clearing everything is the common case and is honoured.
+}
 
 // --- small response helpers ------------------------------------------------
 
@@ -241,9 +340,37 @@ static char *request_host(struct mg_http_message *hm) {
     return host ? host : rs_strdup("127.0.0.1");
 }
 
+// Overlays live network-monitor figures (active clients, in/out byte rate,
+// all-time bytes) onto each stream in a freshly-built /api/state view. Kept out
+// of rs_panel_view (core, no metrics) — the server owns the monitor.
+static void inject_stream_metrics(restream_server_t *s, rs_json *view) {
+    rs_json *providers = (rs_json *)rs_json_obj_get(view, "providers");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        rs_json *streams = (rs_json *)rs_json_obj_get(rs_json_arr_at(providers, i), "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+            rs_json *st = (rs_json *)rs_json_arr_at(streams, j);
+            const char *id = rs_json_obj_str(st, "id", "");
+            if (!id[0]) continue;
+            long long bps = (long long)rs_metrics_bytes_per_sec(s->metrics, id);
+            long long total = rs_metrics_total_bytes(s->metrics, id);
+            rs_json_obj_set_int(st, "activeClients", rs_metrics_active_clients(s->metrics, id));
+            rs_json *out = rs_json_new_obj();
+            rs_json_obj_set_int(out, "bytesPerSecond", bps);
+            rs_json_obj_set_int(out, "allTimeBytes", total);
+            rs_json_obj_set(st, "bandwidth", out);
+            rs_json *in = rs_json_new_obj();  // proxy: input rate ≈ output rate
+            rs_json_obj_set_int(in, "bytesPerSecond", bps);
+            rs_json_obj_set_int(in, "allTimeBytes", total);
+            rs_json_obj_set(st, "inputBandwidth", in);
+        }
+    }
+}
+
 static void handle_state(restream_server_t *s, struct mg_connection *c, struct mg_http_message *hm) {
     char *host = request_host(hm);
-    reply_json(c, 200, rs_panel_view(&s->state, host), NULL);
+    rs_json *view = rs_panel_view(&s->state, host);
+    inject_stream_metrics(s, view);
+    reply_json(c, 200, view, NULL);
     free(host);
 }
 
@@ -291,16 +418,41 @@ static void handle_settings(restream_server_t *s, struct mg_connection *c) {
 // empty until the playback plane (slice 4) produces traffic.
 static rs_json *build_metrics(restream_server_t *s) {
     rs_json *out = rs_json_new_obj();
-    rs_json *zero = rs_json_new_obj();
-    rs_json_obj_set_int(zero, "bytesPerSecond", 0);
-    rs_json_obj_set_int(zero, "allTimeBytes", 0);
-    rs_json_obj_set(out, "global", zero);
-    rs_json *zero2 = rs_json_new_obj();
-    rs_json_obj_set_int(zero2, "bytesPerSecond", 0);
-    rs_json_obj_set_int(zero2, "allTimeBytes", 0);
-    rs_json_obj_set(out, "globalInput", zero2);
+    rs_json *streams = rs_json_new_obj();
+    double global_bps = 0; long long global_total = 0; int global_clients = 0;
+
+    // One entry per stream, plus running totals for the global monitor. The C
+    // server is a proxy, so bytes fetched ≈ bytes served — report the served
+    // rate as both the input (↓) and output (↑) figure.
+    const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *streams_arr = rs_json_obj_get(rs_json_arr_at(providers, i), "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams_arr); j++) {
+            const char *id = rs_json_obj_str(rs_json_arr_at(streams_arr, j), "id", "");
+            if (!id[0]) continue;
+            double bps = rs_metrics_bytes_per_sec(s->metrics, id);
+            long long total = rs_metrics_total_bytes(s->metrics, id);
+            int clients = rs_metrics_active_clients(s->metrics, id);
+            rs_json *sm = rs_json_new_obj();
+            rs_json_obj_set_int(sm, "bytesPerSecond", (long long)bps);
+            rs_json_obj_set_int(sm, "allTimeBytes", total);
+            rs_json_obj_set_int(sm, "activeClients", clients);
+            rs_json_obj_set(streams, id, sm);
+            global_bps += bps; global_total += total; global_clients += clients;
+        }
+    }
+
+    rs_json *global = rs_json_new_obj();
+    rs_json_obj_set_int(global, "bytesPerSecond", (long long)global_bps);
+    rs_json_obj_set_int(global, "allTimeBytes", global_total);
+    rs_json_obj_set_int(global, "activeClients", global_clients);
+    rs_json_obj_set(out, "global", global);
+    rs_json *ginput = rs_json_new_obj();
+    rs_json_obj_set_int(ginput, "bytesPerSecond", (long long)global_bps);
+    rs_json_obj_set_int(ginput, "allTimeBytes", global_total);
+    rs_json_obj_set(out, "globalInput", ginput);
     rs_json_obj_set(out, "system", rs_sysstats_snapshot(s->sysstats));
-    rs_json_obj_set(out, "streams", rs_json_new_obj());
+    rs_json_obj_set(out, "streams", streams);
     rs_json_obj_set(out, "connections", rs_json_new_arr());
     return out;
 }
@@ -325,6 +477,7 @@ static void handle_events(restream_server_t *s, struct mg_connection *c) {
 // The 1s timer: push a fresh metrics frame to every SSE subscriber.
 static void broadcast_metrics(void *arg) {
     restream_server_t *s = (restream_server_t *)arg;
+    rs_metrics_prune(s->metrics);  // expire stale clients/rate windows every tick
     // Snapshot once, reuse for every subscriber.
     bool any = false;
     for (struct mg_connection *c = s->mgr.conns; c != NULL; c = c->next) {
@@ -343,14 +496,87 @@ static void broadcast_metrics(void *arg) {
 
 // The Logs view. No workers run in the C server yet, so there's nothing to
 // report — but the endpoint returns the shape the panel expects.
-static void handle_logs(struct mg_connection *c) {
-    rs_json *out = rs_json_new_obj();
-    rs_json_obj_set(out, "entries", rs_json_new_arr());
-    rs_json_obj_set(out, "availableDates", rs_json_new_arr());
-    reply_json(c, 200, out, NULL);
+static void handle_logs(restream_server_t *s, struct mg_connection *c, struct mg_http_message *hm) {
+    char sid[160] = {0}, lim[32] = {0};
+    mg_http_get_var(&hm->query, "streamId", sid, sizeof(sid));
+    mg_http_get_var(&hm->query, "limit", lim, sizeof(lim));
+    reply_json(c, 200, log_view(s, sid, lim[0] ? atoi(lim) : 150), NULL);
 }
 
 // Dispatches /api/*. Returns true if it handled the request.
+// Finds a provider node by id in the live state (mutable).
+static rs_json *find_provider_by_id(rs_state *st, const char *id) {
+    rs_json *providers = (rs_json *)rs_json_obj_get(st->root, "providers");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        rs_json *p = (rs_json *)rs_json_arr_at(providers, i);
+        if (strcmp(rs_json_obj_str(p, "id", ""), id) == 0) return p;
+    }
+    return NULL;
+}
+
+// Runs a provider's script for one action (login/pair/channels/keys/custom…),
+// passing the provider config + active account, and records stdout/stderr to the
+// log under "script:<providerId>" so the panel's script output + Logs tab show
+// it. This is the C port of PanelServer's script-action runner (ScriptRunner).
+static int run_provider_script(restream_server_t *s, const rs_json *provider,
+                               const char *action, const char **err) {
+    const char *script = rs_json_obj_str(provider, "scriptPath", "");
+    if (!script[0]) { *err = "No script path set on this provider."; return -400; }
+    const char *pid = rs_json_obj_str(provider, "id", "");
+    char sid[192];
+    snprintf(sid, sizeof(sid), "script:%s", pid);
+
+    char sessiondir[512];
+    snprintf(sessiondir, sizeof(sessiondir), "runtime/sessions/%s", pid);
+#ifndef _WIN32
+    mkdir("runtime", 0755); mkdir("runtime/sessions", 0755); mkdir(sessiondir, 0755);
+#endif
+
+    char *args[24]; int n = 0;
+    args[n++] = rs_script_arg("action", action, false);
+    args[n++] = rs_script_arg("sessiondir", sessiondir, false);
+    const char *bind = rs_json_obj_str(provider, "scriptBind", "");
+    const char *doh = rs_json_obj_str(provider, "scriptDoh", "");
+    const char *worker = rs_json_obj_str(provider, "scriptWorker", "");
+    if (bind[0]) args[n++] = rs_script_arg("bind", bind, false);
+    if (doh[0]) args[n++] = rs_script_arg("doh", doh, false);
+    if (worker[0]) args[n++] = rs_script_arg("worker", worker, false);
+    const rs_json *accounts = rs_json_obj_get(provider, "scriptAccounts");
+    const char *active = rs_json_obj_str(provider, "activeScriptAccountId", "");
+    for (size_t i = 0; i < rs_json_arr_len(accounts) && n < 22; i++) {
+        const rs_json *a = rs_json_arr_at(accounts, i);
+        if (strcmp(rs_json_obj_str(a, "id", ""), active) != 0) continue;
+        const char *u = rs_json_obj_str(a, "username", "");
+        const char *p = rs_json_obj_str(a, "password", "");
+        if (u[0]) args[n++] = rs_script_arg("username", u, false);
+        if (p[0]) args[n++] = rs_script_arg("password", p, true);
+        break;
+    }
+
+    log_record(s, sid, "info", "scriptStart", NULL, 0, -1, action);
+    char *out = NULL, *errout = NULL;
+    int rc = rs_script_run_sync(script, (const char **)args, n, 30.0, &out, &errout);
+    for (int i = 0; i < n; i++) free(args[i]);
+
+    if (out && out[0]) {
+        char *copy = rs_strdup(out);
+        for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n"))
+            if (line[0]) log_record(s, sid, "info", "scriptOutput", NULL, 0, -1, line);
+        free(copy);
+    }
+    if (errout && errout[0]) {
+        char *copy = rs_strdup(errout);
+        for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n"))
+            if (line[0]) log_record(s, sid, "error", "scriptError", NULL, 0, -1, line);
+        free(copy);
+    }
+    log_record(s, sid, rc == 0 ? "info" : "error", "scriptEnd", NULL, rc, -1,
+               rc == 0 ? "ok" : "script exited non-zero");
+    free(out); free(errout);
+    if (rc != 0) { *err = "The script exited with an error — see the script log."; return -502; }
+    return 0;
+}
+
 static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_http_message *hm) {
     if (mg_match(hm->uri, mg_str("/api/auth/status"), NULL) && method_is(hm, "GET")) {
         handle_auth_status(s, c, hm); return true;
@@ -380,7 +606,14 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         handle_events(s, c); return true;
     }
     if (mg_match(hm->uri, mg_str("/api/logs"), NULL) && method_is(hm, "GET")) {
-        handle_logs(c); return true;
+        handle_logs(s, c, hm); return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/logs"), NULL) && method_is(hm, "DELETE")) {
+        char sid[160] = {0};
+        mg_http_get_var(&hm->query, "streamId", sid, sizeof(sid));
+        log_clear(s, sid);
+        reply_json(c, 200, log_view(s, sid, 150), NULL);
+        return true;
     }
     if (mg_match(hm->uri, mg_str("/api/probe"), NULL) && method_is(hm, "POST")) {
         if (!g_probe_handler) {
@@ -405,6 +638,39 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         mg_http_reply(c, 200, headers_out, "%s", result);
         rs_free(result);
         return true;
+    }
+
+    // --- provider script actions ---
+    // POST /api/providers/<id>/script/<action> — run a script action; the panel
+    // polls /api/logs?streamId=script:<id> for the output.
+    if (method_is(hm, "POST")) {
+        struct mg_str caps[2];
+        if (mg_match(hm->uri, mg_str("/api/providers/*/script/*"), caps)) {
+            char pid[128] = {0}, action[64] = {0};
+            snprintf(pid, sizeof(pid), "%.*s", (int)caps[0].len, caps[0].buf);
+            snprintf(action, sizeof(action), "%.*s", (int)caps[1].len, caps[1].buf);
+            rs_json *provider = find_provider_by_id(&s->state, pid);
+            if (!provider) { reply_error(c, 404, "Provider not found."); return true; }
+
+            if (strcmp(action, "clear-session") == 0) {
+                // Best-effort: the script owns the files; just log it and let the
+                // next run start fresh (the script recreates its session dir).
+                char sid[192]; snprintf(sid, sizeof(sid), "script:%s", pid);
+                log_record(s, sid, "info", "clearSession", NULL, 0, -1, "session cleared");
+                reply_json(c, 200, log_view(s, sid, 150), NULL);
+                return true;
+            }
+
+            const char *err = NULL;
+            int rc = run_provider_script(s, provider, action, &err);
+            // Persist any state the script may have changed, then return the log
+            // tail so the output shows immediately.
+            rs_state_save(&s->state);
+            if (rc != 0 && rc != -502) { reply_error(c, -rc, err ? err : "Script run failed."); return true; }
+            char sid[192]; snprintf(sid, sizeof(sid), "script:%s", pid);
+            reply_json(c, 200, log_view(s, sid, 150), NULL);
+            return true;
+        }
     }
 
     // --- provider CRUD ---
@@ -452,6 +718,8 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         char *id = capture(hm, "/api/streams/*/start");
         const char *err = NULL;
         int rc = rs_panel_set_stream_running(&s->state, id, true, &err);
+        if (rc == 0) { log_record(s, id, "info", "streamStart", NULL, 0, -1, "stream started");
+                       log_record(s, "__panel__", "info", "streamStart", NULL, 0, -1, id); }
         free(id);
         reply_after_mutation(s, c, hm, rc, err);
         return true;
@@ -460,6 +728,8 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         char *id = capture(hm, "/api/streams/*/stop");
         const char *err = NULL;
         int rc = rs_panel_set_stream_running(&s->state, id, false, &err);
+        if (rc == 0) { log_record(s, id, "info", "streamStop", NULL, 0, -1, "stream stopped");
+                       log_record(s, "__panel__", "info", "streamStop", NULL, 0, -1, id); }
         free(id);
         reply_after_mutation(s, c, hm, rc, err);
         return true;
@@ -784,7 +1054,12 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
     free(proxy);
     free(headers);
     free(range);
-    if (rc != 0) { free(url); free(ct); free(cr); reply_error(c, 502, err[0] ? err : "Segment fetch failed."); return; }
+    if (rc != 0) {
+        log_record(server, stream_id, "error", is_map ? "downloadInit" : "downloadSegment",
+                   url, 0, -1, err[0] ? err : "fetch failed");
+        free(url); free(ct); free(cr);
+        reply_error(c, 502, err[0] ? err : "Segment fetch failed."); return;
+    }
 
     if (decrypt) {
         size_t new_len = 0;
@@ -792,6 +1067,18 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
         body_len = new_len;
         status = 0; free(cr); cr = NULL;  // decrypted body is a fresh whole object
     }
+
+    // Network monitor: attribute the served bytes to this stream + client, and
+    // log the fetch so the stream's Logs tab shows download activity.
+    char client_ip[64] = {0};
+    mg_snprintf(client_ip, sizeof(client_ip), "%M", mg_print_ip, &c->rem);
+    char *ua = header_dup(hm, "User-Agent");
+    char *pkey = playback_key(hm);
+    const char *identity = (pkey && pkey[0]) ? pkey : client_ip;
+    rs_metrics_record(server->metrics, stream_id, identity, client_ip, ua ? ua : "", (int)body_len);
+    log_record(server, stream_id, "info", is_map ? "downloadInit" : "downloadSegment",
+               url, status, (long long)body_len, NULL);
+    free(ua); free(pkey);
 
     const char *type = (ct && ct[0]) ? ct : content_type_from_ext(url);
     // Relay the upstream's 206 + Content-Range so the player's byte-range
@@ -1043,6 +1330,18 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     }
 
     if (mg_match(hm->uri, mg_str("/api/#"), NULL)) {
+        // Panel access log — record API calls under "__panel__", skipping the
+        // high-frequency polls (state/logs/events) that would drown out the rest.
+        if (server &&
+            !mg_match(hm->uri, mg_str("/api/state"), NULL) &&
+            !mg_match(hm->uri, mg_str("/api/logs"), NULL) &&
+            !mg_match(hm->uri, mg_str("/api/events"), NULL)) {
+            char line[512], ip[64] = {0};
+            mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
+            snprintf(line, sizeof(line), "%.*s %.*s  from %s",
+                     (int)hm->method.len, hm->method.buf, (int)hm->uri.len, hm->uri.buf, ip);
+            log_record(server, "__panel__", "info", "access", NULL, 0, -1, line);
+        }
         if (server && handle_api(server, c, hm)) return;
         // A recognised prefix but not a route we serve yet: honest 501, so a
         // browser gets a clean error rather than an HTML page as JSON.
@@ -1077,17 +1376,20 @@ restream_server_t* restream_server_create(void) {
     server->web_root = NULL;
     server->auth = rs_auth_create();
     server->sysstats = rs_sysstats_create();
+    server->metrics = rs_metrics_create();
     // state.json lives in the working directory, matching the Swift binary.
-    if (rs_state_load(&server->state, "state.json") != 0 || !server->auth || !server->sysstats) {
+    if (rs_state_load(&server->state, "state.json") != 0 || !server->auth || !server->sysstats || !server->metrics) {
         // A malformed state.json is fatal — better to refuse than to risk
         // overwriting it with a fresh one and losing the user's data.
         rs_auth_destroy(server->auth);
         rs_sysstats_destroy(server->sysstats);
+        rs_metrics_destroy(server->metrics);
         rs_state_dispose(&server->state);
         mg_mgr_free(&server->mgr);
         free(server);
         return NULL;
     }
+    log_record(server, "__panel__", "info", "serverStart", NULL, 0, -1, "ReStreamAir C server started");
     return server;
 }
 
@@ -1152,6 +1454,8 @@ void restream_server_destroy(restream_server_t* server) {
         mg_mgr_free(&server->mgr);
         rs_auth_destroy(server->auth);
         rs_sysstats_destroy(server->sysstats);
+        rs_metrics_destroy(server->metrics);
+        log_clear(server, "");  // frees ring-buffer strings
         rs_state_dispose(&server->state);
         free(server->web_root);
         free(server);
