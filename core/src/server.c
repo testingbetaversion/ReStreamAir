@@ -446,6 +446,24 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         reply_after_mutation(s, c, hm, rc, err);
         return true;
     }
+    // Start/stop: playback is on-demand, so this just flips the stored status
+    // (the player pulls /play/<id>/index.m3u8 whenever it's running).
+    if (mg_match(hm->uri, mg_str("/api/streams/*/start"), NULL) && method_is(hm, "POST")) {
+        char *id = capture(hm, "/api/streams/*/start");
+        const char *err = NULL;
+        int rc = rs_panel_set_stream_running(&s->state, id, true, &err);
+        free(id);
+        reply_after_mutation(s, c, hm, rc, err);
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/streams/*/stop"), NULL) && method_is(hm, "POST")) {
+        char *id = capture(hm, "/api/streams/*/stop");
+        const char *err = NULL;
+        int rc = rs_panel_set_stream_running(&s->state, id, false, &err);
+        free(id);
+        reply_after_mutation(s, c, hm, rc, err);
+        return true;
+    }
     if (mg_match(hm->uri, mg_str("/api/streams/*"), NULL) && method_is(hm, "PUT")) {
         char *id = capture(hm, "/api/streams/*");
         rs_json *body = parse_body(hm);
