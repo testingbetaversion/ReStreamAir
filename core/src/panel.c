@@ -419,6 +419,7 @@ rs_json *rs_panel_keys_view(const rs_state *st) {
 static const char *normalize_downloader(const char *d) {
     if (strcmp(d, "wget") == 0) return "wget";
     if (strcmp(d, "aria2c") == 0) return "aria2c";
+    if (strcmp(d, "native") == 0 || strcmp(d, "internal") == 0 || strcmp(d, "libcurl") == 0) return "native";
     return "curl";
 }
 
