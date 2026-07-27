@@ -1355,9 +1355,11 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     struct mg_http_message *hm = (struct mg_http_message *)ev_data;
     restream_server_t *server = (restream_server_t *)c->fn_data;
 
-    // Liveness probe.
+    // Liveness probe. Carries the binary's build time so it's trivial to tell,
+    // from an unauthenticated curl, whether a rebuilt server was actually
+    // restarted (a stale process reports the old stamp).
     if (mg_match(hm->uri, mg_str("/ping"), NULL)) {
-        mg_http_reply(c, 200, JSON_HEADERS, "{\"status\":\"ok\"}");
+        mg_http_reply(c, 200, JSON_HEADERS, "{\"status\":\"ok\",\"build\":\"%s %s\"}", __DATE__, __TIME__);
         return;
     }
 
