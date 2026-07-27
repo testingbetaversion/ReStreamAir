@@ -113,6 +113,16 @@
             <label>Name<input name="name" placeholder="Provider name" required></label>
             <label>Proxy<span class="field-hint">Default for every stream under this provider</span><input name="proxy" placeholder="http://127.0.0.1:8888"></label>
             <label>Generic headers<span class="field-hint">Applied to all requests for all streams, one "Name: value" per line</span><textarea name="headers" placeholder="Authorization: Bearer TOKEN"></textarea></label>
+            <div class="form-row">
+              <label>Downloader<span class="field-hint">Tool used to fetch this provider's manifests &amp; segments</span>
+                <select name="downloader">
+                  <option value="curl">curl</option>
+                  <option value="wget">wget</option>
+                  <option value="aria2c">aria2c</option>
+                </select>
+              </label>
+              <label>Downloader params<span class="field-hint">Extra CLI args passed to the tool, e.g. --retry 3 or aria2c -x 8</span><input name="downloaderParams" placeholder="optional"></label>
+            </div>
             <label class="check"><input name="inheritUrlParams" type="checkbox"> Append each stream's own Source URL query params to its segments</label>
             <label id="segmentUrlParamsField">Segment URL params<span class="field-hint">Fixed fallback appended to every media/init segment URL when the option above is off, e.g. token=abc&amp;region=us</span><input name="segmentUrlParams" placeholder="token=abc&region=us"></label>
 
