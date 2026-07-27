@@ -27,6 +27,7 @@
 
 #include "net.h"
 #include "probe.h"
+#include "rs_dash.h"
 #include "restream.h"
 
 namespace {
@@ -135,6 +136,7 @@ int main(int argc, char **argv) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     restream_server_set_probe_handler(rs_probe_source);
     restream_server_set_fetch_handler(rs_fetch_url);
+    restream_server_set_dash_handler(rs_dash_describe);
 
     restream_server_t *server = restream_server_create();
     if (!server) {
@@ -157,8 +159,9 @@ int main(int argc, char **argv) {
         std::printf("  no web root — serving /ping only. Pass --root public/ to serve the panel's files.\n");
     } else {
         std::printf("  serving %s + the panel API: auth, provider/stream/user/key management,\n"
-                    "  live monitoring, source auto-detect, and direct-source playback.\n"
-                    "  Proxied/DASH streaming and script providers aren't in the C server yet.\n",
+                    "  live monitoring, source auto-detect, direct/HLS-proxy/DASH playback\n"
+                    "  (DASH ClearKey CENC decrypted in-server). ffmpeg input modes and\n"
+                    "  script providers aren't in the C server yet.\n",
                     web_root.c_str());
     }
     std::fflush(stdout);

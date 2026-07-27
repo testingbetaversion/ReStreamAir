@@ -1,6 +1,7 @@
 #include "restream.h"
 #include "rs_common.h"
 #include "rs_auth.h"
+#include "rs_cenc.h"
 #include "rs_json.h"
 #include "rs_m3u8.h"
 #include "rs_panel.h"
@@ -31,6 +32,7 @@ struct restream_server {
 // the router (below) can reference them before their setters are defined.
 static restream_probe_fn g_probe_handler = NULL;
 static restream_fetch_fn g_fetch_handler = NULL;
+static restream_dash_fn g_dash_handler = NULL;
 
 // --- small response helpers ------------------------------------------------
 
@@ -690,7 +692,7 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     char err[256] = {0};
     int rc = g_fetch_handler(manifest_url, proxy, headers, NULL,
                              effective_downloader(provider), effective_downloader_params(provider),
-                             &body, &body_len, NULL, NULL, NULL, err, sizeof(err));
+                             &body, &body_len, NULL, NULL, NULL, NULL, err, sizeof(err));
     free(proxy);
     free(headers);
     if (rc != 0) { free(variant); reply_error(c, 502, err[0] ? err : "Could not fetch the playlist."); return; }
@@ -712,8 +714,28 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     rs_free(rewritten);
 }
 
+// Applies ClearKey CENC to a fetched DASH item in place: patches the init
+// segment (kind=map) or AES-CTR-decrypts a media segment using the stream's
+// configured KID:KEY. No-op (returns the input) when no key is set.
+static uint8_t *apply_cenc(const rs_json *stream, bool is_map, uint8_t *body, size_t body_len, size_t *out_len) {
+    *out_len = body_len;
+    rs_cenc_keys keys = rs_cenc_parse_keys(rs_json_obj_str(stream, "decryptionKeys", ""));
+    uint8_t *out = NULL;
+    if (is_map) {
+        // The init needs patching to a clear codec even before any key exists.
+        out = rs_cenc_patch_init(body, body_len, out_len, NULL, NULL);
+    } else if (keys.count > 0) {
+        out = rs_cenc_decrypt_segment(body, body_len, out_len, keys.keys[0], 8);
+    }
+    rs_cenc_keys_free(&keys);
+    if (out) { free(body); return out; }
+    *out_len = body_len;
+    return body;
+}
+
 // Proxies one segment/key/init: fetch ?u= through the stream's media settings
-// and stream the bytes back.
+// and stream the bytes back. ?dec=1 (set by the DASH playlist) applies ClearKey
+// CENC decryption; ?kind=map marks the init segment.
 static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
                              struct mg_http_message *hm, const char *stream_id) {
     const rs_json *stream = rs_panel_find_stream(&server->state, stream_id);
@@ -722,9 +744,16 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
     if (!url) { reply_error(c, 400, "Missing ?u= target."); return; }
     const rs_json *provider = provider_of(&server->state, stream);
 
+    char *dec = query_var(hm, "dec");
+    char *kindq = query_var(hm, "kind");
+    bool decrypt = dec && dec[0] == '1';
+    bool is_map = kindq && strcmp(kindq, "map") == 0;
+    free(dec); free(kindq);
+
     // Forward the player's Range so byte-range segments and seeking fetch only
-    // the requested slice (and never a whole huge file).
-    char *range = header_dup(hm, "Range");
+    // the requested slice — but never for a to-be-decrypted item: CENC needs the
+    // whole segment, so a ranged fetch would corrupt it.
+    char *range = decrypt ? NULL : header_dup(hm, "Range");
     char *proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
     char *headers = effective_headers(provider, stream, "mediaHeaders");
     char *body = NULL, *ct = NULL, *cr = NULL;
@@ -733,11 +762,18 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
     char err[256] = {0};
     int rc = g_fetch_handler(url, proxy, headers, range,
                              effective_downloader(provider), effective_downloader_params(provider),
-                             &body, &body_len, &status, &ct, &cr, err, sizeof(err));
+                             &body, &body_len, &status, &ct, &cr, NULL, err, sizeof(err));
     free(proxy);
     free(headers);
     free(range);
     if (rc != 0) { free(url); free(ct); free(cr); reply_error(c, 502, err[0] ? err : "Segment fetch failed."); return; }
+
+    if (decrypt) {
+        size_t new_len = 0;
+        body = (char *)apply_cenc(stream, is_map, (uint8_t *)body, body_len, &new_len);
+        body_len = new_len;
+        status = 0; free(cr); cr = NULL;  // decrypted body is a fresh whole object
+    }
 
     const char *type = (ct && ct[0]) ? ct : content_type_from_ext(url);
     // Relay the upstream's 206 + Content-Range so the player's byte-range
@@ -760,8 +796,137 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
     free(body);
 }
 
-// Playback routes. Direct-source streams redirect; HLS passthrough is proxied
-// live. DASH (mpd) and ffmpeg modes still need the worker layer and 501.
+// Calls the DASH describe hook with the stream's source + network settings.
+// Returns malloc'd JSON (caller rs_json_free after parse) or NULL with err set.
+static char *dash_describe(restream_server_t *server, const rs_json *stream,
+                           const char *rep, int want, char *err, size_t errlen) {
+    const rs_json *provider = provider_of(&server->state, stream);
+    const char *src = stream_source_target(stream);
+    if (!src[0]) { snprintf(err, errlen, "Stream has no source URL."); return NULL; }
+    char *proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    char *headers = effective_headers(provider, stream, "manifestHeaders");
+    char *json = g_dash_handler(src, proxy, headers,
+                                effective_downloader(provider), effective_downloader_params(provider),
+                                rep, want, err, errlen);
+    free(proxy); free(headers);
+    return json;
+}
+
+// Serves the DASH master playlist: a video variant plus (if present) an audio
+// rendition, each pointing at a per-representation media playlist on this server.
+static void serve_dash_master(restream_server_t *server, struct mg_connection *c,
+                              struct mg_http_message *hm, const rs_json *stream) {
+    (void)hm;
+    const char *stream_id = rs_json_obj_str(stream, "id", "");
+    char err[256] = {0};
+    char *json = dash_describe(server, stream, "", 0, err, sizeof(err));
+    if (!json) { reply_error(c, 502, err[0] ? err : "Could not read the MPD."); return; }
+    rs_json *root = rs_json_parse(json, strlen(json));
+    free(json);
+    if (!root) { reply_error(c, 502, "Bad DASH description."); return; }
+
+    const rs_json *video = rs_json_obj_get(root, "video");
+    const rs_json *audio = rs_json_obj_get(root, "audio");
+    if (!video || rs_json_type_of(video) != RS_JSON_OBJ) { rs_json_free(root); reply_error(c, 502, "No video representation in the MPD."); return; }
+    const char *vid = rs_json_obj_str(video, "id", "");
+    const char *vcodecs = rs_json_obj_str(video, "codecs", "");
+    long long vbw = (long long)rs_json_as_num(rs_json_obj_get(video, "bandwidth"), 3000000);
+    bool have_audio = audio && rs_json_type_of(audio) == RS_JSON_OBJ;
+    const char *acodecs = have_audio ? rs_json_obj_str(audio, "codecs", "") : "";
+
+    char *venc = query_encode(vid);
+    char codecs[256];
+    if (vcodecs[0] && acodecs[0]) snprintf(codecs, sizeof(codecs), "%s,%s", vcodecs, acodecs);
+    else snprintf(codecs, sizeof(codecs), "%s", vcodecs);
+
+    char *buf = NULL; size_t bufsz = 0;
+    FILE *f = open_memstream(&buf, &bufsz);
+    if (!f) { free(venc); rs_json_free(root); reply_error(c, 500, "Out of memory."); return; }
+    fprintf(f, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    if (have_audio) {
+        char *aenc = query_encode(rs_json_obj_str(audio, "id", ""));
+        fprintf(f, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,AUTOSELECT=YES,"
+                   "URI=\"/play/%s/index.m3u8?rep=%s&mtype=audio\"\n", stream_id, aenc ? aenc : "");
+        free(aenc);
+    }
+    fprintf(f, "#EXT-X-STREAM-INF:BANDWIDTH=%lld", vbw > 0 ? vbw : 3000000);
+    if (codecs[0]) fprintf(f, ",CODECS=\"%s\"", codecs);
+    if (have_audio) fprintf(f, ",AUDIO=\"aud\"");
+    fprintf(f, "\n/play/%s/index.m3u8?rep=%s&mtype=video\n", stream_id, venc ? venc : "");
+    fclose(f);
+    free(venc);
+    rs_json_free(root);
+
+    mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
+                          "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n", "%s", buf);
+    free(buf);
+}
+
+// Serves a per-representation DASH media playlist: EXT-X-MAP for the init and
+// one EXTINF per segment, every URI routed back through /proxy with dec=1 so the
+// ClearKey CENC is applied here. Rebuilt each reload — that IS the live poll.
+static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
+                             struct mg_http_message *hm, const rs_json *stream, const char *rep) {
+    (void)hm;
+    const char *stream_id = rs_json_obj_str(stream, "id", "");
+    int want = (int)rs_json_obj_int(stream, "playlistSegments", 6);
+    if (want < 1) want = 6;
+    char err[256] = {0};
+    char *json = dash_describe(server, stream, rep, want, err, sizeof(err));
+    if (!json) { reply_error(c, 502, err[0] ? err : "Could not read the MPD."); return; }
+    rs_json *root = rs_json_parse(json, strlen(json));
+    free(json);
+    const rs_json *plan = root ? rs_json_obj_get(root, "plan") : NULL;
+    if (!plan || rs_json_type_of(plan) != RS_JSON_OBJ) { rs_json_free(root); reply_error(c, 502, "Representation not found in the MPD."); return; }
+
+    long long timescale = (long long)rs_json_as_num(rs_json_obj_get(plan, "timescale"), 1);
+    if (timescale < 1) timescale = 1;
+    const char *init_url = rs_json_obj_str(plan, "initUrl", "");
+    const rs_json *segs = rs_json_obj_get(plan, "segments");
+    size_t nseg = rs_json_arr_len(segs);
+
+    double maxdur = 0;
+    for (size_t i = 0; i < nseg; i++)
+        { double d = rs_json_as_num(rs_json_obj_get(rs_json_arr_at(segs, i), "duration"), 0); if (d > maxdur) maxdur = d; }
+    int target = (int)(maxdur + 0.999); if (target < 1) target = 1;
+
+    // Media sequence derived from the first segment's timeline position so it is
+    // stable across reloads and advances by 1 as the live window slides.
+    long long seq = 0;
+    if (nseg > 0) {
+        const rs_json *s0 = rs_json_arr_at(segs, 0);
+        long long t0 = (long long)rs_json_as_num(rs_json_obj_get(s0, "time"), 0);
+        double d0 = rs_json_as_num(rs_json_obj_get(s0, "duration"), 0);
+        long long units = (long long)(d0 * (double)timescale + 0.5);
+        if (units > 0 && t0 > 0) seq = t0 / units;
+    }
+
+    char *buf = NULL; size_t bufsz = 0;
+    FILE *f = open_memstream(&buf, &bufsz);
+    if (!f) { rs_json_free(root); reply_error(c, 500, "Out of memory."); return; }
+    fprintf(f, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%lld\n", target, seq);
+    if (init_url[0]) {
+        char *ienc = query_encode(init_url);
+        fprintf(f, "#EXT-X-MAP:URI=\"/proxy/%s/item?u=%s&kind=map&dec=1\"\n", stream_id, ienc ? ienc : "");
+        free(ienc);
+    }
+    for (size_t i = 0; i < nseg; i++) {
+        const rs_json *s = rs_json_arr_at(segs, i);
+        double d = rs_json_as_num(rs_json_obj_get(s, "duration"), maxdur);
+        char *senc = query_encode(rs_json_obj_str(s, "url", ""));
+        fprintf(f, "#EXTINF:%.3f,\n/proxy/%s/item?u=%s&kind=segment&dec=1\n", d, stream_id, senc ? senc : "");
+        free(senc);
+    }
+    fclose(f);
+    rs_json_free(root);
+
+    mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
+                          "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n", "%s", buf);
+    free(buf);
+}
+
+// Playback routes. Direct-source streams redirect; HLS passthrough and DASH
+// (on-demand MPD->HLS translation) are proxied live. ffmpeg modes still 501.
 static bool handle_playback(restream_server_t *server, struct mg_connection *c,
                             struct mg_http_message *hm) {
     bool is_source = mg_match(hm->uri, mg_str("/source/*"), NULL);
@@ -818,6 +983,17 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
         if (is_m3u8 && strcmp(kind, "m3u8") == 0 && strcmp(input_mode, "internal") == 0) {
             if (!g_fetch_handler) { reply_error(c, 501, "Proxy playback isn't in this build."); return true; }
             serve_hls_playlist(server, c, hm, stream);
+            return true;
+        }
+        // DASH: on-demand MPD->HLS. The master lists a video + audio rendition;
+        // ?rep= serves that representation's media playlist (re-expanded from the
+        // live MPD each reload). Segments/init flow through /proxy with dec=1.
+        if (is_m3u8 && strcmp(kind, "mpd") == 0 && strcmp(input_mode, "internal") == 0) {
+            if (!g_dash_handler || !g_fetch_handler) { reply_error(c, 501, "DASH playback isn't in this build."); return true; }
+            char *rep = query_var(hm, "rep");
+            if (rep && rep[0]) serve_dash_media(server, c, hm, stream, rep);
+            else serve_dash_master(server, c, hm, stream);
+            free(rep);
             return true;
         }
     }
@@ -913,6 +1089,10 @@ void restream_server_set_probe_handler(restream_probe_fn handler) {
 
 void restream_server_set_fetch_handler(restream_fetch_fn handler) {
     g_fetch_handler = handler;
+}
+
+void restream_server_set_dash_handler(restream_dash_fn handler) {
+    g_dash_handler = handler;
 }
 
 bool restream_server_start(restream_server_t* server, uint16_t port, const char* bind_address) {

@@ -47,6 +47,22 @@ int rs_dash_plan_build(const char *mpd_xml, size_t len, const char *mpd_url,
 
 void rs_dash_plan_dispose(rs_dash_plan *plan);
 
+// Fetches the MPD at `url` (through the given proxy / "Name: value" headers /
+// downloader) and returns a malloc'd JSON description the C server turns into
+// HLS playlists (caller frees with free), or NULL with a message in errbuf:
+//
+//   { "dynamic":bool, "mup":num, "tsb":num,
+//     "video": {"id","codecs","bandwidth"} | null,   // default video rendition
+//     "audio": {"id","codecs"} | null,               // default audio rendition
+//     "plan":  {                                       // only when `rep` matched
+//        "repId","type","timescale","initUrl",
+//        "segments":[ {"url","time","duration"} ... ] } }
+//
+// Redirects are followed and segment URLs resolve against the final URL.
+char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
+                       const char *downloader, const char *dl_params,
+                       const char *rep, int want, char *errbuf, size_t errbuf_len);
+
 #ifdef __cplusplus
 }
 #endif

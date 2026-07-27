@@ -48,12 +48,27 @@ void restream_server_set_probe_handler(restream_probe_fn handler);
 // `downloader`/`dl_params` pick the per-provider download mechanism: NULL or ""
 // means the in-process libcurl fetch; "curl"/"wget"/"aria2c" run that external
 // tool with `dl_params` appended (and fall back to libcurl if it is missing).
+// `effective_url` (may be NULL) receives a malloc'd copy of the final URL after
+// redirects — needed to resolve a DASH MPD's relative segment URLs when the
+// manifest 302s to a session-tokenized host. Only the libcurl path fills it.
 typedef int (*restream_fetch_fn)(const char *url, const char *proxy, const char *headers,
                                  const char *range, const char *downloader, const char *dl_params,
                                  char **out, size_t *out_len,
                                  long *status, char **content_type, char **content_range,
-                                 char *errbuf, size_t errbuf_len);
+                                 char **effective_url, char *errbuf, size_t errbuf_len);
 void restream_server_set_fetch_handler(restream_fetch_fn handler);
+
+// A DASH describe handler: fetches an MPD (through proxy/headers/downloader),
+// follows redirects, and returns a malloc'd JSON description (freed with
+// rs_free) — default video/audio renditions plus, when `rep` is given, that
+// representation's init + newest-`want` segment URLs. NULL on failure with a
+// message in errbuf. Lives in the C++ server (libxml2); the core only holds the
+// pointer, so the Swift build never links libxml2. When unset, DASH playback
+// returns 501. See rs_dash_describe.
+typedef char *(*restream_dash_fn)(const char *url, const char *proxy, const char *headers,
+                                  const char *downloader, const char *dl_params,
+                                  const char *rep, int want, char *errbuf, size_t errbuf_len);
+void restream_server_set_dash_handler(restream_dash_fn handler);
 
 // Start the server (non-blocking, or spawns a background thread in C,
 // or the Swift app just loops over a poll function).

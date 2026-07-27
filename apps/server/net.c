@@ -65,9 +65,10 @@ static size_t header_cb(char *buffer, size_t size, size_t nitems, void *userdata
 
 static int fetch_libcurl(const char *url, const char *proxy, const char *headers, const char *range,
                          char **out, size_t *out_len, long *status, char **content_type,
-                         char **content_range, char *errbuf, size_t errbuf_len) {
+                         char **content_range, char **effective_url, char *errbuf, size_t errbuf_len) {
     if (content_type) *content_type = NULL;
     if (content_range) *content_range = NULL;
+    if (effective_url) *effective_url = NULL;
     if (status) *status = 0;
 
     CURL *curl = curl_easy_init();
@@ -113,6 +114,10 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     char *ct = NULL;
     if (content_type && curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &ct) == CURLE_OK && ct) {
         *content_type = rs_strdup(ct);
+    }
+    char *eff = NULL;
+    if (effective_url && curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff) == CURLE_OK && eff) {
+        *effective_url = rs_strdup(eff);
     }
     if (content_range) *content_range = captured_range;
     if (header_list) curl_slist_free_all(header_list);
@@ -244,9 +249,10 @@ static int spawn_wait(char *const argv[], const char *err_path) {
 static int fetch_external(const char *tool, const char *dl_params,
                           const char *url, const char *proxy, const char *headers, const char *range,
                           char **out, size_t *out_len, long *status, char **content_type,
-                          char **content_range, char *errbuf, size_t errbuf_len) {
+                          char **content_range, char **effective_url, char *errbuf, size_t errbuf_len) {
     if (content_type) *content_type = NULL;
     if (content_range) *content_range = NULL;
+    if (effective_url) *effective_url = NULL;  // external tools don't report it
     if (status) *status = 0;
 
     const char *tmpdir = getenv("TMPDIR"); if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
@@ -359,7 +365,7 @@ static int fetch_external(const char *tool, const char *dl_params,
 int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
                  const char *downloader, const char *dl_params,
                  char **out, size_t *out_len, long *status, char **content_type,
-                 char **content_range, char *errbuf, size_t errbuf_len) {
+                 char **content_range, char **effective_url, char *errbuf, size_t errbuf_len) {
     // NULL / "" / "internal" / "libcurl" → in-process libcurl. Otherwise run the
     // chosen external tool, falling back to libcurl if it isn't installed so a
     // missing binary never dead-ends a stream.
@@ -368,11 +374,11 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
 #ifndef _WIN32
     if (!internal) {
         int rc = fetch_external(downloader, dl_params, url, proxy, headers, range,
-                                out, out_len, status, content_type, content_range, errbuf, errbuf_len);
+                                out, out_len, status, content_type, content_range, effective_url, errbuf, errbuf_len);
         if (rc != -2) return rc;  // -2 = tool missing → fall through to libcurl
     }
 #else
     (void)dl_params;
 #endif
-    return fetch_libcurl(url, proxy, headers, range, out, out_len, status, content_type, content_range, errbuf, errbuf_len);
+    return fetch_libcurl(url, proxy, headers, range, out, out_len, status, content_type, content_range, effective_url, errbuf, errbuf_len);
 }

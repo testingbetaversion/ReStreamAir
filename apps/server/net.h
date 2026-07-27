@@ -24,10 +24,12 @@ extern "C" {
 // in-process libcurl fetch; "curl"/"wget"/"aria2c" shell out to that binary
 // (with `dl_params` appended verbatim), falling back to libcurl if it is not
 // installed. `dl_params` is a free-form extra-arguments string (may be NULL).
+// `effective_url` (may be NULL) receives the final URL after redirects (libcurl
+// path only) — used to resolve a redirected DASH MPD's segment URLs.
 int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
                  const char *downloader, const char *dl_params,
                  char **out, size_t *out_len, long *status, char **content_type,
-                 char **content_range, char *errbuf, size_t errbuf_len);
+                 char **content_range, char **effective_url, char *errbuf, size_t errbuf_len);
 
 #ifdef __cplusplus
 }
