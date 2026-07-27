@@ -37,6 +37,12 @@ int rs_panel_create_stream(rs_state *st, const char *provider_id, const rs_json 
 int rs_panel_update_stream(rs_state *st, const char *stream_id, const rs_json *body, const char **err);
 int rs_panel_delete_stream(rs_state *st, const char *stream_id, const char **err);
 
+// Marks a stream started/stopped. Playback in the C server is on-demand (the
+// player's playlist requests drive it — there is no worker to spawn), so this
+// only sets the stored status; the view reports `running` from it. -404 if the
+// stream isn't found.
+int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool running, const char **err);
+
 // User creation hashes the password, so it needs the auth module.
 int rs_panel_create_user(rs_state *st, const rs_json *body, const char **err);
 int rs_panel_delete_user(rs_state *st, const char *id, const char **err);

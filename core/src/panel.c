@@ -261,8 +261,10 @@ static rs_json *stream_view(const rs_state *st, const rs_json *stream, const cha
     char *slug = rs_panel_slugify(name);
     const char *play_id = (slug && slug[0] && slug_occurrences(st, slug) == 1) ? slug : id;
 
-    // No worker layer yet, so nothing is ever running in the C server.
-    rs_json_obj_set_bool(v, "running", false);
+    // Playback is on-demand (no worker), so "running" is simply whether the
+    // stream has been started — reflected from the stored status.
+    const char *status = rs_json_obj_str(stream, "status", "stopped");
+    rs_json_obj_set_bool(v, "running", strcmp(status, "running") == 0);
     if (!rs_json_obj_get(stream, "status")) rs_json_obj_set_str(v, "status", "stopped");
     rs_json_obj_set_int(v, "activeClients", 0);
     rs_json_obj_set(v, "bandwidth", zero_bandwidth());
@@ -597,6 +599,15 @@ int rs_panel_delete_stream(rs_state *st, const char *stream_id, const char **err
     bool found = false;
     rs_json *kept = array_without_id(rs_json_obj_get(provider, "streams"), stream_id, &found);
     rs_json_obj_set(provider, "streams", kept);
+    return 0;
+}
+
+int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool running, const char **err) {
+    rs_json *provider = NULL;
+    rs_json *stream = find_stream(st, stream_id, &provider);
+    if (!stream) { *err = "Stream not found."; return -404; }
+    rs_json_obj_set_str(stream, "status", running ? "running" : "stopped");
+    rs_json_obj_set(stream, "lastError", rs_json_new_null());
     return 0;
 }
 
