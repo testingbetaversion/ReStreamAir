@@ -299,16 +299,25 @@ static void handle_auth_login(restream_server_t *s, struct mg_connection *c,
     bool remember = body && strcmp(rs_json_as_str(rs_json_obj_get(body, "remember"), ""), "true") == 0;
     rs_json_free(body);
 
+    char ip[64] = {0};
+    mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
+
     rs_json *admin = (username && username[0]) ? admin_by_username(&s->state, username) : NULL;
     bool ok = admin && password &&
               rs_auth_verify_password(password,
                                       rs_json_as_str(rs_json_obj_get(admin, "passwordHash"), ""),
                                       rs_json_as_str(rs_json_obj_get(admin, "salt"), ""));
     if (!ok) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "failed sign-in for '%s' from %s", username ? username : "", ip);
+        log_record(s, "__panel__", "error", "loginFailed", NULL, 0, -1, msg);
         free(username); free(password);
         reply_error(c, 401, "Invalid username or password.");
         return;
     }
+    char loginmsg[256];
+    snprintf(loginmsg, sizeof(loginmsg), "%s signed in from %s", username, ip);
+    log_record(s, "__panel__", "info", "login", NULL, 0, -1, loginmsg);
     char *token = rs_auth_create_session(s->auth, username, remember);
     char *cookie = token ? rs_auth_set_cookie(token, remember) : NULL;
     free(username); free(password); rs_free(token);
@@ -321,6 +330,9 @@ static void handle_auth_login(restream_server_t *s, struct mg_connection *c,
 
 static void handle_auth_logout(restream_server_t *s, struct mg_connection *c,
                                struct mg_http_message *hm) {
+    char ip[64] = {0};
+    mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
+    log_record(s, "__panel__", "info", "logout", NULL, 0, -1, ip);
     char *cookie = header_dup(hm, "Cookie");
     if (cookie) {
         char *token = rs_auth_cookie_token(cookie);
@@ -1176,9 +1188,17 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
     const char *stream_id = rs_json_obj_str(stream, "id", "");
     int want = (int)rs_json_obj_int(stream, "playlistSegments", 6);
     if (want < 1) want = 6;
+    int delay = (int)rs_json_obj_int(stream, "playbackDelaySeconds", 0);
+    if (delay < 0) delay = 0;
+    // Fetch extra history so the advertised window can sit `delay` seconds behind
+    // the live edge without running out of segments.
+    int fetch_want = want + (delay > 0 ? delay + 4 : 0);
     char err[256] = {0};
-    char *json = dash_describe(server, stream, rep, want, err, sizeof(err));
-    if (!json) { reply_error(c, 502, err[0] ? err : "Could not read the MPD."); return; }
+    char *json = dash_describe(server, stream, rep, fetch_want, err, sizeof(err));
+    if (!json) {
+        log_record(server, stream_id, "error", "manifest", stream_source_target(stream), 0, -1, err);
+        reply_error(c, 502, err[0] ? err : "Could not read the MPD."); return;
+    }
     rs_json *root = rs_json_parse(json, strlen(json));
     free(json);
     const rs_json *plan = root ? rs_json_obj_get(root, "plan") : NULL;
@@ -1188,18 +1208,31 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
     if (timescale < 1) timescale = 1;
     const char *init_url = rs_json_obj_str(plan, "initUrl", "");
     const rs_json *segs = rs_json_obj_get(plan, "segments");
-    size_t nseg = rs_json_arr_len(segs);
+    size_t total = rs_json_arr_len(segs);
+
+    // Longest segment in the batch → how many segments make up `delay` seconds.
+    double segdur = 0;
+    for (size_t i = 0; i < total; i++)
+        { double d = rs_json_as_num(rs_json_obj_get(rs_json_arr_at(segs, i), "duration"), 0); if (d > segdur) segdur = d; }
+    int delay_segs = (delay > 0 && segdur > 0) ? (int)((double)delay / segdur + 0.5) : 0;
+
+    // Advertised window: `want` segments ending `delay_segs` before the live edge
+    // (segments are oldest→newest). Never hold back the whole buffer.
+    long long end = (long long)total - delay_segs;
+    if (end < 1) end = (long long)total;
+    long long start = end - want;
+    if (start < 0) start = 0;
 
     double maxdur = 0;
-    for (size_t i = 0; i < nseg; i++)
+    for (long long i = start; i < end; i++)
         { double d = rs_json_as_num(rs_json_obj_get(rs_json_arr_at(segs, i), "duration"), 0); if (d > maxdur) maxdur = d; }
     int target = (int)(maxdur + 0.999); if (target < 1) target = 1;
 
-    // Media sequence derived from the first segment's timeline position so it is
-    // stable across reloads and advances by 1 as the live window slides.
+    // Media sequence from the window's first segment position — stable across
+    // reloads and advancing by 1 as the window slides.
     long long seq = 0;
-    if (nseg > 0) {
-        const rs_json *s0 = rs_json_arr_at(segs, 0);
+    if (end > start) {
+        const rs_json *s0 = rs_json_arr_at(segs, start);
         long long t0 = (long long)rs_json_as_num(rs_json_obj_get(s0, "time"), 0);
         double d0 = rs_json_as_num(rs_json_obj_get(s0, "duration"), 0);
         long long units = (long long)(d0 * (double)timescale + 0.5);
@@ -1215,7 +1248,7 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
         fprintf(f, "#EXT-X-MAP:URI=\"/proxy/%s/item?u=%s&kind=map&dec=1\"\n", stream_id, ienc ? ienc : "");
         free(ienc);
     }
-    for (size_t i = 0; i < nseg; i++) {
+    for (long long i = start; i < end; i++) {
         const rs_json *s = rs_json_arr_at(segs, i);
         double d = rs_json_as_num(rs_json_obj_get(s, "duration"), maxdur);
         char *senc = query_encode(rs_json_obj_str(s, "url", ""));
@@ -1223,6 +1256,13 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
         free(senc);
     }
     fclose(f);
+    // One log line per playlist build so the stream's Logs tab shows activity
+    // as soon as the player loads it, before segments start flowing.
+    {
+        char m[160];
+        snprintf(m, sizeof(m), "%s: %lld segments%s", rep, end - start, delay > 0 ? " (delayed)" : "");
+        log_record(server, stream_id, "info", "manifest", stream_source_target(stream), 0, -1, m);
+    }
     rs_json_free(root);
 
     mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"

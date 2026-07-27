@@ -648,6 +648,7 @@ function renderEditor() {
     if (!editingNewStream) {
       form.reset();
       form.elements.playlistSegments.value = 6;
+      form.elements.playbackDelaySeconds.value = 0;
       form.elements.keepSegments.value = 10;
       form.elements.downloadAhead.value = 8;
       form.elements.pollInterval.value = 2;
@@ -707,6 +708,7 @@ function renderEditor() {
   form.elements.period.value = stream.period || "";
   form.elements.proxy.value = stream.proxy || "";
   form.elements.playlistSegments.value = stream.playlistSegments || 6;
+  form.elements.playbackDelaySeconds.value = stream.playbackDelaySeconds || 0;
   form.elements.keepSegments.value = stream.keepSegments || 10;
   form.elements.downloadAhead.value = stream.downloadAhead || 8;
   form.elements.pollInterval.value = stream.pollInterval || 2;
@@ -825,6 +827,7 @@ function streamPayload() {
     period: form.elements.period.value,
     proxy: form.elements.proxy.value,
     playlistSegments: Number(form.elements.playlistSegments.value),
+    playbackDelaySeconds: Number(form.elements.playbackDelaySeconds.value),
     keepSegments: Number(form.elements.keepSegments.value),
     downloadAhead: Number(form.elements.downloadAhead.value),
     pollInterval: Number(form.elements.pollInterval.value),
@@ -924,6 +927,7 @@ function newStream() {
   $("#streamForm").elements.id.value = "";
   $("#streamForm").elements.kind.value = "mpd";
   $("#streamForm").elements.playlistSegments.value = 6;
+  $("#streamForm").elements.playbackDelaySeconds.value = 0;
   $("#streamForm").elements.keepSegments.value = 10;
   $("#streamForm").elements.downloadAhead.value = 8;
   $("#streamForm").elements.pollInterval.value = 2;
