@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <ctype.h>
 #ifndef _WIN32
 #include <sys/stat.h>   // mkdir for the script session dir
 #endif
@@ -944,15 +945,40 @@ static const char *effective_downloader_params(const rs_json *provider) {
 }
 
 // The rewrite transforms need the stream id to build proxy/variant paths.
+// Picks a proxy filename with an extension ffmpeg's HLS demuxer will accept
+// (keys/maps aside, it validates the segment URL's extension). Keeps the source
+// URL's own extension when it's a short alphanumeric one, else a sane default.
+static void proxy_filename(const char *abs_uri, rs_m3u8_line_kind kind, char *out, size_t outlen) {
+    if (kind == RS_M3U8_LINE_KEY) { snprintf(out, outlen, "key.key"); return; }
+    if (kind == RS_M3U8_LINE_MAP) { snprintf(out, outlen, "init.mp4"); return; }
+    const char *q = strchr(abs_uri, '?');
+    size_t plen = q ? (size_t)(q - abs_uri) : strlen(abs_uri);
+    const char *dot = NULL;
+    for (size_t i = 0; i < plen; i++) {
+        if (abs_uri[i] == '/') dot = NULL;
+        else if (abs_uri[i] == '.') dot = abs_uri + i;
+    }
+    if (dot) {
+        size_t elen = plen - (size_t)(dot + 1 - abs_uri);
+        bool ok = elen >= 1 && elen <= 5;
+        for (size_t i = 0; ok && i < elen; i++)
+            if (!isalnum((unsigned char)dot[1 + i])) ok = false;
+        if (ok) { snprintf(out, outlen, "seg.%.*s", (int)elen, dot + 1); return; }
+    }
+    snprintf(out, outlen, "seg.ts");
+}
+
 static char *media_transform(void *ud, const char *abs_uri, rs_m3u8_line_kind kind, int64_t seq) {
     (void)seq;
     const char *stream_id = (const char *)ud;
     const char *kindstr = kind == RS_M3U8_LINE_KEY ? "key" : (kind == RS_M3U8_LINE_MAP ? "map" : "segment");
+    char fname[16];
+    proxy_filename(abs_uri, kind, fname, sizeof(fname));
     char *enc = query_encode(abs_uri);
     if (!enc) return NULL;
-    size_t need = strlen(stream_id) + strlen(enc) + 64;
+    size_t need = strlen(stream_id) + strlen(enc) + strlen(fname) + 64;
     char *out = (char *)malloc(need);
-    if (out) snprintf(out, need, "/proxy/%s/item?u=%s&kind=%s", stream_id, enc, kindstr);
+    if (out) snprintf(out, need, "/proxy/%s/%s?u=%s&kind=%s", stream_id, fname, enc, kindstr);
     free(enc);
     return out;
 }
@@ -1245,14 +1271,19 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
     fprintf(f, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%lld\n", target, seq);
     if (init_url[0]) {
         char *ienc = query_encode(init_url);
-        fprintf(f, "#EXT-X-MAP:URI=\"/proxy/%s/item?u=%s&kind=map&dec=1\"\n", stream_id, ienc ? ienc : "");
+        // The path must end in a media extension (init.mp4 / seg.m4s): ffmpeg's
+        // HLS demuxer hard-rejects any segment URL whose extension isn't in its
+        // allowed list, so a query-only "/item" path fails to parse ("is not in
+        // allowed_segment_extensions"). The ?u= target is what actually gets
+        // fetched; the filename is only there to satisfy the demuxer.
+        fprintf(f, "#EXT-X-MAP:URI=\"/proxy/%s/init.mp4?u=%s&kind=map&dec=1\"\n", stream_id, ienc ? ienc : "");
         free(ienc);
     }
     for (long long i = start; i < end; i++) {
         const rs_json *s = rs_json_arr_at(segs, i);
         double d = rs_json_as_num(rs_json_obj_get(s, "duration"), maxdur);
         char *senc = query_encode(rs_json_obj_str(s, "url", ""));
-        fprintf(f, "#EXTINF:%.3f,\n/proxy/%s/item?u=%s&kind=segment&dec=1\n", d, stream_id, senc ? senc : "");
+        fprintf(f, "#EXTINF:%.3f,\n/proxy/%s/seg.m4s?u=%s&kind=segment&dec=1\n", d, stream_id, senc ? senc : "");
         free(senc);
     }
     fclose(f);
