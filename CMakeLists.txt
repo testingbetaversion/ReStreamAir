@@ -59,6 +59,9 @@ add_library(restream_core STATIC
 )
 target_include_directories(restream_core PUBLIC core/include PRIVATE core/deps)
 target_link_libraries(restream_core PUBLIC restream_base)
+# The segment prefetcher runs on its own thread; glibc needs -pthread explicitly.
+find_package(Threads REQUIRED)
+target_link_libraries(restream_core PUBLIC Threads::Threads)
 # Warnings apply to our source only; mongoose is vendored and compiles as-is.
 set_source_files_properties(core/src/server.c PROPERTIES COMPILE_OPTIONS "${RS_WARNINGS}")
 if(WIN32)

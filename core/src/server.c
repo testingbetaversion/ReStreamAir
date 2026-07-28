@@ -45,6 +45,7 @@ struct restream_server {
     rs_auth *auth;          // admin accounts + sessions
     rs_sysstats *sysstats;  // live host stats for the monitoring view
     rs_metrics *metrics;    // per-stream client/bytes network monitor
+    struct rs_prefetch *prefetch;  // background segment downloader + cache
     rs_log_entry log_ring[RS_LOG_CAP];
     size_t log_head;        // next write slot
     size_t log_count;       // entries in use (<= RS_LOG_CAP)
@@ -119,6 +120,221 @@ static rs_json *log_view(restream_server_t *s, const char *sid, int limit) {
     rs_json_obj_set(out, "availableDates", rs_json_new_arr());
     return out;
 }
+
+// --- segment prefetch cache -------------------------------------------------
+//
+// Playback is driven by the player's playlist reloads, but fetching each
+// segment only when it's asked for means every segment's origin latency lands
+// in the playback path (this origin takes ~2.5s per segment) and the player
+// never builds a buffer. A background thread downloads — and CENC-decrypts —
+// the segments in the advertised window ahead of time, so /proxy usually
+// answers from memory instead of going to the network.
+
+#ifndef _WIN32
+#include <pthread.h>
+
+#define RS_CACHE_CAP 48    // decrypted segments held in memory
+#define RS_WANT_CAP 32     // segments queued for prefetch per publish
+
+typedef struct {
+    char *url;        // upstream URL (the ?u= target), NULL = free slot
+    uint8_t *data;    // decrypted, ready to serve
+    size_t len;
+    double used;      // last touch, for LRU eviction
+} seg_cache_entry;
+
+typedef struct {
+    char *url;
+    bool is_map;
+} want_item;
+
+struct rs_prefetch {
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool stop;
+    bool started;
+
+    // Work published by the request thread (owned here, replaced each publish).
+    want_item want[RS_WANT_CAP];
+    size_t want_n;
+    bool have_work;
+    char *stream_id, *proxy, *headers, *downloader, *dl_params;
+    uint8_t key[16];
+    bool have_key;
+    int iv_size;
+
+    seg_cache_entry cache[RS_CACHE_CAP];
+};
+#endif
+
+// Applies CENC to freshly fetched bytes: patch the init, or AES-CTR-decrypt a
+// media segment. Returns malloc'd output (frees `body`), or `body` unchanged.
+static uint8_t *decrypt_bytes(bool is_map, const uint8_t *key, bool have_key, int iv_size,
+                              uint8_t *body, size_t len, size_t *out_len) {
+    uint8_t *out = NULL;
+    *out_len = len;
+    if (is_map) out = rs_cenc_patch_init(body, len, out_len, NULL, NULL);
+    else if (have_key) out = rs_cenc_decrypt_segment(body, len, out_len, key, iv_size > 0 ? iv_size : 8);
+    if (out) { free(body); return out; }
+    *out_len = len;
+    return body;
+}
+
+#ifndef _WIN32
+// Stores decrypted bytes under `url`, evicting the least-recently-used entry
+// when full. Takes ownership of `data`. Caller holds the lock.
+static void cache_put_locked(struct rs_prefetch *pf, const char *url, uint8_t *data, size_t len) {
+    size_t victim = 0; double oldest = 0; bool have_victim = false;
+    for (size_t i = 0; i < RS_CACHE_CAP; i++) {
+        if (!pf->cache[i].url) { victim = i; have_victim = true; break; }
+        if (strcmp(pf->cache[i].url, url) == 0) { victim = i; have_victim = true; break; }
+        if (!have_victim || pf->cache[i].used < oldest) { oldest = pf->cache[i].used; victim = i; }
+    }
+    seg_cache_entry *e = &pf->cache[victim];
+    free(e->url); free(e->data);
+    e->url = rs_strdup(url);
+    e->data = data;
+    e->len = len;
+    e->used = now_ms();
+}
+
+// Hands out a copy of a cached segment, or NULL on a miss.
+static uint8_t *cache_take(struct rs_prefetch *pf, const char *url, size_t *out_len) {
+    if (!pf) return NULL;
+    uint8_t *copy = NULL;
+    pthread_mutex_lock(&pf->mu);
+    for (size_t i = 0; i < RS_CACHE_CAP; i++) {
+        seg_cache_entry *e = &pf->cache[i];
+        if (!e->url || strcmp(e->url, url) != 0) continue;
+        copy = (uint8_t *)malloc(e->len ? e->len : 1);
+        if (copy) { memcpy(copy, e->data, e->len); *out_len = e->len; e->used = now_ms(); }
+        break;
+    }
+    pthread_mutex_unlock(&pf->mu);
+    return copy;
+}
+
+static bool cache_has_locked(struct rs_prefetch *pf, const char *url) {
+    for (size_t i = 0; i < RS_CACHE_CAP; i++)
+        if (pf->cache[i].url && strcmp(pf->cache[i].url, url) == 0) return true;
+    return false;
+}
+
+// The prefetch loop: wait for a published window, then download + decrypt any
+// segment not already cached. Runs off the mongoose thread, so it only touches
+// the prefetch struct (never rs_state) — everything it needs is copied in.
+static void *prefetch_main(void *arg) {
+    struct rs_prefetch *pf = (struct rs_prefetch *)arg;
+    for (;;) {
+        pthread_mutex_lock(&pf->mu);
+        while (!pf->stop && !pf->have_work) pthread_cond_wait(&pf->cv, &pf->mu);
+        if (pf->stop) { pthread_mutex_unlock(&pf->mu); break; }
+        pf->have_work = false;
+
+        // Snapshot the work so the lock isn't held across the network calls.
+        size_t n = pf->want_n;
+        char *urls[RS_WANT_CAP]; bool maps[RS_WANT_CAP];
+        for (size_t i = 0; i < n; i++) {
+            urls[i] = pf->want[i].url ? rs_strdup(pf->want[i].url) : NULL;
+            maps[i] = pf->want[i].is_map;
+        }
+        char *proxy = pf->proxy ? rs_strdup(pf->proxy) : NULL;
+        char *headers = pf->headers ? rs_strdup(pf->headers) : NULL;
+        char *dl = pf->downloader ? rs_strdup(pf->downloader) : NULL;
+        char *dlp = pf->dl_params ? rs_strdup(pf->dl_params) : NULL;
+        uint8_t key[16]; memcpy(key, pf->key, 16);
+        bool have_key = pf->have_key; int ivs = pf->iv_size;
+        pthread_mutex_unlock(&pf->mu);
+
+        for (size_t i = 0; i < n; i++) {
+            if (!urls[i]) continue;
+            pthread_mutex_lock(&pf->mu);
+            bool skip = pf->stop || cache_has_locked(pf, urls[i]);
+            pthread_mutex_unlock(&pf->mu);
+            if (skip) { free(urls[i]); continue; }
+            if (!g_fetch_handler) { free(urls[i]); continue; }
+
+            char *body = NULL; size_t len = 0; char err[256] = {0};
+            int rc = g_fetch_handler(urls[i], proxy, headers, NULL, dl, dlp,
+                                     &body, &len, NULL, NULL, NULL, NULL, err, sizeof(err));
+            if (rc == 0 && body) {
+                size_t out_len = 0;
+                uint8_t *ready = decrypt_bytes(maps[i], key, have_key, ivs, (uint8_t *)body, len, &out_len);
+                pthread_mutex_lock(&pf->mu);
+                cache_put_locked(pf, urls[i], ready, out_len);
+                pthread_mutex_unlock(&pf->mu);
+            } else {
+                free(body);
+            }
+            free(urls[i]);
+        }
+        free(proxy); free(headers); free(dl); free(dlp);
+    }
+    return NULL;
+}
+
+// Publishes the current playlist window for background download. Replaces any
+// previous list — the newest window is always what matters for live.
+static void prefetch_publish(struct rs_prefetch *pf, const char *stream_id,
+                             const char *proxy, const char *headers,
+                             const char *downloader, const char *dl_params,
+                             const uint8_t *key, bool have_key, int iv_size,
+                             want_item *items, size_t n) {
+    if (!pf || !pf->started) return;
+    pthread_mutex_lock(&pf->mu);
+    for (size_t i = 0; i < pf->want_n; i++) free(pf->want[i].url);
+    pf->want_n = n > RS_WANT_CAP ? RS_WANT_CAP : n;
+    for (size_t i = 0; i < pf->want_n; i++) {
+        pf->want[i].url = items[i].url ? rs_strdup(items[i].url) : NULL;
+        pf->want[i].is_map = items[i].is_map;
+    }
+    free(pf->stream_id); free(pf->proxy); free(pf->headers); free(pf->downloader); free(pf->dl_params);
+    pf->stream_id = stream_id ? rs_strdup(stream_id) : NULL;
+    pf->proxy = proxy ? rs_strdup(proxy) : NULL;
+    pf->headers = headers ? rs_strdup(headers) : NULL;
+    pf->downloader = downloader ? rs_strdup(downloader) : NULL;
+    pf->dl_params = dl_params ? rs_strdup(dl_params) : NULL;
+    if (have_key) memcpy(pf->key, key, 16);
+    pf->have_key = have_key;
+    pf->iv_size = iv_size;
+    pf->have_work = true;
+    pthread_cond_signal(&pf->cv);
+    pthread_mutex_unlock(&pf->mu);
+}
+
+static struct rs_prefetch *prefetch_create(void) {
+    struct rs_prefetch *pf = (struct rs_prefetch *)calloc(1, sizeof(*pf));
+    if (!pf) return NULL;
+    pthread_mutex_init(&pf->mu, NULL);
+    pthread_cond_init(&pf->cv, NULL);
+    if (pthread_create(&pf->thread, NULL, prefetch_main, pf) == 0) pf->started = true;
+    return pf;
+}
+
+static void prefetch_destroy(struct rs_prefetch *pf) {
+    if (!pf) return;
+    if (pf->started) {
+        pthread_mutex_lock(&pf->mu);
+        pf->stop = true;
+        pthread_cond_signal(&pf->cv);
+        pthread_mutex_unlock(&pf->mu);
+        pthread_join(pf->thread, NULL);
+    }
+    for (size_t i = 0; i < pf->want_n; i++) free(pf->want[i].url);
+    for (size_t i = 0; i < RS_CACHE_CAP; i++) { free(pf->cache[i].url); free(pf->cache[i].data); }
+    free(pf->stream_id); free(pf->proxy); free(pf->headers); free(pf->downloader); free(pf->dl_params);
+    pthread_mutex_destroy(&pf->mu);
+    pthread_cond_destroy(&pf->cv);
+    free(pf);
+}
+#else
+static uint8_t *cache_take(struct rs_prefetch *pf, const char *url, size_t *out_len) {
+    (void)pf; (void)url; (void)out_len; return NULL;
+}
+static struct rs_prefetch *prefetch_create(void) { return NULL; }
+static void prefetch_destroy(struct rs_prefetch *pf) { (void)pf; }
+#endif
 
 static void log_clear(restream_server_t *s, const char *sid) {
     if (!sid || !sid[0]) {
@@ -1076,6 +1292,32 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
     bool is_map = kindq && strcmp(kindq, "map") == 0;
     free(dec); free(kindq);
 
+    // Prefetch hit: the background downloader already has this segment decrypted
+    // and in memory, so answer without touching the network. This is what keeps
+    // the player ahead of a slow origin.
+    if (decrypt) {
+        size_t clen = 0;
+        uint8_t *cached = cache_take(server->prefetch, url, &clen);
+        if (cached) {
+            char cip[64] = {0};
+            mg_snprintf(cip, sizeof(cip), "%M", mg_print_ip, &c->rem);
+            char *cua = header_dup(hm, "User-Agent");
+            char *ckey = playback_key(hm);
+            rs_metrics_record(server->metrics, stream_id, (ckey && ckey[0]) ? ckey : cip,
+                              cip, cua ? cua : "", (int)clen);
+            log_record(server, stream_id, "info", is_map ? "downloadInit" : "downloadSegment",
+                       url, 200, (long long)clen, "cached");
+            free(cua); free(ckey);
+            mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: %lu\r\n"
+                         "Accept-Ranges: bytes\r\nCache-Control: no-store\r\n"
+                         "Access-Control-Allow-Origin: *\r\n\r\n", (unsigned long)clen);
+            mg_send(c, cached, clen);
+            free(cached);
+            free(url);
+            return;
+        }
+    }
+
     // Forward the player's Range so byte-range segments and seeking fetch only
     // the requested slice — but never for a to-be-decrypted item: CENC needs the
     // whole segment, so a ranged fetch would corrupt it.
@@ -1287,6 +1529,30 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
         free(senc);
     }
     fclose(f);
+
+    // Hand the whole window (init first) to the background downloader so the
+    // segments are fetched and decrypted before the player asks for them.
+#ifndef _WIN32
+    {
+        const rs_json *provider = provider_of(&server->state, stream);
+        char *pxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
+        char *hdrs = effective_headers(provider, stream, "mediaHeaders");
+        rs_cenc_keys keys = rs_cenc_parse_keys(rs_json_obj_str(stream, "decryptionKeys", ""));
+        want_item items[RS_WANT_CAP]; size_t nw = 0;
+        if (init_url[0] && nw < RS_WANT_CAP) { items[nw].url = (char *)init_url; items[nw].is_map = true; nw++; }
+        for (long long i = start; i < end && nw < RS_WANT_CAP; i++) {
+            items[nw].url = (char *)rs_json_obj_str(rs_json_arr_at(segs, i), "url", "");
+            items[nw].is_map = false;
+            nw++;
+        }
+        prefetch_publish(server->prefetch, stream_id, pxy, hdrs,
+                         effective_downloader(provider), effective_downloader_params(provider),
+                         keys.count > 0 ? keys.keys[0] : NULL, keys.count > 0, 8, items, nw);
+        rs_cenc_keys_free(&keys);
+        free(pxy); free(hdrs);
+    }
+#endif
+
     // One log line per playlist build so the stream's Logs tab shows activity
     // as soon as the player loads it, before segments start flowing.
     {
@@ -1450,6 +1716,7 @@ restream_server_t* restream_server_create(void) {
     server->auth = rs_auth_create();
     server->sysstats = rs_sysstats_create();
     server->metrics = rs_metrics_create();
+    server->prefetch = prefetch_create();
     // state.json lives in the working directory, matching the Swift binary.
     if (rs_state_load(&server->state, "state.json") != 0 || !server->auth || !server->sysstats || !server->metrics) {
         // A malformed state.json is fatal — better to refuse than to risk
@@ -1528,6 +1795,7 @@ void restream_server_destroy(restream_server_t* server) {
         rs_auth_destroy(server->auth);
         rs_sysstats_destroy(server->sysstats);
         rs_metrics_destroy(server->metrics);
+        prefetch_destroy(server->prefetch);
         log_clear(server, "");  // frees ring-buffer strings
         rs_state_dispose(&server->state);
         free(server->web_root);
