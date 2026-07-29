@@ -3,9 +3,13 @@
 #include "rs_auth.h"
 #include "rs_cdm.h"
 #include "rs_cenc.h"
+#include "rs_hls_decrypt.h"
+#include "rs_ffargs.h"
 #include "rs_json.h"
+#include "rs_logo.h"
 #include "rs_m3u8.h"
 #include "rs_metrics.h"
+#include "rs_nm3u8dlre.h"
 #include "rs_panel.h"
 #include "rs_script.h"
 #include "rs_state.h"
@@ -46,6 +50,7 @@ struct restream_server {
     rs_sysstats *sysstats;  // live host stats for the monitoring view
     rs_metrics *metrics;    // per-stream client/bytes network monitor
     struct rs_prefetch *prefetch;  // background segment downloader + cache
+    rs_logo_cache *logo_cache;
     rs_log_entry log_ring[RS_LOG_CAP];
     size_t log_head;        // next write slot
     size_t log_count;       // entries in use (<= RS_LOG_CAP)
@@ -57,10 +62,28 @@ struct restream_server {
 
 // The probe/fetch handlers are registered by the C++ app; the core only calls
 // through them, so libcurl/libxml2 never reach the Swift build. Declared here so
-// the router (below) can reference them before their setters are defined.
+// everything below (including the logo fetcher and the prefetch workers) can
+// reference them before their setters are defined.
 static restream_probe_fn g_probe_handler = NULL;
 static restream_fetch_fn g_fetch_handler = NULL;
 static restream_dash_fn g_dash_handler = NULL;
+
+// Forward declaration: query helpers are defined with the routing code below,
+// but the playback handlers above them need it.
+static char *query_var(struct mg_http_message *hm, const char *name);
+
+static char *logo_fetch_wrapper(const char *url, void *ctx) {
+    (void)ctx;
+    if (!g_fetch_handler) return NULL;
+    char *body = NULL;
+    size_t body_len = 0;
+    long status = 0;
+    char err[128] = {0};
+    int rc = g_fetch_handler(url, NULL, NULL, NULL, NULL, NULL, &body, &body_len, &status, NULL, NULL, NULL, err, sizeof(err));
+    if (rc == 0 && status == 200 && body) return body;
+    free(body);
+    return NULL;
+}
 
 // --- log store -------------------------------------------------------------
 
@@ -75,6 +98,25 @@ static double now_ms(void) {
 static void log_record(restream_server_t *s, const char *sid, const char *level,
                        const char *event, const char *url, long status, long long bytes,
                        const char *message) {
+    // Throttle repeats: a live player reloads its playlist every couple of
+    // seconds, which otherwise buries the interesting lines under an endless
+    // run of identical "manifest"/"streamStart" entries. An identical
+    // (stream, event, message) inside this window is dropped; anything that
+    // actually changed — a new segment, an error, a different count — still
+    // logs immediately.
+    if (s->log_count > 0) {
+        double cutoff = now_ms() - 30000.0;
+        for (size_t i = 0; i < s->log_count && i < 40; i++) {
+            size_t idx = (s->log_head + RS_LOG_CAP - 1 - i) % RS_LOG_CAP;
+            rs_log_entry *p = &s->log_ring[idx];
+            if (p->ts_ms < cutoff) break;
+            if (strcmp(p->sid, sid ? sid : "__panel__") != 0) continue;
+            if (strcmp(p->event, event ? event : "") != 0) continue;
+            const char *pm = p->message ? p->message : "";
+            const char *nm = message ? message : "";
+            if (strcmp(pm, nm) == 0) return;  // same line, still fresh — skip
+        }
+    }
     rs_log_entry *e = &s->log_ring[s->log_head];
     if (s->log_count == RS_LOG_CAP) {
         // Overwriting the oldest live entry — free its strings first.
@@ -133,8 +175,11 @@ static rs_json *log_view(restream_server_t *s, const char *sid, int limit) {
 #ifndef _WIN32
 #include <pthread.h>
 
-#define RS_CACHE_CAP 48    // decrypted segments held in memory
-#define RS_WANT_CAP 32     // segments queued for prefetch per publish
+#define RS_CACHE_CAP 64          // decrypted segments held in memory
+#define RS_WANT_CAP 32           // segments accepted per publish
+#define RS_PF_WORKERS 4          // parallel downloaders
+#define RS_PF_QUEUE 96           // pending jobs
+#define RS_CACHE_MAX_BYTES (192u * 1024u * 1024u)
 
 typedef struct {
     char *url;        // upstream URL (the ?u= target), NULL = free slot
@@ -148,21 +193,33 @@ typedef struct {
     bool is_map;
 } want_item;
 
+// One queued download. Each job carries its own fetch context so a job for the
+// video rendition is never invalidated by the audio rendition publishing next.
+typedef struct {
+    char *url;
+    bool is_map;
+    char *proxy, *headers, *downloader, *dl_params;
+    uint8_t key[16];
+    bool have_key;
+    int iv_size;
+} pf_job;
+
 struct rs_prefetch {
-    pthread_t thread;
+    pthread_t threads[RS_PF_WORKERS];
     pthread_mutex_t mu;
     pthread_cond_t cv;
     bool stop;
     bool started;
 
-    // Work published by the request thread (owned here, replaced each publish).
-    want_item want[RS_WANT_CAP];
-    size_t want_n;
-    bool have_work;
-    char *stream_id, *proxy, *headers, *downloader, *dl_params;
-    uint8_t key[16];
-    bool have_key;
-    int iv_size;
+    // Ring queue of pending downloads, shared by the workers. Publishing
+    // APPENDS (deduped) instead of replacing, so every rendition's window is
+    // fetched rather than the last publish winning.
+    pf_job queue[RS_PF_QUEUE];
+    size_t qhead, qtail, qcount;
+    // URLs currently queued or being fetched, so a republished window doesn't
+    // enqueue the same segment repeatedly.
+    char *inflight[RS_PF_QUEUE];
+    size_t inflight_n;
 
     seg_cache_entry cache[RS_CACHE_CAP];
 };
@@ -185,6 +242,22 @@ static uint8_t *decrypt_bytes(bool is_map, const uint8_t *key, bool have_key, in
 // Stores decrypted bytes under `url`, evicting the least-recently-used entry
 // when full. Takes ownership of `data`. Caller holds the lock.
 static void cache_put_locked(struct rs_prefetch *pf, const char *url, uint8_t *data, size_t len) {
+    // Keep total memory bounded: drop the least-recently-used entries until the
+    // new one fits under the cap (segments here run ~0.5-1.5 MB each).
+    size_t total = len;
+    for (size_t i = 0; i < RS_CACHE_CAP; i++) if (pf->cache[i].url) total += pf->cache[i].len;
+    while (total > RS_CACHE_MAX_BYTES) {
+        size_t lru = RS_CACHE_CAP; double oldest_ts = 0;
+        for (size_t i = 0; i < RS_CACHE_CAP; i++) {
+            if (!pf->cache[i].url) continue;
+            if (lru == RS_CACHE_CAP || pf->cache[i].used < oldest_ts) { oldest_ts = pf->cache[i].used; lru = i; }
+        }
+        if (lru == RS_CACHE_CAP) break;
+        total -= pf->cache[lru].len;
+        free(pf->cache[lru].url); free(pf->cache[lru].data);
+        memset(&pf->cache[lru], 0, sizeof(pf->cache[lru]));
+    }
+
     size_t victim = 0; double oldest = 0; bool have_victim = false;
     for (size_t i = 0; i < RS_CACHE_CAP; i++) {
         if (!pf->cache[i].url) { victim = i; have_victim = true; break; }
@@ -221,85 +294,100 @@ static bool cache_has_locked(struct rs_prefetch *pf, const char *url) {
     return false;
 }
 
-// The prefetch loop: wait for a published window, then download + decrypt any
-// segment not already cached. Runs off the mongoose thread, so it only touches
-// the prefetch struct (never rs_state) — everything it needs is copied in.
+static bool inflight_has_locked(struct rs_prefetch *pf, const char *url) {
+    for (size_t i = 0; i < pf->inflight_n; i++)
+        if (pf->inflight[i] && strcmp(pf->inflight[i], url) == 0) return true;
+    return false;
+}
+static void inflight_drop_locked(struct rs_prefetch *pf, const char *url) {
+    for (size_t i = 0; i < pf->inflight_n; i++) {
+        if (!pf->inflight[i] || strcmp(pf->inflight[i], url) != 0) continue;
+        free(pf->inflight[i]);
+        pf->inflight[i] = pf->inflight[pf->inflight_n - 1];
+        pf->inflight[pf->inflight_n - 1] = NULL;
+        pf->inflight_n--;
+        return;
+    }
+}
+static void job_free(pf_job *j) {
+    free(j->url); free(j->proxy); free(j->headers); free(j->downloader); free(j->dl_params);
+    memset(j, 0, sizeof(*j));
+}
+
+// Worker: pull a job, download, decrypt, cache. Several of these run in
+// parallel — serial prefetching was slower than the live window (6 segments x
+// ~2.6s), so the cache never warmed and every request fell back to a blocking
+// inline fetch on the single-threaded server.
 static void *prefetch_main(void *arg) {
     struct rs_prefetch *pf = (struct rs_prefetch *)arg;
     for (;;) {
         pthread_mutex_lock(&pf->mu);
-        while (!pf->stop && !pf->have_work) pthread_cond_wait(&pf->cv, &pf->mu);
+        while (!pf->stop && pf->qcount == 0) pthread_cond_wait(&pf->cv, &pf->mu);
         if (pf->stop) { pthread_mutex_unlock(&pf->mu); break; }
-        pf->have_work = false;
-
-        // Snapshot the work so the lock isn't held across the network calls.
-        size_t n = pf->want_n;
-        char *urls[RS_WANT_CAP]; bool maps[RS_WANT_CAP];
-        for (size_t i = 0; i < n; i++) {
-            urls[i] = pf->want[i].url ? rs_strdup(pf->want[i].url) : NULL;
-            maps[i] = pf->want[i].is_map;
-        }
-        char *proxy = pf->proxy ? rs_strdup(pf->proxy) : NULL;
-        char *headers = pf->headers ? rs_strdup(pf->headers) : NULL;
-        char *dl = pf->downloader ? rs_strdup(pf->downloader) : NULL;
-        char *dlp = pf->dl_params ? rs_strdup(pf->dl_params) : NULL;
-        uint8_t key[16]; memcpy(key, pf->key, 16);
-        bool have_key = pf->have_key; int ivs = pf->iv_size;
+        pf_job job = pf->queue[pf->qhead];
+        memset(&pf->queue[pf->qhead], 0, sizeof(pf_job));
+        pf->qhead = (pf->qhead + 1) % RS_PF_QUEUE;
+        pf->qcount--;
+        bool already = cache_has_locked(pf, job.url);
         pthread_mutex_unlock(&pf->mu);
 
-        for (size_t i = 0; i < n; i++) {
-            if (!urls[i]) continue;
-            pthread_mutex_lock(&pf->mu);
-            bool skip = pf->stop || cache_has_locked(pf, urls[i]);
-            pthread_mutex_unlock(&pf->mu);
-            if (skip) { free(urls[i]); continue; }
-            if (!g_fetch_handler) { free(urls[i]); continue; }
-
+        if (!already && g_fetch_handler && job.url) {
             char *body = NULL; size_t len = 0; char err[256] = {0};
-            int rc = g_fetch_handler(urls[i], proxy, headers, NULL, dl, dlp,
+            int rc = g_fetch_handler(job.url, job.proxy, job.headers, NULL,
+                                     job.downloader, job.dl_params,
                                      &body, &len, NULL, NULL, NULL, NULL, err, sizeof(err));
             if (rc == 0 && body) {
                 size_t out_len = 0;
-                uint8_t *ready = decrypt_bytes(maps[i], key, have_key, ivs, (uint8_t *)body, len, &out_len);
+                uint8_t *ready = decrypt_bytes(job.is_map, job.key, job.have_key, job.iv_size,
+                                               (uint8_t *)body, len, &out_len);
                 pthread_mutex_lock(&pf->mu);
-                cache_put_locked(pf, urls[i], ready, out_len);
+                cache_put_locked(pf, job.url, ready, out_len);
                 pthread_mutex_unlock(&pf->mu);
             } else {
                 free(body);
             }
-            free(urls[i]);
         }
-        free(proxy); free(headers); free(dl); free(dlp);
+        pthread_mutex_lock(&pf->mu);
+        inflight_drop_locked(pf, job.url);
+        pthread_mutex_unlock(&pf->mu);
+        job_free(&job);
     }
     return NULL;
 }
 
-// Publishes the current playlist window for background download. Replaces any
-// previous list — the newest window is always what matters for live.
+// Queues a playlist window for background download. Appends (deduped against
+// the cache and what's already queued) rather than replacing, so the video and
+// audio renditions don't cancel each other out.
 static void prefetch_publish(struct rs_prefetch *pf, const char *stream_id,
                              const char *proxy, const char *headers,
                              const char *downloader, const char *dl_params,
                              const uint8_t *key, bool have_key, int iv_size,
                              want_item *items, size_t n) {
+    (void)stream_id;
     if (!pf || !pf->started) return;
+    if (n > RS_WANT_CAP) n = RS_WANT_CAP;
     pthread_mutex_lock(&pf->mu);
-    for (size_t i = 0; i < pf->want_n; i++) free(pf->want[i].url);
-    pf->want_n = n > RS_WANT_CAP ? RS_WANT_CAP : n;
-    for (size_t i = 0; i < pf->want_n; i++) {
-        pf->want[i].url = items[i].url ? rs_strdup(items[i].url) : NULL;
-        pf->want[i].is_map = items[i].is_map;
+    for (size_t i = 0; i < n; i++) {
+        const char *u = items[i].url;
+        if (!u || !u[0]) continue;
+        if (cache_has_locked(pf, u) || inflight_has_locked(pf, u)) continue;
+        if (pf->qcount >= RS_PF_QUEUE || pf->inflight_n >= RS_PF_QUEUE) break;
+        pf_job *j = &pf->queue[pf->qtail];
+        memset(j, 0, sizeof(*j));
+        j->url = rs_strdup(u);
+        j->is_map = items[i].is_map;
+        j->proxy = proxy ? rs_strdup(proxy) : NULL;
+        j->headers = headers ? rs_strdup(headers) : NULL;
+        j->downloader = downloader ? rs_strdup(downloader) : NULL;
+        j->dl_params = dl_params ? rs_strdup(dl_params) : NULL;
+        if (have_key && key) memcpy(j->key, key, 16);
+        j->have_key = have_key;
+        j->iv_size = iv_size;
+        pf->qtail = (pf->qtail + 1) % RS_PF_QUEUE;
+        pf->qcount++;
+        pf->inflight[pf->inflight_n++] = rs_strdup(u);
     }
-    free(pf->stream_id); free(pf->proxy); free(pf->headers); free(pf->downloader); free(pf->dl_params);
-    pf->stream_id = stream_id ? rs_strdup(stream_id) : NULL;
-    pf->proxy = proxy ? rs_strdup(proxy) : NULL;
-    pf->headers = headers ? rs_strdup(headers) : NULL;
-    pf->downloader = downloader ? rs_strdup(downloader) : NULL;
-    pf->dl_params = dl_params ? rs_strdup(dl_params) : NULL;
-    if (have_key) memcpy(pf->key, key, 16);
-    pf->have_key = have_key;
-    pf->iv_size = iv_size;
-    pf->have_work = true;
-    pthread_cond_signal(&pf->cv);
+    pthread_cond_broadcast(&pf->cv);
     pthread_mutex_unlock(&pf->mu);
 }
 
@@ -308,7 +396,10 @@ static struct rs_prefetch *prefetch_create(void) {
     if (!pf) return NULL;
     pthread_mutex_init(&pf->mu, NULL);
     pthread_cond_init(&pf->cv, NULL);
-    if (pthread_create(&pf->thread, NULL, prefetch_main, pf) == 0) pf->started = true;
+    size_t started = 0;
+    for (size_t i = 0; i < RS_PF_WORKERS; i++)
+        if (pthread_create(&pf->threads[i], NULL, prefetch_main, pf) == 0) started++;
+    pf->started = started > 0;
     return pf;
 }
 
@@ -317,13 +408,13 @@ static void prefetch_destroy(struct rs_prefetch *pf) {
     if (pf->started) {
         pthread_mutex_lock(&pf->mu);
         pf->stop = true;
-        pthread_cond_signal(&pf->cv);
+        pthread_cond_broadcast(&pf->cv);
         pthread_mutex_unlock(&pf->mu);
-        pthread_join(pf->thread, NULL);
+        for (size_t i = 0; i < RS_PF_WORKERS; i++) pthread_join(pf->threads[i], NULL);
     }
-    for (size_t i = 0; i < pf->want_n; i++) free(pf->want[i].url);
+    while (pf->qcount > 0) { job_free(&pf->queue[pf->qhead]); pf->qhead = (pf->qhead + 1) % RS_PF_QUEUE; pf->qcount--; }
+    for (size_t i = 0; i < pf->inflight_n; i++) free(pf->inflight[i]);
     for (size_t i = 0; i < RS_CACHE_CAP; i++) { free(pf->cache[i].url); free(pf->cache[i].data); }
-    free(pf->stream_id); free(pf->proxy); free(pf->headers); free(pf->downloader); free(pf->dl_params);
     pthread_mutex_destroy(&pf->mu);
     pthread_cond_destroy(&pf->cv);
     free(pf);
@@ -1033,6 +1124,70 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         reply_json(c, 200, rs_panel_keys_view(&s->state), NULL);
         return true;
     }
+
+    if (mg_match(hm->uri, mg_str("/api/logo-lookup"), NULL) && method_is(hm, "GET")) {
+        char *name = query_var(hm, "name");
+        if (!name || !name[0]) {
+            free(name);
+            reply_error(c, 400, "Missing ?name= parameter.");
+            return true;
+        }
+        if (!s->logo_cache) s->logo_cache = rs_logo_cache_create("logos.json");
+        char *logo_url = rs_logo_lookup(s->logo_cache, name, logo_fetch_wrapper, NULL);
+        free(name);
+        if (logo_url) {
+            rs_json *o = rs_json_new_obj();
+            rs_json_obj_set_str(o, "url", logo_url);
+            reply_json(c, 200, o, NULL);
+            free(logo_url);
+        } else {
+            reply_error(c, 404, "Logo not found.");
+        }
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/ffmpeg-status"), NULL) && method_is(hm, "GET")) {
+        char *path = rs_ffmpeg_resolve();
+        rs_json *o = rs_json_new_obj();
+        rs_json_obj_set_str(o, "status", path ? "available" : "missing");
+        if (path) rs_json_obj_set_str(o, "path", path);
+        free(path);
+        reply_json(c, 200, o, NULL);
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/nm3u8dlre-status"), NULL) && method_is(hm, "GET")) {
+        char *path = rs_nm3u8dlre_resolve();
+        rs_json *o = rs_json_new_obj();
+        rs_json_obj_set_str(o, "status", path ? "available" : "missing");
+        if (path) rs_json_obj_set_str(o, "path", path);
+        free(path);
+        reply_json(c, 200, o, NULL);
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/ffmpeg-install"), NULL) && (method_is(hm, "GET") || method_is(hm, "POST"))) {
+        char *cmd_plan = rs_ffmpeg_install_plan();
+        if (cmd_plan) {
+            rs_json *o = rs_json_new_obj();
+            rs_json_obj_set_str(o, "command", cmd_plan);
+            reply_json(c, 200, o, NULL);
+            free(cmd_plan);
+        } else {
+            reply_error(c, 501, "Automatic install not supported on this platform.");
+        }
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/nm3u8dlre-install"), NULL) && (method_is(hm, "GET") || method_is(hm, "POST"))) {
+        char *cmd_plan = rs_nm3u8dlre_install_plan();
+        if (cmd_plan) {
+            rs_json *o = rs_json_new_obj();
+            rs_json_obj_set_str(o, "command", cmd_plan);
+            reply_json(c, 200, o, NULL);
+            free(cmd_plan);
+        } else {
+            reply_error(c, 501, "Automatic install not supported on this platform.");
+        }
+        return true;
+    }
+
     return false;
 }
 
@@ -1282,6 +1437,11 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
                              struct mg_http_message *hm, const char *stream_id) {
     const rs_json *stream = rs_panel_find_stream(&server->state, stream_id);
     if (!stream) { reply_error(c, 404, "Stream not found."); return; }
+    const char *st_val = rs_json_obj_str(stream, "status", "stopped");
+    if (strcmp(st_val, "running") != 0 && !rs_json_obj_bool(stream, "directSource", false)) {
+        reply_error(c, 404, "Stream is stopped.");
+        return;
+    }
     char *url = query_var(hm, "u");
     if (!url) { reply_error(c, 400, "Missing ?u= target."); return; }
     const rs_json *provider = provider_of(&server->state, stream);
@@ -1290,6 +1450,7 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
     char *kindq = query_var(hm, "kind");
     bool decrypt = dec && dec[0] == '1';
     bool is_map = kindq && strcmp(kindq, "map") == 0;
+    bool is_key = kindq && strcmp(kindq, "key") == 0;
     free(dec); free(kindq);
 
     // Prefetch hit: the background downloader already has this segment decrypted
@@ -1348,6 +1509,24 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
         status = 0; free(cr); cr = NULL;  // decrypted body is a fresh whole object
     }
 
+    const char *hls_key = rs_json_obj_str(stream, "hlsKey", "");
+    if (hls_key && hls_key[0] != '\0' && !is_key) {
+        const char *hls_iv = rs_json_obj_str(stream, "hlsIV", "");
+        char *seq_str = query_var(hm, "seq");
+        int seq = seq_str ? atoi(seq_str) : 0;
+        free(seq_str);
+        uint8_t *dec_out = NULL;
+        size_t dec_len = 0;
+        if (rs_hls_decrypt((uint8_t *)body, body_len, hls_key, hls_iv ? hls_iv : "", seq, &dec_out, &dec_len) == 0 && dec_out) {
+            free(body);
+            body = (char *)dec_out;
+            body_len = dec_len;
+            status = 0; free(cr); cr = NULL;
+        } else {
+            log_record(server, stream_id, "error", "decryptSegment", url, 0, -1, "HLS decryption failed");
+        }
+    }
+
     // Network monitor: attribute the served bytes to this stream + client, and
     // log the fetch so the stream's Logs tab shows download activity.
     char client_ip[64] = {0};
@@ -1356,8 +1535,11 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
     char *pkey = playback_key(hm);
     const char *identity = (pkey && pkey[0]) ? pkey : client_ip;
     rs_metrics_record(server->metrics, stream_id, identity, client_ip, ua ? ua : "", (int)body_len);
+    // "miss" = the prefetcher hadn't warmed this one, so the fetch happened
+    // inline and blocked the server. Frequent misses mean the prefetch isn't
+    // keeping up with the live edge.
     log_record(server, stream_id, "info", is_map ? "downloadInit" : "downloadSegment",
-               url, status, (long long)body_len, NULL);
+               url, status, (long long)body_len, decrypt ? "miss (fetched inline)" : NULL);
     free(ua); free(pkey);
 
     const char *type = (ct && ct[0]) ? ct : content_type_from_ext(url);
@@ -1610,6 +1792,11 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
         const rs_json *stream = segment ? rs_panel_find_stream(&server->state, segment) : NULL;
         free(segment);
         if (!stream) { reply_error(c, 404, "Stream not found."); return true; }
+        const char *st_val = rs_json_obj_str(stream, "status", "stopped");
+        if (strcmp(st_val, "running") != 0 && !rs_json_obj_bool(stream, "directSource", false)) {
+            reply_error(c, 404, "Stream is stopped.");
+            return true;
+        }
 
         if (rs_json_obj_bool(stream, "directSource", false)) {
             const char *target = stream_source_target(stream);
@@ -1796,6 +1983,7 @@ void restream_server_destroy(restream_server_t* server) {
         rs_sysstats_destroy(server->sysstats);
         rs_metrics_destroy(server->metrics);
         prefetch_destroy(server->prefetch);
+        if (server->logo_cache) rs_logo_cache_destroy(server->logo_cache);
         log_clear(server, "");  // frees ring-buffer strings
         rs_state_dispose(&server->state);
         free(server->web_root);

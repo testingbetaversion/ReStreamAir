@@ -69,6 +69,11 @@ char *rs_ffargs_header_block(const char *headers);
 // with rs_free_strv(*tokens, *count).
 int rs_ffargs_tokenize(const char *text, char ***tokens, size_t *count);
 
+// Locate ffmpeg on PATH and standard locations (returns malloc'd path or NULL).
+char *rs_ffmpeg_resolve(void);
+// Generate installation plan for ffmpeg (returns malloc'd shell command string or NULL).
+char *rs_ffmpeg_install_plan(void);
+
 #ifdef __cplusplus
 }
 #endif

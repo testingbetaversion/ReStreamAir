@@ -2729,7 +2729,7 @@ final class PanelServer {
             // escalate to guarantee the worker actually dies. The worker is
             // stateless (it only writes segment files + an atomically-replaced
             // playlist), so there's nothing to flush.
-            #if os(Linux)
+            #if !os(Windows)
             if pid > 0 { kill(pid, SIGKILL) }
             #endif
         }
@@ -2764,8 +2764,6 @@ final class PanelServer {
             guard commandLooksLikeWorker(pid) else { continue }
             #if !os(Windows)
             kill(pid, SIGTERM)
-            #endif
-            #if os(Linux)
             // Workers inherit a blocked SIGTERM mask (see stop()) — escalate.
             kill(pid, SIGKILL)
             #endif
@@ -3277,18 +3275,16 @@ final class PanelServer {
               let target = request.query["u"], let requestedUrl = URL(string: target) else { throw PanelError.badRequest("Invalid proxy request.") }
         let state = try readState()
         guard let (provider, stream) = providerAndStream(id, in: state) else { throw PanelError.notFound("Stream not found.") }
+        guard stream.status == "running" else { throw PanelError.notFound("Stream is stopped.") }
         let kind = request.query["kind"] ?? "segment"
         let category: HeaderCategory = kind == "key" ? .hlsKey : .media
         let url = kind == "key" ? requestedUrl : appendingQueryParams(requestedUrl, effectiveSegmentUrlParams(provider: provider, stream: stream))
         var data: Data
         do {
             data = try fetchRemote(provider: provider, stream: stream, url: url, category: category)
+            logStore.record(streamId: stream.id, level: "info", event: kind == "map" ? "accessInit" : "accessSegment", url: url.absoluteString, message: "Served \(kind) (\(data.count) bytes)")
         } catch {
-            // Error-only, unlike fetchManifest's success logging above — this
-            // runs once per client per segment (not once per shared worker
-            // loop like kind=mpd), so logging every success here would flood
-            // the log for any stream with more than a couple of viewers.
-            logStore.record(streamId: stream.id, level: "error", event: "downloadSegment", url: url.absoluteString, message: "\(error)")
+            logStore.record(streamId: stream.id, level: "error", event: kind == "map" ? "accessInit" : "accessSegment", url: url.absoluteString, message: "\(error)")
             throw error
         }
         metrics.recordInput(streamId: stream.id, bytes: data.count)
@@ -3305,6 +3301,9 @@ final class PanelServer {
     }
 
     func serveRuntime(streamId: String, file: String) throws -> Data {
+        if let state = try? readState(), let (_, stream) = providerAndStream(streamId, in: state), stream.status != "running" {
+            throw PanelError.notFound("Stream is stopped.")
+        }
         let base = runtimeDir.appendingPathComponent(streamId, isDirectory: true).standardizedFileURL
         let url = base.appendingPathComponent(file).standardizedFileURL
         guard url.path.hasPrefix(base.path) else { throw PanelError.badRequest("Invalid path.") }
@@ -3312,6 +3311,9 @@ final class PanelServer {
             throw PanelError.notFound("Runtime file is not ready.")
         }
         let data = try Data(contentsOf: url)
+        if !file.hasSuffix(".m3u8") && !file.hasSuffix(".mpd") {
+            logStore.record(streamId: streamId, level: "info", event: "accessSegment", url: file, message: "Served segment (\(data.count) bytes)")
+        }
         return response(status: 200, body: data, type: contentType(url.path), noStore: url.pathExtension == "m3u8")
     }
 

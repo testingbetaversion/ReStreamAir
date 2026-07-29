@@ -2,8 +2,21 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "rs_internal.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#ifndef F_OK
+#define F_OK 0
+#endif
+#define access_fn _access
+#else
+#include <unistd.h>
+#include <sys/stat.h>
+#endif
 
 static bool str_equal(const char *a, const char *b) {
     return a && b && strcmp(a, b) == 0;
@@ -338,4 +351,90 @@ void rs_ffargs_command_dispose(rs_ffargs_command *cmd) {
     rs_free_strv(cmd->env_keys, cmd->env_count);
     rs_free_strv(cmd->env_values, cmd->env_count);
     memset(cmd, 0, sizeof(*cmd));
+}
+
+static bool ffmpeg_is_exec(const char *path) {
+#ifdef _WIN32
+    return _access(path, F_OK) == 0;
+#else
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & S_IXUSR)) return true;
+    return false;
+#endif
+}
+
+static char *check_ffmpeg_bin(const char *dir, const char *name) {
+    if (!dir || !name || strlen(dir) == 0) return NULL;
+    rs_buf b = RS_BUF_INIT;
+    rs_buf_append_str(&b, dir);
+#ifdef _WIN32
+    if (dir[strlen(dir) - 1] != '\\' && dir[strlen(dir) - 1] != '/') rs_buf_append_char(&b, '\\');
+#else
+    if (dir[strlen(dir) - 1] != '/') rs_buf_append_char(&b, '/');
+#endif
+    rs_buf_append_str(&b, name);
+    char *path = rs_buf_take(&b);
+    if (path && ffmpeg_is_exec(path)) return path;
+    rs_free(path);
+    return NULL;
+}
+
+char *rs_ffmpeg_resolve(void) {
+    const char *names[] = {
+#ifdef _WIN32
+        "ffmpeg.exe", "ffmpeg"
+#else
+        "ffmpeg"
+#endif
+    };
+    size_t names_cnt = sizeof(names) / sizeof(names[0]);
+    char sep =
+#ifdef _WIN32
+        ';'
+#else
+        ':'
+#endif
+    ;
+    const char *env_path = getenv("PATH");
+    if (env_path) {
+        size_t len = strlen(env_path);
+        size_t i = 0;
+        while (i < len) {
+            size_t start = i;
+            while (i < len && env_path[i] != sep) i++;
+            const char *dir_str = NULL;
+            size_t dir_len = rs_trim(env_path + start, i - start, false, &dir_str);
+            if (dir_len > 0) {
+                char *dir = rs_trim_dup(dir_str, dir_len, false);
+                if (dir) {
+                    for (size_t j = 0; j < names_cnt; j++) {
+                        char *found = check_ffmpeg_bin(dir, names[j]);
+                        if (found) { free(dir); return found; }
+                    }
+                    free(dir);
+                }
+            }
+            if (i < len && env_path[i] == sep) i++;
+        }
+    }
+#ifndef _WIN32
+    const char *common_dirs[] = { "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/snap/bin" };
+    for (size_t i = 0; i < sizeof(common_dirs) / sizeof(common_dirs[0]); i++) {
+        for (size_t j = 0; j < names_cnt; j++) {
+            char *found = check_ffmpeg_bin(common_dirs[i], names[j]);
+            if (found) return found;
+        }
+    }
+#endif
+    return NULL;
+}
+
+char *rs_ffmpeg_install_plan(void) {
+#if defined(__APPLE__)
+    return strdup("brew install ffmpeg");
+#elif defined(__linux__)
+    return strdup("apt-get install -y ffmpeg");
+#else
+    return NULL;
+#endif
 }
