@@ -1317,10 +1317,12 @@ static uint8_t *apply_cenc(const rs_json *stream, bool is_map, uint8_t *body, si
     return body;
 }
 
-// Restreams one segment/key/init: hand back what the live engine already
-// downloaded and decrypted, or — for the HLS passthrough path and for anything
-// that has aged out — fetch ?u= through the stream's media settings and stream
-// the bytes back. ?dec=1 applies ClearKey CENC; ?kind=map marks the init.
+// Restreams one segment/key/init.
+//
+// For a DASH stream (live=1) this only ever hands back what the live engine
+// already downloaded and decrypted — a memcpy, never a network request. The
+// inline fetch below is for the HLS passthrough path, which has no engine
+// behind it.
 static void serve_restream_item(restream_server_t *server, struct mg_connection *c,
                                 struct mg_http_message *hm, const char *stream_id) {
     const rs_json *stream = rs_panel_find_stream(&server->state, stream_id);
@@ -1371,12 +1373,27 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
             return;
         }
         // A miss means the player asked for something that has already aged out
-        // of the queue (it fell behind) or that the worker never managed to
-        // fetch. Fall through to an inline fetch so playback survives, and say
-        // so plainly — a run of these is the signal that keep/hold-back is too
-        // small for how far behind this player is running.
+        // of the queue (it fell behind), or that the worker never managed to
+        // fetch at all.
+        //
+        // Answer 404 immediately rather than fetching it inline. The inline
+        // path is a synchronous origin request on the single-threaded event
+        // loop, so one miss against a slow origin stalls *every* other request
+        // — including the playlist reloads of every other viewer, which players
+        // then report as a playlist timeout even though playlists are served
+        // from memory. It is also unlikely to succeed: these URLs carry
+        // per-request session tokens that have usually expired by the time a
+        // segment has aged out of the window. A prompt 404 lets the player skip
+        // ahead to the live edge, which is the recovery it is designed for.
         log_record(server, stream_id, "error", is_map ? "cacheMissInit" : "cacheMissSegment",
-                   url, 0, -1, "not in the live cache — fetching inline (this blocks the server)");
+                   url, 404, -1,
+                   "outside the live window — 404 so the player reseeks (raise keepSegments "
+                   "or the hold-back if this repeats)");
+        free(url);
+        mg_http_reply(c, 404, "Content-Type: text/plain\r\nCache-Control: no-store\r\n"
+                              "Access-Control-Allow-Origin: *\r\n",
+                      "Segment is outside the live window.\n");
+        return;
     }
 
     // Forward the player's Range so byte-range segments and seeking fetch only
