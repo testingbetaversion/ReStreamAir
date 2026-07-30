@@ -130,6 +130,36 @@ static double now_seconds(void) {
     return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
 }
 
+// A segment's identity, stable across session-token rotation.
+//
+// Token-authenticated origins mint a fresh URL for the same segment on every
+// manifest poll — the path carries a per-request token (…/bpk-token/1aa@<40
+// chars>/…) and the CDN hostname rotates between mirrors as well. Keying "have
+// I already downloaded this?" on the URL therefore makes the entire advertised
+// window look new on every single poll: the queue fills with duplicates of the
+// same media, and EXT-X-MEDIA-SEQUENCE (the append counter) races ahead of the
+// real timeline by the width of the window each time. Players report that as
+// "skipping N segments ahead, expired from playlists" and then stall with an
+// empty buffer, having never been given two consecutive segments that agree.
+//
+// What does not rotate is the manifest's own $Time$ value and the segment
+// filename, so the identity is those two together. `time` is -1 for the
+// initialization segment, whose filename alone is already unique per
+// representation.
+static void stable_key(const char *url, long long time_val, char *out, size_t outlen) {
+    if (!url) url = "";
+    const char *q = strchr(url, '?');
+    size_t path_len = q ? (size_t)(q - url) : strlen(url);
+    const char *base = url;
+    for (size_t i = 0; i < path_len; i++)
+        if (url[i] == '/') base = url + i + 1;
+    size_t base_len = path_len - (size_t)(base - url);
+    // Keep the tail if the filename is implausibly long: that end carries the
+    // per-segment number/timestamp, the head is the common prefix.
+    if (base_len > 192) { base += base_len - 192; base_len = 192; }
+    snprintf(out, outlen, "%lld|%.*s", time_val, (int)base_len, base);
+}
+
 // --- the seen-URL set -------------------------------------------------------
 
 typedef struct seen_node {
@@ -238,7 +268,8 @@ typedef struct {
     long long total_queued;    // every segment ever appended — see writePlaylist
     long long dropped_disc;    // discontinuities that rolled off the queue
 
-    char *init_url;
+    char *init_url;        // the URL the held init was actually fetched from
+    char *init_key;        // its token-independent identity (see stable_key)
     uint8_t *init_data;
     size_t init_len;
 
@@ -378,6 +409,7 @@ static bool live_stopping(live_stream *st) {
 // One queued download and its result.
 typedef struct {
     char *url;
+    long long time_val;   // the manifest's $Time$, for the stable identity
     double duration;
     uint8_t *data;
     size_t len;
@@ -561,10 +593,15 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
     }
     rs_cenc_keys_free(&keys);
 
+    char idkey[288];
+    stable_key(init_url, -1, idkey, sizeof(idkey));
+
     pthread_mutex_lock(&st->mu);
     free(rep->init_url);
+    free(rep->init_key);
     free(rep->init_data);
     rep->init_url = rs_strdup(init_url);
+    rep->init_key = rs_strdup(idkey);
     rep->init_data = patched;
     rep->init_len = out_len;
     rep->timescale = ts;
@@ -623,10 +660,14 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
         "%s: %lu segments in the manifest window (%.2fs)", rep->rep_id,
         (unsigned long)total, now_seconds() - t0);
 
-    // The init segment is fetched once, and again only if the source rotates it.
+    // The init segment is fetched once, and again only if the source genuinely
+    // rotates it — compared by stable identity, so a re-tokenized URL for the
+    // same init does not trigger a pointless refetch every poll.
+    char init_key[288];
+    stable_key(init_url, -1, init_key, sizeof(init_key));
     bool need_init;
     pthread_mutex_lock(&st->mu);
-    need_init = init_url[0] && (!rep->init_url || strcmp(rep->init_url, init_url) != 0);
+    need_init = init_url[0] && (!rep->init_key || strcmp(rep->init_key, init_key) != 0);
     pthread_mutex_unlock(&st->mu);
     if (need_init) rep_load_init(rep, init_url, cfg, plan_ts);
     if (live_stopping(st)) { rs_json_free(root); return; }
@@ -639,8 +680,13 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     for (size_t i = 0; i < total; i++) {
         const rs_json *s = rs_json_arr_at(segs, i);
         const char *u = rs_json_obj_str(s, "url", "");
-        if (!u[0] || seen_has(&rep->seen, u)) continue;
+        if (!u[0]) continue;
+        long long tv = (long long)rs_json_as_num(rs_json_obj_get(s, "time"), -1);
+        char idkey[288];
+        stable_key(u, tv, idkey, sizeof(idkey));
+        if (seen_has(&rep->seen, idkey)) continue;
         items[n].url = rs_strdup(u);
+        items[n].time_val = tv;
         items[n].duration = rs_json_as_num(rs_json_obj_get(s, "duration"), 0);
         n++;
     }
@@ -662,6 +708,8 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     long long added_bytes = 0;
     for (size_t i = 0; i < n; i++) {
         batch_item *it = &items[i];
+        char idkey[288];
+        stable_key(it->url, it->time_val, idkey, sizeof(idkey));
         if (!it->ok) {
             failed++;
             // A single miss at the live edge is routine — the origin may simply
@@ -669,7 +717,7 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
             // forever, and let the window slide past it.
             lgf(st, "error", "downloadSegment", it->url, 0, -1, "%s: %s", rep->rep_id, it->err);
             pthread_mutex_lock(&st->mu);
-            seen_add(&rep->seen, it->url);
+            seen_add(&rep->seen, idkey);
             pthread_mutex_unlock(&st->mu);
             free(it->url);
             continue;
@@ -716,7 +764,7 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
         rep_append_locked(rep, it->url, data, len,
                           it->duration > 0 ? it->duration : 2.0, start, have_start);
         if (rep->nsegs > 0) was_disc = rep->segs[rep->nsegs - 1].disc;
-        seen_add(&rep->seen, it->url);
+        seen_add(&rep->seen, idkey);
         pthread_mutex_unlock(&st->mu);
 
         added++;
@@ -810,7 +858,7 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
         // rejects any segment URL whose extension is not in its allow-list, so a
         // query-only "/item" path fails to parse outright. The ?u= target is
         // what actually gets served; the filename only satisfies the demuxer.
-        sb_addf(&b, "#EXT-X-MAP:URI=\"/proxy/%s/init.mp4?u=%s&rep=%s&kind=map&dec=1&live=1\"\n",
+        sb_addf(&b, "#EXT-X-MAP:URI=\"/restream/%s/init.mp4?u=%s&rep=%s&kind=map&dec=1&live=1\"\n",
                 rep->owner->id, ienc ? ienc : "", rep_enc ? rep_enc : "");
         free(ienc);
     }
@@ -821,7 +869,7 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
         // EXT-X-DISCONTINUITY-SEQUENCE above.
         if (s->disc && i > window_start) sb_add(&b, "#EXT-X-DISCONTINUITY\n");
         char *senc = qenc(s->url);
-        sb_addf(&b, "#EXTINF:%.3f,\n/proxy/%s/seg.m4s?u=%s&rep=%s&kind=segment&dec=1&live=1\n",
+        sb_addf(&b, "#EXTINF:%.3f,\n/restream/%s/seg.m4s?u=%s&rep=%s&kind=segment&dec=1&live=1\n",
                 s->duration, rep->owner->id, senc ? senc : "", rep_enc ? rep_enc : "");
         free(senc);
     }
@@ -1029,6 +1077,7 @@ static void rep_dispose(live_rep *rep) {
     }
     free(rep->segs);
     free(rep->init_url);
+    free(rep->init_key);
     free(rep->init_data);
     free(rep->rep_id);
     free(rep->kind);

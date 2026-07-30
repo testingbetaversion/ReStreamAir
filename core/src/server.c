@@ -1202,8 +1202,8 @@ static const char *effective_downloader_params(const rs_json *provider) {
     return rs_json_obj_str(provider, "downloaderParams", "");
 }
 
-// The rewrite transforms need the stream id to build proxy/variant paths.
-// Picks a proxy filename with an extension ffmpeg's HLS demuxer will accept
+// The rewrite transforms need the stream id to build restream/variant paths.
+// Picks a filename with an extension ffmpeg's HLS demuxer will accept
 // (keys/maps aside, it validates the segment URL's extension). Keeps the source
 // URL's own extension when it's a short alphanumeric one, else a sane default.
 static void proxy_filename(const char *abs_uri, rs_m3u8_line_kind kind, char *out, size_t outlen) {
@@ -1236,7 +1236,7 @@ static char *media_transform(void *ud, const char *abs_uri, rs_m3u8_line_kind ki
     if (!enc) return NULL;
     size_t need = strlen(stream_id) + strlen(enc) + strlen(fname) + 64;
     char *out = (char *)malloc(need);
-    if (out) snprintf(out, need, "/proxy/%s/%s?u=%s&kind=%s", stream_id, fname, enc, kindstr);
+    if (out) snprintf(out, need, "/restream/%s/%s?u=%s&kind=%s", stream_id, fname, enc, kindstr);
     free(enc);
     return out;
 }
@@ -1317,11 +1317,12 @@ static uint8_t *apply_cenc(const rs_json *stream, bool is_map, uint8_t *body, si
     return body;
 }
 
-// Proxies one segment/key/init: fetch ?u= through the stream's media settings
-// and stream the bytes back. ?dec=1 (set by the DASH playlist) applies ClearKey
-// CENC decryption; ?kind=map marks the init segment.
-static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
-                             struct mg_http_message *hm, const char *stream_id) {
+// Restreams one segment/key/init: hand back what the live engine already
+// downloaded and decrypted, or — for the HLS passthrough path and for anything
+// that has aged out — fetch ?u= through the stream's media settings and stream
+// the bytes back. ?dec=1 applies ClearKey CENC; ?kind=map marks the init.
+static void serve_restream_item(restream_server_t *server, struct mg_connection *c,
+                                struct mg_http_message *hm, const char *stream_id) {
     const rs_json *stream = rs_panel_find_stream(&server->state, stream_id);
     if (!stream) { reply_error(c, 404, "Stream not found."); return; }
     const char *st_val = rs_json_obj_str(stream, "status", "stopped");
@@ -1653,8 +1654,8 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
                             struct mg_http_message *hm) {
     bool is_source = mg_match(hm->uri, mg_str("/source/*"), NULL);
     bool is_play = mg_match(hm->uri, mg_str("/play/#"), NULL);
-    bool is_proxy = mg_match(hm->uri, mg_str("/proxy/#"), NULL);
-    if (!is_source && !is_play && !is_proxy) return false;
+    bool is_restream = mg_match(hm->uri, mg_str("/restream/#"), NULL);
+    if (!is_source && !is_play && !is_restream) return false;
 
     // Playback auth: an API key is required only once at least one exists.
     char *key = playback_key(hm);
@@ -1671,11 +1672,11 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
     }
     free(key);
 
-    if (is_proxy) {
-        if (!g_fetch_handler) { reply_error(c, 501, "Proxy playback isn't in this build."); return true; }
-        char *id = capture(hm, "/proxy/*/#");
-        if (id) serve_proxy_item(server, c, hm, id);
-        else reply_error(c, 400, "Bad proxy path.");
+    if (is_restream) {
+        if (!g_fetch_handler) { reply_error(c, 501, "Restreaming isn't in this build."); return true; }
+        char *id = capture(hm, "/restream/*/#");
+        if (id) serve_restream_item(server, c, hm, id);
+        else reply_error(c, 400, "Bad restream path.");
         free(id);
         return true;
     }
@@ -1759,7 +1760,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     // passthrough is proxied live; /proxy streams the segments.
     if (server && (mg_match(hm->uri, mg_str("/source/#"), NULL) ||
                    mg_match(hm->uri, mg_str("/play/#"), NULL) ||
-                   mg_match(hm->uri, mg_str("/proxy/#"), NULL))) {
+                   mg_match(hm->uri, mg_str("/restream/#"), NULL))) {
         if (handle_playback(server, c, hm)) return;
     }
 
