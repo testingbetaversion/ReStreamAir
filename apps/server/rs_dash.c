@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -69,6 +70,32 @@ static double parse_duration(const char *s) {
         num = 0; have = false;
     }
     return total;
+}
+
+// ISO-8601 UTC timestamp ("2026-07-30T12:34:56.789Z") to seconds since the Unix
+// epoch, or -1 when absent or unparseable. This is MPD@availabilityStartTime,
+// which is what anchors a $Number$-addressed live stream to the wall clock.
+// A trailing numeric zone offset is not honoured — DASH publishes these in UTC.
+static double parse_datetime(const char *s) {
+    if (!s || !s[0]) return -1;
+    int y, mo, d, h, mi;
+    double sec = 0;
+    if (sscanf(s, "%d-%d-%dT%d:%d:%lf", &y, &mo, &d, &h, &mi, &sec) < 6) return -1;
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_year = y - 1900;
+    tm.tm_mon = mo - 1;
+    tm.tm_mday = d;
+    tm.tm_hour = h;
+    tm.tm_min = mi;
+    tm.tm_sec = 0;
+#ifdef _WIN32
+    time_t base = _mkgmtime(&tm);
+#else
+    time_t base = timegm(&tm);
+#endif
+    if (base == (time_t)-1) return -1;
+    return (double)base + sec;
 }
 
 // --- template token substitution -------------------------------------------
@@ -244,6 +271,18 @@ int rs_dash_plan_build(const char *mpd_xml, size_t len, const char *mpd_url,
     free(type);
     char *mup = attr(root, "minimumUpdatePeriod");
     out->minimum_update_period = parse_duration(mup); free(mup);
+
+    // Anchors for $Number$-addressed streams, which carry no explicit timeline:
+    // the wall-clock origin of the presentation, and (for a static MPD) how long
+    // it runs.
+    char *ast_attr = attr(root, "availabilityStartTime");
+    double availability_start = parse_datetime(ast_attr);
+    free(ast_attr);
+    char *mpd_dur_attr = attr(root, "mediaPresentationDuration");
+    double mpd_duration = parse_duration(mpd_dur_attr);
+    free(mpd_dur_attr);
+    double now_utc = (double)time(NULL);
+
     char *tsb = attr(root, "timeShiftBufferDepth");
     out->time_shift_buffer_depth = parse_duration(tsb); free(tsb);
 
@@ -256,6 +295,13 @@ int rs_dash_plan_build(const char *mpd_xml, size_t len, const char *mpd_url,
         char *period_base_piece = base_url_child(period);
         char *base_after_period = stack_base(base_after_mpd, period_base_piece);
         free(period_base_piece);
+
+        char *pstart_attr = attr(period, "start");
+        double period_start = parse_duration(pstart_attr);
+        free(pstart_attr);
+        char *pdur_attr = attr(period, "duration");
+        double period_duration = parse_duration(pdur_attr);
+        free(pdur_attr);
 
         for (xmlNode *adap = period->children; adap && !found; adap = adap->next) {
             if (!node_is(adap, "AdaptationSet")) continue;
@@ -321,6 +367,60 @@ int rs_dash_plan_build(const char *mpd_xml, size_t len, const char *mpd_url,
                                 seg->duration = t.timescale ? (double)e->d / (double)t.timescale : 0;
                                 free(path);
                                 number++; cur += e->d;
+                            }
+                        }
+                    } else if (t.duration > 0) {
+                        // SegmentTemplate@duration with $Number$ and no
+                        // SegmentTimeline. This is the other half of live DASH —
+                        // DASH-IF's own reference streams and plenty of real
+                        // CDNs publish it — and it used to fall straight through
+                        // to `found = true` with an empty segment list, so the
+                        // engine polled forever reporting "0 segments in the
+                        // manifest window" and no player ever got a playlist.
+                        //
+                        // There is no timeline to walk: segment N covers media
+                        // time [N*duration, (N+1)*duration) from the period's
+                        // start, so the live edge has to be derived from the
+                        // wall clock against MPD@availabilityStartTime.
+                        double ts = t.timescale ? (double)t.timescale : 1.0;
+                        double seg_dur = t.duration / ts;
+                        long long first_number = t.start_number ? t.start_number : 1;
+                        long long newest = -1;   // 0-based index of the newest complete segment
+
+                        if (out->dynamic) {
+                            if (availability_start >= 0) {
+                                double elapsed = now_utc - availability_start - period_start;
+                                if (elapsed > 0) newest = (long long)(elapsed / seg_dur) - 1;
+                            }
+                        } else {
+                            double total = period_duration > 0 ? period_duration : mpd_duration;
+                            if (total > 0) newest = (long long)(total / seg_dur) - 1;
+                        }
+
+                        if (newest >= 0 && seg_dur > 0) {
+                            // How far back to go: the caller trims to `want`, so
+                            // honour that when given and otherwise fall back to
+                            // the advertised time-shift buffer.
+                            long long n = want > 0 ? want
+                                        : (out->time_shift_buffer_depth > 0
+                                               ? (long long)(out->time_shift_buffer_depth / seg_dur)
+                                               : 10);
+                            if (n < 1) n = 1;
+                            if (n > 5000) n = 5000;
+                            long long start_idx = newest - n + 1;
+                            if (start_idx < 0) start_idx = 0;
+
+                            for (long long idx = start_idx; idx <= newest; idx++) {
+                                if (out->count >= cap) { cap = cap ? cap * 2 : 64; out->segments = realloc(out->segments, cap * sizeof(rs_dash_segment)); }
+                                long long number = first_number + idx;
+                                long long media_time = t.pto + idx * (long long)t.duration;
+                                char *path = fill_template(t.media, rid, bandwidth, number, media_time);
+                                rs_dash_segment *seg = &out->segments[out->count++];
+                                seg->url = rs_url_resolve(base, path);
+                                seg->number = number;
+                                seg->time = media_time;
+                                seg->duration = seg_dur;
+                                free(path);
                             }
                         }
                     }
