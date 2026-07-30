@@ -125,11 +125,13 @@ char *rs_live_master_playlist(rs_live *live, const char *stream_id);
 // representation has no advertisable window yet. Caller frees with rs_free.
 char *rs_live_media_playlist(rs_live *live, const char *stream_id, const char *rep);
 
-// Hands out a copy of an already-downloaded, already-decrypted segment (or the
-// patched init segment) by its upstream URL, or NULL on a miss. Caller frees
-// with rs_free. `*out_len` receives the length.
-uint8_t *rs_live_take_segment(rs_live *live, const char *stream_id, const char *url,
-                              size_t *out_len);
+// Hands out a copy of an already-downloaded, already-decrypted segment, or the
+// patched init segment when `want_init` is set. Addressed the way the playlist
+// advertises it — representation slot plus media sequence — so the public URL
+// never has to carry the origin address. NULL on a miss (the segment has aged
+// out of the queue). Caller frees with rs_free; `*out_len` receives the length.
+uint8_t *rs_live_take_indexed(rs_live *live, const char *stream_id, int rep_index,
+                              long long seq, bool want_init, size_t *out_len);
 
 // A one-line health summary for the logs/diagnostics ("video 12 segs, seq 431,
 // 3 disc; audio 12 segs …"). Caller frees with rs_free, or NULL if unknown.

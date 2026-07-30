@@ -256,6 +256,7 @@ typedef struct {
     struct live_stream *owner;
     char *rep_id;
     char *kind;            // "video" | "audio"
+    int index;             // slot in owner->reps, used as the public URL token
 
     pthread_t thread;
     bool thread_started;
@@ -851,16 +852,19 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
     sb_addf(&b, "#EXT-X-MEDIA-SEQUENCE:%lld\n", rep->segs[window_start].seq);
     if (disc_seq > 0) sb_addf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%lld\n", disc_seq);
 
-    char *rep_enc = qenc(rep->rep_id);
-    if (rep->init_url && rep->init_url[0]) {
-        char *ienc = qenc(rep->init_url);
-        // The path has to end in a real media extension: ffmpeg's HLS demuxer
-        // rejects any segment URL whose extension is not in its allow-list, so a
-        // query-only "/item" path fails to parse outright. The ?u= target is
-        // what actually gets served; the filename only satisfies the demuxer.
-        sb_addf(&b, "#EXT-X-MAP:URI=\"/restream/%s/init.mp4?u=%s&rep=%s&kind=map&dec=1&live=1\"\n",
-                rep->owner->id, ienc ? ienc : "", rep_enc ? rep_enc : "");
-        free(ienc);
+    // Opaque URLs: "<repIndex>_<sequence>.m4s", resolved against this queue.
+    //
+    // These used to embed the upstream URL as ?u=<encoded>, which handed every
+    // viewer the origin address complete with its session token — anyone with
+    // the playlist could fetch from the CDN directly and skip the restream. The
+    // segment is already downloaded and decrypted in memory by the time it is
+    // advertised, so the playlist has no reason to name where it came from.
+    //
+    // The filename still ends in a real media extension because ffmpeg's HLS
+    // demuxer rejects any segment URL whose extension is not on its allow-list.
+    if (rep->init_data && rep->init_len) {
+        sb_addf(&b, "#EXT-X-MAP:URI=\"/restream/%s/%d_init.mp4\"\n",
+                rep->owner->id, rep->index);
     }
     for (long long i = window_start; i < window_end; i++) {
         live_seg *s = &rep->segs[i];
@@ -868,12 +872,9 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
         // the first one in the window — that break is already carried by
         // EXT-X-DISCONTINUITY-SEQUENCE above.
         if (s->disc && i > window_start) sb_add(&b, "#EXT-X-DISCONTINUITY\n");
-        char *senc = qenc(s->url);
-        sb_addf(&b, "#EXTINF:%.3f,\n/restream/%s/seg.m4s?u=%s&rep=%s&kind=segment&dec=1&live=1\n",
-                s->duration, rep->owner->id, senc ? senc : "", rep_enc ? rep_enc : "");
-        free(senc);
+        sb_addf(&b, "#EXTINF:%.3f,\n/restream/%s/%d_%lld.m4s\n",
+                s->duration, rep->owner->id, rep->index, s->seq);
     }
-    free(rep_enc);
     return b.p;
 }
 
@@ -971,6 +972,7 @@ static void rep_ensure_locked(live_stream *st, const char *rep_id, const char *k
     rep->rep_id = rs_strdup(rep_id);
     rep->kind = rs_strdup(kind && kind[0] ? kind : "video");
     rep->iv_size = 8;
+    rep->index = (int)st->nreps;
     st->reps[st->nreps++] = rep;
     if (pthread_create(&rep->thread, NULL, rep_main, rep) == 0) rep->thread_started = true;
     else rep->finished = true;
@@ -1392,27 +1394,31 @@ char *rs_live_media_playlist(rs_live *live, const char *stream_id, const char *r
     return copy;
 }
 
-uint8_t *rs_live_take_segment(rs_live *live, const char *stream_id, const char *url,
-                              size_t *out_len) {
-    if (!live || !stream_id || !url || !out_len) return NULL;
+uint8_t *rs_live_take_indexed(rs_live *live, const char *stream_id, int rep_index,
+                              long long seq, bool want_init, size_t *out_len) {
+    if (!live || !stream_id || !out_len || rep_index < 0) return NULL;
     pthread_mutex_lock(&live->mu);
     live_stream *st = stream_find_locked(live, stream_id);
     uint8_t *copy = NULL;
     if (st) {
         pthread_mutex_lock(&st->mu);
-        for (size_t i = 0; i < st->nreps && !copy; i++) {
-            live_rep *r = st->reps[i];
-            if (r->init_url && r->init_data && strcmp(r->init_url, url) == 0) {
-                copy = (uint8_t *)malloc(r->init_len ? r->init_len : 1);
-                if (copy) { memcpy(copy, r->init_data, r->init_len); *out_len = r->init_len; }
-                break;
-            }
-            for (size_t j = 0; j < r->nsegs; j++) {
-                if (strcmp(r->segs[j].url, url) != 0) continue;
-                size_t len = r->segs[j].len;
-                copy = (uint8_t *)malloc(len ? len : 1);
-                if (copy) { memcpy(copy, r->segs[j].data, len); *out_len = len; }
-                break;
+        if ((size_t)rep_index < st->nreps) {
+            live_rep *r = st->reps[rep_index];
+            if (want_init) {
+                if (r->init_data) {
+                    copy = (uint8_t *)malloc(r->init_len ? r->init_len : 1);
+                    if (copy) { memcpy(copy, r->init_data, r->init_len); *out_len = r->init_len; }
+                }
+            } else {
+                // The queue is small (a couple of dozen entries) and ordered, so
+                // a scan costs nothing next to the memcpy that follows.
+                for (size_t j = 0; j < r->nsegs; j++) {
+                    if (r->segs[j].seq != seq) continue;
+                    size_t len = r->segs[j].len;
+                    copy = (uint8_t *)malloc(len ? len : 1);
+                    if (copy) { memcpy(copy, r->segs[j].data, len); *out_len = len; }
+                    break;
+                }
             }
         }
         pthread_mutex_unlock(&st->mu);
@@ -1469,8 +1475,10 @@ char *rs_live_master_playlist(rs_live *live, const char *stream_id) { (void)live
 char *rs_live_media_playlist(rs_live *live, const char *stream_id, const char *rep) {
     (void)live; (void)stream_id; (void)rep; return NULL;
 }
-uint8_t *rs_live_take_segment(rs_live *live, const char *stream_id, const char *url, size_t *out_len) {
-    (void)live; (void)stream_id; (void)url; (void)out_len; return NULL;
+uint8_t *rs_live_take_indexed(rs_live *live, const char *stream_id, int rep_index,
+                              long long seq, bool want_init, size_t *out_len) {
+    (void)live; (void)stream_id; (void)rep_index; (void)seq; (void)want_init; (void)out_len;
+    return NULL;
 }
 char *rs_live_status_line(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return NULL; }
 

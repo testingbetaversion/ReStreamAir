@@ -522,6 +522,16 @@ static void handle_state(restream_server_t *s, struct mg_connection *c, struct m
     free(host);
 }
 
+// A matched capture as a fresh NUL-terminated string (mongoose hands them back
+// as pointer+length into the request buffer, which is not NUL-terminated).
+static char *capture_dup(struct mg_str s) {
+    char *out = (char *)malloc(s.len + 1);
+    if (!out) return NULL;
+    memcpy(out, s.buf, s.len);
+    out[s.len] = '\0';
+    return out;
+}
+
 // Captures the first `*`/`#` segment of a matched URI pattern as a fresh string.
 static char *capture(struct mg_http_message *hm, const char *pattern) {
     struct mg_str caps[4];
@@ -1324,7 +1334,8 @@ static uint8_t *apply_cenc(const rs_json *stream, bool is_map, uint8_t *body, si
 // inline fetch below is for the HLS passthrough path, which has no engine
 // behind it.
 static void serve_restream_item(restream_server_t *server, struct mg_connection *c,
-                                struct mg_http_message *hm, const char *stream_id) {
+                                struct mg_http_message *hm, const char *stream_id,
+                                const char *fname) {
     const rs_json *stream = rs_panel_find_stream(&server->state, stream_id);
     if (!stream) { reply_error(c, 404, "Stream not found."); return; }
     const char *st_val = rs_json_obj_str(stream, "status", "stopped");
@@ -1332,6 +1343,57 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
         reply_error(c, 404, "Stream is stopped.");
         return;
     }
+
+    // Live-engine URL: "<repIndex>_<sequence>.m4s" or "<repIndex>_init.mp4".
+    // The bytes were downloaded and decrypted by the background worker before
+    // this segment was ever advertised, so answering costs a memcpy and the
+    // request never touches the network. The URL deliberately carries no
+    // upstream address — see the playlist renderer in live.c.
+    int rep_index = -1;
+    long long want_seq = -1;
+    bool live_init = false, live_seg = false;
+    if (fname && fname[0] >= '0' && fname[0] <= '9') {
+        if (sscanf(fname, "%d_init", &rep_index) == 1) live_init = true;
+        else if (sscanf(fname, "%d_%lld", &rep_index, &want_seq) == 2) live_seg = true;
+    }
+    if (live_init || live_seg) {
+        size_t clen = 0;
+        uint8_t *cached = rs_live_take_indexed(server->live, stream_id, rep_index,
+                                               want_seq, live_init, &clen);
+        char cip[64] = {0};
+        mg_snprintf(cip, sizeof(cip), "%M", mg_print_ip, &c->rem);
+        if (cached) {
+            char *cua = header_dup(hm, "User-Agent");
+            char *ckey = playback_key(hm);
+            rs_metrics_record(server->metrics, stream_id, (ckey && ckey[0]) ? ckey : cip,
+                              cip, cua ? cua : "", (int)clen);
+            log_recordf(server, stream_id, "info", live_init ? "serveInit" : "serveSegment",
+                        NULL, 200, (long long)clen, "rep %d %s to %s",
+                        rep_index, fname, cip);
+            free(cua); free(ckey);
+            mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: %lu\r\n"
+                         "Accept-Ranges: bytes\r\nCache-Control: no-store\r\n"
+                         "Access-Control-Allow-Origin: *\r\n\r\n", (unsigned long)clen);
+            mg_send(c, cached, clen);
+            rs_free(cached);
+            return;
+        }
+        // The player asked for something that has aged out of the queue, so it
+        // has fallen behind the advertised window. 404 immediately and let it
+        // reseek to the live edge — that is the recovery it is built for, and
+        // there is nothing to fetch inline because the origin URL is long gone.
+        log_recordf(server, stream_id, "error",
+                    live_init ? "cacheMissInit" : "cacheMissSegment", NULL, 404, -1,
+                    "rep %d %s outside the live window — 404 so %s reseeks "
+                    "(raise keepSegments if this repeats)", rep_index, fname, cip);
+        mg_http_reply(c, 404, "Content-Type: text/plain\r\nCache-Control: no-store\r\n"
+                              "Access-Control-Allow-Origin: *\r\n",
+                      "Segment is outside the live window.\n");
+        return;
+    }
+
+    // Everything below is the HLS passthrough path, which has no engine behind
+    // it and still resolves ?u= per request.
     char *url = query_var(hm, "u");
     if (!url) { reply_error(c, 400, "Missing ?u= target."); return; }
     const rs_json *provider = provider_of(&server->state, stream);
@@ -1342,58 +1404,7 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     bool is_map = kindq && strcmp(kindq, "map") == 0;
     bool is_key = kindq && strcmp(kindq, "key") == 0;
     free(dec); free(kindq);
-
-    // Live-engine hit: the background worker downloaded and decrypted this
-    // segment before it was ever advertised, so this answers from memory
-    // without touching the network. On a healthy stream every segment request
-    // takes this path — which is the whole point, since a network fetch here
-    // would stall the single-threaded event loop for the origin's full latency.
-    char *live_q = query_var(hm, "live");
-    bool from_live = live_q && live_q[0] == '1';
-    free(live_q);
-    if (from_live) {
-        size_t clen = 0;
-        uint8_t *cached = rs_live_take_segment(server->live, stream_id, url, &clen);
-        if (cached) {
-            char cip[64] = {0};
-            mg_snprintf(cip, sizeof(cip), "%M", mg_print_ip, &c->rem);
-            char *cua = header_dup(hm, "User-Agent");
-            char *ckey = playback_key(hm);
-            rs_metrics_record(server->metrics, stream_id, (ckey && ckey[0]) ? ckey : cip,
-                              cip, cua ? cua : "", (int)clen);
-            log_recordf(server, stream_id, "info", is_map ? "serveInit" : "serveSegment",
-                        url, 200, (long long)clen, "from the live cache, %s", cip);
-            free(cua); free(ckey);
-            mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: %lu\r\n"
-                         "Accept-Ranges: bytes\r\nCache-Control: no-store\r\n"
-                         "Access-Control-Allow-Origin: *\r\n\r\n", (unsigned long)clen);
-            mg_send(c, cached, clen);
-            rs_free(cached);
-            free(url);
-            return;
-        }
-        // A miss means the player asked for something that has already aged out
-        // of the queue (it fell behind), or that the worker never managed to
-        // fetch at all.
-        //
-        // Answer 404 immediately rather than fetching it inline. The inline
-        // path is a synchronous origin request on the single-threaded event
-        // loop, so one miss against a slow origin stalls *every* other request
-        // — including the playlist reloads of every other viewer, which players
-        // then report as a playlist timeout even though playlists are served
-        // from memory. It is also unlikely to succeed: these URLs carry
-        // per-request session tokens that have usually expired by the time a
-        // segment has aged out of the window. A prompt 404 lets the player skip
-        // ahead to the live edge, which is the recovery it is designed for.
-        log_record(server, stream_id, "error", is_map ? "cacheMissInit" : "cacheMissSegment",
-                   url, 404, -1,
-                   "outside the live window — 404 so the player reseeks (raise keepSegments "
-                   "or the hold-back if this repeats)");
-        free(url);
-        mg_http_reply(c, 404, "Content-Type: text/plain\r\nCache-Control: no-store\r\n"
-                              "Access-Control-Allow-Origin: *\r\n",
-                      "Segment is outside the live window.\n");
-        return;
+    {
     }
 
     // Forward the player's Range so byte-range segments and seeking fetch only
@@ -1691,10 +1702,15 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
 
     if (is_restream) {
         if (!g_fetch_handler) { reply_error(c, 501, "Restreaming isn't in this build."); return true; }
-        char *id = capture(hm, "/restream/*/#");
-        if (id) serve_restream_item(server, c, hm, id);
+        struct mg_str rcaps[2];
+        char *id = NULL, *fname = NULL;
+        if (mg_match(hm->uri, mg_str("/restream/*/*"), rcaps)) {
+            id = capture_dup(rcaps[0]);
+            fname = capture_dup(rcaps[1]);
+        }
+        if (id && fname) serve_restream_item(server, c, hm, id, fname);
         else reply_error(c, 400, "Bad restream path.");
-        free(id);
+        free(id); free(fname);
         return true;
     }
 
