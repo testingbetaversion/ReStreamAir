@@ -19,6 +19,20 @@ else()
     set(RS_WARNINGS -Wall -Wextra -Wconversion -Wno-sign-conversion)
 endif()
 
+# -DRS_SANITIZE=ON builds the server with AddressSanitizer + UndefinedBehavior-
+# Sanitizer. It is the tool for a crash that only shows up after hours of real
+# traffic: instead of dying somewhere unrelated later, the process aborts at the
+# instruction that corrupted memory and prints the allocation and the stack.
+# Roughly 2x slower and ~3x the RSS, so it is a diagnostic build, not a
+# production one. Run it with:
+#   ASAN_OPTIONS=abort_on_error=1:disable_coredump=0 ./restreamair-server ...
+option(RS_SANITIZE "Build with AddressSanitizer + UBSan (diagnostic builds)" OFF)
+if(RS_SANITIZE AND NOT MSVC)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address,undefined)
+    message(STATUS "restreamair: sanitizers enabled — diagnostic build, do not ship")
+endif()
+
 # ---- restream_base: portable logic, no sockets and no third-party code -------
 # Everything here is pure C11 and platform-independent, which is what lets the
 # self-test binary link it without dragging in mongoose or Winsock.

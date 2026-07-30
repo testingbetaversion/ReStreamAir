@@ -89,9 +89,14 @@ static void classify_pssh(rs_drm_challenge *ch, const char *b64) {
                 }
                 
                 if (bytes[8] == 1 && len >= 32) {
-                    int kid_count = (bytes[28] << 24) | (bytes[29] << 16) | (bytes[30] << 8) | bytes[31];
+                    // Widen before shifting: `bytes[28] << 24` on a byte >= 0x80
+                    // is a signed overflow, and the count is attacker-supplied.
+                    // The loop bounds below already contain it; this keeps the
+                    // arithmetic itself defined.
+                    uint32_t kid_count = ((uint32_t)bytes[28] << 24) | ((uint32_t)bytes[29] << 16)
+                                       | ((uint32_t)bytes[30] << 8) | (uint32_t)bytes[31];
                     size_t offset = 32;
-                    for (int i = 0; i < kid_count && i < 64 && offset + 16 <= len; i++) {
+                    for (uint32_t i = 0; i < kid_count && i < 64 && offset + 16 <= len; i++) {
                         char *kid_hex = bytes_to_hex(bytes + offset, 16);
                         if (kid_hex) {
                             add_kid(ch, kid_hex);

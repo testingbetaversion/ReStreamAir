@@ -6,8 +6,20 @@
 #include <stdio.h>
 #include <ctype.h>
 
-static uint16_t read_u16(const uint8_t *b, size_t off) { return (uint16_t)(b[off] << 8 | b[off+1]); }
-static uint32_t read_u32(const uint8_t *b, size_t off) { return (uint32_t)(b[off] << 24 | b[off+1] << 16 | b[off+2] << 8 | b[off+3]); }
+// Each byte is widened to uint32_t *before* shifting. Without the cast the
+// operand is promoted to int, so any box whose size begins with a byte >= 0x80
+// evaluates `b[off] << 24` as a signed overflow — undefined behaviour, and this
+// runs on the size field of every box of every segment the engine decrypts.
+// UBSan flags it as "left shift of 255 by 24 places cannot be represented in
+// type 'int'"; an optimising build is entitled to do whatever it likes with the
+// result, including feeding a nonsense length into the offsets computed below.
+static uint16_t read_u16(const uint8_t *b, size_t off) {
+    return (uint16_t)(((uint16_t)b[off] << 8) | (uint16_t)b[off+1]);
+}
+static uint32_t read_u32(const uint8_t *b, size_t off) {
+    return ((uint32_t)b[off] << 24) | ((uint32_t)b[off+1] << 16)
+         | ((uint32_t)b[off+2] << 8) | (uint32_t)b[off+3];
+}
 static uint64_t read_u64(const uint8_t *b, size_t off) {
     uint64_t v = 0;
     for (int i=0; i<8; i++) v = (v << 8) | b[off+i];
