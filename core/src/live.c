@@ -887,6 +887,7 @@ static void *rep_main(void *arg) {
     lgf(st, "info", "repStart", NULL, 0, -1, "%s (%s): worker started", rep->rep_id, rep->kind);
     for (;;) {
         if (live_stopping(st)) break;
+        double cycle_start = now_seconds();
 
         cfg_snap cfg;
         pthread_mutex_lock(&st->mu);
@@ -915,9 +916,27 @@ static void *rep_main(void *arg) {
             pthread_mutex_unlock(&st->mu);
         }
 
-        double sleep_for = cfg.poll_interval > 0 ? cfg.poll_interval : interval;
+        // The poll interval is a PERIOD, not a delay. Sleeping the full interval
+        // after the work meant the real cycle was interval + work: with a two
+        // second minimumUpdatePeriod and a poll that takes one to three seconds
+        // to fetch and decrypt its segments, the engine advanced four seconds of
+        // media every four to five seconds of wall clock. That is exactly
+        // break-even, so it never built a cushion, and the first slow origin
+        // response put it permanently behind the live edge — the player then
+        // requests segments the engine has not fetched yet, and every one of
+        // those is a miss.
+        double period = cfg.poll_interval > 0 ? cfg.poll_interval : interval;
+        if (period > 10.0) period = 10.0;
+        double spent = now_seconds() - cycle_start;
+        double sleep_for = period - spent;
+        // Never busy-loop, but do go straight back to the origin when a poll
+        // took longer than its own period: at that point we are behind and the
+        // useful thing to do is fetch again, not wait.
         if (sleep_for < 0.25) sleep_for = 0.25;
-        if (sleep_for > 10.0) sleep_for = 10.0;
+        if (spent > period)
+            lgf(st, "info", "pollSlow", NULL, 0, -1,
+                "%s: poll took %.2fs for a %.2fs period — polling again immediately",
+                rep->rep_id, spent, period);
         cfg_snap_dispose(&cfg);
         if (!live_wait(st, sleep_for)) break;
     }
