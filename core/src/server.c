@@ -6,6 +6,7 @@
 #include "rs_hls_decrypt.h"
 #include "rs_ffargs.h"
 #include "rs_json.h"
+#include "rs_live.h"
 #include "rs_logo.h"
 #include "rs_m3u8.h"
 #include "rs_metrics.h"
@@ -15,12 +16,14 @@
 #include "rs_state.h"
 #include "rs_sysstats.h"
 #include "../deps/mongoose.h"
+#include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
 #ifndef _WIN32
+#include <pthread.h>    // the log ring is written from the live engine's threads
 #include <sys/stat.h>   // mkdir for the script session dir
 #endif
 
@@ -28,7 +31,13 @@
 // renders: the synthetic stream id "__panel__" holds server/auth/start-stop and
 // access lines, "script:<providerId>" holds script output, and real stream ids
 // hold per-stream fetch/download activity.
-#define RS_LOG_CAP 4000
+//
+// Sized for the live engine, which reports every poll, every segment, every
+// discontinuity and every prune for every representation of every running
+// stream. At roughly one line per segment per rendition that is a few thousand
+// lines an hour per stream, so the ring has to be deep enough to still hold
+// something useful from before whatever the user is currently investigating.
+#define RS_LOG_CAP 20000
 typedef struct {
     double ts_ms;     // milliseconds since the epoch (what the UI's Date() wants)
     char *level;      // "info" | "error"
@@ -49,11 +58,14 @@ struct restream_server {
     rs_auth *auth;          // admin accounts + sessions
     rs_sysstats *sysstats;  // live host stats for the monitoring view
     rs_metrics *metrics;    // per-stream client/bytes network monitor
-    struct rs_prefetch *prefetch;  // background segment downloader + cache
+    rs_live *live;          // background DASH->HLS engines, one per running stream
     rs_logo_cache *logo_cache;
     rs_log_entry log_ring[RS_LOG_CAP];
     size_t log_head;        // next write slot
     size_t log_count;       // entries in use (<= RS_LOG_CAP)
+#ifndef _WIN32
+    pthread_mutex_t log_mu; // the live engine's worker threads write here too
+#endif
 };
 
 // A live Server-Sent Events subscriber is marked in mongoose's per-connection
@@ -62,11 +74,19 @@ struct restream_server {
 
 // The probe/fetch handlers are registered by the C++ app; the core only calls
 // through them, so libcurl/libxml2 never reach the Swift build. Declared here so
-// everything below (including the logo fetcher and the prefetch workers) can
+// everything below (including the logo fetcher and the live engine) can
 // reference them before their setters are defined.
 static restream_probe_fn g_probe_handler = NULL;
 static restream_fetch_fn g_fetch_handler = NULL;
 static restream_dash_fn g_dash_handler = NULL;
+
+// The live-engine control plane is defined with the playback handlers, further
+// down, but the /api/streams/*/start|stop|update|delete routes above them have
+// to be able to start and stop engines.
+static void live_sync_stream(restream_server_t *s, const char *stream_id);
+static void live_stop_stream(restream_server_t *s, const char *stream_id);
+static void live_sync_all(restream_server_t *s);
+static const char *stream_source_target(const rs_json *stream);
 
 // Forward declaration: query helpers are defined with the routing code below,
 // but the playback handlers above them need it.
@@ -93,20 +113,53 @@ static double now_ms(void) {
     return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6;
 }
 
+// Lifecycle events that must reach the log verbatim, however often they repeat.
+// Start/stop in particular: a stop-then-start inside the de-duplication window
+// used to leave no trace at all, so the Logs tab could not answer the one
+// question it is opened for — "did my click do anything?".
+static bool log_always(const char *event) {
+    static const char *keep[] = {
+        "serverStart", "streamStart", "streamStop", "streamCreate", "streamUpdate",
+        "streamDelete", "liveStart", "liveStop", "repStart", "repStop",
+        "playlistReady", "renditions", "initReady", "discontinuity",
+        "login", "logout", "loginFailed", "scriptStart", "scriptEnd", "playbackDenied",
+    };
+    if (!event) return false;
+    for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); i++)
+        if (strcmp(event, keep[i]) == 0) return true;
+    return false;
+}
+
+static void log_lock(restream_server_t *s) {
+#ifndef _WIN32
+    pthread_mutex_lock(&s->log_mu);
+#else
+    (void)s;
+#endif
+}
+static void log_unlock(restream_server_t *s) {
+#ifndef _WIN32
+    pthread_mutex_unlock(&s->log_mu);
+#else
+    (void)s;
+#endif
+}
+
 // Records one log entry (ring buffer overwrites the oldest). url/message may be
-// NULL; status 0 and bytes -1 mean "absent". Never blocks; single-threaded.
+// NULL; status 0 and bytes -1 mean "absent". Never blocks on I/O, and is safe to
+// call from the live engine's worker threads.
 static void log_record(restream_server_t *s, const char *sid, const char *level,
                        const char *event, const char *url, long status, long long bytes,
                        const char *message) {
-    // Throttle repeats: a live player reloads its playlist every couple of
-    // seconds, which otherwise buries the interesting lines under an endless
-    // run of identical "manifest"/"streamStart" entries. An identical
-    // (stream, event, message) inside this window is dropped; anything that
-    // actually changed — a new segment, an error, a different count — still
-    // logs immediately.
-    if (s->log_count > 0) {
-        double cutoff = now_ms() - 30000.0;
-        for (size_t i = 0; i < s->log_count && i < 40; i++) {
+    log_lock(s);
+    // Collapse only an exact repeat inside one second, which exists purely to
+    // stop a pathological retry loop from filling the ring in a few seconds.
+    // Everything else is recorded: the point of this log is to show what the
+    // server actually did, and an earlier thirty-second window was hiding the
+    // per-poll and per-segment activity that makes a stalled stream diagnosable.
+    if (s->log_count > 0 && !log_always(event)) {
+        double cutoff = now_ms() - 1000.0;
+        for (size_t i = 0; i < s->log_count && i < 8; i++) {
             size_t idx = (s->log_head + RS_LOG_CAP - 1 - i) % RS_LOG_CAP;
             rs_log_entry *p = &s->log_ring[idx];
             if (p->ts_ms < cutoff) break;
@@ -114,7 +167,9 @@ static void log_record(restream_server_t *s, const char *sid, const char *level,
             if (strcmp(p->event, event ? event : "") != 0) continue;
             const char *pm = p->message ? p->message : "";
             const char *nm = message ? message : "";
-            if (strcmp(pm, nm) == 0) return;  // same line, still fresh — skip
+            const char *pu = p->url ? p->url : "";
+            const char *nu = url ? url : "";
+            if (strcmp(pm, nm) == 0 && strcmp(pu, nu) == 0) { log_unlock(s); return; }
         }
     }
     rs_log_entry *e = &s->log_ring[s->log_head];
@@ -132,6 +187,28 @@ static void log_record(restream_server_t *s, const char *sid, const char *level,
     e->bytes = bytes;
     s->log_head = (s->log_head + 1) % RS_LOG_CAP;
     if (s->log_count < RS_LOG_CAP) s->log_count++;
+    log_unlock(s);
+}
+
+// printf-style log_record, for the many call sites that have to assemble a
+// message from counts and timings.
+static void log_recordf(restream_server_t *s, const char *sid, const char *level,
+                        const char *event, const char *url, long status, long long bytes,
+                        const char *fmt, ...) {
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    log_record(s, sid, level, event, url, status, bytes, msg);
+}
+
+// The live engine's log sink. Called from its worker threads, which is why
+// log_record takes a lock.
+static void live_log_sink(void *ctx, const char *stream_id, const char *level,
+                          const char *event, const char *url, long status,
+                          long long bytes, const char *message) {
+    log_record((restream_server_t *)ctx, stream_id, level, event, url, status, bytes, message);
 }
 
 // Builds the {entries:[...],availableDates:[]} response, oldest→newest, keeping
@@ -139,8 +216,19 @@ static void log_record(restream_server_t *s, const char *sid, const char *level,
 static rs_json *log_view(restream_server_t *s, const char *sid, int limit) {
     rs_json *entries = rs_json_new_arr();
     if (limit <= 0) limit = 150;
-    // Walk newest→oldest, collect up to `limit` matches, then reverse.
-    rs_json *tmp[RS_LOG_CAP]; int n = 0;
+    if (limit > RS_LOG_CAP) limit = RS_LOG_CAP;
+    // Walk newest→oldest, collect up to `limit` matches, then reverse. Sized
+    // from `limit` rather than the ring depth: the ring is now large enough
+    // that an array of one pointer per slot would be a 160 KB stack frame.
+    rs_json **tmp = (rs_json **)malloc((size_t)limit * sizeof(rs_json *));
+    if (!tmp) {
+        rs_json *oom = rs_json_new_obj();
+        rs_json_obj_set(oom, "entries", entries);
+        rs_json_obj_set(oom, "availableDates", rs_json_new_arr());
+        return oom;
+    }
+    int n = 0;
+    log_lock(s);
     for (size_t i = 0; i < s->log_count && n < limit; i++) {
         size_t idx = (s->log_head + RS_LOG_CAP - 1 - i) % RS_LOG_CAP;
         rs_log_entry *e = &s->log_ring[idx];
@@ -156,279 +244,18 @@ static rs_json *log_view(restream_server_t *s, const char *sid, int limit) {
         if (e->bytes >= 0) rs_json_obj_set_int(o, "bytes", e->bytes);
         tmp[n++] = o;
     }
+    log_unlock(s);
     for (int i = n - 1; i >= 0; i--) rs_json_arr_push(entries, tmp[i]);
+    free(tmp);
     rs_json *out = rs_json_new_obj();
     rs_json_obj_set(out, "entries", entries);
     rs_json_obj_set(out, "availableDates", rs_json_new_arr());
     return out;
 }
 
-// --- segment prefetch cache -------------------------------------------------
-//
-// Playback is driven by the player's playlist reloads, but fetching each
-// segment only when it's asked for means every segment's origin latency lands
-// in the playback path (this origin takes ~2.5s per segment) and the player
-// never builds a buffer. A background thread downloads — and CENC-decrypts —
-// the segments in the advertised window ahead of time, so /proxy usually
-// answers from memory instead of going to the network.
-
-#ifndef _WIN32
-#include <pthread.h>
-
-#define RS_CACHE_CAP 64          // decrypted segments held in memory
-#define RS_WANT_CAP 32           // segments accepted per publish
-#define RS_PF_WORKERS 4          // parallel downloaders
-#define RS_PF_QUEUE 96           // pending jobs
-#define RS_CACHE_MAX_BYTES (192u * 1024u * 1024u)
-
-typedef struct {
-    char *url;        // upstream URL (the ?u= target), NULL = free slot
-    uint8_t *data;    // decrypted, ready to serve
-    size_t len;
-    double used;      // last touch, for LRU eviction
-} seg_cache_entry;
-
-typedef struct {
-    char *url;
-    bool is_map;
-} want_item;
-
-// One queued download. Each job carries its own fetch context so a job for the
-// video rendition is never invalidated by the audio rendition publishing next.
-typedef struct {
-    char *url;
-    bool is_map;
-    char *proxy, *headers, *downloader, *dl_params;
-    uint8_t key[16];
-    bool have_key;
-    int iv_size;
-} pf_job;
-
-struct rs_prefetch {
-    pthread_t threads[RS_PF_WORKERS];
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    bool stop;
-    bool started;
-
-    // Ring queue of pending downloads, shared by the workers. Publishing
-    // APPENDS (deduped) instead of replacing, so every rendition's window is
-    // fetched rather than the last publish winning.
-    pf_job queue[RS_PF_QUEUE];
-    size_t qhead, qtail, qcount;
-    // URLs currently queued or being fetched, so a republished window doesn't
-    // enqueue the same segment repeatedly.
-    char *inflight[RS_PF_QUEUE];
-    size_t inflight_n;
-
-    seg_cache_entry cache[RS_CACHE_CAP];
-};
-#endif
-
-// Applies CENC to freshly fetched bytes: patch the init, or AES-CTR-decrypt a
-// media segment. Returns malloc'd output (frees `body`), or `body` unchanged.
-static uint8_t *decrypt_bytes(bool is_map, const uint8_t *key, bool have_key, int iv_size,
-                              uint8_t *body, size_t len, size_t *out_len) {
-    uint8_t *out = NULL;
-    *out_len = len;
-    if (is_map) out = rs_cenc_patch_init(body, len, out_len, NULL, NULL);
-    else if (have_key) out = rs_cenc_decrypt_segment(body, len, out_len, key, iv_size > 0 ? iv_size : 8);
-    if (out) { free(body); return out; }
-    *out_len = len;
-    return body;
-}
-
-#ifndef _WIN32
-// Stores decrypted bytes under `url`, evicting the least-recently-used entry
-// when full. Takes ownership of `data`. Caller holds the lock.
-static void cache_put_locked(struct rs_prefetch *pf, const char *url, uint8_t *data, size_t len) {
-    // Keep total memory bounded: drop the least-recently-used entries until the
-    // new one fits under the cap (segments here run ~0.5-1.5 MB each).
-    size_t total = len;
-    for (size_t i = 0; i < RS_CACHE_CAP; i++) if (pf->cache[i].url) total += pf->cache[i].len;
-    while (total > RS_CACHE_MAX_BYTES) {
-        size_t lru = RS_CACHE_CAP; double oldest_ts = 0;
-        for (size_t i = 0; i < RS_CACHE_CAP; i++) {
-            if (!pf->cache[i].url) continue;
-            if (lru == RS_CACHE_CAP || pf->cache[i].used < oldest_ts) { oldest_ts = pf->cache[i].used; lru = i; }
-        }
-        if (lru == RS_CACHE_CAP) break;
-        total -= pf->cache[lru].len;
-        free(pf->cache[lru].url); free(pf->cache[lru].data);
-        memset(&pf->cache[lru], 0, sizeof(pf->cache[lru]));
-    }
-
-    size_t victim = 0; double oldest = 0; bool have_victim = false;
-    for (size_t i = 0; i < RS_CACHE_CAP; i++) {
-        if (!pf->cache[i].url) { victim = i; have_victim = true; break; }
-        if (strcmp(pf->cache[i].url, url) == 0) { victim = i; have_victim = true; break; }
-        if (!have_victim || pf->cache[i].used < oldest) { oldest = pf->cache[i].used; victim = i; }
-    }
-    seg_cache_entry *e = &pf->cache[victim];
-    free(e->url); free(e->data);
-    e->url = rs_strdup(url);
-    e->data = data;
-    e->len = len;
-    e->used = now_ms();
-}
-
-// Hands out a copy of a cached segment, or NULL on a miss.
-static uint8_t *cache_take(struct rs_prefetch *pf, const char *url, size_t *out_len) {
-    if (!pf) return NULL;
-    uint8_t *copy = NULL;
-    pthread_mutex_lock(&pf->mu);
-    for (size_t i = 0; i < RS_CACHE_CAP; i++) {
-        seg_cache_entry *e = &pf->cache[i];
-        if (!e->url || strcmp(e->url, url) != 0) continue;
-        copy = (uint8_t *)malloc(e->len ? e->len : 1);
-        if (copy) { memcpy(copy, e->data, e->len); *out_len = e->len; e->used = now_ms(); }
-        break;
-    }
-    pthread_mutex_unlock(&pf->mu);
-    return copy;
-}
-
-static bool cache_has_locked(struct rs_prefetch *pf, const char *url) {
-    for (size_t i = 0; i < RS_CACHE_CAP; i++)
-        if (pf->cache[i].url && strcmp(pf->cache[i].url, url) == 0) return true;
-    return false;
-}
-
-static bool inflight_has_locked(struct rs_prefetch *pf, const char *url) {
-    for (size_t i = 0; i < pf->inflight_n; i++)
-        if (pf->inflight[i] && strcmp(pf->inflight[i], url) == 0) return true;
-    return false;
-}
-static void inflight_drop_locked(struct rs_prefetch *pf, const char *url) {
-    for (size_t i = 0; i < pf->inflight_n; i++) {
-        if (!pf->inflight[i] || strcmp(pf->inflight[i], url) != 0) continue;
-        free(pf->inflight[i]);
-        pf->inflight[i] = pf->inflight[pf->inflight_n - 1];
-        pf->inflight[pf->inflight_n - 1] = NULL;
-        pf->inflight_n--;
-        return;
-    }
-}
-static void job_free(pf_job *j) {
-    free(j->url); free(j->proxy); free(j->headers); free(j->downloader); free(j->dl_params);
-    memset(j, 0, sizeof(*j));
-}
-
-// Worker: pull a job, download, decrypt, cache. Several of these run in
-// parallel — serial prefetching was slower than the live window (6 segments x
-// ~2.6s), so the cache never warmed and every request fell back to a blocking
-// inline fetch on the single-threaded server.
-static void *prefetch_main(void *arg) {
-    struct rs_prefetch *pf = (struct rs_prefetch *)arg;
-    for (;;) {
-        pthread_mutex_lock(&pf->mu);
-        while (!pf->stop && pf->qcount == 0) pthread_cond_wait(&pf->cv, &pf->mu);
-        if (pf->stop) { pthread_mutex_unlock(&pf->mu); break; }
-        pf_job job = pf->queue[pf->qhead];
-        memset(&pf->queue[pf->qhead], 0, sizeof(pf_job));
-        pf->qhead = (pf->qhead + 1) % RS_PF_QUEUE;
-        pf->qcount--;
-        bool already = cache_has_locked(pf, job.url);
-        pthread_mutex_unlock(&pf->mu);
-
-        if (!already && g_fetch_handler && job.url) {
-            char *body = NULL; size_t len = 0; char err[256] = {0};
-            int rc = g_fetch_handler(job.url, job.proxy, job.headers, NULL,
-                                     job.downloader, job.dl_params,
-                                     &body, &len, NULL, NULL, NULL, NULL, err, sizeof(err));
-            if (rc == 0 && body) {
-                size_t out_len = 0;
-                uint8_t *ready = decrypt_bytes(job.is_map, job.key, job.have_key, job.iv_size,
-                                               (uint8_t *)body, len, &out_len);
-                pthread_mutex_lock(&pf->mu);
-                cache_put_locked(pf, job.url, ready, out_len);
-                pthread_mutex_unlock(&pf->mu);
-            } else {
-                free(body);
-            }
-        }
-        pthread_mutex_lock(&pf->mu);
-        inflight_drop_locked(pf, job.url);
-        pthread_mutex_unlock(&pf->mu);
-        job_free(&job);
-    }
-    return NULL;
-}
-
-// Queues a playlist window for background download. Appends (deduped against
-// the cache and what's already queued) rather than replacing, so the video and
-// audio renditions don't cancel each other out.
-static void prefetch_publish(struct rs_prefetch *pf, const char *stream_id,
-                             const char *proxy, const char *headers,
-                             const char *downloader, const char *dl_params,
-                             const uint8_t *key, bool have_key, int iv_size,
-                             want_item *items, size_t n) {
-    (void)stream_id;
-    if (!pf || !pf->started) return;
-    if (n > RS_WANT_CAP) n = RS_WANT_CAP;
-    pthread_mutex_lock(&pf->mu);
-    for (size_t i = 0; i < n; i++) {
-        const char *u = items[i].url;
-        if (!u || !u[0]) continue;
-        if (cache_has_locked(pf, u) || inflight_has_locked(pf, u)) continue;
-        if (pf->qcount >= RS_PF_QUEUE || pf->inflight_n >= RS_PF_QUEUE) break;
-        pf_job *j = &pf->queue[pf->qtail];
-        memset(j, 0, sizeof(*j));
-        j->url = rs_strdup(u);
-        j->is_map = items[i].is_map;
-        j->proxy = proxy ? rs_strdup(proxy) : NULL;
-        j->headers = headers ? rs_strdup(headers) : NULL;
-        j->downloader = downloader ? rs_strdup(downloader) : NULL;
-        j->dl_params = dl_params ? rs_strdup(dl_params) : NULL;
-        if (have_key && key) memcpy(j->key, key, 16);
-        j->have_key = have_key;
-        j->iv_size = iv_size;
-        pf->qtail = (pf->qtail + 1) % RS_PF_QUEUE;
-        pf->qcount++;
-        pf->inflight[pf->inflight_n++] = rs_strdup(u);
-    }
-    pthread_cond_broadcast(&pf->cv);
-    pthread_mutex_unlock(&pf->mu);
-}
-
-static struct rs_prefetch *prefetch_create(void) {
-    struct rs_prefetch *pf = (struct rs_prefetch *)calloc(1, sizeof(*pf));
-    if (!pf) return NULL;
-    pthread_mutex_init(&pf->mu, NULL);
-    pthread_cond_init(&pf->cv, NULL);
-    size_t started = 0;
-    for (size_t i = 0; i < RS_PF_WORKERS; i++)
-        if (pthread_create(&pf->threads[i], NULL, prefetch_main, pf) == 0) started++;
-    pf->started = started > 0;
-    return pf;
-}
-
-static void prefetch_destroy(struct rs_prefetch *pf) {
-    if (!pf) return;
-    if (pf->started) {
-        pthread_mutex_lock(&pf->mu);
-        pf->stop = true;
-        pthread_cond_broadcast(&pf->cv);
-        pthread_mutex_unlock(&pf->mu);
-        for (size_t i = 0; i < RS_PF_WORKERS; i++) pthread_join(pf->threads[i], NULL);
-    }
-    while (pf->qcount > 0) { job_free(&pf->queue[pf->qhead]); pf->qhead = (pf->qhead + 1) % RS_PF_QUEUE; pf->qcount--; }
-    for (size_t i = 0; i < pf->inflight_n; i++) free(pf->inflight[i]);
-    for (size_t i = 0; i < RS_CACHE_CAP; i++) { free(pf->cache[i].url); free(pf->cache[i].data); }
-    pthread_mutex_destroy(&pf->mu);
-    pthread_cond_destroy(&pf->cv);
-    free(pf);
-}
-#else
-static uint8_t *cache_take(struct rs_prefetch *pf, const char *url, size_t *out_len) {
-    (void)pf; (void)url; (void)out_len; return NULL;
-}
-static struct rs_prefetch *prefetch_create(void) { return NULL; }
-static void prefetch_destroy(struct rs_prefetch *pf) { (void)pf; }
-#endif
-
 static void log_clear(restream_server_t *s, const char *sid) {
     if (!sid || !sid[0]) {
+        log_lock(s);
         for (size_t i = 0; i < s->log_count; i++) {
             size_t idx = (s->log_head + RS_LOG_CAP - 1 - i) % RS_LOG_CAP;
             rs_log_entry *e = &s->log_ring[idx];
@@ -436,6 +263,7 @@ static void log_clear(restream_server_t *s, const char *sid) {
             memset(e, 0, sizeof(*e));
         }
         s->log_count = 0; s->log_head = 0;
+        log_unlock(s);
     }
     // Per-stream clear is a no-op on the ring (entries age out on their own);
     // clearing everything is the common case and is honoured.
@@ -798,6 +626,10 @@ static void handle_events(restream_server_t *s, struct mg_connection *c) {
 static void broadcast_metrics(void *arg) {
     restream_server_t *s = (restream_server_t *)arg;
     rs_metrics_prune(s->metrics);  // expire stale clients/rate windows every tick
+    // Join and free any engine that finished winding down since the last tick.
+    // Doing it here rather than in the stop handler is what makes Stop return
+    // instantly instead of waiting for an in-flight segment download.
+    rs_live_reap(s->live);
     // Snapshot once, reuse for every subscriber.
     bool any = false;
     for (struct mg_connection *c = s->mgr.conns; c != NULL; c = c->next) {
@@ -814,8 +646,9 @@ static void broadcast_metrics(void *arg) {
     rs_free(body);
 }
 
-// The Logs view. No workers run in the C server yet, so there's nothing to
-// report — but the endpoint returns the shape the panel expects.
+// The Logs view. Everything the server does lands in the ring buffer — panel
+// access, auth, stream start/stop, and every poll, download, decrypt,
+// discontinuity and prune the live engine performs.
 static void handle_logs(restream_server_t *s, struct mg_connection *c, struct mg_http_message *hm) {
     char sid[160] = {0}, lim[32] = {0};
     mg_http_get_var(&hm->query, "streamId", sid, sizeof(sid));
@@ -1027,29 +860,68 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         rs_json *body = parse_body(hm);
         const char *err = NULL;
         int rc = rs_panel_create_stream(&s->state, provider_id, body, &err);
+        if (rc == 0)
+            log_recordf(s, "__panel__", "info", "streamCreate", NULL, 0, -1,
+                        "\"%s\" (%s) added to provider %s",
+                        rs_json_obj_str(body, "name", ""), rs_json_obj_str(body, "kind", "mpd"),
+                        provider_id ? provider_id : "?");
         rs_json_free(body);
         free(provider_id);
         reply_after_mutation(s, c, hm, rc, err);
         return true;
     }
-    // Start/stop: playback is on-demand, so this just flips the stored status
-    // (the player pulls /play/<id>/index.m3u8 whenever it's running).
+    // Start/stop. Both are answered immediately: starting only flips the stored
+    // status and kicks off the background engine, and stopping only flags it.
+    // Neither waits on the network, which is what made these buttons feel dead
+    // before — the request used to queue behind whatever manifest or segment
+    // fetch the single-threaded event loop happened to be blocked on.
     if (mg_match(hm->uri, mg_str("/api/streams/*/start"), NULL) && method_is(hm, "POST")) {
         char *id = capture(hm, "/api/streams/*/start");
+        char ip[64] = {0};
+        mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
         const char *err = NULL;
         int rc = rs_panel_set_stream_running(&s->state, id, true, &err);
-        if (rc == 0) { log_record(s, id, "info", "streamStart", NULL, 0, -1, "stream started");
-                       log_record(s, "__panel__", "info", "streamStart", NULL, 0, -1, id); }
+        if (rc == 0) {
+            const rs_json *stream = rs_panel_find_stream(&s->state, id);
+            const char *name = stream ? rs_json_obj_str(stream, "name", "") : "";
+            const char *kind = stream ? rs_json_obj_str(stream, "kind", "mpd") : "mpd";
+            const char *mode = stream ? rs_json_obj_str(stream, "inputMode", "internal") : "internal";
+            const char *src = stream ? stream_source_target(stream) : "";
+            log_recordf(s, id, "info", "streamStart", src, 0, -1,
+                        "START requested by %s — \"%s\" (%s, %s mode)", ip, name, kind, mode);
+            log_recordf(s, "__panel__", "info", "streamStart", src, 0, -1,
+                        "%s (\"%s\") started by %s", id, name, ip);
+            live_sync_stream(s, id);
+        } else {
+            log_recordf(s, "__panel__", "error", "streamStart", NULL, 0, -1,
+                        "START of %s from %s failed: %s", id ? id : "?", ip,
+                        err ? err : "unknown error");
+        }
         free(id);
         reply_after_mutation(s, c, hm, rc, err);
         return true;
     }
     if (mg_match(hm->uri, mg_str("/api/streams/*/stop"), NULL) && method_is(hm, "POST")) {
         char *id = capture(hm, "/api/streams/*/stop");
+        char ip[64] = {0};
+        mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
         const char *err = NULL;
+        // Flag the engine before the status flip so the log reads in the order
+        // things actually happened.
+        live_stop_stream(s, id);
         int rc = rs_panel_set_stream_running(&s->state, id, false, &err);
-        if (rc == 0) { log_record(s, id, "info", "streamStop", NULL, 0, -1, "stream stopped");
-                       log_record(s, "__panel__", "info", "streamStop", NULL, 0, -1, id); }
+        if (rc == 0) {
+            const rs_json *stream = rs_panel_find_stream(&s->state, id);
+            const char *name = stream ? rs_json_obj_str(stream, "name", "") : "";
+            log_recordf(s, id, "info", "streamStop", NULL, 0, -1,
+                        "STOP requested by %s — \"%s\"", ip, name);
+            log_recordf(s, "__panel__", "info", "streamStop", NULL, 0, -1,
+                        "%s (\"%s\") stopped by %s", id, name, ip);
+        } else {
+            log_recordf(s, "__panel__", "error", "streamStop", NULL, 0, -1,
+                        "STOP of %s from %s failed: %s", id ? id : "?", ip,
+                        err ? err : "unknown error");
+        }
         free(id);
         reply_after_mutation(s, c, hm, rc, err);
         return true;
@@ -1060,6 +932,16 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         const char *err = NULL;
         int rc = rs_panel_update_stream(&s->state, id, body, &err);
         rs_json_free(body);
+        if (rc == 0 && id) {
+            log_record(s, id, "info", "streamUpdate", NULL, 0, -1, "settings saved");
+            // A running stream keeps its warm queue and adopts the new settings
+            // on the next poll; a stream that was just switched off winds down.
+            const rs_json *stream = rs_panel_find_stream(&s->state, id);
+            if (stream && strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0)
+                live_sync_stream(s, id);
+            else
+                live_stop_stream(s, id);
+        }
         free(id);
         reply_after_mutation(s, c, hm, rc, err);
         return true;
@@ -1067,7 +949,12 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     if (mg_match(hm->uri, mg_str("/api/streams/*"), NULL) && method_is(hm, "DELETE")) {
         char *id = capture(hm, "/api/streams/*");
         const char *err = NULL;
+        // Stop the engine before the stream disappears from state: its config
+        // is read from there.
+        live_stop_stream(s, id);
         int rc = rs_panel_delete_stream(&s->state, id, &err);
+        if (rc == 0 && id)
+            log_recordf(s, "__panel__", "info", "streamDelete", NULL, 0, -1, "%s deleted", id);
         free(id);
         reply_after_mutation(s, c, hm, rc, err);
         return true;
@@ -1453,12 +1340,17 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
     bool is_key = kindq && strcmp(kindq, "key") == 0;
     free(dec); free(kindq);
 
-    // Prefetch hit: the background downloader already has this segment decrypted
-    // and in memory, so answer without touching the network. This is what keeps
-    // the player ahead of a slow origin.
-    if (decrypt) {
+    // Live-engine hit: the background worker downloaded and decrypted this
+    // segment before it was ever advertised, so this answers from memory
+    // without touching the network. On a healthy stream every segment request
+    // takes this path — which is the whole point, since a network fetch here
+    // would stall the single-threaded event loop for the origin's full latency.
+    char *live_q = query_var(hm, "live");
+    bool from_live = live_q && live_q[0] == '1';
+    free(live_q);
+    if (from_live) {
         size_t clen = 0;
-        uint8_t *cached = cache_take(server->prefetch, url, &clen);
+        uint8_t *cached = rs_live_take_segment(server->live, stream_id, url, &clen);
         if (cached) {
             char cip[64] = {0};
             mg_snprintf(cip, sizeof(cip), "%M", mg_print_ip, &c->rem);
@@ -1466,17 +1358,24 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
             char *ckey = playback_key(hm);
             rs_metrics_record(server->metrics, stream_id, (ckey && ckey[0]) ? ckey : cip,
                               cip, cua ? cua : "", (int)clen);
-            log_record(server, stream_id, "info", is_map ? "downloadInit" : "downloadSegment",
-                       url, 200, (long long)clen, "cached");
+            log_recordf(server, stream_id, "info", is_map ? "serveInit" : "serveSegment",
+                        url, 200, (long long)clen, "from the live cache, %s", cip);
             free(cua); free(ckey);
             mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: %lu\r\n"
                          "Accept-Ranges: bytes\r\nCache-Control: no-store\r\n"
                          "Access-Control-Allow-Origin: *\r\n\r\n", (unsigned long)clen);
             mg_send(c, cached, clen);
-            free(cached);
+            rs_free(cached);
             free(url);
             return;
         }
+        // A miss means the player asked for something that has already aged out
+        // of the queue (it fell behind) or that the worker never managed to
+        // fetch. Fall through to an inline fetch so playback survives, and say
+        // so plainly — a run of these is the signal that keep/hold-back is too
+        // small for how far behind this player is running.
+        log_record(server, stream_id, "error", is_map ? "cacheMissInit" : "cacheMissSegment",
+                   url, 0, -1, "not in the live cache — fetching inline (this blocks the server)");
     }
 
     // Forward the player's Range so byte-range segments and seeking fetch only
@@ -1535,11 +1434,8 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
     char *pkey = playback_key(hm);
     const char *identity = (pkey && pkey[0]) ? pkey : client_ip;
     rs_metrics_record(server->metrics, stream_id, identity, client_ip, ua ? ua : "", (int)body_len);
-    // "miss" = the prefetcher hadn't warmed this one, so the fetch happened
-    // inline and blocked the server. Frequent misses mean the prefetch isn't
-    // keeping up with the live edge.
-    log_record(server, stream_id, "info", is_map ? "downloadInit" : "downloadSegment",
-               url, status, (long long)body_len, decrypt ? "miss (fetched inline)" : NULL);
+    log_recordf(server, stream_id, "info", is_map ? "serveInit" : "serveSegment",
+                url, status, (long long)body_len, "fetched inline for %s", client_ip);
     free(ua); free(pkey);
 
     const char *type = (ct && ct[0]) ? ct : content_type_from_ext(url);
@@ -1563,190 +1459,192 @@ static void serve_proxy_item(restream_server_t *server, struct mg_connection *c,
     free(body);
 }
 
-// Calls the DASH describe hook with the stream's source + network settings.
-// Returns malloc'd JSON (caller rs_json_free after parse) or NULL with err set.
-static char *dash_describe(restream_server_t *server, const rs_json *stream,
-                           const char *rep, int want, char *err, size_t errlen) {
-    const rs_json *provider = provider_of(&server->state, stream);
+// --- the live DASH engine's control plane -----------------------------------
+//
+// Everything DASH is produced by a background engine (rs_live) rather than by
+// the request handler. The handlers below only start/stop engines and hand out
+// what the engine has already built, so no playback route ever waits on the
+// origin — which is what kept the panel's Start/Stop buttons unresponsive, the
+// whole server being single-threaded.
+
+// Brings the live engine for `stream_id` in line with the stored config:
+// starts it if the stream is a running internal-mode MPD, and otherwise leaves
+// it alone. Safe (and cheap) to call repeatedly — an already-running engine
+// just picks the new settings up on its next poll instead of restarting and
+// throwing away a warm segment queue.
+static void live_sync_stream(restream_server_t *s, const char *stream_id) {
+    if (!s || !s->live || !stream_id || !stream_id[0]) return;
+    const rs_json *stream = rs_panel_find_stream(&s->state, stream_id);
+    if (!stream) return;
+    if (rs_json_obj_bool(stream, "directSource", false)) return;
+    if (strcmp(rs_json_obj_str(stream, "kind", "mpd"), "mpd") != 0) return;
+    if (strcmp(rs_json_obj_str(stream, "inputMode", "internal"), "internal") != 0) return;
+    if (strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") != 0) return;
+
     const char *src = stream_source_target(stream);
-    if (!src[0]) { snprintf(err, errlen, "Stream has no source URL."); return NULL; }
-    char *proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
-    char *headers = effective_headers(provider, stream, "manifestHeaders");
-    char *json = g_dash_handler(src, proxy, headers,
-                                effective_downloader(provider), effective_downloader_params(provider),
-                                rep, want, err, errlen);
-    free(proxy); free(headers);
-    return json;
+    if (!src[0]) {
+        log_record(s, stream_id, "error", "liveStart", NULL, 0, -1,
+                   "stream has no source URL — nothing to poll");
+        return;
+    }
+
+    const rs_json *provider = provider_of(&s->state, stream);
+    char *mproxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    char *dproxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
+    char *mheaders = effective_headers(provider, stream, "manifestHeaders");
+    char *dheaders = effective_headers(provider, stream, "mediaHeaders");
+
+    rs_live_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mpd_url = src;
+    cfg.representation = rs_json_obj_str(stream, "representation", "");
+    cfg.manifest_proxy = mproxy;
+    cfg.media_proxy = dproxy;
+    cfg.manifest_headers = mheaders;
+    cfg.media_headers = dheaders;
+    cfg.downloader = effective_downloader(provider);
+    cfg.dl_params = effective_downloader_params(provider);
+    cfg.decryption_keys = rs_json_obj_str(stream, "decryptionKeys", "");
+    cfg.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
+    cfg.keep_segments = (int)rs_json_obj_int(stream, "keepSegments", 60);
+    cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 8);
+    cfg.playback_delay_seconds = (int)rs_json_obj_int(stream, "playbackDelaySeconds", 0);
+    cfg.audio_delay_ms = (int)rs_json_obj_int(stream, "audioDelayMs", 0);
+    cfg.poll_interval = rs_json_obj_num(stream, "pollInterval", 0);
+
+    bool already = rs_live_is_running(s->live, stream_id);
+    int rc = rs_live_start(s->live, stream_id, &cfg);
+    if (rc != 0) {
+        log_record(s, stream_id, "error", "liveStart", src, 0, -1,
+                   "could not start the live DASH engine");
+    } else if (!already) {
+        log_recordf(s, stream_id, "info", "liveStart", src, 0, -1,
+                    "engine starting: window %d, ahead %d, keep %d, delay %ds, "
+                    "audio offset %dms, keys %s, rep %s",
+                    cfg.playlist_segments, cfg.download_ahead, cfg.keep_segments,
+                    cfg.playback_delay_seconds, cfg.audio_delay_ms,
+                    cfg.decryption_keys[0] ? "set" : "none",
+                    cfg.representation[0] ? cfg.representation : "auto");
+    } else {
+        log_record(s, stream_id, "info", "liveConfig", src, 0, -1,
+                   "settings updated — the workers pick them up on the next poll");
+    }
+
+    free(mproxy); free(dproxy); free(mheaders); free(dheaders);
 }
 
-// Serves the DASH master playlist: a video variant plus (if present) an audio
-// rendition, each pointing at a per-representation media playlist on this server.
+static void live_stop_stream(restream_server_t *s, const char *stream_id) {
+    if (!s || !s->live || !stream_id) return;
+    if (!rs_live_is_running(s->live, stream_id)) return;
+    char *status = rs_live_status_line(s->live, stream_id);
+    log_record(s, stream_id, "info", "liveStop", NULL, 0, -1,
+               status ? status : "engine stopping");
+    rs_free(status);
+    rs_live_stop(s->live, stream_id);
+}
+
+// Starts engines for every stream that state.json says is already running, so a
+// server restart resumes the streams instead of waiting for someone to click
+// Start again.
+static void live_sync_all(restream_server_t *s) {
+    if (!s || !s->live) return;
+    const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
+    int started = 0;
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *streams = rs_json_obj_get(rs_json_arr_at(providers, i), "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+            const rs_json *st = rs_json_arr_at(streams, j);
+            const char *id = rs_json_obj_str(st, "id", "");
+            if (!id[0]) continue;
+            if (strcmp(rs_json_obj_str(st, "status", "stopped"), "running") != 0) continue;
+            live_sync_stream(s, id);
+            if (rs_live_is_running(s->live, id)) started++;
+        }
+    }
+    if (started > 0)
+        log_recordf(s, "__panel__", "info", "serverStart", NULL, 0, -1,
+                    "resuming %d stream%s that were running before the restart",
+                    started, started == 1 ? "" : "s");
+}
+
+// Serves the DASH master playlist. The engine renders it in the background and
+// only publishes it once every rendition it points at can actually answer, so
+// a player never gets a master whose variant playlists 404.
 static void serve_dash_master(restream_server_t *server, struct mg_connection *c,
                               struct mg_http_message *hm, const rs_json *stream) {
     (void)hm;
     const char *stream_id = rs_json_obj_str(stream, "id", "");
-    char err[256] = {0};
-    char *json = dash_describe(server, stream, "", 0, err, sizeof(err));
-    if (!json) { reply_error(c, 502, err[0] ? err : "Could not read the MPD."); return; }
-    rs_json *root = rs_json_parse(json, strlen(json));
-    free(json);
-    if (!root) { reply_error(c, 502, "Bad DASH description."); return; }
-
-    const rs_json *video = rs_json_obj_get(root, "video");
-    const rs_json *audio = rs_json_obj_get(root, "audio");
-    if (!video || rs_json_type_of(video) != RS_JSON_OBJ) { rs_json_free(root); reply_error(c, 502, "No video representation in the MPD."); return; }
-    const char *vid = rs_json_obj_str(video, "id", "");
-    const char *vcodecs = rs_json_obj_str(video, "codecs", "");
-    long long vbw = (long long)rs_json_as_num(rs_json_obj_get(video, "bandwidth"), 3000000);
-    bool have_audio = audio && rs_json_type_of(audio) == RS_JSON_OBJ;
-    const char *acodecs = have_audio ? rs_json_obj_str(audio, "codecs", "") : "";
-
-    char *venc = query_encode(vid);
-    char codecs[256];
-    if (vcodecs[0] && acodecs[0]) snprintf(codecs, sizeof(codecs), "%s,%s", vcodecs, acodecs);
-    else snprintf(codecs, sizeof(codecs), "%s", vcodecs);
-
-    char *buf = NULL; size_t bufsz = 0;
-    FILE *f = open_memstream(&buf, &bufsz);
-    if (!f) { free(venc); rs_json_free(root); reply_error(c, 500, "Out of memory."); return; }
-    fprintf(f, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-    if (have_audio) {
-        char *aenc = query_encode(rs_json_obj_str(audio, "id", ""));
-        fprintf(f, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,AUTOSELECT=YES,"
-                   "URI=\"/play/%s/index.m3u8?rep=%s&mtype=audio\"\n", stream_id, aenc ? aenc : "");
-        free(aenc);
+    if (!server->live) {
+        reply_error(c, 501, "DASH playback needs the threaded live engine, which this build "
+                            "does not have. Use the Swift binary, or an HLS (.m3u8) source.");
+        return;
     }
-    fprintf(f, "#EXT-X-STREAM-INF:BANDWIDTH=%lld", vbw > 0 ? vbw : 3000000);
-    if (codecs[0]) fprintf(f, ",CODECS=\"%s\"", codecs);
-    if (have_audio) fprintf(f, ",AUDIO=\"aud\"");
-    fprintf(f, "\n/play/%s/index.m3u8?rep=%s&mtype=video\n", stream_id, venc ? venc : "");
-    fclose(f);
-    free(venc);
-    rs_json_free(root);
 
+    // Normally a no-op: the engine was started when the stream was started.
+    // It matters when a stream was started before this code was deployed, or
+    // when the engine was reaped after an earlier stop.
+    live_sync_stream(server, stream_id);
+
+    char *master = rs_live_master_playlist(server->live, stream_id);
+    if (!master) {
+        // Cold start only. This is the one place in the playback path that ever
+        // waits, it is bounded, and it happens once per stream — not once per
+        // playlist reload, which is what the old design did.
+        log_record(server, stream_id, "info", "masterCold", NULL, 0, -1,
+                   "engine still warming up — waiting for the first poll");
+        if (rs_live_wait_ready(server->live, stream_id, 6000))
+            master = rs_live_master_playlist(server->live, stream_id);
+    }
+    if (!master) {
+        char *status = rs_live_status_line(server->live, stream_id);
+        log_record(server, stream_id, "error", "master", NULL, 503, -1,
+                   status ? status : "engine not ready yet");
+        rs_free(status);
+        mg_http_reply(c, 503, "Content-Type: text/plain\r\nRetry-After: 2\r\n"
+                              "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
+                      "The stream is still starting up. Retry shortly.\n");
+        return;
+    }
+
+    log_record(server, stream_id, "info", "master", NULL, 200,
+               (long long)strlen(master), "master playlist served");
     mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
-                          "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n", "%s", buf);
-    free(buf);
+                          "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
+                  "%s", master);
+    rs_free(master);
 }
 
-// Serves a per-representation DASH media playlist: EXT-X-MAP for the init and
-// one EXTINF per segment, every URI routed back through /proxy with dec=1 so the
-// ClearKey CENC is applied here. Rebuilt each reload — that IS the live poll.
+// Serves one representation's media playlist. This is the hot path — a live
+// player reloads it every target-duration seconds — so it does nothing but copy
+// the string the representation's worker already rendered.
 static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
                              struct mg_http_message *hm, const rs_json *stream, const char *rep) {
     (void)hm;
     const char *stream_id = rs_json_obj_str(stream, "id", "");
-    int want = (int)rs_json_obj_int(stream, "playlistSegments", 6);
-    if (want < 1) want = 6;
-    int delay = (int)rs_json_obj_int(stream, "playbackDelaySeconds", 0);
-    if (delay < 0) delay = 0;
-    // Fetch extra history so the advertised window can sit `delay` seconds behind
-    // the live edge without running out of segments.
-    int fetch_want = want + (delay > 0 ? delay + 4 : 0);
-    char err[256] = {0};
-    char *json = dash_describe(server, stream, rep, fetch_want, err, sizeof(err));
-    if (!json) {
-        log_record(server, stream_id, "error", "manifest", stream_source_target(stream), 0, -1, err);
-        reply_error(c, 502, err[0] ? err : "Could not read the MPD."); return;
-    }
-    rs_json *root = rs_json_parse(json, strlen(json));
-    free(json);
-    const rs_json *plan = root ? rs_json_obj_get(root, "plan") : NULL;
-    if (!plan || rs_json_type_of(plan) != RS_JSON_OBJ) { rs_json_free(root); reply_error(c, 502, "Representation not found in the MPD."); return; }
-
-    long long timescale = (long long)rs_json_as_num(rs_json_obj_get(plan, "timescale"), 1);
-    if (timescale < 1) timescale = 1;
-    const char *init_url = rs_json_obj_str(plan, "initUrl", "");
-    const rs_json *segs = rs_json_obj_get(plan, "segments");
-    size_t total = rs_json_arr_len(segs);
-
-    // Longest segment in the batch → how many segments make up `delay` seconds.
-    double segdur = 0;
-    for (size_t i = 0; i < total; i++)
-        { double d = rs_json_as_num(rs_json_obj_get(rs_json_arr_at(segs, i), "duration"), 0); if (d > segdur) segdur = d; }
-    int delay_segs = (delay > 0 && segdur > 0) ? (int)((double)delay / segdur + 0.5) : 0;
-
-    // Advertised window: `want` segments ending `delay_segs` before the live edge
-    // (segments are oldest→newest). Never hold back the whole buffer.
-    long long end = (long long)total - delay_segs;
-    if (end < 1) end = (long long)total;
-    long long start = end - want;
-    if (start < 0) start = 0;
-
-    double maxdur = 0;
-    for (long long i = start; i < end; i++)
-        { double d = rs_json_as_num(rs_json_obj_get(rs_json_arr_at(segs, i), "duration"), 0); if (d > maxdur) maxdur = d; }
-    int target = (int)(maxdur + 0.999); if (target < 1) target = 1;
-
-    // Media sequence from the window's first segment position — stable across
-    // reloads and advancing by 1 as the window slides.
-    long long seq = 0;
-    if (end > start) {
-        const rs_json *s0 = rs_json_arr_at(segs, start);
-        long long t0 = (long long)rs_json_as_num(rs_json_obj_get(s0, "time"), 0);
-        double d0 = rs_json_as_num(rs_json_obj_get(s0, "duration"), 0);
-        long long units = (long long)(d0 * (double)timescale + 0.5);
-        if (units > 0 && t0 > 0) seq = t0 / units;
+    if (!server->live) {
+        reply_error(c, 501, "DASH playback needs the threaded live engine, which this build "
+                            "does not have. Use the Swift binary, or an HLS (.m3u8) source.");
+        return;
     }
 
-    char *buf = NULL; size_t bufsz = 0;
-    FILE *f = open_memstream(&buf, &bufsz);
-    if (!f) { rs_json_free(root); reply_error(c, 500, "Out of memory."); return; }
-    fprintf(f, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%lld\n", target, seq);
-    if (init_url[0]) {
-        char *ienc = query_encode(init_url);
-        // The path must end in a media extension (init.mp4 / seg.m4s): ffmpeg's
-        // HLS demuxer hard-rejects any segment URL whose extension isn't in its
-        // allowed list, so a query-only "/item" path fails to parse ("is not in
-        // allowed_segment_extensions"). The ?u= target is what actually gets
-        // fetched; the filename is only there to satisfy the demuxer.
-        fprintf(f, "#EXT-X-MAP:URI=\"/proxy/%s/init.mp4?u=%s&kind=map&dec=1\"\n", stream_id, ienc ? ienc : "");
-        free(ienc);
+    char *playlist = rs_live_media_playlist(server->live, stream_id, rep);
+    if (!playlist) {
+        char *status = rs_live_status_line(server->live, stream_id);
+        log_recordf(server, stream_id, "error", "playlist", NULL, 503, -1,
+                    "%s: no window yet (%s)", rep, status ? status : "engine not running");
+        rs_free(status);
+        mg_http_reply(c, 503, "Content-Type: text/plain\r\nRetry-After: 1\r\n"
+                              "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
+                      "The stream is still starting up. Retry shortly.\n");
+        return;
     }
-    for (long long i = start; i < end; i++) {
-        const rs_json *s = rs_json_arr_at(segs, i);
-        double d = rs_json_as_num(rs_json_obj_get(s, "duration"), maxdur);
-        char *senc = query_encode(rs_json_obj_str(s, "url", ""));
-        fprintf(f, "#EXTINF:%.3f,\n/proxy/%s/seg.m4s?u=%s&kind=segment&dec=1\n", d, stream_id, senc ? senc : "");
-        free(senc);
-    }
-    fclose(f);
 
-    // Hand the whole window (init first) to the background downloader so the
-    // segments are fetched and decrypted before the player asks for them.
-#ifndef _WIN32
-    {
-        const rs_json *provider = provider_of(&server->state, stream);
-        char *pxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
-        char *hdrs = effective_headers(provider, stream, "mediaHeaders");
-        rs_cenc_keys keys = rs_cenc_parse_keys(rs_json_obj_str(stream, "decryptionKeys", ""));
-        want_item items[RS_WANT_CAP]; size_t nw = 0;
-        if (init_url[0] && nw < RS_WANT_CAP) { items[nw].url = (char *)init_url; items[nw].is_map = true; nw++; }
-        for (long long i = start; i < end && nw < RS_WANT_CAP; i++) {
-            items[nw].url = (char *)rs_json_obj_str(rs_json_arr_at(segs, i), "url", "");
-            items[nw].is_map = false;
-            nw++;
-        }
-        prefetch_publish(server->prefetch, stream_id, pxy, hdrs,
-                         effective_downloader(provider), effective_downloader_params(provider),
-                         keys.count > 0 ? keys.keys[0] : NULL, keys.count > 0, 8, items, nw);
-        rs_cenc_keys_free(&keys);
-        free(pxy); free(hdrs);
-    }
-#endif
-
-    // One log line per playlist build so the stream's Logs tab shows activity
-    // as soon as the player loads it, before segments start flowing.
-    {
-        char m[160];
-        snprintf(m, sizeof(m), "%s: %lld segments%s", rep, end - start, delay > 0 ? " (delayed)" : "");
-        log_record(server, stream_id, "info", "manifest", stream_source_target(stream), 0, -1, m);
-    }
-    rs_json_free(root);
-
+    log_recordf(server, stream_id, "info", "playlist", NULL, 200, (long long)strlen(playlist),
+                "%s: media playlist served", rep);
     mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
-                          "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n", "%s", buf);
-    free(buf);
+                          "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
+                  "%s", playlist);
+    rs_free(playlist);
 }
 
 // Playback routes. Direct-source streams redirect; HLS passthrough and DASH
@@ -1761,8 +1659,17 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
     // Playback auth: an API key is required only once at least one exists.
     char *key = playback_key(hm);
     bool allowed = rs_panel_playback_allowed(&server->state, key);
+    if (!allowed) {
+        char ip[64] = {0};
+        mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
+        log_recordf(server, "__panel__", "error", "playbackDenied", NULL, 401, -1,
+                    "%.*s from %s rejected: %s", (int)hm->uri.len, hm->uri.buf, ip,
+                    (key && key[0]) ? "invalid playback key" : "no playback key");
+        free(key);
+        reply_error(c, 401, "A valid playback key is required.");
+        return true;
+    }
     free(key);
-    if (!allowed) { reply_error(c, 401, "A valid playback key is required."); return true; }
 
     if (is_proxy) {
         if (!g_fetch_handler) { reply_error(c, 501, "Proxy playback isn't in this build."); return true; }
@@ -1814,9 +1721,10 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
             serve_hls_playlist(server, c, hm, stream);
             return true;
         }
-        // DASH: on-demand MPD->HLS. The master lists a video + audio rendition;
-        // ?rep= serves that representation's media playlist (re-expanded from the
-        // live MPD each reload). Segments/init flow through /proxy with dec=1.
+        // DASH: MPD->HLS, served entirely out of what the background live
+        // engine has already downloaded and decrypted. The master lists a video
+        // and (when present) an audio rendition; ?rep= selects a rendition's
+        // media playlist. Segments and init flow through /proxy with live=1.
         if (is_m3u8 && strcmp(kind, "mpd") == 0 && strcmp(input_mode, "internal") == 0) {
             if (!g_dash_handler || !g_fetch_handler) { reply_error(c, 501, "DASH playback isn't in this build."); return true; }
             char *rep = query_var(hm, "rep");
@@ -1856,17 +1764,20 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     }
 
     if (mg_match(hm->uri, mg_str("/api/#"), NULL)) {
-        // Panel access log — record API calls under "__panel__", skipping the
-        // high-frequency polls (state/logs/events) that would drown out the rest.
-        if (server &&
-            !mg_match(hm->uri, mg_str("/api/state"), NULL) &&
-            !mg_match(hm->uri, mg_str("/api/logs"), NULL) &&
-            !mg_match(hm->uri, mg_str("/api/events"), NULL)) {
+        // Panel access log, under "__panel__". The panel polls /api/state,
+        // /api/logs and /api/events every second or two; those are recorded as
+        // a separate low-detail event so they can be told apart from — and do
+        // not bury — real API calls, while still showing that the panel is
+        // connected at all. Everything else is logged in full.
+        if (server) {
+            bool poll = mg_match(hm->uri, mg_str("/api/state"), NULL) ||
+                        mg_match(hm->uri, mg_str("/api/logs"), NULL) ||
+                        mg_match(hm->uri, mg_str("/api/events"), NULL);
             char line[512], ip[64] = {0};
             mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
             snprintf(line, sizeof(line), "%.*s %.*s  from %s",
                      (int)hm->method.len, hm->method.buf, (int)hm->uri.len, hm->uri.buf, ip);
-            log_record(server, "__panel__", "info", "access", NULL, 0, -1, line);
+            log_record(server, "__panel__", "info", poll ? "poll" : "access", NULL, 0, -1, line);
         }
         if (server && handle_api(server, c, hm)) return;
         // A recognised prefix but not a route we serve yet: honest 501, so a
@@ -1888,9 +1799,9 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     // No web root: explain, rather than a bare 404.
     mg_http_reply(c, 404, "Content-Type: text/plain\r\n",
                   "restreamair-server: this is the C core. It answers /ping, the panel API "
-                  "(auth, management, monitoring, direct-source playback) and, with --root "
-                  "pointing at public/, the panel's static files. Proxied/DASH streaming "
-                  "isn't in the C server yet.\n");
+                  "(auth, management, monitoring), live DASH and HLS playback, and — with "
+                  "--root pointing at public/ — the panel's static files. ffmpeg input "
+                  "modes and script providers aren't in the C server yet.\n");
 }
 
 restream_server_t* restream_server_create(void) {
@@ -1903,7 +1814,13 @@ restream_server_t* restream_server_create(void) {
     server->auth = rs_auth_create();
     server->sysstats = rs_sysstats_create();
     server->metrics = rs_metrics_create();
-    server->prefetch = prefetch_create();
+#ifndef _WIN32
+    pthread_mutex_init(&server->log_mu, NULL);
+#endif
+    // The engine needs both hooks; without them (the Swift build registers
+    // neither) it stays NULL and the DASH routes report that honestly instead
+    // of half-working. The C++ app registers them before calling this.
+    server->live = rs_live_create(g_fetch_handler, g_dash_handler, live_log_sink, server);
     // state.json lives in the working directory, matching the Swift binary.
     if (rs_state_load(&server->state, "state.json") != 0 || !server->auth || !server->sysstats || !server->metrics) {
         // A malformed state.json is fatal — better to refuse than to risk
@@ -1911,12 +1828,18 @@ restream_server_t* restream_server_create(void) {
         rs_auth_destroy(server->auth);
         rs_sysstats_destroy(server->sysstats);
         rs_metrics_destroy(server->metrics);
+        rs_live_destroy(server->live);
         rs_state_dispose(&server->state);
         mg_mgr_free(&server->mgr);
+#ifndef _WIN32
+        pthread_mutex_destroy(&server->log_mu);
+#endif
         free(server);
         return NULL;
     }
-    log_record(server, "__panel__", "info", "serverStart", NULL, 0, -1, "ReStreamAir C server started");
+    log_recordf(server, "__panel__", "info", "serverStart", NULL, 0, -1,
+                "ReStreamAir C server started (build %s %s, live DASH engine %s)",
+                __DATE__, __TIME__, server->live ? "available" : "unavailable");
     return server;
 }
 
@@ -1957,9 +1880,13 @@ bool restream_server_start(restream_server_t* server, uint16_t port, const char*
     if (server->c == NULL) {
         return false;
     }
-    // Push a metrics frame to SSE subscribers once a second.
+    // Push a metrics frame to SSE subscribers once a second, and reap any live
+    // engines that have finished winding down.
     mg_timer_add(&server->mgr, 1000, MG_TIMER_REPEAT, broadcast_metrics, server);
     server->is_running = true;
+    // Streams that state.json says were running come back up on their own, so a
+    // restart does not silently leave every stream dark until someone notices.
+    live_sync_all(server);
     return true;
 }
 
@@ -1979,12 +1906,19 @@ void restream_server_stop(restream_server_t* server) {
 void restream_server_destroy(restream_server_t* server) {
     if (server) {
         mg_mgr_free(&server->mgr);
+        // Stops and joins every worker first: they hold a pointer to this
+        // server as their log sink, so nothing else may be torn down while one
+        // is still running.
+        rs_live_destroy(server->live);
+        server->live = NULL;
         rs_auth_destroy(server->auth);
         rs_sysstats_destroy(server->sysstats);
         rs_metrics_destroy(server->metrics);
-        prefetch_destroy(server->prefetch);
         if (server->logo_cache) rs_logo_cache_destroy(server->logo_cache);
         log_clear(server, "");  // frees ring-buffer strings
+#ifndef _WIN32
+        pthread_mutex_destroy(&server->log_mu);
+#endif
         rs_state_dispose(&server->state);
         free(server->web_root);
         free(server);

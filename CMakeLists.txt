@@ -55,15 +55,18 @@ endif()
 # ---- restream_core: the HTTP server, built on mongoose ----------------------
 add_library(restream_core STATIC
     core/src/server.c
+    core/src/live.c
     core/deps/mongoose.c
 )
 target_include_directories(restream_core PUBLIC core/include PRIVATE core/deps)
 target_link_libraries(restream_core PUBLIC restream_base)
-# The segment prefetcher runs on its own thread; glibc needs -pthread explicitly.
+# The live DASH engine runs a director plus one worker per representation, and
+# fans segment downloads out across several more threads; glibc needs -pthread
+# spelled out.
 find_package(Threads REQUIRED)
 target_link_libraries(restream_core PUBLIC Threads::Threads)
 # Warnings apply to our source only; mongoose is vendored and compiles as-is.
-set_source_files_properties(core/src/server.c PROPERTIES COMPILE_OPTIONS "${RS_WARNINGS}")
+set_source_files_properties(core/src/server.c core/src/live.c PROPERTIES COMPILE_OPTIONS "${RS_WARNINGS}")
 if(WIN32)
     target_compile_definitions(restream_core PRIVATE _WIN32_WINNT=0x0601)  # Windows 7+
     target_link_libraries(restream_core PUBLIC ws2_32)
