@@ -1,0 +1,1409 @@
+// The live DASH -> HLS engine. See rs_live.h for what this is and why the
+// request-time translation it replaces could not work.
+//
+// Layout of this file:
+//   1. small helpers (string builder, percent-encoding, seen-URL set)
+//   2. the data model (segment / representation / stream / manager)
+//   3. the representation worker: poll -> parallel download -> decrypt ->
+//      append -> prune, i.e. the port of LiveMPDToM3U8.downloadNewSegments
+//   4. the director: rendition discovery + master playlist
+//   5. playlist rendering (the port of LiveMPDToM3U8.writePlaylist)
+//   6. the public API
+
+#include "rs_live.h"
+
+#include "rs_audio_delay.h"
+#include "rs_cenc.h"
+#include "rs_json.h"
+
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifndef _WIN32
+
+#include <pthread.h>
+
+// Live engines tracked at once.
+#define RS_LIVE_MAX_STREAMS 64
+// Renditions per stream (video + audio is the shape every source we handle
+// uses; the extra slots leave room for a pinned representation alongside them).
+#define RS_LIVE_MAX_REPS 4
+// Parallel segment downloads per poll. The origin round-trip is the bottleneck
+// and segments are independent files; serial fetching could not keep up with
+// the live edge, which is exactly what left the player draining to the end of
+// the playlist and stalling. Matches the Swift prefetch fan-out.
+#define RS_LIVE_FETCH_PAR 6
+// Upper bound on remembered segment URLs. This set is what stops a segment that
+// has aged out of our queue — but is still inside the manifest's much larger
+// timeShiftBufferDepth window — from being downloaded and appended a second
+// time, which would inflate the media sequence without the window advancing.
+// The Swift worker never prunes it; 8192 entries is over four hours at two
+// second segments, so nothing the manifest can still advertise is ever
+// forgotten, and the memory stays bounded in a long-lived server.
+#define RS_LIVE_SEEN_MAX 8192
+#define RS_LIVE_SEEN_BUCKETS 2048
+// Per-representation memory ceiling for decrypted segments held in RAM. A
+// backstop for the segment-count limit, for sources whose segments are far
+// larger than the couple of megabytes this is sized around.
+#define RS_LIVE_MAX_BYTES (64u * 1024u * 1024u)
+// How often the director re-reads the rendition list. Representation ids
+// effectively never change mid-stream, so this is deliberately much slower than
+// the segment poll.
+#define RS_LIVE_DIRECTOR_INTERVAL 15.0
+
+// --- 1. helpers -------------------------------------------------------------
+
+typedef struct {
+    char *p;
+    size_t len, cap;
+} sbuf;
+
+static void sb_init(sbuf *b) { b->p = NULL; b->len = 0; b->cap = 0; }
+
+static bool sb_reserve(sbuf *b, size_t extra) {
+    if (b->p && b->len + extra + 1 <= b->cap) return true;
+    size_t want = b->cap ? b->cap : 512;
+    while (want < b->len + extra + 1) want *= 2;
+    char *np = (char *)realloc(b->p, want);
+    if (!np) return false;
+    b->p = np;
+    b->cap = want;
+    if (b->len == 0) b->p[0] = '\0';
+    return true;
+}
+
+static void sb_add(sbuf *b, const char *s) {
+    size_t n = strlen(s);
+    if (!sb_reserve(b, n)) return;
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = '\0';
+}
+
+// printf into the buffer. Sized from the formatted length rather than a fixed
+// scratch array, because an encoded segment URL is routinely over a kilobyte.
+static void sb_addf(sbuf *b, const char *fmt, ...) {
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n > 0 && sb_reserve(b, (size_t)n)) {
+        vsnprintf(b->p + b->len, (size_t)n + 1, fmt, ap2);
+        b->len += (size_t)n;
+    }
+    va_end(ap2);
+}
+
+// Percent-encodes everything outside the RFC 3986 unreserved set, so a segment
+// URL carrying its own '?', '&' or '=' cannot corrupt the query it is embedded
+// in. Same rule as the server's query_encode.
+static char *qenc(const char *s) {
+    static const char hex[] = "0123456789ABCDEF";
+    if (!s) s = "";
+    size_t n = strlen(s);
+    char *out = (char *)malloc(n * 3 + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 0x0f];
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
+static double now_seconds(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+// --- the seen-URL set -------------------------------------------------------
+
+typedef struct seen_node {
+    struct seen_node *next;
+    char *url;
+    uint32_t hash;
+} seen_node;
+
+typedef struct {
+    seen_node *buckets[RS_LIVE_SEEN_BUCKETS];
+    seen_node *order[RS_LIVE_SEEN_MAX];  // insertion order, for FIFO eviction
+    size_t head, count;
+} seen_set;
+
+static uint32_t seen_hash(const char *s) {
+    uint32_t h = 2166136261u;  // FNV-1a
+    for (; *s; s++) {
+        h ^= (uint32_t)(unsigned char)*s;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static bool seen_has(const seen_set *s, const char *url) {
+    uint32_t h = seen_hash(url);
+    for (const seen_node *n = s->buckets[h % RS_LIVE_SEEN_BUCKETS]; n; n = n->next)
+        if (n->hash == h && strcmp(n->url, url) == 0) return true;
+    return false;
+}
+
+static void seen_unlink(seen_set *s, seen_node *victim) {
+    seen_node **slot = &s->buckets[victim->hash % RS_LIVE_SEEN_BUCKETS];
+    while (*slot) {
+        if (*slot == victim) { *slot = victim->next; break; }
+        slot = &(*slot)->next;
+    }
+    free(victim->url);
+    free(victim);
+}
+
+static void seen_add(seen_set *s, const char *url) {
+    if (seen_has(s, url)) return;
+    seen_node *n = (seen_node *)calloc(1, sizeof(*n));
+    if (!n) return;
+    n->url = rs_strdup(url);
+    if (!n->url) { free(n); return; }
+    n->hash = seen_hash(url);
+    size_t b = n->hash % RS_LIVE_SEEN_BUCKETS;
+    n->next = s->buckets[b];
+    s->buckets[b] = n;
+
+    if (s->count == RS_LIVE_SEEN_MAX) {
+        seen_node *old = s->order[s->head];
+        s->order[s->head] = n;
+        s->head = (s->head + 1) % RS_LIVE_SEEN_MAX;
+        if (old) seen_unlink(s, old);
+    } else {
+        s->order[(s->head + s->count) % RS_LIVE_SEEN_MAX] = n;
+        s->count++;
+    }
+}
+
+static void seen_dispose(seen_set *s) {
+    for (size_t i = 0; i < RS_LIVE_SEEN_BUCKETS; i++) {
+        seen_node *n = s->buckets[i];
+        while (n) {
+            seen_node *next = n->next;
+            free(n->url);
+            free(n);
+            n = next;
+        }
+        s->buckets[i] = NULL;
+    }
+    s->head = s->count = 0;
+}
+
+// --- 2. data model ----------------------------------------------------------
+
+// One downloaded, decrypted, ready-to-serve segment.
+typedef struct {
+    char *url;             // upstream URL — the identity a /proxy request carries
+    uint8_t *data;
+    size_t len;
+    double duration;       // seconds, from the manifest
+    long long seq;         // monotonic; the source of EXT-X-MEDIA-SEQUENCE
+    uint64_t start_time;   // tfdt baseMediaDecodeTime, in `timescale` units
+    bool have_start;
+    bool disc;             // needs an EXT-X-DISCONTINUITY before it
+} live_seg;
+
+struct live_stream;
+
+typedef struct {
+    struct live_stream *owner;
+    char *rep_id;
+    char *kind;            // "video" | "audio"
+
+    pthread_t thread;
+    bool thread_started;
+    bool finished;
+
+    live_seg *segs;
+    size_t nsegs, cap;
+    size_t bytes;          // total held by `segs`, for the memory ceiling
+
+    long long total_queued;    // every segment ever appended — see writePlaylist
+    long long dropped_disc;    // discontinuities that rolled off the queue
+
+    char *init_url;
+    uint8_t *init_data;
+    size_t init_len;
+
+    uint32_t timescale;    // mdhd timescale of the media track
+    uint8_t key[16];
+    bool have_key;
+    int iv_size;
+
+    seen_set seen;
+    char *playlist;        // last rendered media playlist, or NULL
+    bool ready;            // a playlist has been rendered at least once
+    double last_poll;
+    long long polls;
+} live_rep;
+
+typedef struct live_stream {
+    struct rs_live *mgr;
+    char *id;
+
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool stop;
+
+    // Config, replaced wholesale by rs_live_start. Guarded by `mu`.
+    char *mpd_url, *representation;
+    char *manifest_proxy, *media_proxy;
+    char *manifest_headers, *media_headers;
+    char *downloader, *dl_params, *keys;
+    int playlist_segments, keep_segments, download_ahead;
+    int playback_delay_seconds, audio_delay_ms;
+    double poll_interval;
+
+    pthread_t dir_thread;
+    bool dir_started, dir_finished;
+
+    char *master;          // rendered master playlist, or NULL until ready
+    live_rep *reps[RS_LIVE_MAX_REPS];
+    size_t nreps;
+} live_stream;
+
+struct rs_live {
+    rs_live_fetch_fn fetch;
+    rs_live_dash_fn dash;
+    rs_live_log_fn log;
+    void *log_ctx;
+    pthread_mutex_t mu;                 // guards the stream table only
+    live_stream *streams[RS_LIVE_MAX_STREAMS];
+    size_t nstreams;
+};
+
+// A worker's private copy of the config, so a panel edit mid-poll cannot free
+// strings out from under an in-flight fetch.
+typedef struct {
+    char *mpd_url, *manifest_proxy, *media_proxy;
+    char *manifest_headers, *media_headers;
+    char *downloader, *dl_params, *keys;
+    int playlist_segments, keep_segments, download_ahead;
+    int playback_delay_seconds, audio_delay_ms;
+    double poll_interval;
+} cfg_snap;
+
+static void cfg_snap_dispose(cfg_snap *c) {
+    free(c->mpd_url); free(c->manifest_proxy); free(c->media_proxy);
+    free(c->manifest_headers); free(c->media_headers);
+    free(c->downloader); free(c->dl_params); free(c->keys);
+    memset(c, 0, sizeof(*c));
+}
+
+// Caller must hold st->mu.
+static void cfg_snapshot_locked(const live_stream *st, cfg_snap *out) {
+    memset(out, 0, sizeof(*out));
+    out->mpd_url = rs_strdup(st->mpd_url ? st->mpd_url : "");
+    out->manifest_proxy = rs_strdup(st->manifest_proxy ? st->manifest_proxy : "");
+    out->media_proxy = rs_strdup(st->media_proxy ? st->media_proxy : "");
+    out->manifest_headers = rs_strdup(st->manifest_headers ? st->manifest_headers : "");
+    out->media_headers = rs_strdup(st->media_headers ? st->media_headers : "");
+    out->downloader = rs_strdup(st->downloader ? st->downloader : "");
+    out->dl_params = rs_strdup(st->dl_params ? st->dl_params : "");
+    out->keys = rs_strdup(st->keys ? st->keys : "");
+    out->playlist_segments = st->playlist_segments;
+    out->keep_segments = st->keep_segments;
+    out->download_ahead = st->download_ahead;
+    out->playback_delay_seconds = st->playback_delay_seconds;
+    out->audio_delay_ms = st->audio_delay_ms;
+    out->poll_interval = st->poll_interval;
+}
+
+// --- logging ----------------------------------------------------------------
+
+static void lg(live_stream *st, const char *level, const char *event, const char *url,
+               long status, long long bytes, const char *message) {
+    if (st && st->mgr && st->mgr->log)
+        st->mgr->log(st->mgr->log_ctx, st->id, level, event, url, status, bytes, message);
+}
+
+static void lgf(live_stream *st, const char *level, const char *event, const char *url,
+                long status, long long bytes, const char *fmt, ...) {
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    lg(st, level, event, url, status, bytes, msg);
+}
+
+// Sleeps up to `seconds`, waking early if the stream is asked to stop. Returns
+// false when the worker should exit. This is why Stop is instant: no worker
+// ever sits in an uninterruptible sleep.
+static bool live_wait(live_stream *st, double seconds) {
+    if (seconds < 0) seconds = 0;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    long whole = (long)seconds;
+    long nsec = (long)((seconds - (double)whole) * 1e9);
+    deadline.tv_sec += (time_t)whole;
+    deadline.tv_nsec += nsec;
+    if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+
+    pthread_mutex_lock(&st->mu);
+    while (!st->stop) {
+        if (pthread_cond_timedwait(&st->cv, &st->mu, &deadline) == ETIMEDOUT) break;
+    }
+    bool go = !st->stop;
+    pthread_mutex_unlock(&st->mu);
+    return go;
+}
+
+static bool live_stopping(live_stream *st) {
+    pthread_mutex_lock(&st->mu);
+    bool s = st->stop;
+    pthread_mutex_unlock(&st->mu);
+    return s;
+}
+
+// --- 3. the representation worker ------------------------------------------
+
+// One queued download and its result.
+typedef struct {
+    char *url;
+    double duration;
+    uint8_t *data;
+    size_t len;
+    bool ok;
+    char err[192];
+} batch_item;
+
+typedef struct {
+    batch_item *items;
+    size_t n, next;
+    pthread_mutex_t mu;
+    rs_live_fetch_fn fetch;
+    const char *proxy, *headers, *downloader, *dl_params;
+    live_stream *st;
+} batch_ctx;
+
+static void *batch_worker(void *arg) {
+    batch_ctx *b = (batch_ctx *)arg;
+    for (;;) {
+        pthread_mutex_lock(&b->mu);
+        size_t i = b->next < b->n ? b->next++ : b->n;
+        pthread_mutex_unlock(&b->mu);
+        if (i >= b->n) break;
+        if (live_stopping(b->st)) break;
+
+        batch_item *it = &b->items[i];
+        char *body = NULL;
+        size_t len = 0;
+        long status = 0;
+        int rc = b->fetch(it->url, b->proxy, b->headers, NULL, b->downloader, b->dl_params,
+                          &body, &len, &status, NULL, NULL, NULL, it->err, sizeof(it->err));
+        if (rc == 0 && body) {
+            it->data = (uint8_t *)body;
+            it->len = len;
+            it->ok = true;
+        } else {
+            free(body);
+            if (!it->err[0]) snprintf(it->err, sizeof(it->err), "fetch failed (status %ld)", status);
+        }
+    }
+    return NULL;
+}
+
+// Downloads every item in `items` with a bounded fan-out. Only the transfer is
+// parallel; the caller still processes the results serially in timeline order,
+// so decrypt / discontinuity / media-sequence behaviour is order-independent of
+// how the network happened to schedule things.
+static void batch_download(live_stream *st, batch_item *items, size_t n, const cfg_snap *cfg) {
+    if (n == 0) return;
+    batch_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.items = items;
+    ctx.n = n;
+    ctx.next = 0;
+    ctx.fetch = st->mgr->fetch;
+    ctx.proxy = cfg->media_proxy;
+    ctx.headers = cfg->media_headers;
+    ctx.downloader = cfg->downloader;
+    ctx.dl_params = cfg->dl_params;
+    ctx.st = st;
+    pthread_mutex_init(&ctx.mu, NULL);
+
+    size_t nthreads = n < RS_LIVE_FETCH_PAR ? n : RS_LIVE_FETCH_PAR;
+    pthread_t threads[RS_LIVE_FETCH_PAR];
+    size_t started = 0;
+    for (size_t i = 0; i < nthreads; i++)
+        if (pthread_create(&threads[started], NULL, batch_worker, &ctx) == 0) started++;
+    if (started == 0) batch_worker(&ctx);  // no threads available: do it inline
+    for (size_t i = 0; i < started; i++) pthread_join(threads[i], NULL);
+    pthread_mutex_destroy(&ctx.mu);
+}
+
+// A segment continues the previous one only if it starts, on the media
+// timeline, where the previous one ended. Sources that splice (SCTE-35 ad
+// insertion) jump the timeline while the manifest goes on advertising a uniform
+// duration, and the tfdt is the only signal that reveals it. Getting this wrong
+// is what makes playback "stick" in a browser: the playlist claims the segment
+// is 2.000s, the media actually resumes a second later, and MSE is left with a
+// hole it can never fill. ffmpeg silently re-offsets instead, which is why the
+// same stream plays from the CLI and stalls in the page.
+static bool is_timeline_break(const live_rep *rep, const live_seg *prev, uint64_t next_start,
+                              bool next_has_start) {
+    if (!prev || !prev->have_start || !next_has_start) return false;
+    if (rep->timescale == 0) return false;
+    double expected = (double)prev->start_time / (double)rep->timescale + prev->duration;
+    double actual = (double)next_start / (double)rep->timescale;
+    double diff = actual - expected;
+    if (diff < 0) diff = -diff;
+    // Encoder jitter (AAC frame alignment) is single-digit milliseconds; a real
+    // splice moves the timeline by about a second.
+    return diff > 0.25;
+}
+
+// Drops the oldest segments until the queue fits both the segment count and the
+// memory ceiling. Caller holds st->mu.
+static void rep_prune_locked(live_rep *rep, int keep) {
+    if (keep < 1) keep = 1;
+    while (rep->nsegs > (size_t)keep || (rep->bytes > RS_LIVE_MAX_BYTES && rep->nsegs > 1)) {
+        live_seg *g = &rep->segs[0];
+        // A discontinuity that rolls off the queue still has to be counted, or
+        // EXT-X-DISCONTINUITY-SEQUENCE drifts and players lose track of which
+        // timeline they are on across reloads.
+        if (g->disc) rep->dropped_disc++;
+        rep->bytes -= g->len;
+        free(g->url);
+        free(g->data);
+        memmove(rep->segs, rep->segs + 1, (rep->nsegs - 1) * sizeof(live_seg));
+        rep->nsegs--;
+    }
+}
+
+// Caller holds st->mu. Takes ownership of `data`.
+static void rep_append_locked(live_rep *rep, const char *url, uint8_t *data, size_t len,
+                              double duration, uint64_t start, bool have_start) {
+    if (rep->nsegs == rep->cap) {
+        size_t ncap = rep->cap ? rep->cap * 2 : 32;
+        live_seg *ns = (live_seg *)realloc(rep->segs, ncap * sizeof(live_seg));
+        if (!ns) { free(data); return; }
+        rep->segs = ns;
+        rep->cap = ncap;
+    }
+    const live_seg *prev = rep->nsegs > 0 ? &rep->segs[rep->nsegs - 1] : NULL;
+    live_seg *s = &rep->segs[rep->nsegs++];
+    memset(s, 0, sizeof(*s));
+    s->url = rs_strdup(url);
+    s->data = data;
+    s->len = len;
+    s->duration = duration;
+    s->start_time = start;
+    s->have_start = have_start;
+    s->disc = is_timeline_break(rep, prev, start, have_start);
+    s->seq = rep->total_queued++;
+    rep->bytes += len;
+}
+
+// Fetches and installs the initialization segment: patch it to a clear codec,
+// pick the ClearKey that matches its default KID, and read the media timescale
+// the discontinuity check needs.
+static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *cfg,
+                          unsigned long plan_timescale) {
+    live_stream *st = rep->owner;
+    char *body = NULL;
+    size_t len = 0;
+    long status = 0;
+    char err[192] = {0};
+    lg(st, "info", "initFetch", init_url, 0, -1, rep->rep_id);
+    int rc = st->mgr->fetch(init_url, cfg->media_proxy, cfg->media_headers, NULL,
+                            cfg->downloader, cfg->dl_params,
+                            &body, &len, &status, NULL, NULL, NULL, err, sizeof(err));
+    if (rc != 0 || !body) {
+        free(body);
+        lgf(st, "error", "initFetch", init_url, status, -1, "%s: %s", rep->rep_id,
+            err[0] ? err : "init segment fetch failed");
+        return;
+    }
+
+    size_t out_len = 0;
+    char *kid_hex = NULL;
+    int iv_size = 0;
+    uint8_t *patched = rs_cenc_patch_init((uint8_t *)body, len, &out_len, &kid_hex, &iv_size);
+    if (patched) { free(body); } else { patched = (uint8_t *)body; out_len = len; }
+
+    uint32_t ts = rs_audio_mdhd_timescale(patched, out_len);
+    if (ts == 0) ts = (uint32_t)(plan_timescale ? plan_timescale : 1);
+
+    // Pick the key whose KID the init actually declares, rather than assuming
+    // the first configured pair — a stream can carry several tracks with
+    // different KIDs, and decrypting with the wrong one yields noise.
+    uint8_t key[16];
+    bool have_key = false;
+    rs_cenc_keys keys = rs_cenc_parse_keys(cfg->keys ? cfg->keys : "");
+    if (keys.count > 0) {
+        size_t pick = 0;
+        if (kid_hex) {
+            for (size_t i = 0; i < keys.count; i++) {
+                if (keys.kids[i] && strcmp(keys.kids[i], kid_hex) == 0) { pick = i; break; }
+            }
+        }
+        memcpy(key, keys.keys[pick], 16);
+        have_key = true;
+    }
+    rs_cenc_keys_free(&keys);
+
+    pthread_mutex_lock(&st->mu);
+    free(rep->init_url);
+    free(rep->init_data);
+    rep->init_url = rs_strdup(init_url);
+    rep->init_data = patched;
+    rep->init_len = out_len;
+    rep->timescale = ts;
+    rep->iv_size = iv_size > 0 ? iv_size : 8;
+    rep->have_key = have_key;
+    if (have_key) memcpy(rep->key, key, 16);
+    pthread_mutex_unlock(&st->mu);
+
+    lgf(st, "info", "initReady", init_url, status, (long long)out_len,
+        "%s: timescale %u, iv %d, key %s%s%s", rep->rep_id, ts, rep->iv_size,
+        have_key ? "yes" : "no", kid_hex ? ", kid " : "", kid_hex ? kid_hex : "");
+    free(kid_hex);
+}
+
+// One poll of one representation: read the manifest window, download whatever
+// is new, decrypt it, and append it in timeline order.
+static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interval) {
+    live_stream *st = rep->owner;
+    char err[256] = {0};
+    double t0 = now_seconds();
+
+    lgf(st, "info", "pollStart", cfg->mpd_url, 0, -1, "%s: requesting %d segments",
+        rep->rep_id, cfg->download_ahead);
+    char *json = st->mgr->dash(cfg->mpd_url, cfg->manifest_proxy, cfg->manifest_headers,
+                               cfg->downloader, cfg->dl_params, rep->rep_id,
+                               cfg->download_ahead, err, sizeof(err));
+    if (!json) {
+        lgf(st, "error", "manifest", cfg->mpd_url, 0, -1, "%s: %s", rep->rep_id,
+            err[0] ? err : "could not read the MPD");
+        return;
+    }
+    rs_json *root = rs_json_parse(json, strlen(json));
+    free(json);
+    if (!root) {
+        lgf(st, "error", "manifest", cfg->mpd_url, 0, -1, "%s: malformed DASH description", rep->rep_id);
+        return;
+    }
+
+    double mup = rs_json_as_num(rs_json_obj_get(root, "mup"), 0);
+    if (mup > 0 && cfg->poll_interval <= 0) *out_next_interval = mup;
+
+    const rs_json *plan = rs_json_obj_get(root, "plan");
+    if (!plan || rs_json_type_of(plan) != RS_JSON_OBJ) {
+        lgf(st, "error", "manifest", cfg->mpd_url, 0, -1,
+            "%s: representation not present in the MPD", rep->rep_id);
+        rs_json_free(root);
+        return;
+    }
+
+    unsigned long plan_ts = (unsigned long)rs_json_as_num(rs_json_obj_get(plan, "timescale"), 1);
+    const char *init_url = rs_json_obj_str(plan, "initUrl", "");
+    const rs_json *segs = rs_json_obj_get(plan, "segments");
+    size_t total = rs_json_arr_len(segs);
+
+    lgf(st, "info", "manifest", cfg->mpd_url, 0, -1,
+        "%s: %lu segments in the manifest window (%.2fs)", rep->rep_id,
+        (unsigned long)total, now_seconds() - t0);
+
+    // The init segment is fetched once, and again only if the source rotates it.
+    bool need_init;
+    pthread_mutex_lock(&st->mu);
+    need_init = init_url[0] && (!rep->init_url || strcmp(rep->init_url, init_url) != 0);
+    pthread_mutex_unlock(&st->mu);
+    if (need_init) rep_load_init(rep, init_url, cfg, plan_ts);
+    if (live_stopping(st)) { rs_json_free(root); return; }
+
+    // Collect the segments this poll has not already served.
+    batch_item *items = (batch_item *)calloc(total ? total : 1, sizeof(batch_item));
+    if (!items) { rs_json_free(root); return; }
+    size_t n = 0;
+    pthread_mutex_lock(&st->mu);
+    for (size_t i = 0; i < total; i++) {
+        const rs_json *s = rs_json_arr_at(segs, i);
+        const char *u = rs_json_obj_str(s, "url", "");
+        if (!u[0] || seen_has(&rep->seen, u)) continue;
+        items[n].url = rs_strdup(u);
+        items[n].duration = rs_json_as_num(rs_json_obj_get(s, "duration"), 0);
+        n++;
+    }
+    pthread_mutex_unlock(&st->mu);
+    rs_json_free(root);
+
+    if (n == 0) {
+        lgf(st, "info", "pollIdle", NULL, 0, -1, "%s: no new segments this poll", rep->rep_id);
+        free(items);
+        return;
+    }
+
+    double dl0 = now_seconds();
+    batch_download(st, items, n, cfg);
+
+    // Serial pass, strictly in timeline order: decrypt, read the media timeline
+    // position, decide discontinuity, append.
+    size_t added = 0, failed = 0;
+    long long added_bytes = 0;
+    for (size_t i = 0; i < n; i++) {
+        batch_item *it = &items[i];
+        if (!it->ok) {
+            failed++;
+            // A single miss at the live edge is routine — the origin may simply
+            // never produce this one. Mark it seen so we do not re-request it
+            // forever, and let the window slide past it.
+            lgf(st, "error", "downloadSegment", it->url, 0, -1, "%s: %s", rep->rep_id, it->err);
+            pthread_mutex_lock(&st->mu);
+            seen_add(&rep->seen, it->url);
+            pthread_mutex_unlock(&st->mu);
+            free(it->url);
+            continue;
+        }
+
+        pthread_mutex_lock(&st->mu);
+        bool have_key = rep->have_key;
+        int iv_size = rep->iv_size > 0 ? rep->iv_size : 8;
+        uint8_t key[16];
+        if (have_key) memcpy(key, rep->key, 16);
+        uint32_t ts = rep->timescale;
+        pthread_mutex_unlock(&st->mu);
+
+        uint8_t *data = it->data;
+        size_t len = it->len;
+        if (have_key) {
+            size_t out_len = 0;
+            uint8_t *clear = rs_cenc_decrypt_segment(data, len, &out_len, key, iv_size);
+            if (clear) { free(data); data = clear; len = out_len; }
+            else lgf(st, "error", "decryptSegment", it->url, 0, -1,
+                     "%s: CENC decrypt failed, serving as-is", rep->rep_id);
+        }
+
+        // Lip-sync offset, audio track only — the same knob the Swift worker
+        // applies to whichever worker owns the audio representation.
+        if (cfg->audio_delay_ms != 0 && ts > 0 && strcmp(rep->kind, "audio") == 0) {
+            int64_t delta = (int64_t)cfg->audio_delay_ms * (int64_t)ts / 1000;
+            size_t out_len = 0;
+            uint8_t *shifted = rs_audio_shift_segment(data, len, delta, &out_len);
+            if (shifted) { free(data); data = shifted; len = out_len; }
+        }
+
+        // tfdt baseMediaDecodeTime: where this segment actually starts on the
+        // media timeline. A missing box reads back as 0, which is
+        // indistinguishable from a genuine zero start, so 0 is treated as
+        // "unknown" throughout — is_timeline_break then skips the comparison
+        // rather than reporting a jump. Missing one real splice is recoverable;
+        // a spurious EXT-X-DISCONTINUITY on every segment is not.
+        uint64_t start = rs_audio_base_decode_time(data, len);
+        bool have_start = start != 0;
+
+        pthread_mutex_lock(&st->mu);
+        bool was_disc = false;
+        rep_append_locked(rep, it->url, data, len,
+                          it->duration > 0 ? it->duration : 2.0, start, have_start);
+        if (rep->nsegs > 0) was_disc = rep->segs[rep->nsegs - 1].disc;
+        seen_add(&rep->seen, it->url);
+        pthread_mutex_unlock(&st->mu);
+
+        added++;
+        added_bytes += (long long)len;
+        lgf(st, "info", "downloadSegment", it->url, 200, (long long)len,
+            "%s: %.3fs%s", rep->rep_id, it->duration, was_disc ? " (discontinuity)" : "");
+        if (was_disc)
+            lgf(st, "info", "discontinuity", it->url, 0, -1,
+                "%s: media timeline jumped — inserting EXT-X-DISCONTINUITY", rep->rep_id);
+        free(it->url);
+    }
+    free(items);
+
+    pthread_mutex_lock(&st->mu);
+    size_t before = rep->nsegs;
+    rep_prune_locked(rep, cfg->keep_segments);
+    size_t pruned = before - rep->nsegs;
+    size_t held = rep->nsegs;
+    size_t held_bytes = rep->bytes;
+    pthread_mutex_unlock(&st->mu);
+
+    lgf(st, added > 0 ? "info" : "error", "pollDone", NULL, 0, added_bytes,
+        "%s: +%lu segments, %lu failed, %lu pruned, %lu held (%.1f MB) in %.2fs",
+        rep->rep_id, (unsigned long)added, (unsigned long)failed, (unsigned long)pruned,
+        (unsigned long)held, (double)held_bytes / (1024.0 * 1024.0), now_seconds() - dl0);
+}
+
+// --- 5. playlist rendering --------------------------------------------------
+
+// Renders this representation's media playlist. Caller holds st->mu.
+//
+// The port of LiveMPDToM3U8.writePlaylist: a window of `playlist_segments`
+// ending `hold_back` segments before the newest one on disk, a media sequence
+// that advances by exactly one per segment, and a discontinuity sequence that
+// accounts for every break that has already scrolled out of the window.
+static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
+    if (rep->nsegs == 0) return NULL;
+
+    // Average duration, for turning the configured delay in seconds into a
+    // number of segments.
+    double sum = 0;
+    for (size_t i = 0; i < rep->nsegs; i++) sum += rep->segs[i].duration;
+    double avg = sum / (double)rep->nsegs;
+
+    // Live-edge hold-back: end the advertised window this many segments before
+    // the newest one we hold, so the player always has that many segments
+    // already downloaded and queued ahead of the playlist end and cannot drain
+    // to the true edge and stall.
+    int base_hold = cfg->download_ahead - cfg->playlist_segments;
+    if (base_hold < 0) base_hold = 0;
+    int delay_hold = (cfg->playback_delay_seconds > 0 && avg > 0.01)
+                         ? (int)((double)cfg->playback_delay_seconds / avg + 0.5)
+                         : 0;
+    long long hold = base_hold + delay_hold;
+    // Never hold back so far that a full window is not available yet (startup).
+    long long slack = (long long)rep->nsegs - cfg->playlist_segments;
+    if (hold > slack) hold = slack;
+    if (hold < 0) hold = 0;
+
+    long long window_end = (long long)rep->nsegs - hold;
+    if (window_end < 1) window_end = (long long)rep->nsegs;
+    long long window_start = window_end - cfg->playlist_segments;
+    if (window_start < 0) window_start = 0;
+
+    double maxdur = 0;
+    for (long long i = window_start; i < window_end; i++)
+        if (rep->segs[i].duration > maxdur) maxdur = rep->segs[i].duration;
+    int target = (int)(maxdur + 0.999);
+    if (target < 1) target = 1;
+
+    // Every break that is no longer *in* the window still has to be accounted
+    // for: the ones that fell off the queue entirely, plus the ones still held
+    // but behind the window's first segment.
+    long long disc_seq = rep->dropped_disc;
+    for (long long i = 0; i < window_start; i++)
+        if (rep->segs[i].disc) disc_seq++;
+
+    sbuf b;
+    sb_init(&b);
+    sb_add(&b, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    sb_addf(&b, "#EXT-X-TARGETDURATION:%d\n", target);
+    // Advances by exactly one per segment (RFC 8216 4.3.3.2) because it is the
+    // append counter, not anything derived from the manifest's $Time$.
+    sb_addf(&b, "#EXT-X-MEDIA-SEQUENCE:%lld\n", rep->segs[window_start].seq);
+    if (disc_seq > 0) sb_addf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%lld\n", disc_seq);
+
+    char *rep_enc = qenc(rep->rep_id);
+    if (rep->init_url && rep->init_url[0]) {
+        char *ienc = qenc(rep->init_url);
+        // The path has to end in a real media extension: ffmpeg's HLS demuxer
+        // rejects any segment URL whose extension is not in its allow-list, so a
+        // query-only "/item" path fails to parse outright. The ?u= target is
+        // what actually gets served; the filename only satisfies the demuxer.
+        sb_addf(&b, "#EXT-X-MAP:URI=\"/proxy/%s/init.mp4?u=%s&rep=%s&kind=map&dec=1&live=1\"\n",
+                rep->owner->id, ienc ? ienc : "", rep_enc ? rep_enc : "");
+        free(ienc);
+    }
+    for (long long i = window_start; i < window_end; i++) {
+        live_seg *s = &rep->segs[i];
+        // The tag marks a break *between* two segments, so it is meaningless on
+        // the first one in the window — that break is already carried by
+        // EXT-X-DISCONTINUITY-SEQUENCE above.
+        if (s->disc && i > window_start) sb_add(&b, "#EXT-X-DISCONTINUITY\n");
+        char *senc = qenc(s->url);
+        sb_addf(&b, "#EXTINF:%.3f,\n/proxy/%s/seg.m4s?u=%s&rep=%s&kind=segment&dec=1&live=1\n",
+                s->duration, rep->owner->id, senc ? senc : "", rep_enc ? rep_enc : "");
+        free(senc);
+    }
+    free(rep_enc);
+    return b.p;
+}
+
+// --- the representation thread ---------------------------------------------
+
+static void *rep_main(void *arg) {
+    live_rep *rep = (live_rep *)arg;
+    live_stream *st = rep->owner;
+    double interval = 2.0;
+
+    lgf(st, "info", "repStart", NULL, 0, -1, "%s (%s): worker started", rep->rep_id, rep->kind);
+    for (;;) {
+        if (live_stopping(st)) break;
+
+        cfg_snap cfg;
+        pthread_mutex_lock(&st->mu);
+        cfg_snapshot_locked(st, &cfg);
+        rep->polls++;
+        rep->last_poll = now_seconds();
+        pthread_mutex_unlock(&st->mu);
+
+        rep_poll(rep, &cfg, &interval);
+
+        // Re-render immediately so the next playlist request is served from
+        // memory with the freshest window.
+        pthread_mutex_lock(&st->mu);
+        char *rendered = rep_render_locked(rep, &cfg);
+        if (rendered) {
+            free(rep->playlist);
+            rep->playlist = rendered;
+            bool first = !rep->ready;
+            rep->ready = true;
+            pthread_cond_broadcast(&st->cv);
+            pthread_mutex_unlock(&st->mu);
+            if (first)
+                lgf(st, "info", "playlistReady", NULL, 0, -1,
+                    "%s: first media playlist is ready", rep->rep_id);
+        } else {
+            pthread_mutex_unlock(&st->mu);
+        }
+
+        double sleep_for = cfg.poll_interval > 0 ? cfg.poll_interval : interval;
+        if (sleep_for < 0.25) sleep_for = 0.25;
+        if (sleep_for > 10.0) sleep_for = 10.0;
+        cfg_snap_dispose(&cfg);
+        if (!live_wait(st, sleep_for)) break;
+    }
+    lgf(st, "info", "repStop", NULL, 0, -1, "%s: worker stopped after %lld polls",
+        rep->rep_id, rep->polls);
+
+    pthread_mutex_lock(&st->mu);
+    rep->finished = true;
+    pthread_mutex_unlock(&st->mu);
+    return NULL;
+}
+
+// --- 4. the director --------------------------------------------------------
+
+// Caller holds st->mu.
+static live_rep *rep_find_locked(live_stream *st, const char *rep_id) {
+    for (size_t i = 0; i < st->nreps; i++)
+        if (strcmp(st->reps[i]->rep_id, rep_id) == 0) return st->reps[i];
+    return NULL;
+}
+
+// Creates and starts a representation worker if it does not exist yet.
+// Caller holds st->mu.
+static void rep_ensure_locked(live_stream *st, const char *rep_id, const char *kind) {
+    if (!rep_id || !rep_id[0]) return;
+    if (rep_find_locked(st, rep_id)) return;
+    if (st->nreps >= RS_LIVE_MAX_REPS) return;
+
+    live_rep *rep = (live_rep *)calloc(1, sizeof(*rep));
+    if (!rep) return;
+    rep->owner = st;
+    rep->rep_id = rs_strdup(rep_id);
+    rep->kind = rs_strdup(kind && kind[0] ? kind : "video");
+    rep->iv_size = 8;
+    st->reps[st->nreps++] = rep;
+    if (pthread_create(&rep->thread, NULL, rep_main, rep) == 0) rep->thread_started = true;
+    else rep->finished = true;
+}
+
+static void *director_main(void *arg) {
+    live_stream *st = (live_stream *)arg;
+    lg(st, "info", "liveStart", NULL, 0, -1, "live DASH engine started");
+
+    for (;;) {
+        if (live_stopping(st)) break;
+
+        cfg_snap cfg;
+        char *pinned = NULL;
+        pthread_mutex_lock(&st->mu);
+        cfg_snapshot_locked(st, &cfg);
+        pinned = rs_strdup(st->representation ? st->representation : "");
+        pthread_mutex_unlock(&st->mu);
+
+        char err[256] = {0};
+        char *json = st->mgr->dash(cfg.mpd_url, cfg.manifest_proxy, cfg.manifest_headers,
+                                   cfg.downloader, cfg.dl_params, "", 0, err, sizeof(err));
+        if (!json) {
+            lgf(st, "error", "renditions", cfg.mpd_url, 0, -1, "%s",
+                err[0] ? err : "could not read the MPD");
+            free(pinned);
+            cfg_snap_dispose(&cfg);
+            if (!live_wait(st, 3.0)) break;
+            continue;
+        }
+
+        rs_json *root = rs_json_parse(json, strlen(json));
+        free(json);
+        if (!root) {
+            lg(st, "error", "renditions", cfg.mpd_url, 0, -1, "malformed DASH description");
+            free(pinned);
+            cfg_snap_dispose(&cfg);
+            if (!live_wait(st, 3.0)) break;
+            continue;
+        }
+
+        const rs_json *video = rs_json_obj_get(root, "video");
+        const rs_json *audio = rs_json_obj_get(root, "audio");
+        bool have_video = video && rs_json_type_of(video) == RS_JSON_OBJ;
+        bool have_audio = audio && rs_json_type_of(audio) == RS_JSON_OBJ;
+        bool dynamic = rs_json_as_bool(rs_json_obj_get(root, "dynamic"), true);
+
+        // A pinned representation overrides the auto-selected video rendition;
+        // the audio rendition is still picked up so the master keeps its
+        // separate audio group.
+        const char *vid = have_video ? rs_json_obj_str(video, "id", "") : "";
+        if (pinned && pinned[0]) vid = pinned;
+        const char *vcodecs = have_video ? rs_json_obj_str(video, "codecs", "") : "";
+        long long vbw = have_video ? (long long)rs_json_as_num(rs_json_obj_get(video, "bandwidth"), 0) : 0;
+        const char *aid = have_audio ? rs_json_obj_str(audio, "id", "") : "";
+        const char *acodecs = have_audio ? rs_json_obj_str(audio, "codecs", "") : "";
+        if (aid[0] && vid[0] && strcmp(aid, vid) == 0) { aid = ""; acodecs = ""; have_audio = false; }
+
+        if (!vid[0]) {
+            lg(st, "error", "renditions", cfg.mpd_url, 0, -1, "no video representation in the MPD");
+            rs_json_free(root);
+            free(pinned);
+            cfg_snap_dispose(&cfg);
+            if (!live_wait(st, 5.0)) break;
+            continue;
+        }
+
+        // Render the master playlist.
+        sbuf b;
+        sb_init(&b);
+        sb_add(&b, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+        if (have_audio && aid[0]) {
+            char *aenc = qenc(aid);
+            sb_addf(&b, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,"
+                        "AUTOSELECT=YES,URI=\"/play/%s/index.m3u8?rep=%s&mtype=audio\"\n",
+                    st->id, aenc ? aenc : "");
+            free(aenc);
+        }
+        sb_addf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%lld", vbw > 0 ? vbw : 3000000);
+        if (vcodecs[0] && acodecs[0]) sb_addf(&b, ",CODECS=\"%s,%s\"", vcodecs, acodecs);
+        else if (vcodecs[0]) sb_addf(&b, ",CODECS=\"%s\"", vcodecs);
+        if (have_audio && aid[0]) sb_add(&b, ",AUDIO=\"aud\"");
+        char *venc = qenc(vid);
+        sb_addf(&b, "\n/play/%s/index.m3u8?rep=%s&mtype=video\n", st->id, venc ? venc : "");
+        free(venc);
+
+        pthread_mutex_lock(&st->mu);
+        bool first = st->master == NULL;
+        free(st->master);
+        st->master = b.p;  // ownership moves to the stream
+        rep_ensure_locked(st, vid, "video");
+        if (have_audio && aid[0]) rep_ensure_locked(st, aid, "audio");
+        pthread_cond_broadcast(&st->cv);
+        pthread_mutex_unlock(&st->mu);
+
+        if (first)
+            lgf(st, "info", "renditions", cfg.mpd_url, 0, -1,
+                "%s MPD — video \"%s\"%s%s%s, master playlist ready",
+                dynamic ? "dynamic" : "static", vid,
+                (have_audio && aid[0]) ? ", audio \"" : "",
+                (have_audio && aid[0]) ? aid : "",
+                (have_audio && aid[0]) ? "\"" : "");
+
+        rs_json_free(root);
+        free(pinned);
+        cfg_snap_dispose(&cfg);
+        if (!live_wait(st, RS_LIVE_DIRECTOR_INTERVAL)) break;
+    }
+
+    lg(st, "info", "liveStop", NULL, 0, -1, "live DASH engine stopped");
+    pthread_mutex_lock(&st->mu);
+    st->dir_finished = true;
+    pthread_mutex_unlock(&st->mu);
+    return NULL;
+}
+
+// --- 6. public API ----------------------------------------------------------
+
+static void rep_dispose(live_rep *rep) {
+    for (size_t i = 0; i < rep->nsegs; i++) {
+        free(rep->segs[i].url);
+        free(rep->segs[i].data);
+    }
+    free(rep->segs);
+    free(rep->init_url);
+    free(rep->init_data);
+    free(rep->rep_id);
+    free(rep->kind);
+    free(rep->playlist);
+    seen_dispose(&rep->seen);
+    free(rep);
+}
+
+static void stream_dispose(live_stream *st) {
+    for (size_t i = 0; i < st->nreps; i++) rep_dispose(st->reps[i]);
+    free(st->id);
+    free(st->mpd_url); free(st->representation);
+    free(st->manifest_proxy); free(st->media_proxy);
+    free(st->manifest_headers); free(st->media_headers);
+    free(st->downloader); free(st->dl_params); free(st->keys);
+    free(st->master);
+    pthread_mutex_destroy(&st->mu);
+    pthread_cond_destroy(&st->cv);
+    free(st);
+}
+
+// Caller holds live->mu.
+//
+// An engine that has been asked to stop is deliberately invisible here: its
+// threads may take a moment to unwind, and until rs_live_reap joins them the
+// object is still in the table. Treating it as absent is what lets a stream be
+// stopped and started again straight away — the restart gets a fresh engine
+// beside the retiring one instead of being refused for the second or so the old
+// one takes to notice the flag.
+static live_stream *stream_find_locked(rs_live *live, const char *stream_id) {
+    for (size_t i = 0; i < live->nstreams; i++) {
+        live_stream *st = live->streams[i];
+        if (strcmp(st->id, stream_id) != 0) continue;
+        pthread_mutex_lock(&st->mu);
+        bool stopping = st->stop;
+        pthread_mutex_unlock(&st->mu);
+        if (!stopping) return st;
+    }
+    return NULL;
+}
+
+// Replaces every configured string on `st`. Caller holds st->mu.
+static void stream_apply_config_locked(live_stream *st, const rs_live_config *cfg) {
+#define SET(field, value) do { free(st->field); st->field = rs_strdup((value) ? (value) : ""); } while (0)
+    SET(mpd_url, cfg->mpd_url);
+    SET(representation, cfg->representation);
+    SET(manifest_proxy, cfg->manifest_proxy);
+    SET(media_proxy, cfg->media_proxy);
+    SET(manifest_headers, cfg->manifest_headers);
+    SET(media_headers, cfg->media_headers);
+    SET(downloader, cfg->downloader);
+    SET(dl_params, cfg->dl_params);
+    SET(keys, cfg->decryption_keys);
+#undef SET
+    st->playlist_segments = cfg->playlist_segments > 0 ? cfg->playlist_segments : 6;
+    if (st->playlist_segments < 3) st->playlist_segments = 3;
+    st->download_ahead = cfg->download_ahead > 0 ? cfg->download_ahead : 8;
+    st->playback_delay_seconds = cfg->playback_delay_seconds > 0 ? cfg->playback_delay_seconds : 0;
+    st->audio_delay_ms = cfg->audio_delay_ms;
+    st->poll_interval = cfg->poll_interval;
+
+    // The queue has to be able to hold the advertised window plus the whole
+    // hold-back, or the playlist would be rebuilt from segments that were
+    // already pruned.
+    //
+    // The upper clamp is the one place this deliberately departs from the Swift
+    // worker. That one kept `keepSegments` (60 by default) on disk, where the
+    // count costs nothing; here the segments are decrypted and held in RAM so
+    // they can be served without touching the network, and 60 of them per
+    // rendition would be well over a hundred megabytes per stream. Everything
+    // past the window plus a lag allowance only serves players that have fallen
+    // badly behind, which the hold-back already exists to prevent.
+    int hold = st->download_ahead - st->playlist_segments;
+    if (hold < 0) hold = 0;
+    int need = st->playlist_segments + hold + 8;
+    st->keep_segments = cfg->keep_segments > 0 ? cfg->keep_segments : 60;
+    if (st->keep_segments < need) st->keep_segments = need;
+    if (st->keep_segments > need + 12) st->keep_segments = need + 12;
+}
+
+rs_live *rs_live_create(rs_live_fetch_fn fetch, rs_live_dash_fn dash,
+                        rs_live_log_fn log, void *log_ctx) {
+    if (!fetch || !dash) return NULL;
+    rs_live *live = (rs_live *)calloc(1, sizeof(*live));
+    if (!live) return NULL;
+    live->fetch = fetch;
+    live->dash = dash;
+    live->log = log;
+    live->log_ctx = log_ctx;
+    pthread_mutex_init(&live->mu, NULL);
+    return live;
+}
+
+int rs_live_start(rs_live *live, const char *stream_id, const rs_live_config *cfg) {
+    if (!live || !stream_id || !stream_id[0] || !cfg) return -1;
+    if (!cfg->mpd_url || !cfg->mpd_url[0]) return -1;
+
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    if (st) {
+        // Already running: re-apply the config, which the workers pick up on
+        // their next poll. Restarting would throw away a warm segment queue.
+        pthread_mutex_lock(&st->mu);
+        stream_apply_config_locked(st, cfg);
+        pthread_mutex_unlock(&st->mu);
+        pthread_mutex_unlock(&live->mu);
+        return 0;
+    }
+    if (live->nstreams >= RS_LIVE_MAX_STREAMS) {
+        pthread_mutex_unlock(&live->mu);
+        return -1;
+    }
+
+    st = (live_stream *)calloc(1, sizeof(*st));
+    if (!st) { pthread_mutex_unlock(&live->mu); return -1; }
+    st->mgr = live;
+    st->id = rs_strdup(stream_id);
+    pthread_mutex_init(&st->mu, NULL);
+    pthread_cond_init(&st->cv, NULL);
+    stream_apply_config_locked(st, cfg);
+    live->streams[live->nstreams++] = st;
+    pthread_mutex_unlock(&live->mu);
+
+    if (pthread_create(&st->dir_thread, NULL, director_main, st) == 0) {
+        st->dir_started = true;
+        return 0;
+    }
+    st->dir_finished = true;
+    lg(st, "error", "liveStart", NULL, 0, -1, "could not start the live engine thread");
+    return -1;
+}
+
+void rs_live_stop(rs_live *live, const char *stream_id) {
+    if (!live || !stream_id) return;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    if (st) {
+        // Flag and wake, then return. Threads unwind on their own and are
+        // joined by rs_live_reap, so the Stop request never waits on a segment
+        // download that is already in flight.
+        pthread_mutex_lock(&st->mu);
+        st->stop = true;
+        pthread_cond_broadcast(&st->cv);
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+}
+
+bool rs_live_is_running(rs_live *live, const char *stream_id) {
+    if (!live || !stream_id) return false;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    bool running = false;
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        running = !st->stop;
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    return running;
+}
+
+void rs_live_reap(rs_live *live) {
+    if (!live) return;
+    pthread_mutex_lock(&live->mu);
+    for (size_t i = 0; i < live->nstreams;) {
+        live_stream *st = live->streams[i];
+        pthread_mutex_lock(&st->mu);
+        bool done = st->stop && (!st->dir_started || st->dir_finished);
+        for (size_t r = 0; done && r < st->nreps; r++)
+            if (st->reps[r]->thread_started && !st->reps[r]->finished) done = false;
+        pthread_mutex_unlock(&st->mu);
+        if (!done) { i++; continue; }
+
+        if (st->dir_started) pthread_join(st->dir_thread, NULL);
+        for (size_t r = 0; r < st->nreps; r++)
+            if (st->reps[r]->thread_started) pthread_join(st->reps[r]->thread, NULL);
+        live->streams[i] = live->streams[live->nstreams - 1];
+        live->nstreams--;
+        pthread_mutex_unlock(&live->mu);
+        stream_dispose(st);
+        pthread_mutex_lock(&live->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+}
+
+void rs_live_destroy(rs_live *live) {
+    if (!live) return;
+    pthread_mutex_lock(&live->mu);
+    for (size_t i = 0; i < live->nstreams; i++) {
+        live_stream *st = live->streams[i];
+        pthread_mutex_lock(&st->mu);
+        st->stop = true;
+        pthread_cond_broadcast(&st->cv);
+        pthread_mutex_unlock(&st->mu);
+    }
+    size_t n = live->nstreams;
+    live_stream *all[RS_LIVE_MAX_STREAMS];
+    for (size_t i = 0; i < n; i++) all[i] = live->streams[i];
+    live->nstreams = 0;
+    pthread_mutex_unlock(&live->mu);
+
+    for (size_t i = 0; i < n; i++) {
+        live_stream *st = all[i];
+        if (st->dir_started) pthread_join(st->dir_thread, NULL);
+        for (size_t r = 0; r < st->nreps; r++)
+            if (st->reps[r]->thread_started) pthread_join(st->reps[r]->thread, NULL);
+        stream_dispose(st);
+    }
+    pthread_mutex_destroy(&live->mu);
+    free(live);
+}
+
+// Caller holds st->mu. The master is only usable once every rendition it points
+// at can actually answer: a player that fetches a variant playlist and gets a
+// 404 abandons the stream instead of retrying.
+static bool stream_ready_locked(const live_stream *st) {
+    if (!st->master || st->nreps == 0) return false;
+    for (size_t i = 0; i < st->nreps; i++)
+        if (!st->reps[i]->ready) return false;
+    return true;
+}
+
+bool rs_live_is_ready(rs_live *live, const char *stream_id) {
+    if (!live || !stream_id) return false;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    bool ready = false;
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        ready = stream_ready_locked(st);
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    return ready;
+}
+
+bool rs_live_wait_ready(rs_live *live, const char *stream_id, int timeout_ms) {
+    if (!live || !stream_id) return false;
+    // The stream table lock is released before waiting: holding it would block
+    // every other stream's start/stop for the duration. Keeping the borrowed
+    // pointer is safe because engines are only ever freed by rs_live_reap /
+    // rs_live_destroy, which — like this function — run on the server's event
+    // loop thread.
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    pthread_mutex_unlock(&live->mu);
+    if (!st) return false;
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+
+    pthread_mutex_lock(&st->mu);
+    bool ready = stream_ready_locked(st);
+    while (!ready && !st->stop) {
+        if (pthread_cond_timedwait(&st->cv, &st->mu, &deadline) == ETIMEDOUT) break;
+        ready = stream_ready_locked(st);
+    }
+    ready = stream_ready_locked(st);
+    pthread_mutex_unlock(&st->mu);
+    return ready;
+}
+
+char *rs_live_master_playlist(rs_live *live, const char *stream_id) {
+    if (!live || !stream_id) return NULL;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    char *copy = NULL;
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        if (stream_ready_locked(st)) copy = rs_strdup(st->master);
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    return copy;
+}
+
+char *rs_live_media_playlist(rs_live *live, const char *stream_id, const char *rep) {
+    if (!live || !stream_id || !rep) return NULL;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    char *copy = NULL;
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        live_rep *r = rep_find_locked(st, rep);
+        if (r && r->playlist) copy = rs_strdup(r->playlist);
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    return copy;
+}
+
+uint8_t *rs_live_take_segment(rs_live *live, const char *stream_id, const char *url,
+                              size_t *out_len) {
+    if (!live || !stream_id || !url || !out_len) return NULL;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    uint8_t *copy = NULL;
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        for (size_t i = 0; i < st->nreps && !copy; i++) {
+            live_rep *r = st->reps[i];
+            if (r->init_url && r->init_data && strcmp(r->init_url, url) == 0) {
+                copy = (uint8_t *)malloc(r->init_len ? r->init_len : 1);
+                if (copy) { memcpy(copy, r->init_data, r->init_len); *out_len = r->init_len; }
+                break;
+            }
+            for (size_t j = 0; j < r->nsegs; j++) {
+                if (strcmp(r->segs[j].url, url) != 0) continue;
+                size_t len = r->segs[j].len;
+                copy = (uint8_t *)malloc(len ? len : 1);
+                if (copy) { memcpy(copy, r->segs[j].data, len); *out_len = len; }
+                break;
+            }
+        }
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    return copy;
+}
+
+char *rs_live_status_line(rs_live *live, const char *stream_id) {
+    if (!live || !stream_id) return NULL;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    char *out = NULL;
+    if (st) {
+        sbuf b;
+        sb_init(&b);
+        pthread_mutex_lock(&st->mu);
+        sb_addf(&b, "master %s", st->master ? "ready" : "pending");
+        for (size_t i = 0; i < st->nreps; i++) {
+            live_rep *r = st->reps[i];
+            sb_addf(&b, "; %s (%s) %lu held, seq %lld-%lld, %lld disc dropped, %.1f MB, %lld polls",
+                    r->rep_id, r->kind, (unsigned long)r->nsegs,
+                    r->nsegs ? r->segs[0].seq : 0,
+                    r->nsegs ? r->segs[r->nsegs - 1].seq : 0, r->dropped_disc,
+                    (double)r->bytes / (1024.0 * 1024.0), r->polls);
+        }
+        pthread_mutex_unlock(&st->mu);
+        out = b.p;
+    }
+    pthread_mutex_unlock(&live->mu);
+    return out;
+}
+
+#else  // _WIN32 — no pthreads here yet; DASH playback falls back to the
+       // request-time path in server.c.
+
+rs_live *rs_live_create(rs_live_fetch_fn fetch, rs_live_dash_fn dash,
+                        rs_live_log_fn log, void *log_ctx) {
+    (void)fetch; (void)dash; (void)log; (void)log_ctx;
+    return NULL;
+}
+void rs_live_destroy(rs_live *live) { (void)live; }
+int rs_live_start(rs_live *live, const char *stream_id, const rs_live_config *cfg) {
+    (void)live; (void)stream_id; (void)cfg; return -1;
+}
+void rs_live_stop(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; }
+bool rs_live_is_running(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return false; }
+void rs_live_reap(rs_live *live) { (void)live; }
+bool rs_live_is_ready(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return false; }
+bool rs_live_wait_ready(rs_live *live, const char *stream_id, int timeout_ms) {
+    (void)live; (void)stream_id; (void)timeout_ms; return false;
+}
+char *rs_live_master_playlist(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return NULL; }
+char *rs_live_media_playlist(rs_live *live, const char *stream_id, const char *rep) {
+    (void)live; (void)stream_id; (void)rep; return NULL;
+}
+uint8_t *rs_live_take_segment(rs_live *live, const char *stream_id, const char *url, size_t *out_len) {
+    (void)live; (void)stream_id; (void)url; (void)out_len; return NULL;
+}
+char *rs_live_status_line(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return NULL; }
+
+#endif  // _WIN32

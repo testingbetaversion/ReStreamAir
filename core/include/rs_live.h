@@ -1,0 +1,142 @@
+#ifndef RS_LIVE_H
+#define RS_LIVE_H
+
+// The live DASH -> HLS engine: the C port of LiveMPDToM3U8.swift.
+//
+// The first C implementation translated the MPD inside the request handler —
+// every playlist reload re-fetched the manifest, re-expanded the window, and
+// re-derived EXT-X-MEDIA-SEQUENCE from the segment's $Time$. That is not what
+// the Swift worker does, and it breaks playback in three separate ways:
+//
+//   * MEDIA-SEQUENCE jumped. RFC 8216 4.3.3.2 requires consecutive segments to
+//     differ by exactly 1; deriving it from $Time$/duration does not hold for a
+//     SegmentTimeline with varying @d, so spec-literal clients (ffmpeg's hls
+//     demuxer, hls.js) read each reload as "thousands of segments moved" and
+//     reload/reseek forever instead of settling.
+//   * No discontinuity detection. A source that splices (SCTE-35 ad breaks)
+//     jumps the media timeline while the manifest keeps advertising a uniform
+//     duration. Without EXT-X-DISCONTINUITY the browser ends up with a hole in
+//     the MSE buffer it can never fill and sits at the gap forever.
+//   * No state across reloads. Nothing remembered which segments had already
+//     been served, so a shifted manifest window silently dropped or repeated
+//     segments — and every reload paid the origin's full latency on the
+//     server's single-threaded event loop, which is what made the panel's
+//     Start/Stop buttons feel frozen.
+//
+// This module restores the Swift design. One engine per stream owns:
+//
+//   * a director thread that polls the MPD for the rendition list and renders
+//     the HLS master playlist, and
+//   * one worker thread per representation that polls the MPD, downloads and
+//     CENC-decrypts new segments in the background, keeps them in a bounded
+//     in-memory queue, and renders that representation's media playlist.
+//
+// Request handlers never touch the network: a playlist reload is a string
+// render under a mutex, and a segment request is a memcpy out of the queue.
+//
+// Threading: every public function is safe to call from the server's event
+// loop thread. Workers only take the per-stream lock to publish results, never
+// while a fetch is in flight.
+
+#include "rs_common.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct rs_live rs_live;
+
+// Same signature as restream_fetch_fn / restream_dash_fn (see restream.h). The
+// engine holds the pointers rather than the implementations so the core never
+// links libcurl or libxml2.
+typedef int (*rs_live_fetch_fn)(const char *url, const char *proxy, const char *headers,
+                                const char *range, const char *downloader, const char *dl_params,
+                                char **out, size_t *out_len, long *status,
+                                char **content_type, char **content_range,
+                                char **effective_url, char *errbuf, size_t errbuf_len);
+
+typedef char *(*rs_live_dash_fn)(const char *url, const char *proxy, const char *headers,
+                                 const char *downloader, const char *dl_params,
+                                 const char *rep, int want, char *errbuf, size_t errbuf_len);
+
+// Log sink. Called from worker threads, so the implementation must be
+// thread-safe. `url`/`message` may be NULL; status 0 and bytes -1 mean absent.
+typedef void (*rs_live_log_fn)(void *ctx, const char *stream_id, const char *level,
+                               const char *event, const char *url, long status,
+                               long long bytes, const char *message);
+
+// A snapshot of one stream's playback settings. Strings are copied; NULL is
+// treated as "". Mirrors the argv PanelServer.swift builds for the Swift worker.
+typedef struct {
+    const char *mpd_url;
+    const char *representation;     // "" = auto-select video + audio renditions
+    const char *manifest_proxy;
+    const char *media_proxy;
+    const char *manifest_headers;   // newline-separated "Name: value"
+    const char *media_headers;
+    const char *downloader;         // "curl" | "wget" | "aria2c" | "" (libcurl)
+    const char *dl_params;
+    const char *decryption_keys;    // "kid:key\nkid:key" ClearKey pairs
+    int playlist_segments;          // advertised window (default 6)
+    int keep_segments;              // segments held in memory (default 60)
+    int download_ahead;             // segments requested per poll (default 8)
+    int playback_delay_seconds;     // extra live-edge hold-back, in seconds
+    int audio_delay_ms;             // lip-sync shift, applied to audio only
+    double poll_interval;           // 0 = follow the MPD's minimumUpdatePeriod
+} rs_live_config;
+
+rs_live *rs_live_create(rs_live_fetch_fn fetch, rs_live_dash_fn dash,
+                        rs_live_log_fn log, void *log_ctx);
+void rs_live_destroy(rs_live *live);
+
+// Starts the engine for `stream_id`, or re-applies `cfg` to an already-running
+// one (an edit in the panel takes effect on the next poll). Returns 0 on
+// success, negative if the engine could not be started.
+int rs_live_start(rs_live *live, const char *stream_id, const rs_live_config *cfg);
+
+// Signals the engine to wind down. Returns immediately — threads notice the
+// flag at their next checkpoint and are joined later by rs_live_reap, so a
+// Stop click is never blocked behind an in-flight segment download.
+void rs_live_stop(rs_live *live, const char *stream_id);
+
+// True while an engine for `stream_id` exists and has not been asked to stop.
+bool rs_live_is_running(rs_live *live, const char *stream_id);
+
+// Joins and frees engines whose threads have exited. Cheap; call it from the
+// server's one-second timer.
+void rs_live_reap(rs_live *live);
+
+// True once the master playlist exists AND every representation it references
+// has a media playlist. Both are required: handing a player a master whose
+// variant playlists 404 makes it give up on the whole stream rather than retry.
+bool rs_live_is_ready(rs_live *live, const char *stream_id);
+
+// Blocks up to `timeout_ms` for rs_live_is_ready. Returns what it ended up
+// being. Meant only for the first master-playlist request after a stream is
+// started — every later request is already warm, so nothing on the hot path
+// ever waits here.
+bool rs_live_wait_ready(rs_live *live, const char *stream_id, int timeout_ms);
+
+// The rendered HLS master playlist, or NULL until the engine is ready (see
+// rs_live_is_ready). Caller frees with rs_free.
+char *rs_live_master_playlist(rs_live *live, const char *stream_id);
+
+// The rendered media playlist for one representation, or NULL when that
+// representation has no advertisable window yet. Caller frees with rs_free.
+char *rs_live_media_playlist(rs_live *live, const char *stream_id, const char *rep);
+
+// Hands out a copy of an already-downloaded, already-decrypted segment (or the
+// patched init segment) by its upstream URL, or NULL on a miss. Caller frees
+// with rs_free. `*out_len` receives the length.
+uint8_t *rs_live_take_segment(rs_live *live, const char *stream_id, const char *url,
+                              size_t *out_len);
+
+// A one-line health summary for the logs/diagnostics ("video 12 segs, seq 431,
+// 3 disc; audio 12 segs …"). Caller frees with rs_free, or NULL if unknown.
+char *rs_live_status_line(rs_live *live, const char *stream_id);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // RS_LIVE_H
