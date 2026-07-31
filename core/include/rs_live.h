@@ -111,11 +111,10 @@ void rs_live_reap(rs_live *live);
 // variant playlists 404 makes it give up on the whole stream rather than retry.
 bool rs_live_is_ready(rs_live *live, const char *stream_id);
 
-// Blocks up to `timeout_ms` for rs_live_is_ready. Returns what it ended up
-// being. Meant only for the first master-playlist request after a stream is
-// started — every later request is already warm, so nothing on the hot path
-// ever waits here.
-bool rs_live_wait_ready(rs_live *live, const char *stream_id, int timeout_ms);
+// There is deliberately no "wait until ready" call. The server is a
+// single-threaded event loop, so blocking a request handler stops every other
+// stream too — a stream whose origin never answers would freeze the whole
+// server on every request for it. Callers answer 503 and let the player retry.
 
 // The rendered HLS master playlist, or NULL until the engine is ready (see
 // rs_live_is_ready). Caller frees with rs_free.

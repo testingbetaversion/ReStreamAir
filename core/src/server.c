@@ -1349,12 +1349,35 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     // this segment was ever advertised, so answering costs a memcpy and the
     // request never touches the network. The URL deliberately carries no
     // upstream address — see the playlist renderer in live.c.
+    // Parsed by hand rather than with sscanf: sscanf returns the number of
+    // *assignments* it made, not whether the whole format matched, so
+    // sscanf("0_4.m4s", "%d_init", &i) returns 1 — %d assigned, then the
+    // literal "init" failed — and every segment was mistaken for the init
+    // segment. Players got a valid fMP4 header with no samples on every
+    // request and reported "Found no media in fragment".
     int rep_index = -1;
     long long want_seq = -1;
     bool live_init = false, live_seg = false;
     if (fname && fname[0] >= '0' && fname[0] <= '9') {
-        if (sscanf(fname, "%d_init", &rep_index) == 1) live_init = true;
-        else if (sscanf(fname, "%d_%lld", &rep_index, &want_seq) == 2) live_seg = true;
+        char *after_idx = NULL;
+        long idx = strtol(fname, &after_idx, 10);
+        // rs_live_take_indexed bounds the index against the stream's actual
+        // representation count; this only rejects obvious nonsense.
+        if (after_idx != fname && *after_idx == '_' && idx >= 0 && idx < 64) {
+            const char *rest = after_idx + 1;
+            if (strncmp(rest, "init", 4) == 0) {
+                rep_index = (int)idx;
+                live_init = true;
+            } else {
+                char *after_seq = NULL;
+                long long seq = strtoll(rest, &after_seq, 10);
+                if (after_seq != rest) {
+                    rep_index = (int)idx;
+                    want_seq = seq;
+                    live_seg = true;
+                }
+            }
+        }
     }
     if (live_init || live_seg) {
         size_t clen = 0;
@@ -1616,13 +1639,21 @@ static void serve_dash_master(restream_server_t *server, struct mg_connection *c
 
     char *master = rs_live_master_playlist(server->live, stream_id);
     if (!master) {
-        // Cold start only. This is the one place in the playback path that ever
-        // waits, it is bounded, and it happens once per stream — not once per
-        // playlist reload, which is what the old design did.
+        // Answer immediately; never wait for the engine here.
+        //
+        // This used to block the event loop for up to six seconds on a cold
+        // start. mongoose is single-threaded, so that is not a wait on *this*
+        // stream — it is the entire server stopped, every other stream's
+        // playlist reloads and segment reads included. A stream whose origin
+        // never answers (geo-blocked, dead URL) is never ready, so every
+        // request for it stalled everything for the full timeout, and healthy
+        // streams showed up in players as playlist and segment timeouts.
+        //
+        // 503 + Retry-After is what a warming stream should say anyway: every
+        // player retries a manifest, so a cold start costs one retry instead
+        // of a server-wide freeze.
         log_record(server, stream_id, "info", "masterCold", NULL, 0, -1,
-                   "engine still warming up — waiting for the first poll");
-        if (rs_live_wait_ready(server->live, stream_id, 6000))
-            master = rs_live_master_playlist(server->live, stream_id);
+                   "engine still warming up — 503 so the player retries");
     }
     if (!master) {
         char *status = rs_live_status_line(server->live, stream_id);

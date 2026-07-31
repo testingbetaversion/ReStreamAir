@@ -1336,35 +1336,6 @@ bool rs_live_is_ready(rs_live *live, const char *stream_id) {
     return ready;
 }
 
-bool rs_live_wait_ready(rs_live *live, const char *stream_id, int timeout_ms) {
-    if (!live || !stream_id) return false;
-    // The stream table lock is released before waiting: holding it would block
-    // every other stream's start/stop for the duration. Keeping the borrowed
-    // pointer is safe because engines are only ever freed by rs_live_reap /
-    // rs_live_destroy, which — like this function — run on the server's event
-    // loop thread.
-    pthread_mutex_lock(&live->mu);
-    live_stream *st = stream_find_locked(live, stream_id);
-    pthread_mutex_unlock(&live->mu);
-    if (!st) return false;
-
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += timeout_ms / 1000;
-    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
-    if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
-
-    pthread_mutex_lock(&st->mu);
-    bool ready = stream_ready_locked(st);
-    while (!ready && !st->stop) {
-        if (pthread_cond_timedwait(&st->cv, &st->mu, &deadline) == ETIMEDOUT) break;
-        ready = stream_ready_locked(st);
-    }
-    ready = stream_ready_locked(st);
-    pthread_mutex_unlock(&st->mu);
-    return ready;
-}
-
 char *rs_live_master_playlist(rs_live *live, const char *stream_id) {
     if (!live || !stream_id) return NULL;
     pthread_mutex_lock(&live->mu);
@@ -1468,9 +1439,6 @@ void rs_live_stop(rs_live *live, const char *stream_id) { (void)live; (void)stre
 bool rs_live_is_running(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return false; }
 void rs_live_reap(rs_live *live) { (void)live; }
 bool rs_live_is_ready(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return false; }
-bool rs_live_wait_ready(rs_live *live, const char *stream_id, int timeout_ms) {
-    (void)live; (void)stream_id; (void)timeout_ms; return false;
-}
 char *rs_live_master_playlist(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return NULL; }
 char *rs_live_media_playlist(rs_live *live, const char *stream_id, const char *rep) {
     (void)live; (void)stream_id; (void)rep; return NULL;
