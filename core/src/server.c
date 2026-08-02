@@ -56,7 +56,7 @@ typedef struct {
 // to a worker thread so it never blocks the mongoose poll loop. Full definition
 // and the machinery around it sit just above serve_hls_playlist, the only
 // callers. Forward-declared here so restream_server can hold the pending list.
-typedef struct rs_pending_fetch rs_pending_fetch;
+typedef struct rs_pending_job rs_pending_job;
 
 struct restream_server {
     struct mg_mgr mgr;
@@ -68,9 +68,10 @@ struct restream_server {
     rs_auth *auth;          // admin accounts + sessions
     rs_sysstats *sysstats;  // live host stats for the monitoring view
     rs_metrics *metrics;    // per-stream client/bytes network monitor
-    rs_pending_fetch *pending_head; // in-flight async HLS-passthrough fetches
+    rs_pending_job *pending_head; // in-flight async jobs (playback fetches, probe, logo lookup, script actions)
     pthread_mutex_t pending_mu;     // guards pending_head and each entry's `cancelled` flag
-    pthread_cond_t pending_cv;      // signalled whenever a fetch unlinks itself; wakes restream_server_destroy's drain
+    pthread_cond_t pending_cv;      // signalled whenever a job unlinks itself; wakes restream_server_destroy's drain
+    pthread_mutex_t logo_mu;        // serialises RS_PENDING_LOGO workers' access to logo_cache (not itself thread-safe)
     rs_live *live;          // background DASH->HLS engines, one per running stream
     rs_logo_cache *logo_cache;
     rs_log_entry log_ring[RS_LOG_CAP];
@@ -108,14 +109,25 @@ static char *query_var(struct mg_http_message *hm, const char *name);
 // Forward declarations: the async HLS-passthrough fetch machinery is defined
 // just above serve_hls_playlist (its only dispatcher), but ev_handler,
 // restream_server_create and restream_server_destroy all need to reach it.
-static void pending_fetch_cancel(restream_server_t *s, unsigned long conn_id);
-static void pending_fetch_finish(restream_server_t *s, struct mg_connection *c, struct mg_str *data);
-static void pending_fetch_wait_idle(restream_server_t *s);
+static void pending_job_cancel(restream_server_t *s, unsigned long conn_id);
+static void pending_job_finish(restream_server_t *s, struct mg_connection *c, struct mg_str *data);
+static void pending_job_wait_idle(restream_server_t *s);
 
 // Forward declaration: apply_cenc is defined between serve_hls_playlist and
-// serve_restream_item, but pending_finish_item (defined just above
+// serve_restream_item, but pending_job_finish_item (defined just above
 // serve_hls_playlist) needs it too.
 static uint8_t *apply_cenc(const char *decryption_keys, bool is_map, uint8_t *body, size_t body_len, size_t *out_len);
+
+// Forward declarations: dispatch_logo_lookup/dispatch_probe/dispatch_script_action
+// are defined alongside pending_job_dispatch (just above serve_hls_playlist),
+// but handle_api — defined well before that — is their only caller. Each always
+// replies to `c` itself, either immediately with an error or (once dispatched)
+// asynchronously once the worker finishes.
+static void dispatch_logo_lookup(restream_server_t *server, struct mg_connection *c, const char *name);
+static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
+                           char *url, char *proxy, char *headers);
+static void dispatch_script_action(restream_server_t *server, struct mg_connection *c,
+                                   const char *sid, const char *script_path, char **args, int argc);
 
 static char *logo_fetch_wrapper(const char *url, void *ctx) {
     (void)ctx;
@@ -702,14 +714,17 @@ static rs_json *find_provider_by_id(rs_state *st, const char *id) {
     return NULL;
 }
 
-// Runs a provider's script for one action (login/pair/channels/keys/custom…),
-// passing the provider config + active account, and records stdout/stderr to the
-// log under "script:<providerId>" so the panel's script output + Logs tab show
-// it. This is the C port of PanelServer's script-action runner (ScriptRunner).
-static int run_provider_script(restream_server_t *s, const rs_json *provider,
-                               const char *action, const char **err) {
+// Runs a provider's script for one action (login/pair/channels/keys/custom…)
+// on a worker thread, passing the provider config + active account. Always
+// replies to `c` itself — either immediately with an error, or (once
+// dispatched) asynchronously once the run finishes: see the "async jobs"
+// section above and pending_job_finish_script, which records stdout/stderr
+// under "script:<providerId>" so the panel's script output + Logs tab show it.
+// This is the C port of PanelServer's script-action runner (ScriptRunner).
+static void run_provider_script(restream_server_t *s, struct mg_connection *c,
+                                const rs_json *provider, const char *action) {
     const char *script = rs_json_obj_str(provider, "scriptPath", "");
-    if (!script[0]) { *err = "No script path set on this provider."; return -400; }
+    if (!script[0]) { reply_error(c, 400, "No script path set on this provider."); return; }
     const char *pid = rs_json_obj_str(provider, "id", "");
     char sid[192];
     snprintf(sid, sizeof(sid), "script:%s", pid);
@@ -720,7 +735,12 @@ static int run_provider_script(restream_server_t *s, const rs_json *provider,
     mkdir("runtime", 0755); mkdir("runtime/sessions", 0755); mkdir(sessiondir, 0755);
 #endif
 
-    char *args[24]; int n = 0;
+    // Heap-allocated (rather than the stack array this used to be) because
+    // dispatch_script_action hands it to a worker thread that outlives this
+    // call — the stack array would be gone by the time the worker ran.
+    char **args = (char **)malloc(24 * sizeof(char *));
+    if (!args) { reply_error(c, 500, "Out of memory."); return; }
+    int n = 0;
     args[n++] = rs_script_arg("action", action, false);
     args[n++] = rs_script_arg("sessiondir", sessiondir, false);
     const char *bind = rs_json_obj_str(provider, "scriptBind", "");
@@ -742,27 +762,7 @@ static int run_provider_script(restream_server_t *s, const rs_json *provider,
     }
 
     log_record(s, sid, "info", "scriptStart", NULL, 0, -1, action);
-    char *out = NULL, *errout = NULL;
-    int rc = rs_script_run_sync(script, (const char **)args, n, 30.0, &out, &errout);
-    for (int i = 0; i < n; i++) free(args[i]);
-
-    if (out && out[0]) {
-        char *copy = rs_strdup(out);
-        for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n"))
-            if (line[0]) log_record(s, sid, "info", "scriptOutput", NULL, 0, -1, line);
-        free(copy);
-    }
-    if (errout && errout[0]) {
-        char *copy = rs_strdup(errout);
-        for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n"))
-            if (line[0]) log_record(s, sid, "error", "scriptError", NULL, 0, -1, line);
-        free(copy);
-    }
-    log_record(s, sid, rc == 0 ? "info" : "error", "scriptEnd", NULL, rc, -1,
-               rc == 0 ? "ok" : "script exited non-zero");
-    free(out); free(errout);
-    if (rc != 0) { *err = "The script exited with an error — see the script log."; return -502; }
-    return 0;
+    dispatch_script_action(s, c, sid, script, args, n);  // always replies
 }
 
 static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_http_message *hm) {
@@ -814,17 +814,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         char *proxy = body_str(body, "proxy");
         char *headers = body_str(body, "headers");
         rs_json_free(body);
-        char errbuf[256] = {0};
-        char *result = g_probe_handler(url, proxy, headers, errbuf, sizeof(errbuf));
-        free(url); free(proxy); free(headers);
-        if (!result) {
-            reply_error(c, 400, errbuf[0] ? errbuf : "Could not probe the source.");
-            return true;
-        }
-        char headers_out[128];
-        snprintf(headers_out, sizeof(headers_out), "%sCache-Control: no-store\r\n", JSON_HEADERS);
-        mg_http_reply(c, 200, headers_out, "%s", result);
-        rs_free(result);
+        dispatch_probe(s, c, url, proxy, headers);  // takes ownership, always replies
         return true;
     }
 
@@ -849,14 +839,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
                 return true;
             }
 
-            const char *err = NULL;
-            int rc = run_provider_script(s, provider, action, &err);
-            // Persist any state the script may have changed, then return the log
-            // tail so the output shows immediately.
-            rs_state_save(&s->state);
-            if (rc != 0 && rc != -502) { reply_error(c, -rc, err ? err : "Script run failed."); return true; }
-            char sid[192]; snprintf(sid, sizeof(sid), "script:%s", pid);
-            reply_json(c, 200, log_view(s, sid, 150), NULL);
+            run_provider_script(s, c, provider, action);  // always replies, sync or async
             return true;
         }
     }
@@ -1054,17 +1037,8 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
             reply_error(c, 400, "Missing ?name= parameter.");
             return true;
         }
-        if (!s->logo_cache) s->logo_cache = rs_logo_cache_create("logos.json");
-        char *logo_url = rs_logo_lookup(s->logo_cache, name, logo_fetch_wrapper, NULL);
+        dispatch_logo_lookup(s, c, name);  // always replies, sync or async
         free(name);
-        if (logo_url) {
-            rs_json *o = rs_json_new_obj();
-            rs_json_obj_set_str(o, "url", logo_url);
-            reply_json(c, 200, o, NULL);
-            free(logo_url);
-        } else {
-            reply_error(c, 404, "Logo not found.");
-        }
         return true;
     }
     if (mg_match(hm->uri, mg_str("/api/ffmpeg-status"), NULL) && method_is(hm, "GET")) {
@@ -1292,82 +1266,124 @@ static void send_redirect(struct mg_connection *c, const char *location) {
                  "Content-Length: 0\r\n\r\n", location);
 }
 
-// --- async HLS-passthrough fetch --------------------------------------------
+// --- async jobs --------------------------------------------------------------
 //
-// serve_hls_playlist and serve_restream_item's HLS-passthrough branch used to
-// call g_fetch_handler (libcurl) inline, in this thread — the single mongoose
-// poll loop that every other connection, every other stream and the panel API
-// all depend on. A slow or stalled origin therefore froze the entire server
-// for as long as the fetch took. serve_dash_master's comment further below
-// documents and fixes the identical failure for DASH by never fetching inline
-// there; this is the same fix for the one playback path that still did.
+// Five routes used to call blocking work — libcurl fetches, a libxml2 probe, or
+// a spawned script with up to a 30s timeout — inline, in this thread: the
+// single mongoose poll loop that every connection, every stream and the panel
+// API all depend on. Any one of them stalling froze the entire server for as
+// long as it took: HLS-passthrough playlist/segment fetches, `/api/probe`
+// (source auto-detect), `/api/logo-lookup`, and provider script actions.
+// serve_dash_master's comment further below documents and fixes the identical
+// failure for DASH by never fetching inline there; this generalises the same
+// fix to the rest.
 //
-// The fetch — and, once it returns, any CPU-only post-processing (playlist
-// rewriting, ClearKey CENC, HLS AES-128 decrypt) — runs on a detached worker
-// thread. struct mg_connection is not thread-safe, so the worker never touches
-// `c`; mg_wakeup() is mongoose's documented thread-safe way back into the poll
-// loop, which is the only thing allowed to build and send the reply.
-typedef enum { RS_PENDING_PLAYLIST, RS_PENDING_ITEM } rs_pending_kind;
+// The blocking call — and, once it returns, any CPU-only post-processing
+// (playlist rewriting, ClearKey CENC, HLS AES-128 decrypt, script log lines) —
+// runs on a detached worker thread. struct mg_connection is not thread-safe,
+// so the worker never touches `c`; mg_wakeup() is mongoose's documented
+// thread-safe way back into the poll loop, which is the only thing allowed to
+// build and send the reply.
+typedef enum {
+    RS_PENDING_PLAYLIST,
+    RS_PENDING_ITEM,
+    RS_PENDING_LOGO,
+    RS_PENDING_PROBE,
+    RS_PENDING_SCRIPT,
+} rs_pending_kind;
 
-struct rs_pending_fetch {
-    struct rs_pending_fetch *next;  // server->pending_head intrusive list
+struct rs_pending_job {
+    struct rs_pending_job *next;  // server->pending_head intrusive list
     restream_server_t *server;
     unsigned long conn_id;
     rs_pending_kind kind;
-    bool cancelled;  // connection closed while the fetch was in flight; guarded by server->pending_mu
+    bool cancelled;  // connection closed while the job was in flight; guarded by server->pending_mu
 
-    // Request, copied up front: hm/stream are only valid for this one mongoose
-    // event, and the stream JSON they point into can be edited or the stream
-    // deleted by another request while this fetch is in flight.
-    char *stream_id;
-    char *url;                     // manifest URL (playlist) or item URL (item)
-    char *proxy;
-    char *headers;
-    char *range;                   // item only
-    char *downloader;
-    char *downloader_params;
-    bool decrypt, is_map, is_key;  // item only
-    char *decryption_keys;         // item only, "KID:KEY[,KID:KEY...]"
-    char *hls_key, *hls_iv;        // item only
-    int seq;                       // item only, for HLS AES-128 IV derivation
-    char *user_agent;              // item only, for the metrics/log line
-    char *playback_key_str;        // item only, ditto
+    // Request, copied up front: hm/stream (and the POST body) are only valid
+    // for this one mongoose event, and a stream/provider JSON node can be
+    // edited or deleted by another request while this job is in flight.
+    char *stream_id;               // PLAYLIST/ITEM: stream id. SCRIPT: "script:<providerId>", also the log key.
+    char *url;                     // PLAYLIST/ITEM: fetch URL. PROBE: source URL. LOGO: channel name to look up.
+    char *proxy;                   // PLAYLIST/ITEM/PROBE
+    char *headers;                 // PLAYLIST/ITEM/PROBE
+    char *range;                   // ITEM only
+    char *downloader;               // PLAYLIST/ITEM only
+    char *downloader_params;       // PLAYLIST/ITEM only
+    bool decrypt, is_map, is_key;  // ITEM only
+    char *decryption_keys;         // ITEM only, "KID:KEY[,KID:KEY...]"
+    char *hls_key, *hls_iv;        // ITEM only
+    int seq;                       // ITEM only, for HLS AES-128 IV derivation
+    char *user_agent;              // ITEM only, for the metrics/log line
+    char *playback_key_str;        // ITEM only, ditto
+    char *script_path;             // SCRIPT only
+    char **script_args;            // SCRIPT only, each rs_script_arg-owned
+    int script_argc;               // SCRIPT only
 
-    // Result, filled by pending_fetch_worker.
+    // Result, filled by pending_job_worker.
     int rc;
     long status;
-    char *body;
+    char *body;              // ITEM/PLAYLIST: fetched bytes. PROBE: result JSON. LOGO: looked-up URL, or NULL.
     size_t body_len;
     char *content_type;
     char *content_range;
+    char *script_stdout, *script_stderr;  // SCRIPT only
     char err[256];
 };
 
-static void pending_fetch_free(rs_pending_fetch *pf) {
+static void pending_job_free(rs_pending_job *pf) {
     if (!pf) return;
     free(pf->stream_id); free(pf->url); free(pf->proxy); free(pf->headers);
     free(pf->range); free(pf->downloader); free(pf->downloader_params);
     free(pf->decryption_keys); free(pf->hls_key); free(pf->hls_iv);
     free(pf->user_agent); free(pf->playback_key_str);
+    free(pf->script_path);
+    for (int i = 0; i < pf->script_argc; i++) free(pf->script_args[i]);
+    free(pf->script_args);
     free(pf->body); free(pf->content_type); free(pf->content_range);
+    free(pf->script_stdout); free(pf->script_stderr);
     free(pf);
 }
 
-static void *pending_fetch_worker(void *arg) {
-    rs_pending_fetch *pf = (rs_pending_fetch *)arg;
+static void *pending_job_worker(void *arg) {
+    rs_pending_job *pf = (rs_pending_job *)arg;
     restream_server_t *server = pf->server;
 
-    pf->rc = g_fetch_handler(pf->url, pf->proxy, pf->headers, pf->range,
-                             pf->downloader, pf->downloader_params,
-                             &pf->body, &pf->body_len, &pf->status,
-                             &pf->content_type, &pf->content_range, NULL,
-                             pf->err, sizeof(pf->err));
+    switch (pf->kind) {
+    case RS_PENDING_PLAYLIST:
+    case RS_PENDING_ITEM:
+        pf->rc = g_fetch_handler(pf->url, pf->proxy, pf->headers, pf->range,
+                                 pf->downloader, pf->downloader_params,
+                                 &pf->body, &pf->body_len, &pf->status,
+                                 &pf->content_type, &pf->content_range, NULL,
+                                 pf->err, sizeof(pf->err));
+        break;
+    case RS_PENDING_LOGO:
+        // The cache itself isn't thread-safe (a plain cJSON tree, no locking —
+        // see logo.c), and lazily creates server->logo_cache on first use, so
+        // the whole lookup — cache hit or fetch-then-cache-write miss — runs
+        // under logo_mu. That only serialises concurrent logo lookups against
+        // each other; the poll thread is still free the whole time.
+        pthread_mutex_lock(&server->logo_mu);
+        if (!server->logo_cache) server->logo_cache = rs_logo_cache_create("logos.json");
+        pf->body = rs_logo_lookup(server->logo_cache, pf->url, logo_fetch_wrapper, NULL);
+        pthread_mutex_unlock(&server->logo_mu);
+        pf->rc = pf->body ? 0 : -1;
+        break;
+    case RS_PENDING_PROBE:
+        pf->body = g_probe_handler(pf->url, pf->proxy, pf->headers, pf->err, sizeof(pf->err));
+        pf->rc = pf->body ? 0 : -1;
+        break;
+    case RS_PENDING_SCRIPT:
+        pf->rc = rs_script_run_sync(pf->script_path, (const char **)pf->script_args, pf->script_argc,
+                                    30.0, &pf->script_stdout, &pf->script_stderr);
+        break;
+    }
 
     pthread_mutex_lock(&server->pending_mu);
     // Unlink before reading `cancelled`, under the same lock the close handler
     // uses to set it — once unlinked nothing else can find pf, so everything
     // after unlock is safe to touch without the lock.
-    rs_pending_fetch **link = &server->pending_head;
+    rs_pending_job **link = &server->pending_head;
     while (*link && *link != pf) link = &(*link)->next;
     if (*link == pf) *link = pf->next;
     bool cancelled = pf->cancelled;
@@ -1378,7 +1394,7 @@ static void *pending_fetch_worker(void *arg) {
     // could not queue the message (pipe not initialised) — either way there is
     // no reply to build, so free the job here instead of leaking it.
     if (cancelled || !mg_wakeup(&server->mgr, pf->conn_id, &pf, sizeof(pf))) {
-        pending_fetch_free(pf);
+        pending_job_free(pf);
     }
     return NULL;
 }
@@ -1386,7 +1402,7 @@ static void *pending_fetch_worker(void *arg) {
 // Hands `pf` off to a worker thread. Always consumes pf: on success the worker
 // frees it once the reply is built; on failure the caller must free it. Fills
 // pf->server/conn_id, so callers only need everything else set.
-static bool pending_fetch_dispatch(restream_server_t *server, struct mg_connection *c, rs_pending_fetch *pf) {
+static bool pending_job_dispatch(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf) {
     // Without a working wakeup pipe a worker could still fetch, but could never
     // hand the result back — the connection would hang forever instead of
     // erroring. Fail the dispatch up front so callers reply with a clean 500.
@@ -1399,9 +1415,9 @@ static bool pending_fetch_dispatch(restream_server_t *server, struct mg_connecti
     pthread_mutex_unlock(&server->pending_mu);
 
     pthread_t tid;
-    if (pthread_create(&tid, NULL, pending_fetch_worker, pf) != 0) {
+    if (pthread_create(&tid, NULL, pending_job_worker, pf) != 0) {
         pthread_mutex_lock(&server->pending_mu);
-        rs_pending_fetch **link = &server->pending_head;
+        rs_pending_job **link = &server->pending_head;
         while (*link && *link != pf) link = &(*link)->next;
         if (*link == pf) *link = pf->next;
         pthread_mutex_unlock(&server->pending_mu);
@@ -1411,25 +1427,84 @@ static bool pending_fetch_dispatch(restream_server_t *server, struct mg_connecti
     return true;
 }
 
-static void pending_fetch_cancel(restream_server_t *s, unsigned long conn_id) {
+// Looks up a channel logo — see the "async jobs" section above and
+// pending_job_finish_logo. Always replies to `c`.
+static void dispatch_logo_lookup(restream_server_t *server, struct mg_connection *c, const char *name) {
+    rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
+    if (!pf) { reply_error(c, 500, "Out of memory."); return; }
+    pf->kind = RS_PENDING_LOGO;
+    pf->url = rs_strdup(name);  // reused as the lookup key — see the struct's field comments
+    if (!pending_job_dispatch(server, c, pf)) {
+        pending_job_free(pf);
+        reply_error(c, 500, "Could not start the logo lookup.");
+    }
+}
+
+// Source auto-detect — see the "async jobs" section above and
+// pending_job_finish_probe. Takes ownership of url/proxy/headers. Always
+// replies to `c`.
+static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
+                           char *url, char *proxy, char *headers) {
+    rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
+    if (!pf) {
+        free(url); free(proxy); free(headers);
+        reply_error(c, 500, "Out of memory.");
+        return;
+    }
+    pf->kind = RS_PENDING_PROBE;
+    pf->url = url;
+    pf->proxy = proxy;
+    pf->headers = headers;  // pf owns all three now
+    if (!pending_job_dispatch(server, c, pf)) {
+        pending_job_free(pf);
+        reply_error(c, 500, "Could not start the probe.");
+    }
+}
+
+// Runs a provider script action — see the "async jobs" section above and
+// pending_job_finish_script. Takes ownership of args (each element and the
+// array itself). Always replies to `c`.
+static void dispatch_script_action(restream_server_t *server, struct mg_connection *c,
+                                   const char *sid, const char *script_path,
+                                   char **args, int argc) {
+    rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
+    if (!pf) {
+        for (int i = 0; i < argc; i++) free(args[i]);
+        free(args);
+        reply_error(c, 500, "Out of memory.");
+        return;
+    }
+    pf->kind = RS_PENDING_SCRIPT;
+    pf->stream_id = rs_strdup(sid);
+    pf->script_path = rs_strdup(script_path);
+    pf->script_args = args;  // pf owns it now
+    pf->script_argc = argc;
+    if (!pending_job_dispatch(server, c, pf)) {
+        pending_job_free(pf);
+        reply_error(c, 500, "Could not start the script.");
+    }
+}
+
+static void pending_job_cancel(restream_server_t *s, unsigned long conn_id) {
     pthread_mutex_lock(&s->pending_mu);
-    for (rs_pending_fetch *pf = s->pending_head; pf; pf = pf->next)
+    for (rs_pending_job *pf = s->pending_head; pf; pf = pf->next)
         if (pf->conn_id == conn_id) pf->cancelled = true;
     pthread_mutex_unlock(&s->pending_mu);
 }
 
-// Blocks until every dispatched fetch has finished and freed itself. Bounded by
-// libcurl's own connect/transfer timeouts (net.c), so this cannot hang forever
-// even against an origin that never answers. Must run before mg_mgr_free and
-// before pending_mu/pending_cv are destroyed — a worker mid-flight touches all
-// three when it finishes.
-static void pending_fetch_wait_idle(restream_server_t *s) {
+// Blocks until every dispatched job has finished and freed itself. Bounded by
+// libcurl's own connect/transfer timeouts (net.c) or the script runner's 30s
+// timeout (script.c), so this cannot hang forever even against an origin or
+// script that never returns. Must run before mg_mgr_free and before
+// pending_mu/pending_cv are destroyed — a worker mid-flight touches all three
+// when it finishes.
+static void pending_job_wait_idle(restream_server_t *s) {
     pthread_mutex_lock(&s->pending_mu);
     while (s->pending_head != NULL) pthread_cond_wait(&s->pending_cv, &s->pending_mu);
     pthread_mutex_unlock(&s->pending_mu);
 }
 
-static void pending_finish_playlist(struct mg_connection *c, rs_pending_fetch *pf) {
+static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job *pf) {
     if (pf->rc != 0) {
         reply_error(c, 502, pf->err[0] ? pf->err : "Could not fetch the playlist.");
         return;
@@ -1449,7 +1524,7 @@ static void pending_finish_playlist(struct mg_connection *c, rs_pending_fetch *p
     rs_free(rewritten);
 }
 
-static void pending_finish_item(restream_server_t *server, struct mg_connection *c, rs_pending_fetch *pf) {
+static void pending_job_finish_item(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf) {
     if (pf->rc != 0) {
         log_record(server, pf->stream_id, "error", pf->is_map ? "downloadInit" : "downloadSegment",
                    pf->url, 0, -1, pf->err[0] ? pf->err : "fetch failed");
@@ -1508,18 +1583,64 @@ static void pending_finish_item(restream_server_t *server, struct mg_connection 
     mg_send(c, body, body_len);
     // CENC/HLS decrypt free pf->body and hand back a distinct allocation, so
     // `body` may not be pf->body any more — free whichever one we ended up
-    // with here, and null pf->body so pending_fetch_free doesn't double-free it.
+    // with here, and null pf->body so pending_job_free doesn't double-free it.
     free(body);
     pf->body = NULL;
 }
 
-static void pending_fetch_finish(restream_server_t *server, struct mg_connection *c, struct mg_str *data) {
-    if (!data || data->len != sizeof(rs_pending_fetch *)) return;
-    rs_pending_fetch *pf;
+static void pending_job_finish_logo(struct mg_connection *c, rs_pending_job *pf) {
+    if (!pf->body) { reply_error(c, 404, "Logo not found."); return; }
+    rs_json *o = rs_json_new_obj();
+    rs_json_obj_set_str(o, "url", pf->body);
+    reply_json(c, 200, o, NULL);
+}
+
+static void pending_job_finish_probe(struct mg_connection *c, rs_pending_job *pf) {
+    if (!pf->body) { reply_error(c, 400, pf->err[0] ? pf->err : "Could not probe the source."); return; }
+    char headers_out[128];
+    snprintf(headers_out, sizeof(headers_out), "%sCache-Control: no-store\r\n", JSON_HEADERS);
+    mg_http_reply(c, 200, headers_out, "%s", pf->body);
+}
+
+// Mirrors run_provider_script's post-run handling exactly — split stdout/
+// stderr into log lines, log the exit, persist state (a script action can
+// change provider fields, e.g. session cookies), then answer with the log
+// tail so the panel's script output shows immediately.
+static void pending_job_finish_script(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf) {
+    if (pf->script_stdout && pf->script_stdout[0]) {
+        char *copy = rs_strdup(pf->script_stdout);
+        for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n"))
+            if (line[0]) log_record(server, pf->stream_id, "info", "scriptOutput", NULL, 0, -1, line);
+        free(copy);
+    }
+    if (pf->script_stderr && pf->script_stderr[0]) {
+        char *copy = rs_strdup(pf->script_stderr);
+        for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n"))
+            if (line[0]) log_record(server, pf->stream_id, "error", "scriptError", NULL, 0, -1, line);
+        free(copy);
+    }
+    log_record(server, pf->stream_id, pf->rc == 0 ? "info" : "error", "scriptEnd", NULL, pf->rc, -1,
+               pf->rc == 0 ? "ok" : "script exited non-zero");
+    // A script action can change provider state (session cookies etc.) even on
+    // a nonzero exit, so persist regardless. A nonzero exit is reported through
+    // the log, not as an HTTP error — matches the original synchronous handler,
+    // and the panel surfaces it via the script output/Logs tab either way.
+    rs_state_save(&server->state);
+    reply_json(c, 200, log_view(server, pf->stream_id, 150), NULL);
+}
+
+static void pending_job_finish(restream_server_t *server, struct mg_connection *c, struct mg_str *data) {
+    if (!data || data->len != sizeof(rs_pending_job *)) return;
+    rs_pending_job *pf;
     memcpy(&pf, data->buf, sizeof(pf));
-    if (pf->kind == RS_PENDING_PLAYLIST) pending_finish_playlist(c, pf);
-    else pending_finish_item(server, c, pf);
-    pending_fetch_free(pf);
+    switch (pf->kind) {
+    case RS_PENDING_PLAYLIST: pending_job_finish_playlist(c, pf); break;
+    case RS_PENDING_ITEM: pending_job_finish_item(server, c, pf); break;
+    case RS_PENDING_LOGO: pending_job_finish_logo(c, pf); break;
+    case RS_PENDING_PROBE: pending_job_finish_probe(c, pf); break;
+    case RS_PENDING_SCRIPT: pending_job_finish_script(server, c, pf); break;
+    }
+    pending_job_free(pf);
 }
 
 // Serves an HLS passthrough playlist: fetch the remote playlist (the configured
@@ -1535,7 +1656,7 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     const char *manifest_url = variant ? variant : stream_source_target(stream);
     if (!manifest_url[0]) { free(variant); reply_error(c, 400, "Stream has no source URL."); return; }
 
-    rs_pending_fetch *pf = (rs_pending_fetch *)calloc(1, sizeof(*pf));
+    rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
     if (!pf) { free(variant); reply_error(c, 500, "Out of memory."); return; }
     pf->kind = RS_PENDING_PLAYLIST;
     pf->stream_id = rs_strdup(stream_id);
@@ -1546,8 +1667,8 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     pf->downloader_params = rs_strdup(effective_downloader_params(provider));
     free(variant);
 
-    if (!pending_fetch_dispatch(server, c, pf)) {
-        pending_fetch_free(pf);
+    if (!pending_job_dispatch(server, c, pf)) {
+        pending_job_free(pf);
         reply_error(c, 500, "Could not start the playlist fetch.");
     }
 }
@@ -1556,7 +1677,7 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
 // segment (kind=map) or AES-CTR-decrypts a media segment using the stream's
 // configured KID:KEY. No-op (returns the input) when no key is set. Takes the
 // raw "KID:KEY" string rather than the stream object itself so it can run on
-// pending_fetch_worker's copy after the stream JSON may have changed underneath.
+// pending_job_worker's copy after the stream JSON may have changed underneath.
 static uint8_t *apply_cenc(const char *decryption_keys, bool is_map, uint8_t *body, size_t body_len, size_t *out_len) {
     *out_len = body_len;
     rs_cenc_keys keys = rs_cenc_parse_keys(decryption_keys ? decryption_keys : "");
@@ -1677,7 +1798,7 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     bool is_key = kindq && strcmp(kindq, "key") == 0;
     free(dec); free(kindq);
 
-    rs_pending_fetch *pf = (rs_pending_fetch *)calloc(1, sizeof(*pf));
+    rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
     if (!pf) { free(url); reply_error(c, 500, "Out of memory."); return; }
     pf->kind = RS_PENDING_ITEM;
     pf->stream_id = rs_strdup(stream_id);
@@ -1702,8 +1823,8 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     pf->user_agent = header_dup(hm, "User-Agent");
     pf->playback_key_str = playback_key(hm);
 
-    if (!pending_fetch_dispatch(server, c, pf)) {
-        pending_fetch_free(pf);
+    if (!pending_job_dispatch(server, c, pf)) {
+        pending_job_free(pf);
         reply_error(c, 502, "Segment fetch failed.");
     }
 }
@@ -2006,20 +2127,20 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
 // Mongoose event handler
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     restream_server_t *server = (restream_server_t *)c->fn_data;
-    // A connection with an in-flight async fetch (see pending_fetch_dispatch)
-    // closing before the worker finishes — the player gave up, or seeked away.
-    // Mark it so the worker frees its own result instead of replying to a
-    // connection that no longer exists.
+    // A connection with an in-flight async job (see pending_job_dispatch)
+    // closing before the worker finishes — the player gave up, or the panel
+    // request was aborted. Mark it so the worker frees its own result instead
+    // of replying to a connection that no longer exists.
     if (ev == MG_EV_CLOSE) {
-        if (server) pending_fetch_cancel(server, c->id);
+        if (server) pending_job_cancel(server, c->id);
         return;
     }
     // A worker thread's fetch finished; ev_data is the struct mg_str mg_wakeup()
-    // delivers, carrying the rs_pending_fetch* it was called with. This is the
-    // only thread that may build a reply from it — pending_fetch_finish builds
+    // delivers, carrying the rs_pending_job* it was called with. This is the
+    // only thread that may build a reply from it — pending_job_finish builds
     // and sends it, then frees the job.
     if (ev == MG_EV_WAKEUP) {
-        if (server) pending_fetch_finish(server, c, (struct mg_str *)ev_data);
+        if (server) pending_job_finish(server, c, (struct mg_str *)ev_data);
         return;
     }
     if (ev != MG_EV_HTTP_MSG) return;
@@ -2086,10 +2207,10 @@ restream_server_t* restream_server_create(void) {
     restream_server_t* server = (restream_server_t*)calloc(1, sizeof(restream_server_t));
     if (!server) return NULL;
     mg_mgr_init(&server->mgr);
-    // Lets pending_fetch_worker() (spawned by the HLS-passthrough playback
+    // Lets pending_job_worker() (spawned by the HLS-passthrough playback
     // routes) hand a finished fetch back to this thread instead of ever
     // touching a struct mg_connection itself. If this fails (should not
-    // happen — it's just a local socketpair) pending_fetch_dispatch refuses to
+    // happen — it's just a local socketpair) pending_job_dispatch refuses to
     // dispatch and those routes reply with a clean 500 instead of hanging.
     server->wakeup_ok = mg_wakeup_init(&server->mgr);
     server->c = NULL;
@@ -2101,6 +2222,7 @@ restream_server_t* restream_server_create(void) {
     server->pending_head = NULL;
     pthread_mutex_init(&server->pending_mu, NULL);
     pthread_cond_init(&server->pending_cv, NULL);
+    pthread_mutex_init(&server->logo_mu, NULL);
 #ifndef _WIN32
     pthread_mutex_init(&server->log_mu, NULL);
 #endif
@@ -2120,6 +2242,7 @@ restream_server_t* restream_server_create(void) {
         mg_mgr_free(&server->mgr);
         pthread_mutex_destroy(&server->pending_mu);
         pthread_cond_destroy(&server->pending_cv);
+        pthread_mutex_destroy(&server->logo_mu);
 #ifndef _WIN32
         pthread_mutex_destroy(&server->log_mu);
 #endif
@@ -2194,13 +2317,13 @@ void restream_server_stop(restream_server_t* server) {
 
 void restream_server_destroy(restream_server_t* server) {
     if (server) {
-        // Detached pending-fetch worker threads (see pending_fetch_dispatch)
-        // call mg_wakeup() on this server's mgr and read/write the pending
-        // list on their own time; both become use-after-free the moment
+        // Detached pending-job worker threads (see pending_job_dispatch) call
+        // mg_wakeup() on this server's mgr and read/write the pending list on
+        // their own time; both become use-after-free the moment
         // mg_mgr_free/pthread_mutex_destroy below run. Block until none are
-        // left in flight — bounded by libcurl's own fetch timeout, so this
-        // cannot hang forever.
-        pending_fetch_wait_idle(server);
+        // left in flight — bounded by each job's own timeout, so this cannot
+        // hang forever.
+        pending_job_wait_idle(server);
         mg_mgr_free(&server->mgr);
         // Stops and joins every worker first: they hold a pointer to this
         // server as their log sink, so nothing else may be torn down while one
@@ -2214,6 +2337,7 @@ void restream_server_destroy(restream_server_t* server) {
         log_clear(server, "");  // frees ring-buffer strings
         pthread_mutex_destroy(&server->pending_mu);
         pthread_cond_destroy(&server->pending_cv);
+        pthread_mutex_destroy(&server->logo_mu);
 #ifndef _WIN32
         pthread_mutex_destroy(&server->log_mu);
 #endif
