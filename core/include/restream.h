@@ -65,9 +65,18 @@ void restream_server_set_fetch_handler(restream_fetch_fn handler);
 // message in errbuf. Lives in the C++ server (libxml2); the core only holds the
 // pointer, so the Swift build never links libxml2. When unset, DASH playback
 // returns 501. See rs_dash_describe.
+//
+// `segment_url_params` (may be NULL/"") is a raw query-string fragment
+// appended to every returned init/segment URL. `inherit_url_params`, when
+// non-zero, overrides that with the query string of the MPD URL that actually
+// answered (i.e. the redirect target) — some CDNs mint a signed token only on
+// the 302 target, so the configured `url` itself carries no query string for
+// segment_url_params to have captured ahead of time.
 typedef char *(*restream_dash_fn)(const char *url, const char *proxy, const char *headers,
                                   const char *downloader, const char *dl_params,
-                                  const char *rep, int want, char *errbuf, size_t errbuf_len);
+                                  const char *rep, int want,
+                                  const char *segment_url_params, int inherit_url_params,
+                                  char *errbuf, size_t errbuf_len);
 void restream_server_set_dash_handler(restream_dash_fn handler);
 
 // Start the server (non-blocking, or spawns a background thread in C,

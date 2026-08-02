@@ -87,6 +87,13 @@ struct LiveM3U8Options {
     var cdmFetchArgs: [String] = []
     var manifestHeaders: [(String, String)] = []
     var segmentUrlParams: String = ""
+    /// When true, `segmentUrlParams` is ignored in favor of the query string
+    /// of whichever manifest URL actually answered the last poll's fetch —
+    /// recomputed every poll, after following any redirect. Some CDNs mint a
+    /// signed token only on the 302 target (the configured `mpd` URL itself
+    /// has no query string), so a param string captured once at spawn time
+    /// would always be empty; this instead tracks the live redirect.
+    var inheritUrlParams: Bool = false
     /// Shifts this representation's segment presentation times by this many
     /// milliseconds (signed) — a lip-sync knob, meant to be set only on the
     /// audio representation's worker. 0 (the default) does nothing.
@@ -134,6 +141,7 @@ struct LiveM3U8ActionRuntime {
                 M3U8ArgumentDoc(name: "baseUrl", required: false, description: "Override base URL used to resolve segment paths."),
                 M3U8ArgumentDoc(name: "decryptionKeys", required: false, description: "CENC clearkey KID:KEY hex pairs, separated by |. Decrypts downloaded segments and patches the init segment. macOS only."),
                 M3U8ArgumentDoc(name: "segmentUrlParams", required: false, description: "Raw query-string fragment appended to every media/init segment URL before download, e.g. token=abc&region=us."),
+                M3U8ArgumentDoc(name: "inheritUrlParams", required: false, description: "true to append the query string of the manifest URL that actually answered each poll (post-redirect) to every media/init segment instead of segmentUrlParams. Default false."),
                 M3U8ArgumentDoc(name: "audioDelayMs", required: false, description: "Shifts this representation's segment tfdt presentation time by this many milliseconds (signed — negative moves it earlier). Intended for the audio representation only, to fix lip-sync drift. Default 0."),
                 M3U8ArgumentDoc(name: "manifestHeader", required: false, description: "HTTP header string used only for the MPD fetch. Separate multiple headers with |. Falls back to `header` when unset."),
                 M3U8ArgumentDoc(name: "timeout", required: false, description: "HTTP timeout in seconds. Default 30."),
@@ -296,6 +304,7 @@ struct LiveM3U8ActionRuntime {
             cdmFetchArgs: (args["cdmFetchArgs"] ?? "").split(whereSeparator: { $0 == "\n" || $0 == "\r" }).map(String.init),
             manifestHeaders: try parseHeaders(args["manifestHeader"]),
             segmentUrlParams: args["segmentUrlParams"] ?? "",
+            inheritUrlParams: try bool("inheritUrlParams", args, defaultValue: false),
             audioDelayMs: try optionalInt("audioDelayMs", args) ?? 0
         )
     }
@@ -444,9 +453,15 @@ final class LiveMPDToM3U8 {
     /// segment resolution, logging) uses this, not the static primary, so a
     /// CDN failover carries through to segment fetches too.
     private var activeURL: URL
+    /// Query string appended to every media/init segment fetch. Starts as
+    /// `options.segmentUrlParams` and, when `options.inheritUrlParams` is
+    /// set, is overwritten after every manifest poll with the query string
+    /// of whatever URL actually answered (see `fetchManifestWithRetries`).
+    private var liveSegmentUrlParams: String
 
     init(options: LiveM3U8Options) {
         self.options = options
+        self.liveSegmentUrlParams = options.segmentUrlParams
         self.candidateURLs = [options.mpdURL] + options.fallbackURLs
         self.activeURL = options.mpdURL
         self.manifestClient = HTTPClient(options: HTTPRequestOptions(
@@ -513,7 +528,15 @@ final class LiveMPDToM3U8 {
                 // of fresh segments and got stuck. Retry a few times — and,
                 // when CDN mirrors are configured, fail over to them — before
                 // giving up so routine network noise doesn't end the stream.
-                mpdData = try fetchManifestWithRetries()
+                let (data, resolvedURL) = try fetchManifestWithRetries()
+                mpdData = data
+                if options.inheritUrlParams {
+                    let query = URLComponents(url: resolvedURL, resolvingAgainstBaseURL: true)?.query ?? ""
+                    if query != liveSegmentUrlParams {
+                        logEvent("inheritUrlParams", url: resolvedURL.absoluteString, status: "success", message: query.isEmpty ? "manifest URL carries no query string" : "segment params updated from resolved manifest URL")
+                    }
+                    liveSegmentUrlParams = query
+                }
             } catch {
                 logEvent("fetchManifest", url: activeURL.absoluteString, status: "error", message: "\(error)")
                 throw error
@@ -597,9 +620,9 @@ final class LiveMPDToM3U8 {
             group.enter()
             workQueue.async {
                 defer { slots.signal(); group.leave() }
-                let fetchURL = self.options.segmentUrlParams.isEmpty
+                let fetchURL = self.liveSegmentUrlParams.isEmpty
                     ? segment.url
-                    : appendingQueryParams(segment.url, self.options.segmentUrlParams)
+                    : appendingQueryParams(segment.url, self.liveSegmentUrlParams)
                 let localURL = self.localSegmentURL(for: segment)
                 // Best-effort: a prefetch miss just falls through to the serial
                 // loop, which downloads it (with the real error handling) there.
@@ -636,7 +659,7 @@ final class LiveMPDToM3U8 {
                 downloadedURLs.insert(segment.url)
                 continue
             }
-            let fetchURL = options.segmentUrlParams.isEmpty ? segment.url : appendingQueryParams(segment.url, options.segmentUrlParams)
+            let fetchURL = liveSegmentUrlParams.isEmpty ? segment.url : appendingQueryParams(segment.url, liveSegmentUrlParams)
             let localURL = localSegmentURL(for: segment)
             logEvent("downloadSegment", url: fetchURL.absoluteString, status: "start", proxy: options.proxy)
             let bytes: Int
@@ -732,12 +755,12 @@ final class LiveMPDToM3U8 {
         }
     }
 
-    private func fetchManifestWithRetries(retries: Int = 5, delay: Double = 0.5) throws -> Data {
+    private func fetchManifestWithRetries(retries: Int = 5, delay: Double = 0.5) throws -> (data: Data, finalURL: URL) {
         // No mirrors configured → original behaviour: keep retrying the one URL.
         guard candidateURLs.count > 1 else {
             var attempt = 0
             while true {
-                do { return try manifestClient.get(activeURL) }
+                do { return try manifestClient.fetch(activeURL) }
                 catch {
                     guard attempt < retries else { throw error }
                     attempt += 1
@@ -757,13 +780,13 @@ final class LiveMPDToM3U8 {
             var attempt = 0
             while true {
                 do {
-                    let data = try manifestClient.get(url)
+                    let result = try manifestClient.fetch(url)
                     if url != activeURL {
                         logEvent("cdnFailover", url: url.absoluteString, status: "success",
                                  message: "manifest source switched to \(url.host ?? url.absoluteString)")
                         activeURL = url
                     }
-                    return data
+                    return result
                 } catch {
                     lastError = error
                     guard attempt < retriesPerCandidate else { break }

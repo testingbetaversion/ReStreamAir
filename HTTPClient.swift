@@ -74,9 +74,19 @@ final class HTTPClient {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
+        // A Basic-auth proxy (`http://user:pass@host:port`) answers CONNECT
+        // with 407 before anything else happens — `connectionProxyDictionary`
+        // only carries host/port, so without a delegate to answer that
+        // challenge every request through such a proxy just fails with no
+        // credentials ever offered.
+        var delegate: ProxyAuthDelegate?
         if let proxy {
             do {
-                configuration.connectionProxyDictionary = try HTTPClient.proxyDictionary(proxy)
+                let resolved = try HTTPClient.proxyDictionary(proxy)
+                configuration.connectionProxyDictionary = resolved.dictionary
+                if let user = resolved.username, let password = resolved.password {
+                    delegate = ProxyAuthDelegate(username: user, password: password)
+                }
             } catch {
                 // A live poll loop would otherwise repeat this same failure
                 // every request forever; fail open (no proxy) with one
@@ -85,12 +95,23 @@ final class HTTPClient {
                 FileHandle.standardError.write(Data("warning: \(error) — continuing without a proxy.\n".utf8))
             }
         }
-        let session = URLSession(configuration: configuration)
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         sessionCache[key] = session
         return session
     }
 
     func get(_ url: URL) throws -> Data {
+        try fetch(url).data
+    }
+
+    /// Like `get`, but also reports the URL the response actually came from.
+    /// `URLSession` follows redirects transparently, so a signed-CDN manifest
+    /// that 302s to a token-bearing host (query params only present on the
+    /// *redirected* URL, not the one we requested) would otherwise leave no
+    /// trace of that token anywhere the caller could see — needed by
+    /// "inherit URL params" to pick up a token minted at redirect time rather
+    /// than one baked into the configured source URL.
+    func fetch(_ url: URL) throws -> (data: Data, finalURL: URL) {
         var request = URLRequest(url: url)
         request.timeoutInterval = options.timeout
         for (name, value) in options.headers {
@@ -126,7 +147,7 @@ final class HTTPClient {
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw HTTPClientError.httpStatus(url, http.statusCode)
         }
-        return data
+        return (data, response.url ?? url)
     }
 
     @discardableResult
@@ -144,23 +165,53 @@ final class HTTPClient {
         }
     }
 
-    private static func proxyDictionary(_ proxy: String) throws -> [AnyHashable: Any] {
+    /// `proxy` may embed Basic-auth credentials (`http://user:pass@host:port`,
+    /// as e.g. paid rotating-IP proxies commonly require) — `connectionProxyDictionary`
+    /// only carries host/port, so those are pulled out separately for
+    /// `ProxyAuthDelegate` to answer the 407 challenge with.
+    private static func proxyDictionary(_ proxy: String) throws -> (dictionary: [AnyHashable: Any], username: String?, password: String?) {
         guard let url = URL(string: proxy), let host = url.host else {
             throw HTTPClientError.invalidProxy(proxy)
         }
         let port = url.port ?? (url.scheme == "https" ? 443 : 80)
+        let dictionary: [AnyHashable: Any]
         if url.scheme == "https" {
-            return [
+            dictionary = [
                 "HTTPSEnable": true,
                 "HTTPSProxy": host,
                 "HTTPSPort": port
             ]
+        } else {
+            dictionary = [
+                "HTTPEnable": true,
+                "HTTPProxy": host,
+                "HTTPPort": port
+            ]
         }
-        return [
-            "HTTPEnable": true,
-            "HTTPProxy": host,
-            "HTTPPort": port
-        ]
+        return (dictionary, url.user, url.password)
+    }
+}
+
+/// Answers a proxy's Basic-auth challenge with credentials parsed out of the
+/// proxy URL. Without this, `URLSession` has nothing to offer a 407 and every
+/// request through a credentialed proxy just fails — there is no interactive
+/// user here to enter one.
+private final class ProxyAuthDelegate: NSObject, URLSessionTaskDelegate {
+    let username: String
+    let password: String
+
+    init(username: String, password: String) {
+        self.username = username
+        self.password = password
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard challenge.protectionSpace.isProxy(), challenge.previousFailureCount == 0 else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(user: username, password: password, persistence: .forSession))
     }
 }
 

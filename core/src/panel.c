@@ -137,6 +137,7 @@ static rs_json *stream_from_body(const rs_json *body, const char *id, const char
     double poll = rs_json_obj_num(body, "pollInterval", 2.0);
     rs_json_obj_set(s, "pollInterval", rs_json_new_num(poll < 0.25 ? 0.25 : poll));
     rs_json_obj_set_bool(s, "forceOffline", rs_json_obj_bool(body, "forceOffline", false));
+    rs_json_obj_set_bool(s, "reducedManifestPolling", rs_json_obj_bool(body, "reducedManifestPolling", false));
     rs_json_obj_set_str(s, "status", "stopped");
     rs_json_obj_set(s, "lastError", rs_json_new_null());
     rs_json_obj_set_str(s, "logo", rs_json_obj_str(body, "logo", ""));

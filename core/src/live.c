@@ -54,6 +54,11 @@
 // effectively never change mid-stream, so this is deliberately much slower than
 // the segment poll.
 #define RS_LIVE_DIRECTOR_INTERVAL 15.0
+// With reduced_manifest_polling on, the interval the director backs off to
+// once it has already found the renditions — just often enough to notice a
+// genuine rendition-list change, rarely enough to stop being a 3rd concurrent
+// manifest fetch alongside the two representation workers.
+#define RS_LIVE_DIRECTOR_IDLE_INTERVAL 300.0
 
 // --- 1. helpers -------------------------------------------------------------
 
@@ -299,6 +304,9 @@ typedef struct live_stream {
     char *manifest_proxy, *media_proxy;
     char *manifest_headers, *media_headers;
     char *downloader, *dl_params, *keys;
+    char *segment_url_params;
+    int inherit_url_params;
+    int reduced_manifest_polling;
     int playlist_segments, keep_segments, download_ahead;
     int playback_delay_seconds, audio_delay_ms;
     double poll_interval;
@@ -327,6 +335,9 @@ typedef struct {
     char *mpd_url, *manifest_proxy, *media_proxy;
     char *manifest_headers, *media_headers;
     char *downloader, *dl_params, *keys;
+    char *segment_url_params;
+    int inherit_url_params;
+    int reduced_manifest_polling;
     int playlist_segments, keep_segments, download_ahead;
     int playback_delay_seconds, audio_delay_ms;
     double poll_interval;
@@ -336,6 +347,7 @@ static void cfg_snap_dispose(cfg_snap *c) {
     free(c->mpd_url); free(c->manifest_proxy); free(c->media_proxy);
     free(c->manifest_headers); free(c->media_headers);
     free(c->downloader); free(c->dl_params); free(c->keys);
+    free(c->segment_url_params);
     memset(c, 0, sizeof(*c));
 }
 
@@ -350,6 +362,9 @@ static void cfg_snapshot_locked(const live_stream *st, cfg_snap *out) {
     out->downloader = rs_strdup(st->downloader ? st->downloader : "");
     out->dl_params = rs_strdup(st->dl_params ? st->dl_params : "");
     out->keys = rs_strdup(st->keys ? st->keys : "");
+    out->segment_url_params = rs_strdup(st->segment_url_params ? st->segment_url_params : "");
+    out->inherit_url_params = st->inherit_url_params;
+    out->reduced_manifest_polling = st->reduced_manifest_polling;
     out->playlist_segments = st->playlist_segments;
     out->keep_segments = st->keep_segments;
     out->download_ahead = st->download_ahead;
@@ -578,19 +593,30 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
 
     // Pick the key whose KID the init actually declares, rather than assuming
     // the first configured pair — a stream can carry several tracks with
-    // different KIDs, and decrypting with the wrong one yields noise.
+    // different KIDs, and decrypting with the wrong one yields noise. When the
+    // init names a KID and none of the configured keys match it, that used to
+    // fall back to the first configured key anyway — silently decrypting with
+    // the wrong key (logged as "key yes") instead of leaving the segment
+    // alone and saying so. `key_mismatch` now distinguishes that case so it
+    // shows up as an error instead of looking like it worked.
     uint8_t key[16];
     bool have_key = false;
+    bool key_mismatch = false;
     rs_cenc_keys keys = rs_cenc_parse_keys(cfg->keys ? cfg->keys : "");
     if (keys.count > 0) {
         size_t pick = 0;
+        bool matched = false;
         if (kid_hex) {
             for (size_t i = 0; i < keys.count; i++) {
-                if (keys.kids[i] && strcmp(keys.kids[i], kid_hex) == 0) { pick = i; break; }
+                if (keys.kids[i] && strcmp(keys.kids[i], kid_hex) == 0) { pick = i; matched = true; break; }
             }
         }
-        memcpy(key, keys.keys[pick], 16);
-        have_key = true;
+        if (matched || !kid_hex || keys.count == 1) {
+            memcpy(key, keys.keys[pick], 16);
+            have_key = true;
+        } else {
+            key_mismatch = true;
+        }
     }
     rs_cenc_keys_free(&keys);
 
@@ -611,9 +637,10 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
     if (have_key) memcpy(rep->key, key, 16);
     pthread_mutex_unlock(&st->mu);
 
-    lgf(st, "info", "initReady", init_url, status, (long long)out_len,
-        "%s: timescale %u, iv %d, key %s%s%s", rep->rep_id, ts, rep->iv_size,
-        have_key ? "yes" : "no", kid_hex ? ", kid " : "", kid_hex ? kid_hex : "");
+    lgf(st, key_mismatch ? "error" : "info", "initReady", init_url, status, (long long)out_len,
+        "%s: timescale %u, iv %d, key %s%s%s%s", rep->rep_id, ts, rep->iv_size,
+        have_key ? "yes" : "no", kid_hex ? ", kid " : "", kid_hex ? kid_hex : "",
+        key_mismatch ? " — none of the configured keys match this KID; segments will stay encrypted" : "");
     free(kid_hex);
 }
 
@@ -628,7 +655,8 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
         rep->rep_id, cfg->download_ahead);
     char *json = st->mgr->dash(cfg->mpd_url, cfg->manifest_proxy, cfg->manifest_headers,
                                cfg->downloader, cfg->dl_params, rep->rep_id,
-                               cfg->download_ahead, err, sizeof(err));
+                               cfg->download_ahead, cfg->segment_url_params, cfg->inherit_url_params,
+                               err, sizeof(err));
     if (!json) {
         lgf(st, "error", "manifest", cfg->mpd_url, 0, -1, "%s: %s", rep->rep_id,
             err[0] ? err : "could not read the MPD");
@@ -994,7 +1022,8 @@ static void *director_main(void *arg) {
 
         char err[256] = {0};
         char *json = st->mgr->dash(cfg.mpd_url, cfg.manifest_proxy, cfg.manifest_headers,
-                                   cfg.downloader, cfg.dl_params, "", 0, err, sizeof(err));
+                                   cfg.downloader, cfg.dl_params, "", 0,
+                                   cfg.segment_url_params, cfg.inherit_url_params, err, sizeof(err));
         if (!json) {
             lgf(st, "error", "renditions", cfg.mpd_url, 0, -1, "%s",
                 err[0] ? err : "could not read the MPD");
@@ -1076,10 +1105,11 @@ static void *director_main(void *arg) {
                 (have_audio && aid[0]) ? aid : "",
                 (have_audio && aid[0]) ? "\"" : "");
 
+        bool reduced = cfg.reduced_manifest_polling != 0;
         rs_json_free(root);
         free(pinned);
         cfg_snap_dispose(&cfg);
-        if (!live_wait(st, RS_LIVE_DIRECTOR_INTERVAL)) break;
+        if (!live_wait(st, reduced ? RS_LIVE_DIRECTOR_IDLE_INTERVAL : RS_LIVE_DIRECTOR_INTERVAL)) break;
     }
 
     lg(st, "info", "liveStop", NULL, 0, -1, "live DASH engine stopped");
@@ -1114,6 +1144,7 @@ static void stream_dispose(live_stream *st) {
     free(st->manifest_proxy); free(st->media_proxy);
     free(st->manifest_headers); free(st->media_headers);
     free(st->downloader); free(st->dl_params); free(st->keys);
+    free(st->segment_url_params);
     free(st->master);
     pthread_mutex_destroy(&st->mu);
     pthread_cond_destroy(&st->cv);
@@ -1152,7 +1183,10 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     SET(downloader, cfg->downloader);
     SET(dl_params, cfg->dl_params);
     SET(keys, cfg->decryption_keys);
+    SET(segment_url_params, cfg->segment_url_params);
 #undef SET
+    st->inherit_url_params = cfg->inherit_url_params;
+    st->reduced_manifest_polling = cfg->reduced_manifest_polling;
     st->playlist_segments = cfg->playlist_segments > 0 ? cfg->playlist_segments : 6;
     if (st->playlist_segments < 3) st->playlist_segments = 3;
     st->download_ahead = cfg->download_ahead > 0 ? cfg->download_ahead : 8;

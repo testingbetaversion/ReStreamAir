@@ -510,9 +510,58 @@ static void pick_default_reps(xmlNode *root,
     }
 }
 
+// --- segment URL query-string inheritance -----------------------------------
+//
+// The C port of appendingQueryParams (HTTPClient.swift): appends a raw
+// query-string fragment (with or without a leading '?'/'&') to a URL, ahead of
+// any fragment. Caller frees the result; returns a copy of `url` unchanged
+// when `params` is empty. Some signed CDNs put an auth token in the query of
+// every segment URL but only stamp it onto the manifest's *redirect target*,
+// never a segment path pulled straight out of the MPD — this is what stands
+// in for that per-segment token.
+static char *append_query(const char *url, const char *params) {
+    if (!params) params = "";
+    while (*params == ' ' || *params == '?' || *params == '&') params++;
+    size_t plen = strlen(params);
+    while (plen && params[plen - 1] == ' ') plen--;
+    if (!plen) return rs_strdup(url);
+
+    const char *hash = strchr(url, '#');
+    size_t head_len = hash ? (size_t)(hash - url) : strlen(url);
+    bool has_query = memchr(url, '?', head_len) != NULL;
+    size_t tail_len = hash ? strlen(hash) : 0;
+    char *out = (char *)malloc(head_len + 1 + plen + tail_len + 1);
+    if (!out) return rs_strdup(url);
+    memcpy(out, url, head_len);
+    size_t pos = head_len;
+    out[pos++] = has_query ? '&' : '?';
+    memcpy(out + pos, params, plen);
+    pos += plen;
+    if (hash) memcpy(out + pos, hash, tail_len);
+    out[pos + tail_len] = '\0';
+    return out;
+}
+
+// The query component of `url` (between '?' and '#'/end), or "" if it has
+// none. Caller frees the result.
+static char *url_query(const char *url) {
+    const char *q = strchr(url, '?');
+    if (!q) return rs_strdup("");
+    q++;
+    const char *hash = strchr(q, '#');
+    size_t len = hash ? (size_t)(hash - q) : strlen(q);
+    char *out = (char *)malloc(len + 1);
+    if (!out) return rs_strdup("");
+    memcpy(out, q, len);
+    out[len] = '\0';
+    return out;
+}
+
 char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
                        const char *downloader, const char *dl_params,
-                       const char *rep, int want, char *errbuf, size_t errbuf_len) {
+                       const char *rep, int want,
+                       const char *segment_url_params, int inherit_url_params,
+                       char *errbuf, size_t errbuf_len) {
     // Fetch the MPD via libcurl (downloader forced internal so we get the final
     // URL after any redirect — segment URLs must resolve against it).
     (void)downloader; (void)dl_params;
@@ -522,11 +571,19 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         return NULL;
     const char *base = (effurl && effurl[0]) ? effurl : url;
 
+    // inherit_url_params wins when set: some CDNs sign a token only onto the
+    // redirect target (base), never onto the configured `url` a fixed
+    // segment_url_params would have to have been typed from ahead of time.
+    char *inherited_params = inherit_url_params ? url_query(base) : NULL;
+    const char *append_params = inherit_url_params
+        ? (inherited_params && inherited_params[0] ? inherited_params : NULL)
+        : ((segment_url_params && segment_url_params[0]) ? segment_url_params : NULL);
+
     xmlDoc *doc = xmlReadMemory(xml, (int)len, "mpd.xml", NULL,
                                 XML_PARSE_NOERROR | XML_PARSE_NOWARNING | XML_PARSE_RECOVER);
-    if (!doc) { free(xml); free(effurl); snprintf(errbuf, errbuf_len, "Could not parse the MPD."); return NULL; }
+    if (!doc) { free(xml); free(effurl); free(inherited_params); snprintf(errbuf, errbuf_len, "Could not parse the MPD."); return NULL; }
     xmlNode *root = xmlDocGetRootElement(doc);
-    if (!root || !node_is(root, "MPD")) { xmlFreeDoc(doc); free(xml); free(effurl); snprintf(errbuf, errbuf_len, "Not an MPD."); return NULL; }
+    if (!root || !node_is(root, "MPD")) { xmlFreeDoc(doc); free(xml); free(effurl); free(inherited_params); snprintf(errbuf, errbuf_len, "Not an MPD."); return NULL; }
 
     rs_json *obj = rs_json_new_obj();
     char *mtype = attr(root, "type");
@@ -560,11 +617,17 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
             rs_json_obj_set_str(p, "repId", plan.representation_id ? plan.representation_id : rep);
             rs_json_obj_set_str(p, "type", plan.adaptation_type ? plan.adaptation_type : "video");
             rs_json_obj_set_int(p, "timescale", (long long)plan.timescale);
-            if (plan.init_url) rs_json_obj_set_str(p, "initUrl", plan.init_url); else rs_json_obj_set(p, "initUrl", rs_json_new_null());
+            if (plan.init_url) {
+                char *init_url = append_params ? append_query(plan.init_url, append_params) : rs_strdup(plan.init_url);
+                rs_json_obj_set_str(p, "initUrl", init_url);
+                free(init_url);
+            } else rs_json_obj_set(p, "initUrl", rs_json_new_null());
             rs_json *segs = rs_json_new_arr();
             for (size_t i = 0; i < plan.count; i++) {
                 rs_json *s = rs_json_new_obj();
-                rs_json_obj_set_str(s, "url", plan.segments[i].url);
+                char *seg_url = append_params ? append_query(plan.segments[i].url, append_params) : rs_strdup(plan.segments[i].url);
+                rs_json_obj_set_str(s, "url", seg_url);
+                free(seg_url);
                 rs_json_obj_set_int(s, "time", plan.segments[i].time);
                 rs_json_obj_set(s, "duration", rs_json_new_num(plan.segments[i].duration));
                 rs_json_arr_push(segs, s);
@@ -576,7 +639,7 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
     }
 
     free(vid); free(vcodecs); free(aid); free(acodecs);
-    free(xml); free(effurl);
+    free(xml); free(effurl); free(inherited_params);
     char *json = rs_json_serialize(obj, false);
     rs_json_free(obj);
     if (!json) snprintf(errbuf, errbuf_len, "Out of memory building the DASH description.");

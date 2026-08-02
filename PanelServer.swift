@@ -2261,7 +2261,12 @@ final class PanelServer {
         // Keys entered by hand win; otherwise, if CDM auto-keys is on, ask the
         // provider script to acquire clear keys from the manifest's DRM info.
         let keys = resolveDecryptionKeys(provider: provider, stream: stream)
-        let segmentParams = effectiveSegmentUrlParams(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
+        // `inheritUrlParams` can't be resolved here: some CDNs only attach the
+        // auth query string on the redirect target, not the configured source
+        // URL (effectiveSegmentUrlParams would read the latter and come back
+        // empty). The worker follows the redirect itself, so it re-derives this
+        // from whatever URL actually answers each poll — see LiveMPDToM3U8.
+        let segmentParams = provider.inheritUrlParams ? "" : effectiveSegmentUrlParams(provider: provider, stream: stream).trimmingCharacters(in: .whitespaces)
 
         // Key rotation: give the worker the CDM script + args so it can
         // re-acquire a key on its own when a segment's KID changes mid-stream
@@ -2317,6 +2322,7 @@ final class PanelServer {
                 args.append("cdmFetchArgs=\(cdmFetchArgs)")
             }
             if !segmentParams.isEmpty { args.append("segmentUrlParams=\(segmentParams)") }
+            if provider.inheritUrlParams { args.append("inheritUrlParams=true") }
             // CDN mirrors: newline-joined (safe — a valid URL has no literal
             // newline), tried in order when the primary manifest fetch fails.
             if !stream.cdnUrls.isEmpty { args.append("fallbackUrls=\(stream.cdnUrls.joined(separator: "\n"))") }

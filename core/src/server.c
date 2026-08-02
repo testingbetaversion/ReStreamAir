@@ -1913,6 +1913,17 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     cfg.downloader = effective_downloader(provider);
     cfg.dl_params = effective_downloader_params(provider);
     cfg.decryption_keys = rs_json_obj_str(stream, "decryptionKeys", "");
+    // inheritUrlParams wins: some CDNs sign a token only onto the manifest's
+    // redirect target, so a segmentUrlParams typed ahead of time from the
+    // configured source URL would always be empty for them (see
+    // rs_dash_describe). Provider-level only — no per-stream override, same as
+    // the Swift panel's effectiveSegmentUrlParams.
+    cfg.inherit_url_params = provider ? rs_json_obj_bool(provider, "inheritUrlParams", false) : false;
+    cfg.segment_url_params = (!cfg.inherit_url_params && provider) ? rs_json_obj_str(provider, "segmentUrlParams", "") : "";
+    // Per-stream, off by default: some CDNs cap concurrent sessions per signed
+    // token low enough that the director's own periodic re-poll (a 3rd fetch
+    // alongside the video and audio workers) trips it by itself. See rs_live.h.
+    cfg.reduced_manifest_polling = rs_json_obj_bool(stream, "reducedManifestPolling", false);
     cfg.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
     cfg.keep_segments = (int)rs_json_obj_int(stream, "keepSegments", 60);
     cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 8);

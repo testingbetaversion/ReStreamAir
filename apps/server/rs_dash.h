@@ -59,9 +59,18 @@ void rs_dash_plan_dispose(rs_dash_plan *plan);
 //        "segments":[ {"url","time","duration"} ... ] } }
 //
 // Redirects are followed and segment URLs resolve against the final URL.
+//
+// `segment_url_params` (NULL/"" for none) is a raw query-string fragment
+// appended to every returned init/segment URL. When `inherit_url_params` is
+// non-zero, that fragment is instead taken from the query string of the URL
+// that actually answered the fetch (the redirect target, when there was one)
+// — needed for CDNs that sign a token only onto the 302 target, never onto
+// the configured MPD URL itself.
 char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
                        const char *downloader, const char *dl_params,
-                       const char *rep, int want, char *errbuf, size_t errbuf_len);
+                       const char *rep, int want,
+                       const char *segment_url_params, int inherit_url_params,
+                       char *errbuf, size_t errbuf_len);
 
 #ifdef __cplusplus
 }

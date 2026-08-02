@@ -57,7 +57,9 @@ typedef int (*rs_live_fetch_fn)(const char *url, const char *proxy, const char *
 
 typedef char *(*rs_live_dash_fn)(const char *url, const char *proxy, const char *headers,
                                  const char *downloader, const char *dl_params,
-                                 const char *rep, int want, char *errbuf, size_t errbuf_len);
+                                 const char *rep, int want,
+                                 const char *segment_url_params, int inherit_url_params,
+                                 char *errbuf, size_t errbuf_len);
 
 // Log sink. Called from worker threads, so the implementation must be
 // thread-safe. `url`/`message` may be NULL; status 0 and bytes -1 mean absent.
@@ -77,6 +79,15 @@ typedef struct {
     const char *downloader;         // "curl" | "wget" | "aria2c" | "" (libcurl)
     const char *dl_params;
     const char *decryption_keys;    // "kid:key\nkid:key" ClearKey pairs
+    const char *segment_url_params; // raw query-string fragment for every segment/init URL
+    int inherit_url_params;         // non-zero: derive it from the MPD's redirect target instead
+    // The director (rendition discovery) and each representation worker poll
+    // the MPD independently — normally 3 simultaneous manifest fetches for one
+    // video+audio stream. Some CDNs cap concurrent sessions per signed token
+    // (e.g. a "cnt":3 claim) low enough that this 3-way overlap alone trips it.
+    // Non-zero backs the director off to a slow keep-alive cadence once the
+    // renditions are known, cutting steady-state concurrency to 2.
+    int reduced_manifest_polling;
     int playlist_segments;          // advertised window (default 6)
     int keep_segments;              // segments held in memory (default 60)
     int download_ahead;             // segments requested per poll (default 8)
