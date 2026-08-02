@@ -22,8 +22,11 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+// live.c already spawns pthreads unconditionally (director/rep/prefetch workers)
+// and restream_core links Threads::Threads on every platform including Windows,
+// so this is available everywhere the live engine already relies on it being.
+#include <pthread.h>
 #ifndef _WIN32
-#include <pthread.h>    // the log ring is written from the live engine's threads
 #include <sys/stat.h>   // mkdir for the script session dir
 #endif
 
@@ -49,15 +52,25 @@ typedef struct {
     long long bytes;  // optional byte count (-1 = none)
 } rs_log_entry;
 
+// An in-flight HLS-passthrough fetch (playlist or segment/key/init), dispatched
+// to a worker thread so it never blocks the mongoose poll loop. Full definition
+// and the machinery around it sit just above serve_hls_playlist, the only
+// callers. Forward-declared here so restream_server can hold the pending list.
+typedef struct rs_pending_fetch rs_pending_fetch;
+
 struct restream_server {
     struct mg_mgr mgr;
     struct mg_connection *c;
     bool is_running;
+    bool wakeup_ok;          // mg_wakeup_init succeeded — async fetches are safe to dispatch
     char *web_root;         // static file directory, or NULL
     rs_state state;         // state.json as a preserved DOM
     rs_auth *auth;          // admin accounts + sessions
     rs_sysstats *sysstats;  // live host stats for the monitoring view
     rs_metrics *metrics;    // per-stream client/bytes network monitor
+    rs_pending_fetch *pending_head; // in-flight async HLS-passthrough fetches
+    pthread_mutex_t pending_mu;     // guards pending_head and each entry's `cancelled` flag
+    pthread_cond_t pending_cv;      // signalled whenever a fetch unlinks itself; wakes restream_server_destroy's drain
     rs_live *live;          // background DASH->HLS engines, one per running stream
     rs_logo_cache *logo_cache;
     rs_log_entry log_ring[RS_LOG_CAP];
@@ -91,6 +104,18 @@ static const char *stream_source_target(const rs_json *stream);
 // Forward declaration: query helpers are defined with the routing code below,
 // but the playback handlers above them need it.
 static char *query_var(struct mg_http_message *hm, const char *name);
+
+// Forward declarations: the async HLS-passthrough fetch machinery is defined
+// just above serve_hls_playlist (its only dispatcher), but ev_handler,
+// restream_server_create and restream_server_destroy all need to reach it.
+static void pending_fetch_cancel(restream_server_t *s, unsigned long conn_id);
+static void pending_fetch_finish(restream_server_t *s, struct mg_connection *c, struct mg_str *data);
+static void pending_fetch_wait_idle(restream_server_t *s);
+
+// Forward declaration: apply_cenc is defined between serve_hls_playlist and
+// serve_restream_item, but pending_finish_item (defined just above
+// serve_hls_playlist) needs it too.
+static uint8_t *apply_cenc(const char *decryption_keys, bool is_map, uint8_t *body, size_t body_len, size_t *out_len);
 
 static char *logo_fetch_wrapper(const char *url, void *ctx) {
     (void)ctx;
@@ -1267,9 +1292,240 @@ static void send_redirect(struct mg_connection *c, const char *location) {
                  "Content-Length: 0\r\n\r\n", location);
 }
 
+// --- async HLS-passthrough fetch --------------------------------------------
+//
+// serve_hls_playlist and serve_restream_item's HLS-passthrough branch used to
+// call g_fetch_handler (libcurl) inline, in this thread — the single mongoose
+// poll loop that every other connection, every other stream and the panel API
+// all depend on. A slow or stalled origin therefore froze the entire server
+// for as long as the fetch took. serve_dash_master's comment further below
+// documents and fixes the identical failure for DASH by never fetching inline
+// there; this is the same fix for the one playback path that still did.
+//
+// The fetch — and, once it returns, any CPU-only post-processing (playlist
+// rewriting, ClearKey CENC, HLS AES-128 decrypt) — runs on a detached worker
+// thread. struct mg_connection is not thread-safe, so the worker never touches
+// `c`; mg_wakeup() is mongoose's documented thread-safe way back into the poll
+// loop, which is the only thing allowed to build and send the reply.
+typedef enum { RS_PENDING_PLAYLIST, RS_PENDING_ITEM } rs_pending_kind;
+
+struct rs_pending_fetch {
+    struct rs_pending_fetch *next;  // server->pending_head intrusive list
+    restream_server_t *server;
+    unsigned long conn_id;
+    rs_pending_kind kind;
+    bool cancelled;  // connection closed while the fetch was in flight; guarded by server->pending_mu
+
+    // Request, copied up front: hm/stream are only valid for this one mongoose
+    // event, and the stream JSON they point into can be edited or the stream
+    // deleted by another request while this fetch is in flight.
+    char *stream_id;
+    char *url;                     // manifest URL (playlist) or item URL (item)
+    char *proxy;
+    char *headers;
+    char *range;                   // item only
+    char *downloader;
+    char *downloader_params;
+    bool decrypt, is_map, is_key;  // item only
+    char *decryption_keys;         // item only, "KID:KEY[,KID:KEY...]"
+    char *hls_key, *hls_iv;        // item only
+    int seq;                       // item only, for HLS AES-128 IV derivation
+    char *user_agent;              // item only, for the metrics/log line
+    char *playback_key_str;        // item only, ditto
+
+    // Result, filled by pending_fetch_worker.
+    int rc;
+    long status;
+    char *body;
+    size_t body_len;
+    char *content_type;
+    char *content_range;
+    char err[256];
+};
+
+static void pending_fetch_free(rs_pending_fetch *pf) {
+    if (!pf) return;
+    free(pf->stream_id); free(pf->url); free(pf->proxy); free(pf->headers);
+    free(pf->range); free(pf->downloader); free(pf->downloader_params);
+    free(pf->decryption_keys); free(pf->hls_key); free(pf->hls_iv);
+    free(pf->user_agent); free(pf->playback_key_str);
+    free(pf->body); free(pf->content_type); free(pf->content_range);
+    free(pf);
+}
+
+static void *pending_fetch_worker(void *arg) {
+    rs_pending_fetch *pf = (rs_pending_fetch *)arg;
+    restream_server_t *server = pf->server;
+
+    pf->rc = g_fetch_handler(pf->url, pf->proxy, pf->headers, pf->range,
+                             pf->downloader, pf->downloader_params,
+                             &pf->body, &pf->body_len, &pf->status,
+                             &pf->content_type, &pf->content_range, NULL,
+                             pf->err, sizeof(pf->err));
+
+    pthread_mutex_lock(&server->pending_mu);
+    // Unlink before reading `cancelled`, under the same lock the close handler
+    // uses to set it — once unlinked nothing else can find pf, so everything
+    // after unlock is safe to touch without the lock.
+    rs_pending_fetch **link = &server->pending_head;
+    while (*link && *link != pf) link = &(*link)->next;
+    if (*link == pf) *link = pf->next;
+    bool cancelled = pf->cancelled;
+    pthread_cond_broadcast(&server->pending_cv);  // wakes restream_server_destroy's drain
+    pthread_mutex_unlock(&server->pending_mu);
+
+    // Either the player gave up and nobody is listening any more, or mg_wakeup
+    // could not queue the message (pipe not initialised) — either way there is
+    // no reply to build, so free the job here instead of leaking it.
+    if (cancelled || !mg_wakeup(&server->mgr, pf->conn_id, &pf, sizeof(pf))) {
+        pending_fetch_free(pf);
+    }
+    return NULL;
+}
+
+// Hands `pf` off to a worker thread. Always consumes pf: on success the worker
+// frees it once the reply is built; on failure the caller must free it. Fills
+// pf->server/conn_id, so callers only need everything else set.
+static bool pending_fetch_dispatch(restream_server_t *server, struct mg_connection *c, rs_pending_fetch *pf) {
+    // Without a working wakeup pipe a worker could still fetch, but could never
+    // hand the result back — the connection would hang forever instead of
+    // erroring. Fail the dispatch up front so callers reply with a clean 500.
+    if (!server->wakeup_ok) return false;
+    pf->server = server;
+    pf->conn_id = c->id;
+    pthread_mutex_lock(&server->pending_mu);
+    pf->next = server->pending_head;
+    server->pending_head = pf;
+    pthread_mutex_unlock(&server->pending_mu);
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, pending_fetch_worker, pf) != 0) {
+        pthread_mutex_lock(&server->pending_mu);
+        rs_pending_fetch **link = &server->pending_head;
+        while (*link && *link != pf) link = &(*link)->next;
+        if (*link == pf) *link = pf->next;
+        pthread_mutex_unlock(&server->pending_mu);
+        return false;
+    }
+    pthread_detach(tid);
+    return true;
+}
+
+static void pending_fetch_cancel(restream_server_t *s, unsigned long conn_id) {
+    pthread_mutex_lock(&s->pending_mu);
+    for (rs_pending_fetch *pf = s->pending_head; pf; pf = pf->next)
+        if (pf->conn_id == conn_id) pf->cancelled = true;
+    pthread_mutex_unlock(&s->pending_mu);
+}
+
+// Blocks until every dispatched fetch has finished and freed itself. Bounded by
+// libcurl's own connect/transfer timeouts (net.c), so this cannot hang forever
+// even against an origin that never answers. Must run before mg_mgr_free and
+// before pending_mu/pending_cv are destroyed — a worker mid-flight touches all
+// three when it finishes.
+static void pending_fetch_wait_idle(restream_server_t *s) {
+    pthread_mutex_lock(&s->pending_mu);
+    while (s->pending_head != NULL) pthread_cond_wait(&s->pending_cv, &s->pending_mu);
+    pthread_mutex_unlock(&s->pending_mu);
+}
+
+static void pending_finish_playlist(struct mg_connection *c, rs_pending_fetch *pf) {
+    if (pf->rc != 0) {
+        reply_error(c, 502, pf->err[0] ? pf->err : "Could not fetch the playlist.");
+        return;
+    }
+    char *rewritten;
+    if (rs_m3u8_is_master(pf->body)) {
+        rewritten = rs_m3u8_rewrite_master(pf->body, pf->url, master_transform, (void *)pf->stream_id);
+    } else {
+        // The player fetches (and, if encrypted, decrypts with) the key itself,
+        // so keys are proxied through rather than dropped — server-side HLS
+        // decryption is a later increment.
+        rewritten = rs_m3u8_rewrite(pf->body, pf->url, false, media_transform, (void *)pf->stream_id);
+    }
+    if (!rewritten) { reply_error(c, 500, "Out of memory rewriting the playlist."); return; }
+    mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
+                          "Cache-Control: no-store\r\n", "%s", rewritten);
+    rs_free(rewritten);
+}
+
+static void pending_finish_item(restream_server_t *server, struct mg_connection *c, rs_pending_fetch *pf) {
+    if (pf->rc != 0) {
+        log_record(server, pf->stream_id, "error", pf->is_map ? "downloadInit" : "downloadSegment",
+                   pf->url, 0, -1, pf->err[0] ? pf->err : "fetch failed");
+        reply_error(c, 502, pf->err[0] ? pf->err : "Segment fetch failed.");
+        return;
+    }
+
+    uint8_t *body = (uint8_t *)pf->body;
+    size_t body_len = pf->body_len;
+    long status = pf->status;
+
+    if (pf->decrypt) {
+        size_t new_len = 0;
+        body = apply_cenc(pf->decryption_keys, pf->is_map, body, body_len, &new_len);
+        body_len = new_len;
+        status = 0; free(pf->content_range); pf->content_range = NULL;  // decrypted body is a fresh whole object
+    }
+
+    if (pf->hls_key && pf->hls_key[0] != '\0' && !pf->is_key) {
+        uint8_t *dec_out = NULL;
+        size_t dec_len = 0;
+        if (rs_hls_decrypt(body, body_len, pf->hls_key, pf->hls_iv ? pf->hls_iv : "", pf->seq, &dec_out, &dec_len) == 0 && dec_out) {
+            free(body);
+            body = dec_out;
+            body_len = dec_len;
+            status = 0; free(pf->content_range); pf->content_range = NULL;
+        } else {
+            log_record(server, pf->stream_id, "error", "decryptSegment", pf->url, 0, -1, "HLS decryption failed");
+        }
+    }
+
+    // Network monitor: attribute the served bytes to this stream + client, and
+    // log the fetch so the stream's Logs tab shows download activity.
+    char client_ip[64] = {0};
+    mg_snprintf(client_ip, sizeof(client_ip), "%M", mg_print_ip, &c->rem);
+    const char *identity = (pf->playback_key_str && pf->playback_key_str[0]) ? pf->playback_key_str : client_ip;
+    rs_metrics_record(server->metrics, pf->stream_id, identity, client_ip,
+                      pf->user_agent ? pf->user_agent : "", (int)body_len);
+    log_recordf(server, pf->stream_id, "info", pf->is_map ? "serveInit" : "serveSegment",
+                pf->url, status, (long long)body_len, "fetched for %s", client_ip);
+
+    const char *type = (pf->content_type && pf->content_type[0]) ? pf->content_type : content_type_from_ext(pf->url);
+    // Relay the upstream's 206 + Content-Range so the player's byte-range
+    // request is answered as a partial response, not a 200 of the wrong length.
+    if (status == 206 && pf->content_range && pf->content_range[0]) {
+        mg_printf(c, "HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\nContent-Range: %s\r\n"
+                     "Content-Length: %lu\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\n"
+                     "Access-Control-Allow-Origin: *\r\n\r\n",
+                  type, pf->content_range, (unsigned long)body_len);
+    } else {
+        mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
+                     "Accept-Ranges: bytes\r\nCache-Control: no-store\r\n"
+                     "Access-Control-Allow-Origin: *\r\n\r\n",
+                  type, (unsigned long)body_len);
+    }
+    mg_send(c, body, body_len);
+    // CENC/HLS decrypt free pf->body and hand back a distinct allocation, so
+    // `body` may not be pf->body any more — free whichever one we ended up
+    // with here, and null pf->body so pending_fetch_free doesn't double-free it.
+    free(body);
+    pf->body = NULL;
+}
+
+static void pending_fetch_finish(restream_server_t *server, struct mg_connection *c, struct mg_str *data) {
+    if (!data || data->len != sizeof(rs_pending_fetch *)) return;
+    rs_pending_fetch *pf;
+    memcpy(&pf, data->buf, sizeof(pf));
+    if (pf->kind == RS_PENDING_PLAYLIST) pending_finish_playlist(c, pf);
+    else pending_finish_item(server, c, pf);
+    pending_fetch_free(pf);
+}
+
 // Serves an HLS passthrough playlist: fetch the remote playlist (the configured
 // URL, or a ?variant= link from an already-rewritten master), rewrite every URI
-// to loop back through this server, and return it.
+// to loop back through this server, and return it. The fetch runs on a worker
+// thread — see the "async HLS-passthrough fetch" section above.
 static void serve_hls_playlist(restream_server_t *server, struct mg_connection *c,
                                struct mg_http_message *hm, const rs_json *stream) {
     const char *stream_id = rs_json_obj_str(stream, "id", "");
@@ -1279,41 +1535,31 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     const char *manifest_url = variant ? variant : stream_source_target(stream);
     if (!manifest_url[0]) { free(variant); reply_error(c, 400, "Stream has no source URL."); return; }
 
-    char *proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
-    char *headers = effective_headers(provider, stream, "manifestHeaders");
-    char *body = NULL;
-    size_t body_len = 0;
-    char err[256] = {0};
-    int rc = g_fetch_handler(manifest_url, proxy, headers, NULL,
-                             effective_downloader(provider), effective_downloader_params(provider),
-                             &body, &body_len, NULL, NULL, NULL, NULL, err, sizeof(err));
-    free(proxy);
-    free(headers);
-    if (rc != 0) { free(variant); reply_error(c, 502, err[0] ? err : "Could not fetch the playlist."); return; }
-
-    char *rewritten;
-    if (rs_m3u8_is_master(body)) {
-        rewritten = rs_m3u8_rewrite_master(body, manifest_url, master_transform, (void *)stream_id);
-    } else {
-        // The player fetches (and, if encrypted, decrypts with) the key itself,
-        // so keys are proxied through rather than dropped — server-side HLS
-        // decryption is a later increment.
-        rewritten = rs_m3u8_rewrite(body, manifest_url, false, media_transform, (void *)stream_id);
-    }
-    free(body);
+    rs_pending_fetch *pf = (rs_pending_fetch *)calloc(1, sizeof(*pf));
+    if (!pf) { free(variant); reply_error(c, 500, "Out of memory."); return; }
+    pf->kind = RS_PENDING_PLAYLIST;
+    pf->stream_id = rs_strdup(stream_id);
+    pf->url = rs_strdup(manifest_url);
+    pf->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    pf->headers = effective_headers(provider, stream, "manifestHeaders");
+    pf->downloader = rs_strdup(effective_downloader(provider));
+    pf->downloader_params = rs_strdup(effective_downloader_params(provider));
     free(variant);
-    if (!rewritten) { reply_error(c, 500, "Out of memory rewriting the playlist."); return; }
-    mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
-                          "Cache-Control: no-store\r\n", "%s", rewritten);
-    rs_free(rewritten);
+
+    if (!pending_fetch_dispatch(server, c, pf)) {
+        pending_fetch_free(pf);
+        reply_error(c, 500, "Could not start the playlist fetch.");
+    }
 }
 
 // Applies ClearKey CENC to a fetched DASH item in place: patches the init
 // segment (kind=map) or AES-CTR-decrypts a media segment using the stream's
-// configured KID:KEY. No-op (returns the input) when no key is set.
-static uint8_t *apply_cenc(const rs_json *stream, bool is_map, uint8_t *body, size_t body_len, size_t *out_len) {
+// configured KID:KEY. No-op (returns the input) when no key is set. Takes the
+// raw "KID:KEY" string rather than the stream object itself so it can run on
+// pending_fetch_worker's copy after the stream JSON may have changed underneath.
+static uint8_t *apply_cenc(const char *decryption_keys, bool is_map, uint8_t *body, size_t body_len, size_t *out_len) {
     *out_len = body_len;
-    rs_cenc_keys keys = rs_cenc_parse_keys(rs_json_obj_str(stream, "decryptionKeys", ""));
+    rs_cenc_keys keys = rs_cenc_parse_keys(decryption_keys ? decryption_keys : "");
     uint8_t *out = NULL;
     if (is_map) {
         // The init needs patching to a clear codec even before any key exists.
@@ -1416,7 +1662,10 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     }
 
     // Everything below is the HLS passthrough path, which has no engine behind
-    // it and still resolves ?u= per request.
+    // it and still resolves ?u= per request. The fetch (and any CENC/HLS
+    // decrypt) runs on a worker thread — see the "async HLS-passthrough fetch"
+    // section above serve_hls_playlist — instead of blocking this, the single
+    // mongoose poll loop every other connection also depends on.
     char *url = query_var(hm, "u");
     if (!url) { reply_error(c, 400, "Missing ?u= target."); return; }
     const rs_json *provider = provider_of(&server->state, stream);
@@ -1427,88 +1676,36 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     bool is_map = kindq && strcmp(kindq, "map") == 0;
     bool is_key = kindq && strcmp(kindq, "key") == 0;
     free(dec); free(kindq);
-    {
-    }
 
+    rs_pending_fetch *pf = (rs_pending_fetch *)calloc(1, sizeof(*pf));
+    if (!pf) { free(url); reply_error(c, 500, "Out of memory."); return; }
+    pf->kind = RS_PENDING_ITEM;
+    pf->stream_id = rs_strdup(stream_id);
+    pf->url = url;  // pf owns it now
+    pf->decrypt = decrypt;
+    pf->is_map = is_map;
+    pf->is_key = is_key;
     // Forward the player's Range so byte-range segments and seeking fetch only
     // the requested slice — but never for a to-be-decrypted item: CENC needs the
     // whole segment, so a ranged fetch would corrupt it.
-    char *range = decrypt ? NULL : header_dup(hm, "Range");
-    char *proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
-    char *headers = effective_headers(provider, stream, "mediaHeaders");
-    char *body = NULL, *ct = NULL, *cr = NULL;
-    size_t body_len = 0;
-    long status = 0;
-    char err[256] = {0};
-    int rc = g_fetch_handler(url, proxy, headers, range,
-                             effective_downloader(provider), effective_downloader_params(provider),
-                             &body, &body_len, &status, &ct, &cr, NULL, err, sizeof(err));
-    free(proxy);
-    free(headers);
-    free(range);
-    if (rc != 0) {
-        log_record(server, stream_id, "error", is_map ? "downloadInit" : "downloadSegment",
-                   url, 0, -1, err[0] ? err : "fetch failed");
-        free(url); free(ct); free(cr);
-        reply_error(c, 502, err[0] ? err : "Segment fetch failed."); return;
-    }
+    pf->range = decrypt ? NULL : header_dup(hm, "Range");
+    pf->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
+    pf->headers = effective_headers(provider, stream, "mediaHeaders");
+    pf->downloader = rs_strdup(effective_downloader(provider));
+    pf->downloader_params = rs_strdup(effective_downloader_params(provider));
+    pf->decryption_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
+    pf->hls_key = rs_strdup(rs_json_obj_str(stream, "hlsKey", ""));
+    pf->hls_iv = rs_strdup(rs_json_obj_str(stream, "hlsIV", ""));
+    char *seq_str = query_var(hm, "seq");
+    pf->seq = seq_str ? atoi(seq_str) : 0;
+    free(seq_str);
+    pf->user_agent = header_dup(hm, "User-Agent");
+    pf->playback_key_str = playback_key(hm);
 
-    if (decrypt) {
-        size_t new_len = 0;
-        body = (char *)apply_cenc(stream, is_map, (uint8_t *)body, body_len, &new_len);
-        body_len = new_len;
-        status = 0; free(cr); cr = NULL;  // decrypted body is a fresh whole object
+    if (!pending_fetch_dispatch(server, c, pf)) {
+        pending_fetch_free(pf);
+        reply_error(c, 502, "Segment fetch failed.");
     }
-
-    const char *hls_key = rs_json_obj_str(stream, "hlsKey", "");
-    if (hls_key && hls_key[0] != '\0' && !is_key) {
-        const char *hls_iv = rs_json_obj_str(stream, "hlsIV", "");
-        char *seq_str = query_var(hm, "seq");
-        int seq = seq_str ? atoi(seq_str) : 0;
-        free(seq_str);
-        uint8_t *dec_out = NULL;
-        size_t dec_len = 0;
-        if (rs_hls_decrypt((uint8_t *)body, body_len, hls_key, hls_iv ? hls_iv : "", seq, &dec_out, &dec_len) == 0 && dec_out) {
-            free(body);
-            body = (char *)dec_out;
-            body_len = dec_len;
-            status = 0; free(cr); cr = NULL;
-        } else {
-            log_record(server, stream_id, "error", "decryptSegment", url, 0, -1, "HLS decryption failed");
-        }
-    }
-
-    // Network monitor: attribute the served bytes to this stream + client, and
-    // log the fetch so the stream's Logs tab shows download activity.
-    char client_ip[64] = {0};
-    mg_snprintf(client_ip, sizeof(client_ip), "%M", mg_print_ip, &c->rem);
-    char *ua = header_dup(hm, "User-Agent");
-    char *pkey = playback_key(hm);
-    const char *identity = (pkey && pkey[0]) ? pkey : client_ip;
-    rs_metrics_record(server->metrics, stream_id, identity, client_ip, ua ? ua : "", (int)body_len);
-    log_recordf(server, stream_id, "info", is_map ? "serveInit" : "serveSegment",
-                url, status, (long long)body_len, "fetched inline for %s", client_ip);
-    free(ua); free(pkey);
-
-    const char *type = (ct && ct[0]) ? ct : content_type_from_ext(url);
-    // Relay the upstream's 206 + Content-Range so the player's byte-range
-    // request is answered as a partial response, not a 200 of the wrong length.
-    if (status == 206 && cr && cr[0]) {
-        mg_printf(c, "HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\nContent-Range: %s\r\n"
-                     "Content-Length: %lu\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\n"
-                     "Access-Control-Allow-Origin: *\r\n\r\n",
-                  type, cr, (unsigned long)body_len);
-    } else {
-        mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
-                     "Accept-Ranges: bytes\r\nCache-Control: no-store\r\n"
-                     "Access-Control-Allow-Origin: *\r\n\r\n",
-                  type, (unsigned long)body_len);
-    }
-    mg_send(c, body, body_len);
-    free(url);
-    free(ct);
-    free(cr);
-    free(body);
 }
 
 // --- the live DASH engine's control plane -----------------------------------
@@ -1808,9 +2005,25 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
 
 // Mongoose event handler
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
+    restream_server_t *server = (restream_server_t *)c->fn_data;
+    // A connection with an in-flight async fetch (see pending_fetch_dispatch)
+    // closing before the worker finishes — the player gave up, or seeked away.
+    // Mark it so the worker frees its own result instead of replying to a
+    // connection that no longer exists.
+    if (ev == MG_EV_CLOSE) {
+        if (server) pending_fetch_cancel(server, c->id);
+        return;
+    }
+    // A worker thread's fetch finished; ev_data is the struct mg_str mg_wakeup()
+    // delivers, carrying the rs_pending_fetch* it was called with. This is the
+    // only thread that may build a reply from it — pending_fetch_finish builds
+    // and sends it, then frees the job.
+    if (ev == MG_EV_WAKEUP) {
+        if (server) pending_fetch_finish(server, c, (struct mg_str *)ev_data);
+        return;
+    }
     if (ev != MG_EV_HTTP_MSG) return;
     struct mg_http_message *hm = (struct mg_http_message *)ev_data;
-    restream_server_t *server = (restream_server_t *)c->fn_data;
 
     // Liveness probe. Carries the binary's build time so it's trivial to tell,
     // from an unauthenticated curl, whether a rebuilt server was actually
@@ -1873,12 +2086,21 @@ restream_server_t* restream_server_create(void) {
     restream_server_t* server = (restream_server_t*)calloc(1, sizeof(restream_server_t));
     if (!server) return NULL;
     mg_mgr_init(&server->mgr);
+    // Lets pending_fetch_worker() (spawned by the HLS-passthrough playback
+    // routes) hand a finished fetch back to this thread instead of ever
+    // touching a struct mg_connection itself. If this fails (should not
+    // happen — it's just a local socketpair) pending_fetch_dispatch refuses to
+    // dispatch and those routes reply with a clean 500 instead of hanging.
+    server->wakeup_ok = mg_wakeup_init(&server->mgr);
     server->c = NULL;
     server->is_running = false;
     server->web_root = NULL;
     server->auth = rs_auth_create();
     server->sysstats = rs_sysstats_create();
     server->metrics = rs_metrics_create();
+    server->pending_head = NULL;
+    pthread_mutex_init(&server->pending_mu, NULL);
+    pthread_cond_init(&server->pending_cv, NULL);
 #ifndef _WIN32
     pthread_mutex_init(&server->log_mu, NULL);
 #endif
@@ -1896,6 +2118,8 @@ restream_server_t* restream_server_create(void) {
         rs_live_destroy(server->live);
         rs_state_dispose(&server->state);
         mg_mgr_free(&server->mgr);
+        pthread_mutex_destroy(&server->pending_mu);
+        pthread_cond_destroy(&server->pending_cv);
 #ifndef _WIN32
         pthread_mutex_destroy(&server->log_mu);
 #endif
@@ -1970,6 +2194,13 @@ void restream_server_stop(restream_server_t* server) {
 
 void restream_server_destroy(restream_server_t* server) {
     if (server) {
+        // Detached pending-fetch worker threads (see pending_fetch_dispatch)
+        // call mg_wakeup() on this server's mgr and read/write the pending
+        // list on their own time; both become use-after-free the moment
+        // mg_mgr_free/pthread_mutex_destroy below run. Block until none are
+        // left in flight — bounded by libcurl's own fetch timeout, so this
+        // cannot hang forever.
+        pending_fetch_wait_idle(server);
         mg_mgr_free(&server->mgr);
         // Stops and joins every worker first: they hold a pointer to this
         // server as their log sink, so nothing else may be torn down while one
@@ -1981,6 +2212,8 @@ void restream_server_destroy(restream_server_t* server) {
         rs_metrics_destroy(server->metrics);
         if (server->logo_cache) rs_logo_cache_destroy(server->logo_cache);
         log_clear(server, "");  // frees ring-buffer strings
+        pthread_mutex_destroy(&server->pending_mu);
+        pthread_cond_destroy(&server->pending_cv);
 #ifndef _WIN32
         pthread_mutex_destroy(&server->log_mu);
 #endif
