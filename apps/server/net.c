@@ -92,6 +92,14 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    // Some IPTV origins (seen on izzigo.tv) run a flaky HTTP/2 stack that
+    // drops mid-stream with "Stream error in the HTTP/2 framing layer" —
+    // reproduced independently with plain curl against the same URL, so it's
+    // the origin, not us. Every fetch here already opens its own connection
+    // (no CURLSH connection-cache is configured), so there is no HTTP/2
+    // multiplexing benefit being traded away — forcing HTTP/1.1 just removes
+    // the broken code path.
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "ReStreamAir/1.0");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     if (proxy && proxy[0]) curl_easy_setopt(curl, CURLOPT_PROXY, proxy);

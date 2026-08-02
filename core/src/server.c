@@ -58,6 +58,11 @@ typedef struct {
 // callers. Forward-declared here so restream_server can hold the pending list.
 typedef struct rs_pending_job rs_pending_job;
 
+// Per-sid "cleared before" cutoffs for the log ring — see log_clear_cutoff,
+// defined with log_clear/log_view further down. Forward-declared here so
+// restream_server can hold the list.
+typedef struct rs_log_clear_entry rs_log_clear_entry;
+
 struct restream_server {
     struct mg_mgr mgr;
     struct mg_connection *c;
@@ -77,6 +82,7 @@ struct restream_server {
     rs_log_entry log_ring[RS_LOG_CAP];
     size_t log_head;        // next write slot
     size_t log_count;       // entries in use (<= RS_LOG_CAP)
+    rs_log_clear_entry *log_clears; // per-sid "cleared before" cutoffs; guarded by log_mu
 #ifndef _WIN32
     pthread_mutex_t log_mu; // the live engine's worker threads write here too
 #endif
@@ -248,28 +254,42 @@ static void live_log_sink(void *ctx, const char *stream_id, const char *level,
     log_record((restream_server_t *)ctx, stream_id, level, event, url, status, bytes, message);
 }
 
-// Builds the {entries:[...],availableDates:[]} response, oldest→newest, keeping
-// at most `limit` of the newest that match `sid` (NULL/"" = all).
+// Per-sid "cleared before" cutoff: log_clear(sid) can't compact the ring (its
+// slots are shared by every sid, addressed only by position), so a per-stream
+// clear instead records a timestamp and log_view hides anything from that sid
+// older than it. A full clear (sid NULL/"") still empties the ring outright,
+// which also makes every per-sid cutoff moot — cleared there too.
+struct rs_log_clear_entry {
+    char *sid;
+    double cutoff_ms;
+    struct rs_log_clear_entry *next;
+};
+
+// Caller holds log_mu.
+static double log_clear_cutoff(restream_server_t *s, const char *sid) {
+    for (rs_log_clear_entry *e = s->log_clears; e; e = e->next)
+        if (strcmp(e->sid, sid) == 0) return e->cutoff_ms;
+    return 0;
+}
+
+// Builds the {entries:[...],availableDates:[]} response, newest→oldest (the
+// frontend renders top-to-bottom and expects the newest entry first — see
+// loadLogs()/groupLogEntries() in app.js), keeping at most `limit` of the
+// newest that match `sid` (NULL/"" = all).
 static rs_json *log_view(restream_server_t *s, const char *sid, int limit) {
     rs_json *entries = rs_json_new_arr();
     if (limit <= 0) limit = 150;
     if (limit > RS_LOG_CAP) limit = RS_LOG_CAP;
-    // Walk newest→oldest, collect up to `limit` matches, then reverse. Sized
-    // from `limit` rather than the ring depth: the ring is now large enough
-    // that an array of one pointer per slot would be a 160 KB stack frame.
-    rs_json **tmp = (rs_json **)malloc((size_t)limit * sizeof(rs_json *));
-    if (!tmp) {
-        rs_json *oom = rs_json_new_obj();
-        rs_json_obj_set(oom, "entries", entries);
-        rs_json_obj_set(oom, "availableDates", rs_json_new_arr());
-        return oom;
-    }
     int n = 0;
     log_lock(s);
+    // Walk newest→oldest; the ring already stores them that way relative to
+    // log_head, so pushing in this order needs no separate reverse pass.
     for (size_t i = 0; i < s->log_count && n < limit; i++) {
         size_t idx = (s->log_head + RS_LOG_CAP - 1 - i) % RS_LOG_CAP;
         rs_log_entry *e = &s->log_ring[idx];
         if (sid && sid[0] && strcmp(sid, e->sid) != 0) continue;
+        double cutoff = log_clear_cutoff(s, e->sid);
+        if (cutoff > 0 && e->ts_ms < cutoff) continue;
         rs_json *o = rs_json_new_obj();
         rs_json_obj_set(o, "timestamp", rs_json_new_num(e->ts_ms));
         rs_json_obj_set_str(o, "level", e->level);
@@ -279,20 +299,23 @@ static rs_json *log_view(restream_server_t *s, const char *sid, int limit) {
         if (e->message) rs_json_obj_set_str(o, "message", e->message);
         if (e->status) rs_json_obj_set_int(o, "status", e->status);
         if (e->bytes >= 0) rs_json_obj_set_int(o, "bytes", e->bytes);
-        tmp[n++] = o;
+        rs_json_arr_push(entries, o);
+        n++;
     }
     log_unlock(s);
-    for (int i = n - 1; i >= 0; i--) rs_json_arr_push(entries, tmp[i]);
-    free(tmp);
     rs_json *out = rs_json_new_obj();
     rs_json_obj_set(out, "entries", entries);
     rs_json_obj_set(out, "availableDates", rs_json_new_arr());
     return out;
 }
 
+// sid NULL/"" empties the ring outright. Otherwise (the panel's per-stream
+// "Clear" button) the ring itself is untouched — see rs_log_clear_entry above
+// — so log_view hides everything from that sid up to now, while new activity
+// for it still shows up.
 static void log_clear(restream_server_t *s, const char *sid) {
+    log_lock(s);
     if (!sid || !sid[0]) {
-        log_lock(s);
         for (size_t i = 0; i < s->log_count; i++) {
             size_t idx = (s->log_head + RS_LOG_CAP - 1 - i) % RS_LOG_CAP;
             rs_log_entry *e = &s->log_ring[idx];
@@ -300,10 +323,24 @@ static void log_clear(restream_server_t *s, const char *sid) {
             memset(e, 0, sizeof(*e));
         }
         s->log_count = 0; s->log_head = 0;
-        log_unlock(s);
+        while (s->log_clears) {
+            rs_log_clear_entry *next = s->log_clears->next;
+            free(s->log_clears->sid);
+            free(s->log_clears);
+            s->log_clears = next;
+        }
+    } else {
+        rs_log_clear_entry *e = s->log_clears;
+        for (; e; e = e->next) if (strcmp(e->sid, sid) == 0) break;
+        if (!e) {
+            e = (rs_log_clear_entry *)calloc(1, sizeof(*e));
+            e->sid = rs_strdup(sid);
+            e->next = s->log_clears;
+            s->log_clears = e;
+        }
+        e->cutoff_ms = now_ms();
     }
-    // Per-stream clear is a no-op on the ring (entries age out on their own);
-    // clearing everything is the common case and is honoured.
+    log_unlock(s);
 }
 
 // --- small response helpers ------------------------------------------------
@@ -1201,11 +1238,12 @@ static char *effective_headers(const rs_json *provider, const rs_json *stream, c
     return out;
 }
 
-// The provider's chosen download tool ("curl" default) and its extra params.
-// Applied to this provider's manifest/segment fetches; see rs_fetch_url.
+// The provider's chosen download tool ("native", i.e. in-process libcurl, by
+// default) and its extra params. Applied to this provider's manifest/segment
+// fetches; see rs_fetch_url.
 static const char *effective_downloader(const rs_json *provider) {
     const char *d = rs_json_obj_str(provider, "downloader", "");
-    return d[0] ? d : "curl";
+    return d[0] ? d : "native";
 }
 static const char *effective_downloader_params(const rs_json *provider) {
     return rs_json_obj_str(provider, "downloaderParams", "");

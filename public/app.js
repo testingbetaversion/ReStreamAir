@@ -1812,7 +1812,7 @@ function openProviderSettingsDialog() {
   form.elements.name.value = provider.name || "";
   form.elements.proxy.value = provider.proxy || "";
   form.elements.headers.value = provider.headers || "";
-  form.elements.downloader.value = provider.downloader || "curl";
+  form.elements.downloader.value = provider.downloader || "native";
   form.elements.downloaderParams.value = provider.downloaderParams || "";
   form.elements.segmentUrlParams.value = provider.segmentUrlParams || "";
   form.elements.inheritUrlParams.checked = Boolean(provider.inheritUrlParams);

@@ -97,10 +97,17 @@ static rs_stream_stats* get_or_create_stream(rs_metrics *m, const char *stream_i
     return s;
 }
 
+// Keyed by (stream_id, identity), not identity alone: an identity defaults to
+// the client IP when no playback key is configured, so the same viewer
+// switching between two streams (or two tabs watching two streams at once)
+// must not collapse into one connection record — that left rs_metrics_
+// active_clients() reporting the viewer against whichever stream they were
+// first seen on, and the monitor never showing them against a stream they
+// switched to.
 static rs_conn_info* get_or_create_conn(rs_metrics *m, const char *stream_id, const char *identity) {
     rs_conn_info *c = m->conns;
     while (c) {
-        if (strcmp(c->identity, identity) == 0) return c;
+        if (strcmp(c->stream_id, stream_id) == 0 && strcmp(c->identity, identity) == 0) return c;
         c = c->next;
     }
     c = calloc(1, sizeof(rs_conn_info));
