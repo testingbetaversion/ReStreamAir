@@ -63,6 +63,36 @@ static size_t header_cb(char *buffer, size_t size, size_t nitems, void *userdata
     return len;
 }
 
+// A non-2xx response often carries the origin's own error payload — e.g. a
+// small JSON body like {"status":"FRUITION_EXCEED","message":"Limit of
+// concurrent streams reached."} — which used to be fetched, buffered, and
+// then thrown away, leaving only the bare "Upstream returned HTTP 403." in
+// the logs. Appends a sanitized, capped snippet of it when the body looks
+// like text (skipped for a binary body — that's not something to dump into a
+// log line).
+static void append_body_snippet(char *errbuf, size_t errbuf_len, const char *body, size_t len) {
+    if (!body || len == 0 || !errbuf || errbuf_len == 0) return;
+    size_t cap = len < 300 ? len : 300;
+    size_t printable = 0;
+    for (size_t i = 0; i < cap; i++) {
+        unsigned char c = (unsigned char)body[i];
+        if (c == '\t' || c == '\n' || c == '\r' || (c >= 0x20 && c < 0x7f)) printable++;
+    }
+    if (printable < cap * 9 / 10) return;
+    size_t used = strnlen(errbuf, errbuf_len);
+    static const char sep[] = " - ";
+    if (used + sizeof(sep) >= errbuf_len) return;
+    memcpy(errbuf + used, sep, sizeof(sep) - 1);
+    used += sizeof(sep) - 1;
+    size_t avail = errbuf_len - used - 1;
+    size_t n = cap < avail ? cap : avail;
+    for (size_t i = 0; i < n; i++) {
+        char c = body[i];
+        errbuf[used + i] = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+    }
+    errbuf[used + n] = '\0';
+}
+
 static int fetch_libcurl(const char *url, const char *proxy, const char *headers, const char *range,
                          char **out, size_t *out_len, long *status, char **content_type,
                          char **content_range, char **effective_url, char *errbuf, size_t errbuf_len) {
@@ -140,6 +170,7 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     }
     if (code < 200 || code >= 400) {
         snprintf(errbuf, errbuf_len, "Upstream returned HTTP %ld.", code);
+        append_body_snippet(errbuf, errbuf_len, buf.data, buf.len);
         free(buf.data);
         if (content_type) { free(*content_type); *content_type = NULL; }
         if (content_range) { free(*content_range); *content_range = NULL; }
@@ -352,6 +383,7 @@ static int fetch_external(const char *tool, const char *dl_params,
     long st = status ? *status : 0;
     if (st != 0 && (st < 200 || st >= 400)) {
         snprintf(errbuf, errbuf_len, "Upstream returned HTTP %ld.", st);
+        append_body_snippet(errbuf, errbuf_len, body, body_len);
         free(body);
         if (content_type) { free(*content_type); *content_type = NULL; }
         if (content_range) { free(*content_range); *content_range = NULL; }
