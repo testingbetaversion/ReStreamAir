@@ -1045,9 +1045,21 @@ function stopPlayer() {
 // moment later. Retrying persistently with backoff lets playback start on its
 // own as soon as the first segments land, and also rides out a transient blip
 // mid-stream rather than tearing the player down.
+// liveSyncDurationCount=2 (hls.js's default) means "start ~4s behind the live
+// edge" — fine when the origin publishes on a steady 2s cadence, but the
+// sources this app restreams get fetched through slow/rate-limited proxies,
+// so the server's own poll cycle can take 10-20s+ per batch and the live edge
+// jumps forward in bursts rather than one segment at a time. hls.js kept
+// recomputing its target to stay ~4s behind a point that had already moved by
+// the time a fragment finished loading, aborting the in-flight load and
+// retargeting forever — buffered stayed empty no matter how long it waited,
+// with no error to recover from because nothing was actually failing. Trading
+// ~16s more live latency for a target that survives one burst gives it
+// something to actually catch up to.
 const HLS_CONFIG = {
-  liveSyncDurationCount: 2,
-  maxLiveSyncPlaybackRate: 1.3,
+  liveSyncDurationCount: 8,
+  liveMaxLatencyDurationCount: 14,
+  maxLiveSyncPlaybackRate: 1,
   debug: true,
   playlistLoadPolicy: {
     default: {
@@ -1058,6 +1070,43 @@ const HLS_CONFIG = {
     },
   },
 };
+
+// hls.js surfaces every failure as an ERROR event rather than throwing, so
+// with nothing listening a fatal one — a network exhausted retries, or (the
+// common case on the flaky live sources this app restreams) an MSE
+// buffer-append failure right after an EXT-X-DISCONTINUITY — just left the
+// player sitting on a dead <video> forever with no indication why. This is
+// hls.js's own documented recovery: network errors resume with startLoad(),
+// media errors resume with recoverMediaError(). recoverMediaError() alone
+// isn't enough for a source that keeps re-erroring — mediaErrorCount only
+// resets on an actual buffered frame, so repeated errors with no progress
+// between them escalate to `onUnrecoverable` instead of retrying forever.
+function attachHlsErrorRecovery(hlsInstance, onUnrecoverable) {
+  let mediaErrorCount = 0;
+  hlsInstance.on(window.Hls.Events.FRAG_BUFFERED, () => { mediaErrorCount = 0; });
+  hlsInstance.on(window.Hls.Events.ERROR, (_event, data) => {
+    if (!data.fatal) return;
+    switch (data.type) {
+      case window.Hls.ErrorTypes.NETWORK_ERROR:
+        hlsInstance.startLoad();
+        break;
+      case window.Hls.ErrorTypes.MEDIA_ERROR:
+        mediaErrorCount++;
+        if (mediaErrorCount <= 3) hlsInstance.recoverMediaError();
+        else onUnrecoverable?.(data);
+        break;
+      default:
+        onUnrecoverable?.(data);
+        break;
+    }
+  });
+}
+
+// Reload attempts are capped and reset whenever the player is (re)loaded for
+// a stream the user picked, so a permanently broken source gives up instead
+// of hammering the server in a tight loop, while a transient run of errors
+// right after opening the player still gets a few full retries.
+let playerReloadAttempts = 0;
 
 function loadPlayer() {
   const stream = selectedStream();
@@ -1071,6 +1120,7 @@ function loadPlayer() {
     $("#statusBox").textContent = "Start the stream to get a play link.";
     return;
   }
+  playerReloadAttempts = 0;
   // hls.js is preferred whenever it can run: some browsers/embedded webviews
   // report native HLS support via canPlayType but handle multi-track audio
   // (a separate EXT-X-MEDIA playlist, which every multi-quality/multi-audio
@@ -1085,6 +1135,14 @@ function loadPlayer() {
     hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
       video.play().catch(() => {});
       renderTrackControls(hls);
+    });
+    attachHlsErrorRecovery(hls, (data) => {
+      console.error("hls.js gave up on", stream.name, data);
+      if (playerReloadAttempts++ < 5 && selectedStream()?.id === stream.id) {
+        setTimeout(loadPlayer, 1000);
+      } else {
+        $("#statusBox").textContent = `Playback stopped: ${data.details || data.type}. Reopen the player to retry.`;
+      }
     });
   } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
     video.src = stream.playUrl;
@@ -1174,6 +1232,15 @@ async function playInPictureInPicture(stream) {
       pipHls = new window.Hls(HLS_CONFIG);
       pipHls.loadSource(stream.playUrl);
       pipHls.attachMedia(video);
+      // No reload loop here like the main player's — requestPictureInPicture()
+      // below only runs once, on this user gesture, and reopening the floating
+      // window on its own later wouldn't be allowed without another one. Once
+      // hls.js truly gives up, just tear it down so the window doesn't sit
+      // there frozen on a dead frame.
+      attachHlsErrorRecovery(pipHls, (data) => {
+        console.error("hls.js gave up on PiP playback for", stream.name, data);
+        stopPipPlayer();
+      });
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
       video.src = stream.playUrl;
     } else {

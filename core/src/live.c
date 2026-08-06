@@ -864,11 +864,20 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
     int target = (int)(maxdur + 0.999);
     if (target < 1) target = 1;
 
-    // Every break that is no longer *in* the window still has to be accounted
-    // for: the ones that fell off the queue entirely, plus the ones still held
-    // but behind the window's first segment.
+    // Every break that isn't rendered as an inline tag still has to be folded
+    // into the count: the ones that fell off the queue entirely, the ones
+    // still held but behind the window's first segment, and — this has to be
+    // "<=", not "<" — window_start's own break. A break landing exactly on
+    // window_start gets no tag (see the loop below: meaningless on the first
+    // segment) and used to get skipped here too, so it vanished from this
+    // poll's playlist entirely, only to reappear a poll later once that
+    // segment scrolled one further back and the "<" finally included it. A
+    // client that reloads across that boundary sees the same segment's
+    // discontinuity generation change retroactively and (rightly) treats the
+    // two playlists as inconsistent — hls.js calls this a "discontinuity
+    // sequence mismatch" and stops loading rather than risk misaligning A/V.
     long long disc_seq = rep->dropped_disc;
-    for (long long i = 0; i < window_start; i++)
+    for (long long i = 0; i <= window_start; i++)
         if (rep->segs[i].disc) disc_seq++;
 
     sbuf b;

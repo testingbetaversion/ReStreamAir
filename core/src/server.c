@@ -1302,6 +1302,11 @@ static char *master_transform(void *ud, const char *abs_uri) {
 static void send_redirect(struct mg_connection *c, const char *location) {
     mg_printf(c, "HTTP/1.1 302 Found\r\nLocation: %s\r\nCache-Control: no-store\r\n"
                  "Content-Length: 0\r\n\r\n", location);
+    // mg_http_reply clears this itself; a raw mg_printf response has to do it
+    // by hand or mongoose leaves the connection marked mid-response forever —
+    // see the identical fix on the two mg_send() sites below for what that
+    // does to a client that reuses the connection for its next request.
+    c->is_resp = 0;
 }
 
 // --- async jobs --------------------------------------------------------------
@@ -1619,6 +1624,14 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
                   type, (unsigned long)body_len);
     }
     mg_send(c, body, body_len);
+    // mg_http_reply resets this when it's done; mg_send on its own does not,
+    // so mongoose still considered this connection "generating a response"
+    // once the handler returned. A client that reuses the connection — every
+    // real HLS player does, for every segment after the first — then sent its
+    // next request into a connection mongoose would never read from again:
+    // no error, no response, just a hang that looked identical to a network
+    // stall no matter how the player or the origin fetch was tuned.
+    c->is_resp = 0;
     // CENC/HLS decrypt free pf->body and hand back a distinct allocation, so
     // `body` may not be pf->body any more — free whichever one we ended up
     // with here, and null pf->body so pending_job_free doesn't double-free it.
@@ -1803,6 +1816,14 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
                          "Accept-Ranges: bytes\r\nCache-Control: no-store\r\n"
                          "Access-Control-Allow-Origin: *\r\n\r\n", (unsigned long)clen);
             mg_send(c, cached, clen);
+            // Without this, mongoose leaves the connection marked as still
+            // generating a response (mg_http_reply would have cleared it) and
+            // never reads the next request off it — invisible on a one-shot
+            // curl, which opens a fresh connection every time, but every real
+            // HLS client keeps the connection alive across segment requests
+            // and would silently hang on the second one, forever, with zero
+            // bytes and no error on either side.
+            c->is_resp = 0;
             rs_free(cached);
             return;
         }
