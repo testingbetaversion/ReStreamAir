@@ -481,42 +481,82 @@
             <nav class="help-toc">
               <a href="#help-start">Getting started</a>
               <a href="#help-providers">Providers &amp; streams</a>
+              <a href="#help-tuning">Stream tuning</a>
+              <a href="#help-network">Network &amp; downloader</a>
               <a href="#help-playback">Playback &amp; output</a>
               <a href="#help-scripts">Provider scripts</a>
               <a href="#help-drm">DRM / keys</a>
               <a href="#help-session">Session manifest &amp; heartbeat</a>
+              <a href="#help-logs">Monitoring &amp; logs</a>
+              <a href="#help-trouble">Troubleshooting</a>
+              <a href="#help-accounts">Accounts &amp; security</a>
               <a href="#help-run">Running the binary</a>
               <a href="#help-api">API keys &amp; CLI</a>
             </nav>
             <div class="help-body">
               <article id="help-start" class="help-card">
                 <h3>Getting started</h3>
-                <p>ReStreamAir re-streams DASH/HLS sources as clean HLS you can play in any player. Create a <b>Provider</b> (a group of streams that share settings/credentials), add <b>Streams</b> under it, then hit play or copy the output URL.</p>
+                <p>ReStreamAir re-streams DASH/HLS sources as clean HLS you can play in any player. Create a <b>Provider</b> (a group of streams that share settings and credentials), add <b>Streams</b> under it, then hit play or copy the output URL.</p>
                 <ol>
                   <li>Go to <b>Providers → New provider</b>.</li>
-                  <li>Open the provider, add a stream with its source URL (an <code>.mpd</code> or <code>.m3u8</code>).</li>
+                  <li>Open the provider, add a stream with its source URL (an <code>.mpd</code> or <code>.m3u8</code>). Paste the URL and pause — the panel probes it and fills in qualities, audio tracks and any DRM KIDs by itself. There is no Detect button and no type dropdown.</li>
                   <li>Press <b>Start</b>, then <b>Copy output URL</b> and open it in VLC / a browser / an IPTV player.</li>
                 </ol>
+                <p class="help-note">A <code>.mpd</code> stream must be <b>started</b> before its URL answers — the engine has to fetch and decrypt a few segments first. Until it's ready, <code>/play</code> returns <code>503</code> with a Retry-After and players retry on their own.</p>
               </article>
 
               <article id="help-providers" class="help-card">
                 <h3>Providers &amp; streams</h3>
-                <p><b>Provider settings</b> hold defaults shared by every stream under them: proxy, generic headers, and a provider <b>script</b> + accounts. A stream inherits these unless it overrides them.</p>
+                <p><b>Provider settings</b> hold defaults shared by every stream under them: proxy, generic headers, downloader, and a provider <b>script</b> + accounts. A stream inherits these unless it overrides them.</p>
                 <ul>
-                  <li><b>Proxy</b> — set once on the provider; a stream's “Network override” wins if filled.</li>
-                  <li><b>Mixer settings</b> (Playlist count, Keep count, Download ahead, Poll seconds) are per-stream, in the stream editor's DASH options.</li>
-                  <li><b>All Streams</b> tab: bulk start/stop/delete, filter by provider/type, and Import channels/events from a provider script.</li>
+                  <li><b>Proxy</b> — set once on the provider; a stream's own Proxy field wins if filled, and <b>Use proxy for</b> scopes it to Script / Manifest / Media independently.</li>
+                  <li><b>Stream tuning</b> (Playlist count, Keep count, Download ahead, Poll seconds, Playback delay) is per-stream, in the stream editor's DASH options — see below.</li>
+                  <li><b>All Streams</b> view: bulk start/stop/delete, filter by provider and by Channels / Events / Manually added, and import channels or events from a provider script.</li>
+                  <li><b>Export / Import</b> — the download icon on a provider card writes one JSON file with every setting, stream, account and the script's own source. It contains <b>passwords in clear</b>; treat it like a credentials file.</li>
                 </ul>
+              </article>
+
+              <article id="help-tuning" class="help-card">
+                <h3>Stream tuning (DASH options)</h3>
+                <p>These control the rolling window the engine keeps for a <code>.mpd</code> stream. The defaults suit most sources; reach for them when a player stalls.</p>
+                <table class="help-table">
+                  <tr><th>Field</th><th>What it does</th><th>Raise it when…</th></tr>
+                  <tr><td><b>Playlist count</b></td><td>Segments advertised in the playlist. Minimum 3.</td><td>Players buffer poorly or stall at the live edge.</td></tr>
+                  <tr><td><b>Keep count</b></td><td>Segments kept behind the window before pruning.</td><td>The logs show <code>404</code>s for segments a player asked for — it fell behind and they'd already aged out.</td></tr>
+                  <tr><td><b>Download ahead</b></td><td>How far ahead of the playlist the engine fetches.</td><td>The origin is slow and the engine can't stay ahead.</td></tr>
+                  <tr><td><b>Poll seconds</b></td><td>How often the MPD is re-read. Defaults to the manifest's own <code>minimumUpdatePeriod</code>, else 2.</td><td>The logs show <code>pollSlow</code> — a poll cycle is overrunning its own interval.</td></tr>
+                  <tr><td><b>Playback delay (s)</b></td><td>Holds playback that many seconds behind the live edge. 0 = live.</td><td>You want a cushion against origin hiccups more than you want latency.</td></tr>
+                  <tr><td><b>Audio delay (ms)</b></td><td>Lip-sync offset, positive or negative. Rewrites each audio segment's timestamps — not a re-encode.</td><td>Audio drifts against video.</td></tr>
+                  <tr><td><b>EPG channel id</b></td><td>Exported as <code>tvg-id</code> in the M3U — how an external player binds guide data to this channel. Blank uses the stream id.</td><td>You're pointing TiviMate, Kodi or Jellyfin at both the playlist and a script's EPG.</td></tr>
+                  <tr><td><b>Allow offline/static MPD</b></td><td>Accepts a <code>type="static"</code> (VOD) manifest.</td><td>The source is a recording, not a live feed — otherwise it's rejected.</td></tr>
+                </table>
+                <p class="help-note"><b>Select more than one quality</b> and the stream serves an HLS master playlist with one worker per representation, so <b>Quality</b> and <b>Audio</b> dropdowns appear in the player. Every track is selected by default.</p>
+              </article>
+
+              <article id="help-network" class="help-card">
+                <h3>Network &amp; downloader</h3>
+                <p>Headers come in buckets so a token only goes where it belongs: the provider's <b>Generic headers</b> apply everywhere, and each stream adds <b>Manifest headers</b>, <b>Media headers</b> and (for HLS) <b>HLS key headers</b> on top.</p>
+                <p><b>Downloader</b> picks what actually fetches:</p>
+                <ul>
+                  <li><code>native</code> (default) — in-process libcurl, no subprocess per fetch. It pins HTTP/1.1, because some origins run a flaky HTTP/2 stack that drops mid-segment.</li>
+                  <li><code>curl</code> / <code>wget</code> / <code>aria2c</code> — spawns that binary instead; <b>Downloader params</b> appends extra arguments (<code>--retry 3</code>, <code>-x 8</code>).</li>
+                </ul>
+                <p><b>Proxies</b> may be HTTP or SOCKS5 (<code>socks5h://user:pass@host:port</code>). Credentials embedded in the URL are used when the proxy challenges for them.</p>
+                <p class="help-note"><b>Tokens in the query string.</b> Tick <b>Append each stream's own Source URL query params to its segments</b> when a CDN signs a token onto the manifest URL and expects it on every segment. The params are read from the URL that <i>actually answered</i> the poll, not the one you configured — some CDNs only sign the redirect target, where the configured URL has no token at all. For a fixed string that isn't part of any stream's URL, use the provider's <b>Segment URL params</b> instead.</p>
               </article>
 
               <article id="help-playback" class="help-card">
                 <h3>Playback &amp; output</h3>
-                <p>Every stream is served at <code>/play/&lt;id&gt;/index.m3u8</code>. The <b>Input/output pipeline</b> section chooses how it's produced:</p>
+                <p>Every stream is served at <code>/play/&lt;id&gt;/index.m3u8</code>, whatever produces it. The <b>Input/output pipeline</b> section chooses how:</p>
                 <ul>
-                  <li><b>Internal remuxer</b> (default) — no ffmpeg needed; downloads + remuxes segments itself, decrypting CENC clear keys.</li>
-                  <li><b>FFmpeg modes</b> — spawn a resident ffmpeg that reads the source and copy-remuxes to HLS, or pushes to SRT/UDP/TCP via the Output target.</li>
-                  <li><b>Direct source</b> — <code>/play</code> 302-redirects to the origin instead of proxying.</li>
+                  <li><b>Internal remuxer</b> (default) — no ffmpeg needed; downloads, decrypts and remuxes segments itself.</li>
+                  <li><b>FFmpeg modes</b> — spawn a resident ffmpeg that reads the source and copy-remuxes to HLS, or pushes to SRT/UDP/TCP via the <b>Output target</b>.</li>
+                  <li><b>N_m3u8DL-RE</b> — hands the source to that downloader instead.</li>
+                  <li><b>Direct source</b> — <code>/play</code> 302-redirects to the origin rather than restreaming. The API-key gate still applies to the redirect.</li>
                 </ul>
+                <p>Beside the player are two opt-in links: <code>/direct/&lt;id&gt;</code> streams a raw fMP4 tail down one never-closing connection (no playlist, no polling), and <code>/download/&lt;id&gt;</code> hands back whatever is currently buffered as a playable <code>.mp4</code>.</p>
+                <p class="help-note"><b>Segment URLs carry no upstream address.</b> A live DASH playlist names its segments <code>&lt;rep&gt;_&lt;seq&gt;.m4s</code> and nothing else — the bytes are already downloaded and decrypted in memory before a segment is ever advertised, so there is no origin URL to leak to whoever holds the playlist.</p>
+                <p><b>Export playlist</b> writes an M3U of every stream for VLC, Kodi or an IPTV app. It lists everything, but opening an entry doesn't start it — <code>.mpd</code> streams must be started here first.</p>
               </article>
 
               <article id="help-scripts" class="help-card">
@@ -534,7 +574,7 @@
                   <tr><td><code>login</code> / <code>pair</code></td><td>yes</td><td>Common args</td><td>Live progress text; the script persists its own session.</td></tr>
                   <tr><td><code>channels</code></td><td>yes</td><td>Common args</td><td>JSON: <code>{"Channels": [{"Name": "...", "Mode": "live", "SessionManifest": true, "UseCdm": true, "ScriptParams": "id=101"}]}</code></td></tr>
                   <tr><td><code>events</code></td><td>yes</td><td>Common args</td><td>JSON: <code>{"Events": [{"Name": "...", "Autostart": true, "Start": 1700000000, "End": 1700007200, "ScriptParams": "eventId=50"}]}</code></td></tr>
-                  <tr><td><code>epg</code></td><td>yes</td><td>Common args</td><td>XMLTV, or JSON <code>{"EPG": [{"ChannelId": "101", "Title": "Show", "Start": ..., "End": ...}]}</code>. Stored; read back at <code>/api/providers/&lt;id&gt;/epg</code>.</td></tr>
+                  <tr><td><code>epg</code></td><td>yes</td><td>Common args</td><td>Guide data, <b>stored verbatim</b> and served back byte-for-byte at <code>/api/providers/&lt;id&gt;/epg</code>. XMLTV is the useful choice — nothing parses it.</td></tr>
                   <tr><td><code>start</code> / <code>stop</code></td><td>yes</td><td>Common args + Script params</td><td>Fired when a stream goes live / stops (claim or release a slot). Exit 0. Optional.</td></tr>
                   <tr><td><code>manifest</code></td><td>yes</td><td>Common args + Script params</td><td>JSON: <code>{"ManifestUrl": "...", "Cdn": [...], "Headers": {"manifest": {...}, "media": {...}}, "Heartbeat": {"PeriodMs": 300000}}</code></td></tr>
                   <tr><td><code>url</code></td><td>yes</td><td>Common args + <code>url=&lt;url&gt;</code></td><td>The rewritten URL, or <code>{"Url": "..."}</code>. Print nothing to leave it unchanged.</td></tr>
@@ -546,7 +586,8 @@
                   <tr><td><code>downloadinit</code> / <code>downloadmedia</code></td><td><b>not yet</b></td><td>Common args + <code>url=</code></td><td>Raw segment bytes. Configurable now, but not invoked yet (a subprocess per segment needs a persistent worker).</td></tr>
                 </table>
                 <p class="field-hint">Timeouts: <code>channels</code>/<code>events</code> 60s, <code>epg</code> 120s, <code>manifest</code> 45s, <code>cdm</code> 60s, pipeline hooks 15–20s, lifecycle 20s; <code>login</code>/<code>pair</code> run in the background with none. Pipeline hooks fail soft — a hook that errors or times out is logged and ReStreamAir falls back to its built-in behaviour.</p>
-                <p>Channel/event import per item uses keys: <code>Name</code>, <code>Mode</code> (live/vod), <code>SessionManifest</code>, <code>UseCdm</code>, <code>CdmType</code>, <code>Video</code>, <code>Autostart</code>, <code>Start</code>/<code>End</code>, and <code>ScriptParams</code>. Re-running an import updates matching streams in place.</p>
+                <p>Channel/event import per item uses keys: <code>Name</code>, <code>Mode</code> (live/vod), <code>SessionManifest</code>, <code>UseCdm</code>, <code>CdmType</code>, <code>Video</code>, <code>Audio</code>, <code>OnDemand</code>, <code>SpeedUp</code>, <code>Autostart</code>, <code>Start</code>/<code>End</code>, <code>RecordEvent</code>, and <code>ScriptParams</code> — each also accepted lowerCamelCase. Re-running an import updates matching streams in place, matched by name. A logo is looked up by channel name and filled in if you haven't set one.</p>
+                <p class="help-callout"><b>Imported streams have no source URL.</b> The import fills in everything above but leaves the URL empty, so an imported channel only plays if it can resolve one — that means <code>SessionManifest</code> plus a working <code>manifest</code> action, or typing the URL in by hand afterwards.</p>
 
                 <h4 class="help-subhead">Expected output — worked examples</h4>
                 <p class="field-hint">The <code>//</code> comments below are explanation only. Your script must print <b>valid JSON</b> (no comments) to stdout — put logs/debug on stderr. ReStreamAir tolerates a few log lines before the JSON blob, and reads the first <code>{ … }</code>.</p>
@@ -613,7 +654,52 @@ c3d43de9ff5b5a45cdc9f4e7f177a1a5:11223344556677889900aabbccddeeff
   "Headers": { "Manifest": { "User-Agent": "…" }, "Media": { … } },
   "Heartbeat": { "Url": "", "Params": "", "PeriodMs": 300000 }
 }</pre>
-                <p>CDN mirrors become failover sources, Headers apply per fetch category, and <code>Heartbeat.PeriodMs</code> auto-sets the heartbeat interval (which re-runs the <code>heartbeat</code> action that often to keep the session alive).</p>
+                <p>CDN mirrors become failover sources, Headers apply per fetch category, and <code>Heartbeat.PeriodMs</code> auto-sets the heartbeat interval (which re-runs the <code>heartbeat</code> action that often to keep the session alive). The stream editor's <b>Heartbeat (seconds)</b> overrides it when non-zero.</p>
+                <p class="help-note"><b><code>manifest</code> is also the recovery hook.</b> When a fetch fails on the primary URL <i>and</i> every CDN mirror, the script is asked for a fresh one, which is saved and retried — inline for <code>.m3u8</code> passthrough, in the background once a <code>.mpd</code> worker has needed two restarts in a row. Throttled to one refresh per stream per minute. So a token that expires mid-stream recovers on its own.</p>
+              </article>
+
+              <article id="help-logs" class="help-card">
+                <h3>Monitoring &amp; logs</h3>
+                <p>The <b>Server</b> view streams live over SSE: input vs output bandwidth (per stream and all-time), active viewers per stream, host CPU/memory/disk, and one searchable row per playback connection.</p>
+                <p>The <b>Logs</b> view shows what each worker is doing, <b>newest first</b>, polled every 2s only while it's open. Filter by stream, level or run date, toggle Verbose for raw JSON, or jump straight to one stream's logs from the icon on its card. Per-stream <b>Clear</b> hides everything logged so far for that stream while leaving new activity visible.</p>
+                <table class="help-table">
+                  <tr><th>Event</th><th>Means</th></tr>
+                  <tr><td><code>manifest</code></td><td>A manifest poll, with the URL that answered it.</td></tr>
+                  <tr><td><code>renditions</code></td><td>Video/audio representations settled; the master playlist is ready.</td></tr>
+                  <tr><td><code>discontinuity</code></td><td>A timeline splice was detected and marked in the playlist.</td></tr>
+                  <tr><td><code>pollSlow</code></td><td>A poll cycle overran its own interval. Consistently slow means a longer <b>Poll seconds</b> or fewer segments per poll — not more polling.</td></tr>
+                  <tr><td><code>error</code></td><td>Includes the origin's own response body when it sent one, so a <code>403</code> that explains itself (“limit of concurrent streams reached”) says so instead of showing only the status code.</td></tr>
+                </table>
+                <p class="field-hint">History is written to <code>logs/&lt;date&gt;.jsonl</code>, capped at 8MB a day and rotated, keeping the newest 5 files.</p>
+              </article>
+
+              <article id="help-trouble" class="help-card">
+                <h3>Troubleshooting</h3>
+                <table class="help-table">
+                  <tr><th>Symptom</th><th>What to do</th></tr>
+                  <tr><td><code>/play</code> returns <b>503</b> right after Start</td><td>Normal — the engine answers immediately rather than blocking while the first segments arrive, and players retry. If it <i>stays</i> at 503 the stream never became ready: check Logs for the manifest fetch.</td></tr>
+                  <tr><td>Player stalls, logs show segment <b>404</b>s</td><td>It's asking for segments that already aged out. Raise <b>Keep count</b> (and <b>Playlist count</b>), or <b>Poll seconds</b> if <code>pollSlow</code> also appears.</td></tr>
+                  <tr><td>Origin returns <b>403</b> and won't say why</td><td>It usually does now — the error line carries the origin's own response body. Concurrent-stream limits in particular say so explicitly.</td></tr>
+                  <tr><td>Concurrent-stream limit trips with <b>one</b> stream running</td><td>A video+audio stream normally makes three concurrent manifest fetches (a director plus two workers). Set <code>reducedManifestPolling</code> on the stream to cut that to two.</td></tr>
+                  <tr><td>Segments download but there's <b>no picture</b></td><td>Check Logs for a key mismatch — a segment whose KID matches none of your pairs is now reported instead of being decrypted with the wrong key. <code>cbcs</code> pattern encryption isn't supported at all; only <code>cenc</code> (AES-CTR).</td></tr>
+                  <tr><td>Audio <b>drifts</b> against video</td><td>Set <b>Audio delay (ms)</b>, positive or negative, in DASH options.</td></tr>
+                  <tr><td>A VOD / recording is <b>rejected</b></td><td>Tick <b>Allow offline/static MPD</b>.</td></tr>
+                  <tr><td>Playback breaks in the browser only</td><td>hls.js runs in debug mode — its full event log is in the browser console, no server logs needed.</td></tr>
+                </table>
+              </article>
+
+              <article id="help-accounts" class="help-card">
+                <h3>Accounts &amp; security</h3>
+                <p>Panel accounts live in <b>Settings → Accounts</b> and come in two roles:</p>
+                <ul>
+                  <li><b>Admin</b> — full control.</li>
+                  <li><b>Viewer</b> — read-only. Sees the panel, monitoring and logs; every write is refused with a <code>403</code>. Enforcement is on the HTTP method, not a route list, so anything added later is read-only for viewers by default. Provider <b>export</b> is admin-only, since it embeds script-account passwords.</li>
+                </ul>
+                <p>The last admin can't be deleted, and deleting an account ends its sessions immediately.</p>
+                <p><b>Sessions survive a restart.</b> They're kept in <code>state.json</code> as SHA-256 hashes — never the token itself — so “remember me for 30 days” means 30 days, not “until the next restart”. Failed sign-ins are throttled per username and address: five free attempts, then a doubling delay capped at 15 minutes, answered with <code>429</code>. That counter is in memory only, so nobody can lock an account out across restarts.</p>
+                <p class="help-callout"><b>The panel speaks plain HTTP.</b> On a trusted LAN that's fine. Anywhere reachable from the internet, put a terminating proxy in front of it — otherwise the sign-in form and the session cookie cross the network in the clear. The README has Docker, Compose-with-Caddy and systemd recipes.</p>
+                <p><b>Behind a proxy, set Trusted proxies</b> (Settings). Untouched, every request appears to come from the proxy's own address — one “client” for the entire internet, which collapses the viewer counts, the connection table and the login throttle onto a single address, and leaves the session cookie without its <code>Secure</code> flag. Accepts <code>loopback</code>, <code>private</code>, <code>any</code>, or a list of addresses and CIDR blocks. Only then are <code>X-Forwarded-For</code> and <code>X-Forwarded-Proto</code> believed — untrusted, they're ignored outright, which is what stops a client forging its way past the throttle.</p>
+                <p class="field-hint">Your proxy also has to stop buffering: <code>/api/events</code> is an SSE stream open for the life of the panel and <code>/direct/</code> never ends. Caddy: <code>flush_interval -1</code>. nginx: <code>proxy_buffering off</code> plus a long <code>proxy_read_timeout</code>.</p>
               </article>
 
               <article id="help-run" class="help-card">
@@ -623,14 +709,19 @@ c3d43de9ff5b5a45cdc9f4e7f177a1a5:11223344556677889900aabbccddeeff
 cd restreamair-vX-linux-x86_64
 ./restreamair --port 8787 --bind 0.0.0.0</pre>
                 <p><code>restreamair</code> is a wrapper that points <code>LD_LIBRARY_PATH</code> at the bundled <code>libs/</code> (so it works on distros that ship a different <code>libxml2</code> soname). To update, replace the folder (or drop the new <code>restreamair-linux</code> over the old one).</p>
+                <p><b>Port</b> resolves as <code>--port</code>, then <code>$PORT</code>, then the value saved in <b>Settings</b>, then 8787; <b>bind address</b> the same way. Both need a restart — a live listener can't rebind.</p>
+                <p class="help-note">There is also a fully static <code>restreamair-linux-static</code> build with no library dependencies at all — but its statically linked TLS stack <b>can't make outbound HTTPS requests</b>, so use the bundled or dynamic build on anything that has to reach an origin.</p>
+                <p>Everything lives in the working directory: <code>state.json</code> (all config, <b>including script passwords</b>), <code>runtime/</code> (segments and script sessions), <code>logs/</code>, and <code>logo-cache.json</code>.</p>
               </article>
 
               <article id="help-api" class="help-card">
                 <h3>API keys &amp; CLI</h3>
                 <ul>
-                  <li><b>API Keys</b> tab — generate keys to require auth on playback; add <code>?key=…</code> to the play URL.</li>
+                  <li><b>API Keys</b> view — generate keys to require auth on playback; add <code>?key=…</code> to the play URL, or send <code>Authorization: Bearer &lt;key&gt;</code>. The gate covers every playback route (<code>/play/</code>, <code>/restream/</code>, <code>/proxy/</code>, <code>/direct/</code>, <code>/download/</code>, <code>/source/</code>). <b>With no keys defined, playback is open to anyone who can reach the port.</b></li>
+                  <li><b>Panel logins</b> are separate — an API key never gets you into <code>/api/*</code>, and an admin account is not a playback key.</li>
                   <li><b>Export playlist</b> — one M3U of every stream, for VLC/Kodi/an IPTV app.</li>
-                  <li><b>CLI:</b> <code>restreamair cdmprobe mpd=&lt;url&gt; [script=&lt;path&gt;]</code> prints the DRM challenge (KIDs/PSSH) and, with a script, the clear keys — handy for testing a CDM script.</li>
+                  <li><b>CLI:</b> <code>restreamair cdmprobe mpd=&lt;url&gt; [script=&lt;path&gt;]</code> prints the DRM challenge (KIDs/PSSH) and, with a script, the clear keys it returned — the quickest way to test a CDM script.</li>
+                  <li><b>CLI:</b> <code>restreamair dash --info &lt;url&gt;</code> inspects a manifest without touching the panel; <code>restreamair selftest</code> runs the crypto known-answer vectors.</li>
                 </ul>
               </article>
             </div>
