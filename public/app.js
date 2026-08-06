@@ -713,6 +713,7 @@ function renderEditor() {
   form.elements.downloadAhead.value = stream.downloadAhead || 8;
   form.elements.pollInterval.value = stream.pollInterval || 2;
   form.elements.audioDelayMs.value = stream.audioDelayMs || 0;
+  form.elements.tvgId.value = stream.tvgId || "";
   form.elements.forceOffline.checked = Boolean(stream.forceOffline);
   form.elements.directSource.checked = Boolean(stream.directSource);
   form.elements.manifestHeaders.value = stream.manifestHeaders || "";
@@ -832,6 +833,7 @@ function streamPayload() {
     downloadAhead: Number(form.elements.downloadAhead.value),
     pollInterval: Number(form.elements.pollInterval.value),
     audioDelayMs: Number(form.elements.audioDelayMs.value) || 0,
+    tvgId: form.elements.tvgId.value.trim(),
     forceOffline: form.elements.forceOffline.checked,
     directSource: form.elements.directSource.checked,
     manifestHeaders: form.elements.manifestHeaders.value,
@@ -2265,6 +2267,7 @@ async function loadSettingsView() {
     const settings = await request("/api/settings");
     $("#portForm").elements.port.value = settings.port;
     $("#portForm").elements.bindAddress.value = settings.bindAddress || "";
+    $("#portForm").elements.trustedProxies.value = settings.trustedProxies || "";
   } catch (error) { /* ignore */ }
   await refreshUserList();
 }
@@ -2276,19 +2279,28 @@ async function refreshUserList() {
     const users = result.users || [];
     if (!users.length) {
       list.className = "key-list empty-state";
-      list.textContent = "No admin accounts found.";
+      list.textContent = "No accounts found.";
       return;
     }
+    // The last admin can't be removed (the server refuses too), but viewers
+    // alongside it can — so the button depends on the admin count, not the
+    // account count.
+    const admins = users.filter((user) => (user.role || "admin") === "admin").length;
     list.className = "key-list";
-    list.innerHTML = users.map((user) => `
+    list.innerHTML = users.map((user) => {
+      const role = user.role || "admin";
+      const removable = role !== "admin" || admins > 1;
+      return `
       <div class="key-row">
         <div class="key-top">
           <strong>${escapeHtml(user.username)}</strong>
-          ${users.length > 1 ? `<button type="button" class="danger" data-user-id="${escapeAttr(user.id)}"><span data-icon="trash"></span>Remove</button>` : ""}
+          <span class="pill">${role === "viewer" ? "Read-only" : "Admin"}</span>
+          ${removable ? `<button type="button" class="danger" data-user-id="${escapeAttr(user.id)}"><span data-icon="trash"></span>Remove</button>` : ""}
         </div>
         <div class="key-meta">Created ${new Date(user.createdAt).toLocaleString()}</div>
       </div>
-    `).join("");
+    `;
+    }).join("");
     list.querySelectorAll("button[data-user-id]").forEach((button) => {
       button.addEventListener("click", async () => {
         await request(`/api/users/${button.dataset.userId}`, { method: "DELETE" });
@@ -2307,7 +2319,11 @@ $("#portForm").addEventListener("submit", async (event) => {
   const form = event.currentTarget;
   await request("/api/settings", {
     method: "POST",
-    body: JSON.stringify({ port: Number(form.elements.port.value), bindAddress: form.elements.bindAddress.value }),
+    body: JSON.stringify({
+      port: Number(form.elements.port.value),
+      bindAddress: form.elements.bindAddress.value,
+      trustedProxies: form.elements.trustedProxies.value,
+    }),
   });
   $("#viewMeta").textContent = "Saved — restart the server for it to take effect.";
 });
@@ -2315,7 +2331,14 @@ $("#portForm").addEventListener("submit", async (event) => {
 $("#userForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
-  await request("/api/users", { method: "POST", body: JSON.stringify({ username: form.elements.username.value, password: form.elements.password.value }) });
+  await request("/api/users", {
+    method: "POST",
+    body: JSON.stringify({
+      username: form.elements.username.value,
+      password: form.elements.password.value,
+      role: form.elements.role.value,
+    }),
+  });
   form.reset();
   refreshUserList();
 });
@@ -2492,7 +2515,13 @@ async function checkAuth() {
     showAuthScreen();
     return false;
   }
-  $("#whoami").textContent = status.username ? `Signed in as ${status.username}` : "";
+  const role = status.role || "admin";
+  // A viewer's writes are refused by the server with a 403; say so up front
+  // rather than letting them find out one failed save at a time.
+  $("#whoami").textContent = status.username
+    ? `Signed in as ${status.username}${role === "viewer" ? " (read-only)" : ""}`
+    : "";
+  document.body.dataset.role = role;
   showApp();
   return true;
 }

@@ -14,16 +14,42 @@
 #define RS_SESSION_REMEMBER_SECONDS (30 * 24 * 60 * 60)
 #define RS_COOKIE_NAME "restreamair_session"
 
+// Swift's JSONEncoder writes a Date as seconds since the 2001 reference epoch,
+// and state.json is shared between the two servers, so persisted timestamps use
+// that reference too — the same convention adminUsers.createdAt already
+// follows. Storing Unix seconds here would look ~31 years stale to the Swift
+// binary, which would quietly drop every session the C server wrote.
+#define RS_APPLE_EPOCH_OFFSET 978307200.0
+
+// Sign-in throttle shape. The first RS_THROTTLE_FREE_ATTEMPTS failures are
+// free, so a typo costs nothing; after that each failure doubles the wait, up
+// to RS_THROTTLE_MAX_DELAY. A quiet RS_THROTTLE_WINDOW forgets the record
+// entirely, so a locked-out operator is never locked out permanently.
+#define RS_THROTTLE_FREE_ATTEMPTS 5
+#define RS_THROTTLE_BASE_DELAY 2
+#define RS_THROTTLE_MAX_DELAY (15 * 60)
+#define RS_THROTTLE_WINDOW (60 * 60)
+
 typedef struct {
-    char *token;
+    char *token_hash;  // SHA-256 of the token, hex — never the token itself
     char *username;
     time_t expires_at;
 } rs_session;
+
+typedef struct {
+    char *identity;    // "username|client-ip"
+    int failures;
+    time_t last_failure;
+    time_t retry_after;
+} rs_throttle;
 
 struct rs_auth {
     rs_session *sessions;
     size_t len;
     size_t cap;
+    rs_throttle *throttles;
+    size_t throttle_len;
+    size_t throttle_cap;
 };
 
 rs_auth *rs_auth_create(void) {
@@ -33,10 +59,12 @@ rs_auth *rs_auth_create(void) {
 void rs_auth_destroy(rs_auth *auth) {
     if (!auth) return;
     for (size_t i = 0; i < auth->len; i++) {
-        free(auth->sessions[i].token);
+        free(auth->sessions[i].token_hash);
         free(auth->sessions[i].username);
     }
     free(auth->sessions);
+    for (size_t i = 0; i < auth->throttle_len; i++) free(auth->throttles[i].identity);
+    free(auth->throttles);
     free(auth);
 }
 
@@ -114,58 +142,215 @@ static char *make_token(void) {
     return token;
 }
 
+// SHA-256 of a token, lowercase hex. This is what the session store holds and
+// what state.json persists; the raw token exists only in the cookie.
+static char *hash_token(const char *token) {
+    uint8_t digest[RS_SHA256_DIGEST_LEN];
+    rs_sha256((const uint8_t *)token, strlen(token), digest);
+    char *out = (char *)malloc(sizeof(digest) * 2 + 1);
+    if (!out) return NULL;
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0xf];
+    }
+    out[sizeof(digest) * 2] = '\0';
+    return out;
+}
+
 static void drop_session(rs_auth *auth, size_t index) {
-    free(auth->sessions[index].token);
+    free(auth->sessions[index].token_hash);
     free(auth->sessions[index].username);
     memmove(&auth->sessions[index], &auth->sessions[index + 1],
             (auth->len - index - 1) * sizeof(rs_session));
     auth->len--;
 }
 
+// Adds a session record for an already-hashed token. Takes ownership of neither
+// argument. Returns false on allocation failure.
+static bool push_session(rs_auth *auth, char *token_hash, const char *username, time_t expires_at) {
+    char *username_copy = rs_strdup(username);
+    if (!username_copy) return false;
+    if (auth->len + 1 > auth->cap) {
+        size_t cap = auth->cap ? auth->cap * 2 : 8;
+        rs_session *grown = (rs_session *)realloc(auth->sessions, cap * sizeof(rs_session));
+        if (!grown) { free(username_copy); return false; }
+        auth->sessions = grown;
+        auth->cap = cap;
+    }
+    auth->sessions[auth->len].token_hash = token_hash;
+    auth->sessions[auth->len].username = username_copy;
+    auth->sessions[auth->len].expires_at = expires_at;
+    auth->len++;
+    return true;
+}
+
 char *rs_auth_create_session(rs_auth *auth, const char *username, bool remember) {
     if (!auth || !username) return NULL;
     char *token = make_token();
     if (!token) return NULL;
-    char *username_copy = rs_strdup(username);
-    if (!username_copy) { free(token); return NULL; }
+    char *token_hash = hash_token(token);
+    if (!token_hash) { free(token); return NULL; }
 
-    if (auth->len + 1 > auth->cap) {
-        size_t cap = auth->cap ? auth->cap * 2 : 8;
-        rs_session *grown = (rs_session *)realloc(auth->sessions, cap * sizeof(rs_session));
-        if (!grown) { free(token); free(username_copy); return NULL; }
-        auth->sessions = grown;
-        auth->cap = cap;
-    }
     long lifetime = remember ? RS_SESSION_REMEMBER_SECONDS : RS_SESSION_DEFAULT_SECONDS;
-    auth->sessions[auth->len].token = token;
-    auth->sessions[auth->len].username = username_copy;
-    auth->sessions[auth->len].expires_at = time(NULL) + lifetime;
-    auth->len++;
-    // Hand back a copy so the caller owns its own string.
-    return rs_strdup(token);
+    if (!push_session(auth, token_hash, username, time(NULL) + lifetime)) {
+        free(token_hash);
+        free(token);
+        return NULL;
+    }
+    return token;  // the caller owns the only copy of the raw token
 }
 
 char *rs_auth_username_for_token(rs_auth *auth, const char *token) {
     if (!auth || !token) return NULL;
+    char *presented = hash_token(token);
+    if (!presented) return NULL;
     time_t now = time(NULL);
+    char *found = NULL;
     for (size_t i = 0; i < auth->len;) {
         if (auth->sessions[i].expires_at <= now) {
             drop_session(auth, i);  // reap expired sessions as we pass them
             continue;
         }
-        if (strcmp(auth->sessions[i].token, token) == 0) {
-            return rs_strdup(auth->sessions[i].username);
+        if (!found && constant_time_equal(auth->sessions[i].token_hash, presented)) {
+            found = rs_strdup(auth->sessions[i].username);
         }
         i++;
     }
-    return NULL;
+    free(presented);
+    return found;
 }
 
 void rs_auth_end_session(rs_auth *auth, const char *token) {
     if (!auth || !token) return;
+    char *presented = hash_token(token);
+    if (!presented) return;
     for (size_t i = 0; i < auth->len; i++) {
-        if (strcmp(auth->sessions[i].token, token) == 0) {
+        if (strcmp(auth->sessions[i].token_hash, presented) == 0) {
             drop_session(auth, i);
+            break;
+        }
+    }
+    free(presented);
+}
+
+size_t rs_auth_end_sessions_for_user(rs_auth *auth, const char *username) {
+    if (!auth || !username) return 0;
+    size_t dropped = 0;
+    for (size_t i = 0; i < auth->len;) {
+        if (strcmp(auth->sessions[i].username, username) == 0) {
+            drop_session(auth, i);
+            dropped++;
+            continue;
+        }
+        i++;
+    }
+    return dropped;
+}
+
+rs_json *rs_auth_export_sessions(rs_auth *auth) {
+    rs_json *arr = rs_json_new_arr();
+    if (!auth || !arr) return arr;
+    time_t now = time(NULL);
+    for (size_t i = 0; i < auth->len; i++) {
+        if (auth->sessions[i].expires_at <= now) continue;
+        rs_json *entry = rs_json_new_obj();
+        rs_json_obj_set_str(entry, "tokenHash", auth->sessions[i].token_hash);
+        rs_json_obj_set_str(entry, "username", auth->sessions[i].username);
+        rs_json_obj_set(entry, "expiresAt",
+                        rs_json_new_num((double)auth->sessions[i].expires_at - RS_APPLE_EPOCH_OFFSET));
+        rs_json_arr_push(arr, entry);
+    }
+    return arr;
+}
+
+void rs_auth_import_sessions(rs_auth *auth, const rs_json *sessions) {
+    if (!auth || !sessions) return;
+    time_t now = time(NULL);
+    for (size_t i = 0; i < rs_json_arr_len(sessions); i++) {
+        const rs_json *entry = rs_json_arr_at(sessions, i);
+        const char *token_hash = rs_json_obj_str(entry, "tokenHash", "");
+        const char *username = rs_json_obj_str(entry, "username", "");
+        time_t expires_at = (time_t)(rs_json_obj_num(entry, "expiresAt", 0) + RS_APPLE_EPOCH_OFFSET);
+        if (!token_hash[0] || !username[0] || expires_at <= now) continue;
+        char *copy = rs_strdup(token_hash);
+        if (!copy) return;
+        if (!push_session(auth, copy, username, expires_at)) { free(copy); return; }
+    }
+}
+
+// --- login throttling ------------------------------------------------------
+
+static rs_throttle *throttle_find(rs_auth *auth, const char *identity, bool create) {
+    time_t now = time(NULL);
+    for (size_t i = 0; i < auth->throttle_len;) {
+        // Drop records nothing has touched for a full window, so a long-running
+        // server does not accumulate one entry per guessed username forever.
+        if (now - auth->throttles[i].last_failure > RS_THROTTLE_WINDOW) {
+            free(auth->throttles[i].identity);
+            memmove(&auth->throttles[i], &auth->throttles[i + 1],
+                    (auth->throttle_len - i - 1) * sizeof(rs_throttle));
+            auth->throttle_len--;
+            continue;
+        }
+        if (strcmp(auth->throttles[i].identity, identity) == 0) return &auth->throttles[i];
+        i++;
+    }
+    if (!create) return NULL;
+    if (auth->throttle_len + 1 > auth->throttle_cap) {
+        size_t cap = auth->throttle_cap ? auth->throttle_cap * 2 : 8;
+        rs_throttle *grown = (rs_throttle *)realloc(auth->throttles, cap * sizeof(rs_throttle));
+        if (!grown) return NULL;
+        auth->throttles = grown;
+        auth->throttle_cap = cap;
+    }
+    char *copy = rs_strdup(identity);
+    if (!copy) return NULL;
+    rs_throttle *slot = &auth->throttles[auth->throttle_len++];
+    slot->identity = copy;
+    slot->failures = 0;
+    slot->last_failure = now;
+    slot->retry_after = 0;
+    return slot;
+}
+
+int rs_auth_throttle_delay(rs_auth *auth, const char *identity) {
+    if (!auth || !identity) return 0;
+    rs_throttle *slot = throttle_find(auth, identity, false);
+    if (!slot) return 0;
+    time_t now = time(NULL);
+    return slot->retry_after > now ? (int)(slot->retry_after - now) : 0;
+}
+
+int rs_auth_throttle_record_failure(rs_auth *auth, const char *identity) {
+    if (!auth || !identity) return 0;
+    rs_throttle *slot = throttle_find(auth, identity, true);
+    if (!slot) return 0;
+    time_t now = time(NULL);
+    slot->failures++;
+    slot->last_failure = now;
+    if (slot->failures <= RS_THROTTLE_FREE_ATTEMPTS) {
+        slot->retry_after = 0;
+        return 0;
+    }
+    // 2s, 4s, 8s … capped. Shifting by more than the width of the type is
+    // undefined, so the exponent is clamped well before that.
+    int steps = slot->failures - RS_THROTTLE_FREE_ATTEMPTS - 1;
+    if (steps > 20) steps = 20;
+    long delay = (long)RS_THROTTLE_BASE_DELAY << steps;
+    if (delay > RS_THROTTLE_MAX_DELAY) delay = RS_THROTTLE_MAX_DELAY;
+    slot->retry_after = now + delay;
+    return (int)delay;
+}
+
+void rs_auth_throttle_reset(rs_auth *auth, const char *identity) {
+    if (!auth || !identity) return;
+    for (size_t i = 0; i < auth->throttle_len; i++) {
+        if (strcmp(auth->throttles[i].identity, identity) == 0) {
+            free(auth->throttles[i].identity);
+            memmove(&auth->throttles[i], &auth->throttles[i + 1],
+                    (auth->throttle_len - i - 1) * sizeof(rs_throttle));
+            auth->throttle_len--;
             return;
         }
     }
@@ -199,21 +384,26 @@ char *rs_auth_cookie_token(const char *cookie_header) {
     return NULL;
 }
 
-char *rs_auth_set_cookie(const char *token, bool remember) {
+char *rs_auth_set_cookie(const char *token, bool remember, bool secure) {
     // Matches AuthStore.setCookieHeader exactly.
     const char *base_fmt = RS_COOKIE_NAME "=%s; HttpOnly; Path=/; SameSite=Lax";
-    size_t need = strlen(token) + strlen(base_fmt) + 32;
+    size_t need = strlen(token) + strlen(base_fmt) + 48;
     char *out = (char *)malloc(need);
     if (!out) return NULL;
     int n = snprintf(out, need, base_fmt, token);
-    if (remember && n > 0 && (size_t)n < need) {
-        snprintf(out + n, need - (size_t)n, "; Max-Age=%d", RS_SESSION_REMEMBER_SECONDS);
+    if (n < 0 || (size_t)n >= need) { free(out); return NULL; }
+    if (remember) {
+        int written = snprintf(out + n, need - (size_t)n, "; Max-Age=%d", RS_SESSION_REMEMBER_SECONDS);
+        if (written > 0) n += written;
     }
+    if (secure) snprintf(out + n, need - (size_t)n, "; Secure");
     return out;
 }
 
-char *rs_auth_clear_cookie(void) {
-    return rs_strdup(RS_COOKIE_NAME "=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax");
+char *rs_auth_clear_cookie(bool secure) {
+    return rs_strdup(secure
+                     ? RS_COOKIE_NAME "=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax; Secure"
+                     : RS_COOKIE_NAME "=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax");
 }
 
 // --- basic auth ------------------------------------------------------------

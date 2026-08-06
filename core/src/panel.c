@@ -157,6 +157,9 @@ static rs_json *stream_from_body(const rs_json *body, const char *id, const char
     rs_json_obj_set_str(s, "mediaHeaders", rs_json_obj_str(body, "mediaHeaders", ""));
     rs_json_obj_set_str(s, "hlsKeyHeaders", rs_json_obj_str(body, "hlsKeyHeaders", ""));
     rs_json_obj_set_int(s, "audioDelayMs", rs_json_obj_int(body, "audioDelayMs", 0));
+    // The XMLTV channel id, exported as tvg-id in the M3U so a player can bind
+    // guide data to this stream. Blank falls back to the stream id.
+    rs_json_obj_set_str(s, "tvgId", rs_json_obj_str(body, "tvgId", ""));
 
     // Enumerated fields fall back to their default when the value isn't valid.
     const char *input_mode = rs_json_obj_str(body, "inputMode", "internal");
@@ -394,6 +397,7 @@ rs_json *rs_panel_users_view(const rs_state *st) {
         rs_json *view = rs_json_new_obj();
         rs_json_obj_set_str(view, "id", rs_json_obj_str(u, "id", ""));
         rs_json_obj_set_str(view, "username", rs_json_obj_str(u, "username", ""));
+        rs_json_obj_set_str(view, "role", rs_panel_user_role(u));
         char *created = iso8601_from_apple(rs_json_obj_num(u, "createdAt", 0));
         rs_json_obj_set_str(view, "createdAt", created);
         free(created);
@@ -616,12 +620,34 @@ int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool runnin
 
 // --- user + key mutations --------------------------------------------------
 
+const char *rs_panel_user_role(const rs_json *user) {
+    // Accounts created before roles existed have no field and are admins, which
+    // is what they have always been — a migration that silently demoted the
+    // only account would lock the operator out of their own panel.
+    const char *role = rs_json_obj_str(user, "role", "admin");
+    return strcmp(role, "viewer") == 0 ? "viewer" : "admin";
+}
+
+size_t rs_panel_admin_count(const rs_state *st) {
+    const rs_json *users = rs_json_obj_get(st->root, "adminUsers");
+    size_t admins = 0;
+    for (size_t i = 0; i < rs_json_arr_len(users); i++) {
+        if (strcmp(rs_panel_user_role(rs_json_arr_at(users, i)), "admin") == 0) admins++;
+    }
+    return admins;
+}
+
 int rs_panel_create_user(rs_state *st, const rs_json *body, const char **err) {
     const char *username = rs_json_obj_str(body, "username", "");
     const char *password = rs_json_obj_str(body, "password", "");
+    const char *role = rs_json_obj_str(body, "role", "admin");
     const char *trimmed = NULL;
     if (rs_trim(username, strlen(username), true, &trimmed) == 0 || strlen(password) < 8) {
         *err = "Username and an 8+ character password are required.";
+        return -400;
+    }
+    if (strcmp(role, "admin") != 0 && strcmp(role, "viewer") != 0) {
+        *err = "Role must be 'admin' or 'viewer'.";
         return -400;
     }
     rs_json *users = rs_state_admin_users(st);
@@ -640,6 +666,7 @@ int rs_panel_create_user(rs_state *st, const rs_json *body, const char **err) {
     rs_json_obj_set_str(u, "username", username);
     rs_json_obj_set_str(u, "passwordHash", hash);
     rs_json_obj_set_str(u, "salt", salt);
+    rs_json_obj_set_str(u, "role", role);
     rs_json_obj_set(u, "createdAt", rs_json_new_num(apple_epoch_now()));
     rs_free(hash);
     rs_free(salt);
@@ -647,9 +674,135 @@ int rs_panel_create_user(rs_state *st, const rs_json *body, const char **err) {
     return 0;
 }
 
+// --- provider export / import ----------------------------------------------
+
+rs_json *rs_panel_export_provider(const rs_state *st, const char *provider_id) {
+    const rs_json *providers = rs_json_obj_get(st->root, "providers");
+    const rs_json *found = NULL;
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        if (strcmp(rs_json_obj_str(rs_json_arr_at(providers, i), "id", ""), provider_id) == 0) {
+            found = rs_json_arr_at(providers, i);
+            break;
+        }
+    }
+    if (!found) return NULL;
+
+    // Mirrors ProviderExport/ExportedProvider in PanelServer.swift field for
+    // field, so a file written by either server imports into the other. Ids are
+    // deliberately omitted: they mean nothing on the importing install, which
+    // regenerates them. The active account is carried by *name* for the same
+    // reason.
+    rs_json *provider = rs_json_new_obj();
+    static const char *const copied[] = {
+        "name", "logo", "proxy", "headers", "segmentUrlParams",
+        "scriptBind", "scriptDoh", "scriptWorker", "accountSelectionMode", NULL,
+    };
+    for (size_t i = 0; copied[i]; i++) {
+        rs_json_obj_set_str(provider, copied[i],
+                            rs_json_obj_str(found, copied[i], strcmp(copied[i], "accountSelectionMode") == 0 ? "fixed" : ""));
+    }
+    rs_json_obj_set_bool(provider, "inheritUrlParams", rs_json_obj_bool(found, "inheritUrlParams", false));
+
+    const rs_json *accounts = rs_json_obj_get(found, "scriptAccounts");
+    rs_json_obj_set(provider, "scriptAccounts",
+                    accounts ? rs_json_clone(accounts) : rs_json_new_arr());
+
+    const char *active_id = rs_json_obj_str(found, "activeScriptAccountId", "");
+    const char *active_name = "";
+    for (size_t i = 0; i < rs_json_arr_len(accounts); i++) {
+        const rs_json *account = rs_json_arr_at(accounts, i);
+        if (strcmp(rs_json_obj_str(account, "id", ""), active_id) == 0) {
+            active_name = rs_json_obj_str(account, "name", "");
+            break;
+        }
+    }
+    rs_json_obj_set_str(provider, "activeScriptAccountName", active_name);
+
+    rs_json *out = rs_json_new_obj();
+    rs_json_obj_set_int(out, "restreamairExport", 1);
+    rs_json_obj_set(out, "provider", provider);
+    const rs_json *streams = rs_json_obj_get(found, "streams");
+    rs_json_obj_set(out, "streams", streams ? rs_json_clone(streams) : rs_json_new_arr());
+    return out;
+}
+
+int rs_panel_import_provider(rs_state *st, const rs_json *doc, const char *script_path,
+                             char **new_id, const char **err) {
+    if (new_id) *new_id = NULL;
+    const rs_json *source = rs_json_obj_get(doc, "provider");
+    const char *name = rs_json_obj_str(source, "name", "");
+    const char *trimmed = NULL;
+    if (!source || rs_trim(name, strlen(name), true, &trimmed) == 0) {
+        *err = "Import file has no provider name.";
+        return -400;
+    }
+
+    rs_json *p = rs_json_clone(source);
+    if (!p) { *err = "Out of memory."; return -500; }
+
+    // Every id is regenerated: the exporting install's ids mean nothing here,
+    // and reusing them would collide with whatever already holds them.
+    char *id = make_id("provider");
+    rs_json_obj_set_str(p, "id", id);
+
+    rs_json *accounts = (rs_json *)rs_json_obj_get(p, "scriptAccounts");
+    if (!accounts || rs_json_type_of(accounts) != RS_JSON_ARR) {
+        accounts = rs_json_new_arr();
+        rs_json_obj_set(p, "scriptAccounts", accounts);
+    }
+    const char *wanted = rs_json_obj_str(source, "activeScriptAccountName", "");
+    char *active_id = NULL;
+    for (size_t i = 0; i < rs_json_arr_len(accounts); i++) {
+        rs_json *account = (rs_json *)rs_json_arr_at(accounts, i);
+        char *account_id = make_id("account");
+        rs_json_obj_set_str(account, "id", account_id);
+        // Re-resolve the active account by name, since the id it referenced on
+        // the exporting install does not exist here.
+        if (!active_id && wanted[0] && strcmp(rs_json_obj_str(account, "name", ""), wanted) == 0) {
+            active_id = rs_strdup(account_id);
+        }
+        free(account_id);
+    }
+    rs_json_obj_set_str(p, "activeScriptAccountId", active_id ? active_id : "");
+    rs_free(active_id);
+    rs_json_obj_remove(p, "activeScriptAccountName");
+
+    rs_json_obj_set_str(p, "scriptPath", script_path ? script_path : "");
+
+    // Streams come across with fresh ids and stopped, never mid-run.
+    rs_json *streams = rs_json_new_arr();
+    const rs_json *exported_streams = rs_json_obj_get(doc, "streams");
+    for (size_t i = 0; i < rs_json_arr_len(exported_streams); i++) {
+        rs_json *stream = rs_json_clone(rs_json_arr_at(exported_streams, i));
+        if (!stream) continue;
+        char *stream_id = make_id("stream");
+        rs_json_obj_set_str(stream, "id", stream_id);
+        free(stream_id);
+        rs_json_obj_set_str(stream, "status", "stopped");
+        rs_json_arr_push(streams, stream);
+    }
+    rs_json_obj_set(p, "streams", streams);
+
+    rs_json_arr_push(providers_array(st), p);
+    if (new_id) *new_id = id; else free(id);
+    return 0;
+}
+
 int rs_panel_delete_user(rs_state *st, const char *id, const char **err) {
     rs_json *users = rs_state_admin_users(st);
-    if (rs_json_arr_len(users) <= 1) { *err = "Cannot remove the last admin account."; return -400; }
+    // Only admins count towards the floor: deleting the last one would leave a
+    // panel nobody can administer, but any number of viewers may come and go.
+    const rs_json *target = NULL;
+    for (size_t i = 0; i < rs_json_arr_len(users); i++) {
+        if (strcmp(rs_json_obj_str(rs_json_arr_at(users, i), "id", ""), id) == 0) {
+            target = rs_json_arr_at(users, i);
+            break;
+        }
+    }
+    if (target && strcmp(rs_panel_user_role(target), "admin") == 0 && rs_panel_admin_count(st) <= 1) {
+        *err = "Cannot remove the last admin account.";
+        return -400;
+    }
     bool found = false;
     rs_json *kept = array_without_id(users, id, &found);
     rs_json_obj_set(st->root, "adminUsers", kept);

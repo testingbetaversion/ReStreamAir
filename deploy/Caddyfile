@@ -1,0 +1,28 @@
+# Caddy in front of ReStreamAir. Certificates are obtained and renewed
+# automatically from Let's Encrypt for {$RESTREAMAIR_DOMAIN}.
+#
+# The panel reads X-Forwarded-Proto and X-Forwarded-For (both of which Caddy
+# sets for you) only when Settings → "Trusted proxies" names the address the
+# request arrives from. In the compose setup that is the container network, so
+# `private` is the value to use.
+
+{$RESTREAMAIR_DOMAIN} {
+	encode zstd gzip
+
+	reverse_proxy restreamair:8787 {
+		# Live playback is a long-lived response — a fMP4 tail on /direct/ never
+		# ends, and an SSE stream on /api/events is open for as long as the panel
+		# is. Both would be cut off by the default read timeout.
+		flush_interval -1
+		transport http {
+			response_header_timeout 30s
+		}
+	}
+
+	header {
+		# Caddy sets HSTS itself; these are the two the panel cannot set for
+		# static assets it does not serve.
+		X-Content-Type-Options nosniff
+		Referrer-Policy same-origin
+	}
+}

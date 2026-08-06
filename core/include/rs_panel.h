@@ -47,6 +47,29 @@ int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool runnin
 int rs_panel_create_user(rs_state *st, const rs_json *body, const char **err);
 int rs_panel_delete_user(rs_state *st, const char *id, const char **err);
 
+// Builds the provider-export document (the C port of ProviderExport in
+// PanelServer.swift), or NULL if no such provider. Ids are deliberately left
+// out — they mean nothing on the importing install — and the active script
+// account is carried by name. The caller adds the base64 script file, which
+// needs file IO. Free with rs_json_free.
+rs_json *rs_panel_export_provider(const rs_state *st, const char *provider_id);
+
+// Reverses the export: clones the document into a new provider with fresh ids
+// for the provider, its streams and its script accounts, re-resolves the active
+// account by name, and points scriptPath at `script_path` (which the caller has
+// already written to disk, or "" for none). On success returns 0 and, when
+// `new_id` is non-NULL, stores the new provider id there (free with rs_free).
+int rs_panel_import_provider(rs_state *st, const rs_json *doc, const char *script_path,
+                             char **new_id, const char **err);
+
+// An account's role, normalised: "admin" (full control) or "viewer"
+// (read-only). Accounts stored before roles existed report "admin".
+const char *rs_panel_user_role(const rs_json *user);
+
+// How many accounts can still administer the panel. Used to refuse the delete
+// that would leave none.
+size_t rs_panel_admin_count(const rs_state *st);
+
 int rs_panel_create_key(rs_state *st, const rs_json *body, const char **err);
 int rs_panel_delete_key(rs_state *st, const char *id, const char **err);
 

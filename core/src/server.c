@@ -10,10 +10,12 @@
 #include "rs_logo.h"
 #include "rs_m3u8.h"
 #include "rs_metrics.h"
+#include "rs_netmatch.h"
 #include "rs_nm3u8dlre.h"
 #include "rs_panel.h"
 #include "rs_script.h"
 #include "rs_state.h"
+#include "rs_internal.h"
 #include "rs_sysstats.h"
 #include "../deps/mongoose.h"
 #include <stdarg.h>
@@ -347,9 +349,28 @@ static void log_clear(restream_server_t *s, const char *sid) {
 
 static const char *JSON_HEADERS = "Content-Type: application/json\r\n";
 
+// Security headers for the request currently being handled. Whether HSTS
+// belongs on a response depends on how *that* request reached us, and threading
+// that through the ~40 reply sites by hand would be forgotten at exactly the one
+// that mattered. mongoose runs every connection on a single thread, so a
+// request-scoped static is safe: set_request_security() fills it at the top of
+// each request and clears it for replies that outlive one (async job results).
+static char g_request_security[192] = "";
+
 // A JSON error body the panel's fetch layer reads as `payload.error`.
 static void reply_error(struct mg_connection *c, int status, const char *message) {
-    mg_http_reply(c, status, JSON_HEADERS, "{\"error\":%m}", MG_ESC(message));
+    char headers[320];
+    snprintf(headers, sizeof(headers), "%s%s", JSON_HEADERS, g_request_security);
+    mg_http_reply(c, status, headers, "{\"error\":%m}", MG_ESC(message));
+}
+
+// The same, with extra headers — a 429 has to carry Retry-After to be useful.
+static void reply_error_headers(struct mg_connection *c, int status, const char *message,
+                                const char *extra_headers) {
+    char headers[512];
+    snprintf(headers, sizeof(headers), "%s%s%s", JSON_HEADERS, g_request_security,
+             extra_headers ? extra_headers : "");
+    mg_http_reply(c, status, headers, "{\"error\":%m}", MG_ESC(message));
 }
 
 // Serializes and sends a JSON DOM, then frees it. `extra_headers` may be NULL.
@@ -361,9 +382,9 @@ static void reply_json(struct mg_connection *c, int status, rs_json *value,
         reply_error(c, 500, "Out of memory building the response.");
         return;
     }
-    char headers[512];
-    snprintf(headers, sizeof(headers), "%sCache-Control: no-store\r\n%s",
-             JSON_HEADERS, extra_headers ? extra_headers : "");
+    char headers[640];
+    snprintf(headers, sizeof(headers), "%sCache-Control: no-store\r\n%s%s",
+             JSON_HEADERS, g_request_security, extra_headers ? extra_headers : "");
     mg_http_reply(c, status, headers, "%s", body);
     rs_free(body);
 }
@@ -380,6 +401,70 @@ static char *header_dup(struct mg_http_message *hm, const char *name) {
     memcpy(out, value->buf, value->len);
     out[value->len] = '\0';
     return out;
+}
+
+// --- request context -------------------------------------------------------
+//
+// Behind a reverse proxy every request arrives from the proxy's address over
+// plain HTTP, so taken literally the peer address is useless (one "client" for
+// the whole internet) and the connection looks insecure even when the user is
+// on HTTPS. The settings key `trustedProxies` names the hops we believe:
+// "loopback", "private", "any", or a comma-separated list of addresses and CIDR
+// blocks. Empty — the default — means trust nothing and use the peer address,
+// which is the right answer for a directly exposed server.
+
+static const char *trusted_proxies(restream_server_t *s) {
+    const rs_json *settings = rs_json_obj_get(s->state.root, "settings");
+    return rs_json_as_str(rs_json_obj_get(settings, "trustedProxies"), "");
+}
+
+// The peer address of the connection itself, ignoring any forwarding header.
+static void peer_ip(struct mg_connection *c, char *out, size_t out_cap) {
+    mg_snprintf(out, out_cap, "%M", mg_print_ip, &c->rem);
+    // mg_print_ip renders a v4-mapped peer as ::ffff:1.2.3.4 on a dual-stack
+    // listener; normalise so a "192.168.0.0/16" rule matches it as written.
+    if (strncmp(out, "::ffff:", 7) == 0 && strchr(out, '.') != NULL) {
+        memmove(out, out + 7, strlen(out + 7) + 1);
+    }
+}
+
+// The address to attribute this request to: the peer, or what a trusted proxy
+// says is behind it. Caller frees.
+static char *client_ip(restream_server_t *s, struct mg_connection *c,
+                       struct mg_http_message *hm) {
+    char peer[64];
+    peer_ip(c, peer, sizeof(peer));
+    char *xff = header_dup(hm, "X-Forwarded-For");
+    char *resolved = rs_client_ip(peer, xff, trusted_proxies(s));
+    free(xff);
+    return resolved ? resolved : rs_strdup(peer);
+}
+
+// True if the user reached us over HTTPS — directly, or through a trusted proxy
+// that terminated TLS and said so.
+static bool request_is_secure(restream_server_t *s, struct mg_connection *c,
+                              struct mg_http_message *hm) {
+    char peer[64];
+    peer_ip(c, peer, sizeof(peer));
+    char *proto = header_dup(hm, "X-Forwarded-Proto");
+    bool secure = rs_request_is_secure(peer, proto, trusted_proxies(s), c->is_tls);
+    free(proto);
+    return secure;
+}
+
+// The security headers every panel response carries. HSTS is only meaningful —
+// and only safe — on a connection the user actually reached over HTTPS; sending
+// it from a plain-HTTP LAN install would pin browsers to a scheme that install
+// does not serve.
+static void security_headers(restream_server_t *s, struct mg_connection *c,
+                             struct mg_http_message *hm, char *out, size_t out_cap) {
+    const char *base = "X-Content-Type-Options: nosniff\r\n"
+                       "Referrer-Policy: same-origin\r\n";
+    if (request_is_secure(s, c, hm)) {
+        snprintf(out, out_cap, "%sStrict-Transport-Security: max-age=31536000\r\n", base);
+    } else {
+        snprintf(out, out_cap, "%s", base);
+    }
 }
 
 // --- auth helpers ----------------------------------------------------------
@@ -422,6 +507,8 @@ static void handle_auth_status(restream_server_t *s, struct mg_connection *c,
     rs_json_obj_set(out, "needsSetup", rs_json_new_bool(rs_json_arr_len(users) == 0));
     rs_json_obj_set(out, "authenticated", rs_json_new_bool(user != NULL));
     rs_json_obj_set(out, "username", user ? rs_json_new_str(user) : rs_json_new_null());
+    const rs_json *account = user ? admin_by_username(&s->state, user) : NULL;
+    rs_json_obj_set_str(out, "role", account ? rs_panel_user_role(account) : "admin");
     free(user);
     reply_json(c, 200, out, NULL);
 }
@@ -430,6 +517,30 @@ static void handle_auth_status(restream_server_t *s, struct mg_connection *c,
 // seconds since the 2001 reference epoch. Keeps createdAt byte-compatible.
 static double apple_epoch_now(void) {
     return (double)time(NULL) - 978307200.0;
+}
+
+// Mirrors the live session store into state.json. Called after anything that
+// creates or drops a session, so a restart resumes them instead of signing
+// everyone out. Only token *hashes* are written — see rs_auth.h.
+static void persist_sessions(restream_server_t *s) {
+    rs_json_obj_set(s->state.root, "sessions", rs_auth_export_sessions(s->auth));
+    rs_state_save(&s->state);
+}
+
+// Builds the Set-Cookie (plus security) header block for a successful sign-in.
+// Returns false if the session could not be created.
+static bool session_headers(restream_server_t *s, struct mg_connection *c,
+                            struct mg_http_message *hm, const char *username,
+                            bool remember, char *out, size_t out_cap) {
+    char *token = rs_auth_create_session(s->auth, username, remember);
+    if (!token) return false;
+    char *cookie = rs_auth_set_cookie(token, remember, request_is_secure(s, c, hm));
+    rs_free(token);
+    if (!cookie) return false;
+    persist_sessions(s);
+    snprintf(out, out_cap, "Set-Cookie: %s\r\n", cookie);
+    rs_free(cookie);
+    return true;
 }
 
 static void handle_auth_setup(restream_server_t *s, struct mg_connection *c,
@@ -491,13 +602,10 @@ static void handle_auth_setup(restream_server_t *s, struct mg_connection *c,
         return;
     }
 
-    char *token = rs_auth_create_session(s->auth, username, remember);
-    char *cookie = token ? rs_auth_set_cookie(token, remember) : NULL;
-    free(username); free(password); rs_free(token);
-    if (!cookie) { reply_error(c, 500, "Could not start a session."); return; }
-    char extra[512];
-    snprintf(extra, sizeof(extra), "Set-Cookie: %s\r\n", cookie);
-    rs_free(cookie);
+    char extra[768];
+    bool ok = session_headers(s, c, hm, username, remember, extra, sizeof(extra));
+    free(username); free(password);
+    if (!ok) { reply_error(c, 500, "Could not start a session."); return; }
     reply_json(c, 200, rs_json_new_obj(), extra);  // {"ok":true} shape isn't required; UI only checks response.ok
 }
 
@@ -509,8 +617,27 @@ static void handle_auth_login(restream_server_t *s, struct mg_connection *c,
     bool remember = body && strcmp(rs_json_as_str(rs_json_obj_get(body, "remember"), ""), "true") == 0;
     rs_json_free(body);
 
-    char ip[64] = {0};
-    mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
+    char *ip = client_ip(s, c, hm);
+
+    // The throttle is keyed on username *and* address, so one attacker cannot
+    // lock a real operator out by guessing at their username from elsewhere,
+    // and one host cannot spread its guessing across many usernames for free.
+    char identity[320];
+    snprintf(identity, sizeof(identity), "%s|%s", username ? username : "", ip ? ip : "");
+    int wait = rs_auth_throttle_delay(s->auth, identity);
+    if (wait > 0) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "throttled sign-in for '%s' from %s (%ds remaining)",
+                 username ? username : "", ip ? ip : "", wait);
+        log_record(s, "__panel__", "error", "loginThrottled", NULL, 0, -1, msg);
+        char headers[128];
+        snprintf(headers, sizeof(headers), "Retry-After: %d\r\n", wait);
+        free(username); free(password); rs_free(ip);
+        char body[160];
+        snprintf(body, sizeof(body), "Too many failed sign-ins. Try again in %d seconds.", wait);
+        reply_error_headers(c, 429, body, headers);
+        return;
+    }
 
     rs_json *admin = (username && username[0]) ? admin_by_username(&s->state, username) : NULL;
     bool ok = admin && password &&
@@ -518,39 +645,43 @@ static void handle_auth_login(restream_server_t *s, struct mg_connection *c,
                                       rs_json_as_str(rs_json_obj_get(admin, "passwordHash"), ""),
                                       rs_json_as_str(rs_json_obj_get(admin, "salt"), ""));
     if (!ok) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "failed sign-in for '%s' from %s", username ? username : "", ip);
+        int delay = rs_auth_throttle_record_failure(s->auth, identity);
+        char msg[320];
+        snprintf(msg, sizeof(msg), "failed sign-in for '%s' from %s%s",
+                 username ? username : "", ip ? ip : "",
+                 delay > 0 ? " (throttled)" : "");
         log_record(s, "__panel__", "error", "loginFailed", NULL, 0, -1, msg);
-        free(username); free(password);
+        free(username); free(password); rs_free(ip);
         reply_error(c, 401, "Invalid username or password.");
         return;
     }
-    char loginmsg[256];
-    snprintf(loginmsg, sizeof(loginmsg), "%s signed in from %s", username, ip);
+    rs_auth_throttle_reset(s->auth, identity);
+    char loginmsg[320];
+    snprintf(loginmsg, sizeof(loginmsg), "%s signed in from %s", username, ip ? ip : "");
     log_record(s, "__panel__", "info", "login", NULL, 0, -1, loginmsg);
-    char *token = rs_auth_create_session(s->auth, username, remember);
-    char *cookie = token ? rs_auth_set_cookie(token, remember) : NULL;
-    free(username); free(password); rs_free(token);
-    if (!cookie) { reply_error(c, 500, "Could not start a session."); return; }
-    char extra[512];
-    snprintf(extra, sizeof(extra), "Set-Cookie: %s\r\n", cookie);
-    rs_free(cookie);
+    rs_free(ip);
+
+    char extra[768];
+    bool started = session_headers(s, c, hm, username, remember, extra, sizeof(extra));
+    free(username); free(password);
+    if (!started) { reply_error(c, 500, "Could not start a session."); return; }
     reply_json(c, 200, rs_json_new_obj(), extra);
 }
 
 static void handle_auth_logout(restream_server_t *s, struct mg_connection *c,
                                struct mg_http_message *hm) {
-    char ip[64] = {0};
-    mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
-    log_record(s, "__panel__", "info", "logout", NULL, 0, -1, ip);
+    char *ip = client_ip(s, c, hm);
+    log_record(s, "__panel__", "info", "logout", NULL, 0, -1, ip ? ip : "");
+    rs_free(ip);
     char *cookie = header_dup(hm, "Cookie");
     if (cookie) {
         char *token = rs_auth_cookie_token(cookie);
         if (token) { rs_auth_end_session(s->auth, token); free(token); }
         free(cookie);
     }
-    char *clear = rs_auth_clear_cookie();
-    char extra[256];
+    persist_sessions(s);
+    char *clear = rs_auth_clear_cookie(request_is_secure(s, c, hm));
+    char extra[512];
     snprintf(extra, sizeof(extra), "Set-Cookie: %s\r\n", clear ? clear : "");
     rs_free(clear);
     reply_json(c, 200, rs_json_new_obj(), extra);
@@ -635,13 +766,65 @@ static rs_json *parse_body(struct mg_http_message *hm) {
     return body ? body : rs_json_new_obj();
 }
 
-static void handle_settings(restream_server_t *s, struct mg_connection *c) {
+static rs_json *settings_view(restream_server_t *s) {
     const rs_json *settings = rs_json_obj_get(s->state.root, "settings");
     rs_json *out = rs_json_new_obj();
     rs_json_obj_set(out, "port",
                     rs_json_new_int((long long)rs_json_as_num(rs_json_obj_get(settings, "port"), 8787)));
     rs_json_obj_set(out, "bindAddress",
                     rs_json_new_str(rs_json_as_str(rs_json_obj_get(settings, "bindAddress"), "")));
+    rs_json_obj_set(out, "trustedProxies",
+                    rs_json_new_str(rs_json_as_str(rs_json_obj_get(settings, "trustedProxies"), "")));
+    return out;
+}
+
+static void handle_settings(restream_server_t *s, struct mg_connection *c) {
+    reply_json(c, 200, settings_view(s), NULL);
+}
+
+static void handle_settings_update(restream_server_t *s, struct mg_connection *c,
+                                   struct mg_http_message *hm) {
+    rs_json *body = parse_body(hm);
+    rs_json *settings = rs_state_settings(&s->state);
+
+    double port = rs_json_as_num(rs_json_obj_get(body, "port"), 0);
+    if (port > 0 && port <= 65535) rs_json_obj_set_int(settings, "port", (long long)port);
+
+    const rs_json *bind = rs_json_obj_get(body, "bindAddress");
+    if (bind && rs_json_type_of(bind) == RS_JSON_STR) {
+        const char *trimmed = NULL;
+        size_t len = rs_trim(rs_json_as_str(bind, ""), strlen(rs_json_as_str(bind, "")), true, &trimmed);
+        char *copy = (char *)malloc(len + 1);
+        if (copy) {
+            memcpy(copy, trimmed, len);
+            copy[len] = '\0';
+            rs_json_obj_set_str(settings, "bindAddress", copy);
+            free(copy);
+        }
+    }
+
+    // The trusted-proxy list is validated on the way in: a typo here does not
+    // fail loudly at request time, it just silently stops matching, and the
+    // operator is left believing their proxy is trusted when it is not.
+    const rs_json *trusted = rs_json_obj_get(body, "trustedProxies");
+    if (trusted && rs_json_type_of(trusted) == RS_JSON_STR) {
+        const char *value = rs_json_as_str(trusted, "");
+        char bad[80];
+        if (!rs_ip_list_valid(value, bad, sizeof(bad))) {
+            rs_json_free(body);
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "'%s' is not an address, CIDR block, 'loopback', 'private' or 'any'.", bad);
+            reply_error(c, 400, msg);
+            return;
+        }
+        rs_json_obj_set_str(settings, "trustedProxies", value);
+    }
+
+    rs_json_free(body);
+    if (rs_state_save(&s->state) != 0) { reply_error(c, 500, "Could not save state."); return; }
+    rs_json *out = settings_view(s);
+    rs_json_obj_set_str(out, "note", "Takes effect after restart.");
     reply_json(c, 200, out, NULL);
 }
 
@@ -802,6 +985,222 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     dispatch_script_action(s, c, sid, script, args, n);  // always replies
 }
 
+// --- M3U export, provider export/import, EPG --------------------------------
+
+// Quotes cannot appear inside an M3U attribute value without breaking the parse
+// for every player. Provider and stream names are free text nobody expected to
+// need escaping, so strip rather than try to escape — same rule as
+// PanelServer.m3uAttrSafe.
+static void m3u_attr_append(rs_buf *out, const char *text) {
+    for (const char *p = text ? text : ""; *p; p++) {
+        if (*p == '"') continue;
+        rs_buf_append_char(out, (*p == '\n' || *p == '\r') ? ' ' : *p);
+    }
+}
+
+// `only_provider` NULL exports every provider; otherwise just that one.
+static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
+                               struct mg_http_message *hm, const char *only_provider) {
+    char *host = request_host(hm);
+    const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
+    bool found = only_provider == NULL;
+    const char *filename = "restreamair-all";
+
+    rs_buf body = RS_BUF_INIT;
+    rs_buf_append_str(&body, "#EXTM3U\n");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *provider = rs_json_arr_at(providers, i);
+        if (only_provider && strcmp(rs_json_obj_str(provider, "id", ""), only_provider) != 0) continue;
+        found = true;
+        const char *provider_name = rs_json_obj_str(provider, "name", "");
+        const char *provider_logo = rs_json_obj_str(provider, "logo", "");
+        if (only_provider) filename = provider_name;
+
+        const rs_json *streams = rs_json_obj_get(provider, "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+            const rs_json *stream = rs_json_arr_at(streams, j);
+            const char *id = rs_json_obj_str(stream, "id", "");
+            const char *name = rs_json_obj_str(stream, "name", "");
+            const char *logo = rs_json_obj_str(stream, "logo", "");
+            if (!logo[0]) logo = provider_logo;
+            // tvg-id is what binds a guide entry to this channel; without it the
+            // EPG a script provider fetches has nothing to attach to.
+            const char *tvg_id = rs_json_obj_str(stream, "tvgId", "");
+            if (!tvg_id[0]) tvg_id = id;
+
+            rs_buf_append_str(&body, "#EXTINF:-1 tvg-id=\"");
+            m3u_attr_append(&body, tvg_id);
+            rs_buf_append_str(&body, "\" tvg-name=\"");
+            m3u_attr_append(&body, name);
+            rs_buf_append_str(&body, "\"");
+            if (logo[0]) {
+                rs_buf_append_str(&body, " tvg-logo=\"");
+                m3u_attr_append(&body, logo);
+                rs_buf_append_str(&body, "\"");
+            }
+            rs_buf_append_str(&body, " group-title=\"");
+            m3u_attr_append(&body, provider_name);
+            rs_buf_append_str(&body, "\",");
+            m3u_attr_append(&body, name);
+            rs_buf_append_char(&body, '\n');
+            rs_buf_append_str(&body, "http://");
+            rs_buf_append_str(&body, host);
+            rs_buf_append_str(&body, "/play/");
+            rs_buf_append_str(&body, id);
+            rs_buf_append_str(&body, "/index.m3u8\n");
+        }
+    }
+    free(host);
+
+    char *text = rs_buf_take(&body);
+    if (!found) { rs_free(text); reply_error(c, 404, "Provider not found."); return; }
+    if (!text) { reply_error(c, 500, "Out of memory."); return; }
+
+    char *safe = rs_panel_slugify(filename);
+    char headers[256];
+    snprintf(headers, sizeof(headers),
+             "Content-Type: audio/x-mpegurl\r\nCache-Control: no-store\r\n"
+             "Content-Disposition: attachment; filename=\"%s.m3u8\"\r\n",
+             safe && safe[0] ? safe : "playlist");
+    mg_http_reply(c, 200, headers, "%s", text);
+    rs_free(safe);
+    rs_free(text);
+}
+
+// Reads a whole file into memory. Returns NULL if it cannot be read.
+static uint8_t *read_file(const char *path, size_t *out_len) {
+    *out_len = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    if (size < 0) { fclose(f); return NULL; }
+    rewind(f);
+    uint8_t *buf = (uint8_t *)malloc((size_t)size + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t read = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[read] = 0;
+    *out_len = read;
+    return buf;
+}
+
+static void serve_provider_export(restream_server_t *s, struct mg_connection *c,
+                                  const char *provider_id) {
+    rs_json *doc = rs_panel_export_provider(&s->state, provider_id);
+    if (!doc) { reply_error(c, 404, "Provider not found."); return; }
+
+    // Embed the script itself, so an import on another install is self-contained.
+    const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
+    const char *script_path = "";
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *p = rs_json_arr_at(providers, i);
+        if (strcmp(rs_json_obj_str(p, "id", ""), provider_id) == 0) {
+            script_path = rs_json_obj_str(p, "scriptPath", "");
+            break;
+        }
+    }
+    if (script_path[0]) {
+        size_t len = 0;
+        uint8_t *contents = read_file(script_path, &len);
+        if (contents) {
+            char *encoded = rs_base64_encode(contents, len);
+            free(contents);
+            if (encoded) {
+                const char *slash = strrchr(script_path, '/');
+#ifdef _WIN32
+                const char *backslash = strrchr(script_path, '\\');
+                if (backslash && (!slash || backslash > slash)) slash = backslash;
+#endif
+                rs_json *file = rs_json_new_obj();
+                rs_json_obj_set_str(file, "filename", slash ? slash + 1 : script_path);
+                rs_json_obj_set_str(file, "contentBase64", encoded);
+                rs_json_obj_set(doc, "scriptFile", file);
+                rs_free(encoded);
+            }
+        }
+    }
+
+    // The export carries script-account passwords in the clear (the script has
+    // to be handed the real thing), so it is as sensitive as state.json — the
+    // API gate already keeps it admin-only.
+    reply_json(c, 200, doc, "Content-Disposition: attachment; filename=\"provider.restreamair-provider.json\"\r\n");
+}
+
+static void handle_provider_import(restream_server_t *s, struct mg_connection *c,
+                                   struct mg_http_message *hm) {
+    rs_json *doc = parse_body(hm);
+    char *written_path = NULL;
+
+    // Write the embedded script under scripts/, never overwriting one already
+    // there — an unrelated script of the same name must survive.
+    const rs_json *file = rs_json_obj_get(doc, "scriptFile");
+    const char *filename = rs_json_obj_str(file, "filename", "");
+    const char *encoded = rs_json_obj_str(file, "contentBase64", "");
+    if (filename[0] && encoded[0] && !strchr(filename, '/') && !strchr(filename, '\\')) {
+        size_t cap = strlen(encoded);
+        uint8_t *decoded = (uint8_t *)malloc(cap + 1);
+        size_t decoded_len = 0;
+        if (decoded && rs_base64_decode(encoded, decoded, cap, &decoded_len) == 0) {
+#ifndef _WIN32
+            mkdir("scripts", 0755);
+#endif
+            char candidate[512];
+            snprintf(candidate, sizeof(candidate), "scripts/%s", filename);
+            for (int attempt = 1; attempt < 100; attempt++) {
+                FILE *existing = fopen(candidate, "rb");
+                if (!existing) break;
+                fclose(existing);
+                snprintf(candidate, sizeof(candidate), "scripts/%d-%s", attempt, filename);
+            }
+            FILE *out = fopen(candidate, "wb");
+            if (out) {
+                fwrite(decoded, 1, decoded_len, out);
+                fclose(out);
+#ifndef _WIN32
+                chmod(candidate, 0755);  // it has to be executable to be run
+#endif
+                written_path = rs_strdup(candidate);
+            }
+        }
+        free(decoded);
+    }
+
+    const char *err = NULL;
+    char *new_id = NULL;
+    int rc = rs_panel_import_provider(&s->state, doc, written_path ? written_path : "", &new_id, &err);
+    if (rc == 0) {
+        log_recordf(s, "__panel__", "info", "providerImport", NULL, 0, -1,
+                    "imported \"%s\" as %s",
+                    rs_json_obj_str(rs_json_obj_get(doc, "provider"), "name", ""),
+                    new_id ? new_id : "?");
+    }
+    rs_free(new_id);
+    rs_free(written_path);
+    rs_json_free(doc);
+    reply_after_mutation(s, c, hm, rc, err);
+}
+
+static void serve_provider_epg(struct mg_connection *c, const char *provider_id) {
+    // Stored by the script's `epg` action under the provider's session dir.
+    char path[512];
+    snprintf(path, sizeof(path), "runtime/sessions/%s/epg.xml", provider_id);
+    size_t len = 0;
+    uint8_t *data = read_file(path, &len);
+    if (!data) {
+        reply_error(c, 404, "No EPG stored for this provider yet — run the epg action first.");
+        return;
+    }
+    // The script may return XMLTV or JSON; sniff it the same way the Swift
+    // handler does rather than forcing one content type on both.
+    const char *type = (len > 0 && data[0] == '<') ? "application/xml; charset=utf-8"
+                                                   : "application/json; charset=utf-8";
+    mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
+                 "Cache-Control: no-store\r\n\r\n", type, (unsigned long)len);
+    mg_send(c, data, len);
+    free(data);
+}
+
 static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_http_message *hm) {
     if (mg_match(hm->uri, mg_str("/api/auth/status"), NULL) && method_is(hm, "GET")) {
         handle_auth_status(s, c, hm); return true;
@@ -816,16 +1215,29 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         handle_auth_logout(s, c, hm); return true;
     }
 
-    // Everything past here needs a signed-in admin, same as the Swift panel.
+    // Everything past here needs a signed-in account, same as the Swift panel.
     char *user = current_user(s, hm);
     if (!user) { reply_error(c, 401, "Not signed in."); return true; }
+
+    // A viewer may read the panel but not change it. Enforcing on the method
+    // rather than on a list of routes means a route added later is read-only
+    // for viewers by default, which is the safe direction to fail in.
+    const rs_json *account = admin_by_username(&s->state, user);
+    bool is_viewer = account && strcmp(rs_panel_user_role(account), "viewer") == 0;
     free(user);
+    if (is_viewer && !method_is(hm, "GET")) {
+        reply_error(c, 403, "This account is read-only.");
+        return true;
+    }
 
     if (mg_match(hm->uri, mg_str("/api/state"), NULL) && method_is(hm, "GET")) {
         handle_state(s, c, hm); return true;
     }
     if (mg_match(hm->uri, mg_str("/api/settings"), NULL) && method_is(hm, "GET")) {
         handle_settings(s, c); return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/settings"), NULL) && method_is(hm, "POST")) {
+        handle_settings_update(s, c, hm); return true;
     }
     if (mg_match(hm->uri, mg_str("/api/events"), NULL) && method_is(hm, "GET")) {
         handle_events(s, c); return true;
@@ -909,6 +1321,34 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         return true;
     }
 
+    // --- M3U export, provider export/import, EPG ---
+    if (mg_match(hm->uri, mg_str("/api/playlist.m3u8"), NULL) && method_is(hm, "GET")) {
+        serve_m3u_playlist(s, c, hm, NULL);
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/providers/*/playlist.m3u8"), NULL) && method_is(hm, "GET")) {
+        char *provider_id = capture(hm, "/api/providers/*/playlist.m3u8");
+        serve_m3u_playlist(s, c, hm, provider_id);
+        free(provider_id);
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/providers/*/export"), NULL) && method_is(hm, "GET")) {
+        char *provider_id = capture(hm, "/api/providers/*/export");
+        serve_provider_export(s, c, provider_id);
+        free(provider_id);
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/providers/import"), NULL) && method_is(hm, "POST")) {
+        handle_provider_import(s, c, hm);
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/providers/*/epg"), NULL) && method_is(hm, "GET")) {
+        char *provider_id = capture(hm, "/api/providers/*/epg");
+        serve_provider_epg(c, provider_id);
+        free(provider_id);
+        return true;
+    }
+
     // --- stream CRUD ---
     if (mg_match(hm->uri, mg_str("/api/providers/*/streams"), NULL) && method_is(hm, "POST")) {
         char *provider_id = capture(hm, "/api/providers/*/streams");
@@ -932,8 +1372,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     // fetch the single-threaded event loop happened to be blocked on.
     if (mg_match(hm->uri, mg_str("/api/streams/*/start"), NULL) && method_is(hm, "POST")) {
         char *id = capture(hm, "/api/streams/*/start");
-        char ip[64] = {0};
-        mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
+        char *ip = client_ip(s, c, hm);
         const char *err = NULL;
         int rc = rs_panel_set_stream_running(&s->state, id, true, &err);
         if (rc == 0) {
@@ -952,14 +1391,14 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
                         "START of %s from %s failed: %s", id ? id : "?", ip,
                         err ? err : "unknown error");
         }
+        rs_free(ip);
         free(id);
         reply_after_mutation(s, c, hm, rc, err);
         return true;
     }
     if (mg_match(hm->uri, mg_str("/api/streams/*/stop"), NULL) && method_is(hm, "POST")) {
         char *id = capture(hm, "/api/streams/*/stop");
-        char ip[64] = {0};
-        mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
+        char *ip = client_ip(s, c, hm);
         const char *err = NULL;
         // Flag the engine before the status flip so the log reads in the order
         // things actually happened.
@@ -977,6 +1416,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
                         "STOP of %s from %s failed: %s", id ? id : "?", ip,
                         err ? err : "unknown error");
         }
+        rs_free(ip);
         free(id);
         reply_after_mutation(s, c, hm, rc, err);
         return true;
@@ -1358,6 +1798,9 @@ struct rs_pending_job {
     int seq;                       // ITEM only, for HLS AES-128 IV derivation
     char *user_agent;              // ITEM only, for the metrics/log line
     char *playback_key_str;        // ITEM only, ditto
+    char *client_ip;               // ITEM only — resolved at dispatch, since the
+                                   // request (and any X-Forwarded-For) is gone
+                                   // by the time the worker reports back
     char *script_path;             // SCRIPT only
     char **script_args;            // SCRIPT only, each rs_script_arg-owned
     int script_argc;               // SCRIPT only
@@ -1378,7 +1821,7 @@ static void pending_job_free(rs_pending_job *pf) {
     free(pf->stream_id); free(pf->url); free(pf->proxy); free(pf->headers);
     free(pf->range); free(pf->downloader); free(pf->downloader_params);
     free(pf->decryption_keys); free(pf->hls_key); free(pf->hls_iv);
-    free(pf->user_agent); free(pf->playback_key_str);
+    free(pf->user_agent); free(pf->playback_key_str); free(pf->client_ip);
     free(pf->script_path);
     for (int i = 0; i < pf->script_argc; i++) free(pf->script_args[i]);
     free(pf->script_args);
@@ -1601,13 +2044,12 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
 
     // Network monitor: attribute the served bytes to this stream + client, and
     // log the fetch so the stream's Logs tab shows download activity.
-    char client_ip[64] = {0};
-    mg_snprintf(client_ip, sizeof(client_ip), "%M", mg_print_ip, &c->rem);
-    const char *identity = (pf->playback_key_str && pf->playback_key_str[0]) ? pf->playback_key_str : client_ip;
-    rs_metrics_record(server->metrics, pf->stream_id, identity, client_ip,
+    const char *peer = pf->client_ip ? pf->client_ip : "";
+    const char *identity = (pf->playback_key_str && pf->playback_key_str[0]) ? pf->playback_key_str : peer;
+    rs_metrics_record(server->metrics, pf->stream_id, identity, peer,
                       pf->user_agent ? pf->user_agent : "", (int)body_len);
     log_recordf(server, pf->stream_id, "info", pf->is_map ? "serveInit" : "serveSegment",
-                pf->url, status, (long long)body_len, "fetched for %s", client_ip);
+                pf->url, status, (long long)body_len, "fetched for %s", peer);
 
     const char *type = (pf->content_type && pf->content_type[0]) ? pf->content_type : content_type_from_ext(pf->url);
     // Relay the upstream's 206 + Content-Range so the player's byte-range
@@ -1801,8 +2243,7 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
         size_t clen = 0;
         uint8_t *cached = rs_live_take_indexed(server->live, stream_id, rep_index,
                                                want_seq, live_init, &clen);
-        char cip[64] = {0};
-        mg_snprintf(cip, sizeof(cip), "%M", mg_print_ip, &c->rem);
+        char *cip = client_ip(server, c, hm);
         if (cached) {
             char *cua = header_dup(hm, "User-Agent");
             char *ckey = playback_key(hm);
@@ -1825,6 +2266,7 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
             // bytes and no error on either side.
             c->is_resp = 0;
             rs_free(cached);
+            rs_free(cip);
             return;
         }
         // The player asked for something that has aged out of the queue, so it
@@ -1838,6 +2280,7 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
         mg_http_reply(c, 404, "Content-Type: text/plain\r\nCache-Control: no-store\r\n"
                               "Access-Control-Allow-Origin: *\r\n",
                       "Segment is outside the live window.\n");
+        rs_free(cip);
         return;
     }
 
@@ -1880,6 +2323,7 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     pf->seq = seq_str ? atoi(seq_str) : 0;
     free(seq_str);
     pf->user_agent = header_dup(hm, "User-Agent");
+    pf->client_ip = client_ip(server, c, hm);
     pf->playback_key_str = playback_key(hm);
 
     if (!pending_job_dispatch(server, c, pf)) {
@@ -2108,11 +2552,11 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
     char *key = playback_key(hm);
     bool allowed = rs_panel_playback_allowed(&server->state, key);
     if (!allowed) {
-        char ip[64] = {0};
-        mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
+        char *ip = client_ip(server, c, hm);
         log_recordf(server, "__panel__", "error", "playbackDenied", NULL, 401, -1,
                     "%.*s from %s rejected: %s", (int)hm->uri.len, hm->uri.buf, ip,
                     (key && key[0]) ? "invalid playback key" : "no playback key");
+        rs_free(ip);
         free(key);
         reply_error(c, 401, "A valid playback key is required.");
         return true;
@@ -2210,11 +2654,17 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     // only thread that may build a reply from it — pending_job_finish builds
     // and sends it, then frees the job.
     if (ev == MG_EV_WAKEUP) {
+        // The request that started this job is long gone, so there is nothing
+        // to describe: reply without a stale request's headers.
+        g_request_security[0] = '\0';
         if (server) pending_job_finish(server, c, (struct mg_str *)ev_data);
         return;
     }
     if (ev != MG_EV_HTTP_MSG) return;
     struct mg_http_message *hm = (struct mg_http_message *)ev_data;
+
+    if (server) security_headers(server, c, hm, g_request_security, sizeof(g_request_security));
+    else g_request_security[0] = '\0';
 
     // Liveness probe. Carries the binary's build time so it's trivial to tell,
     // from an unauthenticated curl, whether a rebuilt server was actually
@@ -2242,11 +2692,12 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
             bool poll = mg_match(hm->uri, mg_str("/api/state"), NULL) ||
                         mg_match(hm->uri, mg_str("/api/logs"), NULL) ||
                         mg_match(hm->uri, mg_str("/api/events"), NULL);
-            char line[512], ip[64] = {0};
-            mg_snprintf(ip, sizeof(ip), "%M", mg_print_ip, &c->rem);
+            char line[512];
+            char *ip = client_ip(server, c, hm);
             snprintf(line, sizeof(line), "%.*s %.*s  from %s",
                      (int)hm->method.len, hm->method.buf, (int)hm->uri.len, hm->uri.buf, ip);
             log_record(server, "__panel__", "info", poll ? "poll" : "access", NULL, 0, -1, line);
+            rs_free(ip);
         }
         if (server && handle_api(server, c, hm)) return;
         // A recognised prefix but not a route we serve yet: honest 501, so a
@@ -2261,6 +2712,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     if (server && server->web_root) {
         struct mg_http_serve_opts opts = {0};
         opts.root_dir = server->web_root;
+        opts.extra_headers = g_request_security;
         mg_http_serve_dir(c, hm, &opts);
         return;
     }
@@ -2319,6 +2771,10 @@ restream_server_t* restream_server_create(void) {
         free(server);
         return NULL;
     }
+    // Resume the sessions the previous run persisted, so a restart (or a switch
+    // between the C and Swift servers, which share state.json) leaves signed-in
+    // browsers signed in.
+    rs_auth_import_sessions(server->auth, rs_json_obj_get(server->state.root, "sessions"));
     log_recordf(server, "__panel__", "info", "serverStart", NULL, 0, -1,
                 "ReStreamAir C server started (build %s %s, live DASH engine %s)",
                 __DATE__, __TIME__, server->live ? "available" : "unavailable");

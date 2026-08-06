@@ -34,7 +34,9 @@ jobs:
           sed -i '' "s/static let commit = \"unknown\"/static let commit = \"${GITHUB_SHA:0:7}\"/" Version.swift
       - name: Embed web UI
         run: sh scripts/embed-assets.sh
-      - run: swiftc -O $(ls *.swift | grep -vE 'MenuBarApp.swift|Package.swift') -o restreamair
+      # SwiftPM, not a bare swiftc: the Swift sources import restream_core, and
+      # only SwiftPM compiles and links the C core alongside them.
+      - run: swift build -c release --product restreamair && cp .build/release/restreamair restreamair
       - run: swiftc -O HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKit
       - run: tar -czf restreamair-${{ steps.ver.outputs.tag }}-macos.tar.gz restreamair restreamair-menubar
       - uses: actions/upload-artifact@v4
@@ -78,7 +80,8 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src swift:6.0 bash -c "
             set -e
             sh scripts/embed-assets.sh
-            swiftc -O -static-stdlib \$(ls *.swift | grep -vE 'MenuBarApp.swift|Package.swift') -o restreamair-linux
+            swift build -c release --product restreamair -Xswiftc -static-stdlib
+            cp .build/release/restreamair restreamair-linux
             sh scripts/bundle-linux.sh '$STAGE'
           "
           file restreamair-linux
@@ -192,9 +195,9 @@ jobs:
         shell: pwsh
         run: |
           $STAGE = "restreamair-${{ steps.ver.outputs.tag }}-windows-x64"
-          $sources = (Get-ChildItem *.swift |
-            Where-Object { $_.Name -notmatch 'MenuBarApp\.swift|Package\.swift' }).Name
-          swiftc -O $sources -o restreamair.exe
+          # SwiftPM, not a bare swiftc: the sources import restream_core.
+          swift build -c release --product restreamair
+          Copy-Item .build\release\restreamair.exe -Destination restreamair.exe
           New-Item -ItemType Directory -Path $STAGE -Force
           Copy-Item restreamair.exe -Destination "$STAGE\restreamair.exe"
           $swiftBin = Split-Path (Get-Command swiftc).Path

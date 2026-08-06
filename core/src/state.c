@@ -4,6 +4,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+// state.json holds admin password hashes, session tokens' hashes, API keys and
+// — for script providers — account passwords in the clear, because the script
+// has to be handed the real thing. It has no business being world-readable, and
+// the default umask would make it exactly that. Opening with an explicit 0600
+// (rather than fopen + chmod) means it is never briefly readable by anyone else.
+static FILE *open_private(const char *path) {
+#ifdef _WIN32
+    return fopen(path, "wb");
+#else
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) close(fd);
+    return f;
+#endif
+}
+
 // Ensures `st->root` names an object array member, creating an empty one if it
 // isn't there yet. Returns the (possibly newly created) node.
 static rs_json *ensure_array(rs_state *st, const char *key) {
@@ -75,7 +98,7 @@ int rs_state_save(const rs_state *st) {
     memcpy(tmp, st->path, path_len);
     memcpy(tmp + path_len, ".tmp", 5);
 
-    FILE *f = fopen(tmp, "wb");
+    FILE *f = open_private(tmp);
     if (!f) { free(tmp); rs_free(text); return -1; }
     size_t len = strlen(text);
     size_t written = fwrite(text, 1, len, f);
@@ -85,6 +108,12 @@ int rs_state_save(const rs_state *st) {
     if (written != len || !flush_ok) { remove(tmp); free(tmp); return -1; }
 
     if (rename(tmp, st->path) != 0) { remove(tmp); free(tmp); return -1; }
+#ifndef _WIN32
+    // rename() keeps the temp file's mode, but an existing state.json written
+    // by an older build (or restored from a backup) keeps its own — tighten it
+    // either way, every save.
+    chmod(st->path, S_IRUSR | S_IWUSR);
+#endif
     free(tmp);
     return 0;
 }

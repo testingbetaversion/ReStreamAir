@@ -1,0 +1,54 @@
+# ReStreamAir behind Caddy, which gets and renews a real certificate on its own.
+# This is the supported way to run the panel over HTTPS: the panel itself speaks
+# plain HTTP, and a terminating proxy in front of it is what turns a sign-in
+# form and a session cookie into something safe to expose beyond a trusted LAN.
+#
+#   1. Point a DNS record at this host.
+#   2. RESTREAMAIR_DOMAIN=panel.example.com docker compose up -d
+#   3. Open https://panel.example.com and create the admin account.
+#   4. In Settings, set "Trusted proxies" to `private`.
+#
+# Step 4 is what makes the panel believe Caddy about the client: with it, the
+# session cookie gains `Secure`, responses carry HSTS, and the monitoring view
+# and login throttle see real client addresses instead of one proxy address for
+# the entire internet. Without it the panel ignores those headers — which is the
+# right default, because an unauthenticated client could otherwise forge them.
+#
+# To run on a trusted LAN without a domain or TLS, start just the panel and
+# publish its port yourself:
+#   docker compose up -d restreamair
+#   docker run ... -p 8787:8787   (or add a `ports:` mapping below)
+# Leave "Trusted proxies" empty in that setup — there is no proxy to believe.
+
+services:
+  restreamair:
+    build: .
+    image: restreamair
+    restart: unless-stopped
+    volumes:
+      - restreamair-data:/data
+    # No published port in the default setup: only Caddy should be able to
+    # reach the panel, so that the plain-HTTP listener is never exposed. Add
+    # `ports: ["8787:8787"]` only if you deliberately want direct LAN access.
+    expose:
+      - "8787"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - restreamair
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      RESTREAMAIR_DOMAIN: ${RESTREAMAIR_DOMAIN:?set RESTREAMAIR_DOMAIN to the hostname this panel answers on}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  restreamair-data:
+  caddy-data:
+  caddy-config:

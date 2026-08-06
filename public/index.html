@@ -221,6 +221,7 @@
               <div class="form-row">
                 <label>Poll seconds<input name="pollInterval" type="number" min="0.25" step="0.25" value="2"></label>
                 <label>Audio delay (ms)<span class="field-hint">Lip-sync offset, can be negative. Applied to the audio track only.</span><input name="audioDelayMs" type="number" step="10" value="0"></label>
+                <label>EPG channel id<span class="field-hint">Exported as <code>tvg-id</code> in the M3U, which is how external players match guide data to this channel. Blank uses the stream id.</span><input name="tvgId" placeholder="bbc-one.uk"></label>
               </div>
               <label class="check"><input name="forceOffline" type="checkbox"> Allow offline/static MPD</label>
               <button type="button" id="showDecryptionKeysBtn" class="ghost hidden">Add decryption keys</button>
@@ -455,13 +456,20 @@
               <form id="portForm" class="form-row">
                 <label>Panel port<span class="field-hint">Takes effect after restart</span><input name="port" type="number" min="1" max="65535"></label>
                 <label>Bind address<span class="field-hint">Blank = all interfaces. Use 127.0.0.1 to only accept local connections.</span><input name="bindAddress" placeholder="0.0.0.0"></label>
+                <label>Trusted proxies<span class="field-hint">Blank = trust nothing. Set to <code>loopback</code> when a reverse proxy in front of ReStreamAir terminates HTTPS, so the real client address and https:// scheme are honoured. Accepts addresses, CIDR blocks, <code>loopback</code>, <code>private</code> or <code>any</code>.</span><input name="trustedProxies" placeholder="loopback"></label>
                 <div class="actions"><button type="submit">Save</button></div>
               </form>
-              <h3>Admin users</h3>
+              <h3>Accounts</h3>
               <form id="userForm" class="form-row">
                 <label>Username<input name="username" required></label>
                 <label>Password<input name="password" type="password" minlength="8" required></label>
-                <div class="actions"><button type="submit"><span data-icon="plus"></span>Add admin</button></div>
+                <label>Role<span class="field-hint">Viewers can see everything but change nothing.</span>
+                  <select name="role">
+                    <option value="admin">Admin — full control</option>
+                    <option value="viewer">Viewer — read-only</option>
+                  </select>
+                </label>
+                <div class="actions"><button type="submit"><span data-icon="plus"></span>Add account</button></div>
               </form>
               <div id="userList" class="key-list empty-state">Loading…</div>
             </div>

@@ -1,0 +1,51 @@
+# systemd unit for a bare-metal install — the alternative to the nohup line the
+# README used to be the only answer.
+#
+#   sudo useradd --system --home /var/lib/restreamair --create-home restreamair
+#   sudo cp restreamair /usr/local/bin/
+#   sudo cp -r public /var/lib/restreamair/
+#   sudo chown -R restreamair:restreamair /var/lib/restreamair
+#   sudo cp deploy/restreamair.service /etc/systemd/system/
+#   sudo systemctl enable --now restreamair
+#
+# The panel speaks plain HTTP. Leave --bind at 127.0.0.1 and put a TLS
+# terminator (nginx, Caddy) in front of it unless this is a trusted LAN; then
+# set Settings → "Trusted proxies" to `loopback` so the panel honours that
+# proxy's X-Forwarded-Proto and X-Forwarded-For.
+
+[Unit]
+Description=ReStreamAir DASH/HLS restreaming panel
+Documentation=https://github.com/testingbetaversion/ReStreamAir
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=restreamair
+Group=restreamair
+# state.json, runtime/, logs/ and logo-cache.json all resolve relative to this.
+WorkingDirectory=/var/lib/restreamair
+ExecStart=/usr/local/bin/restreamair serve --bind 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5s
+
+# The panel needs to write its working directory, reach the network, and
+# nothing else. Everything below is what it can do without.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/restreamair
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+# state.json carries password hashes and script-account passwords; the server
+# creates it 0600, and this keeps anything else it writes just as private.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

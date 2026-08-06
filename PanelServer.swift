@@ -20,14 +20,18 @@ struct PanelState: Codable {
     var systemPeaks: SystemPeaks = SystemPeaks()
     var settings: PanelSettings = PanelSettings()
     var adminUsers: [AdminUser] = []
+    /// Signed-in sessions, so a restart doesn't sign everyone out. Token hashes
+    /// only — see StoredSession.
+    var sessions: [StoredSession] = []
 
-    init(providers: [Provider] = [], apiKeys: [APIKey] = [], bandwidthTotals: BandwidthTotals = BandwidthTotals(), systemPeaks: SystemPeaks = SystemPeaks(), settings: PanelSettings = PanelSettings(), adminUsers: [AdminUser] = []) {
+    init(providers: [Provider] = [], apiKeys: [APIKey] = [], bandwidthTotals: BandwidthTotals = BandwidthTotals(), systemPeaks: SystemPeaks = SystemPeaks(), settings: PanelSettings = PanelSettings(), adminUsers: [AdminUser] = [], sessions: [StoredSession] = []) {
         self.providers = providers
         self.apiKeys = apiKeys
         self.bandwidthTotals = bandwidthTotals
         self.systemPeaks = systemPeaks
         self.settings = settings
         self.adminUsers = adminUsers
+        self.sessions = sessions
     }
 
     // Custom decoder: Swift's synthesized Decodable does NOT fall back to a
@@ -42,6 +46,7 @@ struct PanelState: Codable {
         systemPeaks = try container.decodeIfPresent(SystemPeaks.self, forKey: .systemPeaks) ?? SystemPeaks()
         settings = try container.decodeIfPresent(PanelSettings.self, forKey: .settings) ?? PanelSettings()
         adminUsers = try container.decodeIfPresent([AdminUser].self, forKey: .adminUsers) ?? []
+        sessions = try container.decodeIfPresent([StoredSession].self, forKey: .sessions) ?? []
     }
 }
 
@@ -51,16 +56,24 @@ struct PanelSettings: Codable {
     /// "127.0.0.1" to only accept connections from the same machine, or a
     /// specific LAN IP to bind just that interface.
     var bindAddress: String = ""
+    /// Which upstream hops may be believed when they report the client's
+    /// address and scheme: "loopback", "private", "any", or a comma-separated
+    /// list of addresses and CIDR blocks. Empty — the default — trusts nothing
+    /// and uses the peer address, which is right for a directly exposed server.
+    /// See the "Running behind a reverse proxy" section of the README.
+    var trustedProxies: String = ""
 
-    init(port: UInt16 = 8787, bindAddress: String = "") {
+    init(port: UInt16 = 8787, bindAddress: String = "", trustedProxies: String = "") {
         self.port = port
         self.bindAddress = bindAddress
+        self.trustedProxies = trustedProxies
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         port = try container.decodeIfPresent(UInt16.self, forKey: .port) ?? 8787
         bindAddress = try container.decodeIfPresent(String.self, forKey: .bindAddress) ?? ""
+        trustedProxies = try container.decodeIfPresent(String.self, forKey: .trustedProxies) ?? ""
     }
 }
 
@@ -364,6 +377,12 @@ struct StreamConfig: Codable {
     // playback pipeline yet (that's session-manifest live playback, still
     // planned) — they're stored now so a re-import is idempotent and the
     // data isn't silently discarded before that lands.
+    /// The XMLTV channel id this stream's EPG entries use. Exported as tvg-id
+    /// in the M3U, which is how a player (TiviMate, Kodi, Jellyfin) binds guide
+    /// data to a channel — without it the EPG a script provider fetches has
+    /// nothing to attach to. Blank falls back to the stream id, which is what
+    /// the guide is keyed on when the script doesn't say otherwise.
+    var tvgId: String = ""
     var sourceType: String = ""       // "" (manual) | "channel" | "event"
     var mode: String = "live"         // "live" | "vod", the script JSON's "Mode" — independent of `kind` (mpd/m3u8 protocol)
     var sessionManifest: Bool = false
@@ -487,6 +506,7 @@ struct StreamConfig: Codable {
         mediaHeaders = try container.decodeIfPresent(String.self, forKey: .mediaHeaders) ?? legacyHeaders
         hlsKeyHeaders = try container.decodeIfPresent(String.self, forKey: .hlsKeyHeaders) ?? ""
         audioDelayMs = try container.decodeIfPresent(Int.self, forKey: .audioDelayMs) ?? 0
+        tvgId = try container.decodeIfPresent(String.self, forKey: .tvgId) ?? ""
         sourceType = try container.decodeIfPresent(String.self, forKey: .sourceType) ?? ""
         mode = try container.decodeIfPresent(String.self, forKey: .mode) ?? "live"
         sessionManifest = try container.decodeIfPresent(Bool.self, forKey: .sessionManifest) ?? false
@@ -594,10 +614,18 @@ enum PanelError: Error, CustomStringConvertible {
     case notFound(String)
     case server(String)
     case unauthorized(String)
+    /// Signed in, but not allowed — a viewer attempting a write. Distinct from
+    /// `unauthorized` so the panel can tell "sign in again" (401, which its
+    /// fetch layer handles by bouncing to the login screen) apart from "your
+    /// account cannot do that" (403, which it must simply report).
+    case forbidden(String)
+    /// Too many failed sign-ins. Carries the seconds to wait, for Retry-After.
+    case throttled(String, retryAfter: Int)
 
     var description: String {
         switch self {
-        case .badRequest(let message), .notFound(let message), .server(let message), .unauthorized(let message):
+        case .badRequest(let message), .notFound(let message), .server(let message),
+             .unauthorized(let message), .forbidden(let message), .throttled(let message, _):
             return message
         }
     }
@@ -759,6 +787,10 @@ final class PanelServer {
             metrics.seed(bandwidth: initial.bandwidthTotals)
             if !portPinned { port = initial.settings.port }
             if !bindAddressPinned { bindAddress = initial.settings.bindAddress }
+            // Resume the sessions the previous run persisted, so a restart
+            // leaves signed-in browsers signed in. state.json is shared with
+            // the C server, so a session started there resolves here too.
+            authStore.importSessions(initial.sessions)
         }
         let boundPort = port
         let boundAddress = bindAddress
@@ -1065,7 +1097,12 @@ final class PanelServer {
         for provider in providers {
             for stream in provider.streams {
                 let logo = stream.logo.isEmpty ? provider.logo : stream.logo
-                var attrs = ""
+                // tvg-id is what binds a guide entry to this channel; tvg-name
+                // is the display name players fall back to when their own EPG
+                // has no match. Both were missing, which made the EPG a script
+                // provider fetches unusable in every external player.
+                let tvgId = stream.tvgId.isEmpty ? stream.id : stream.tvgId
+                var attrs = " tvg-id=\"\(m3uAttrSafe(tvgId))\" tvg-name=\"\(m3uAttrSafe(stream.name))\""
                 if !logo.isEmpty { attrs += " tvg-logo=\"\(m3uAttrSafe(logo))\"" }
                 attrs += " group-title=\"\(m3uAttrSafe(provider.name))\""
                 lines.append("#EXTINF:-1\(attrs),\(m3uAttrSafe(stream.name))")
@@ -1148,6 +1185,10 @@ final class PanelServer {
             guard let self else { return }
             var request = rawRequest
             request.remoteAddress = remoteAddress
+            // Behind a trusted proxy the peer address is the proxy's, so every
+            // viewer would otherwise collapse into a single client in the
+            // monitor and a single identity in the connection table.
+            let clientAddress = (try? self.readState()).map { self.clientIP(request, state: $0) } ?? remoteAddress
             if request.method == "GET", request.path == "/api/events" {
                 self.handleEvents(connection, request: request)
                 return
@@ -1156,7 +1197,7 @@ final class PanelServer {
             if request.method == "GET", request.path.hasPrefix("/direct/") {
                 do {
                     let identity = try self.authorizePlayback(request)
-                    try self.handleDirectStream(connection, request: request, identity: identity, clientIP: remoteAddress, userAgent: userAgent)
+                    try self.handleDirectStream(connection, request: request, identity: identity, clientIP: clientAddress, userAgent: userAgent)
                 } catch {
                     let response = self.jsonResponse(status: 401, ["error": "\(error)"])
                     connection.send(response) { _ in connection.cancel() }
@@ -1170,22 +1211,31 @@ final class PanelServer {
                 }
                 let response = try self.route(request)
                 if let identity {
-                    self.metrics.recordRequest(streamId: self.extractStreamId(request.path), identity: identity, bytes: response.count, clientIP: remoteAddress, userAgent: userAgent)
+                    self.metrics.recordRequest(streamId: self.extractStreamId(request.path), identity: identity, bytes: response.count, clientIP: clientAddress, userAgent: userAgent)
                 }
                 connection.send(response) { _ in connection.cancel() }
             } catch PanelError.notFound(let message) {
-                self.recordPlaybackError(request, remoteAddress: remoteAddress)
+                self.recordPlaybackError(request, remoteAddress: clientAddress)
                 let response = self.jsonResponse(status: 404, ["error": message])
                 connection.send(response) { _ in connection.cancel() }
             } catch PanelError.badRequest(let message) {
-                self.recordPlaybackError(request, remoteAddress: remoteAddress)
+                self.recordPlaybackError(request, remoteAddress: clientAddress)
                 let response = self.jsonResponse(status: 400, ["error": message])
                 connection.send(response) { _ in connection.cancel() }
             } catch PanelError.unauthorized(let message) {
                 let response = self.jsonResponse(status: 401, ["error": message])
                 connection.send(response) { _ in connection.cancel() }
+            } catch PanelError.forbidden(let message) {
+                let response = self.jsonResponse(status: 403, ["error": message])
+                connection.send(response) { _ in connection.cancel() }
+            } catch PanelError.throttled(let message, let retryAfter) {
+                let body = (try? JSONSerialization.data(withJSONObject: ["error": message])) ?? Data("{}".utf8)
+                let response = self.response(status: 429, body: body,
+                                             type: "application/json; charset=utf-8", noStore: true,
+                                             extraHeaders: ["Retry-After": "\(retryAfter)"])
+                connection.send(response) { _ in connection.cancel() }
             } catch {
-                self.recordPlaybackError(request, remoteAddress: remoteAddress)
+                self.recordPlaybackError(request, remoteAddress: clientAddress)
                 let response = self.jsonResponse(status: 500, ["error": "\(error)"])
                 connection.send(response) { _ in connection.cancel() }
             }
@@ -1210,7 +1260,7 @@ final class PanelServer {
     @discardableResult
     func authorizePlayback(_ request: HTTPRequest) throws -> String {
         let state = try readState()
-        guard !state.apiKeys.isEmpty else { return "ip:\(request.remoteAddress)" }
+        guard !state.apiKeys.isEmpty else { return "ip:\(clientIP(request, state: state))" }
         let supplied = request.query["key"] ?? bearerToken(request.headers["authorization"])
         guard let supplied, let matched = state.apiKeys.first(where: { $0.key == supplied }) else {
             throw PanelError.unauthorized("Valid API key required. Pass ?key=<key> or an Authorization: Bearer header.")
@@ -1227,18 +1277,114 @@ final class PanelServer {
         metrics.recordConnectionError(streamId: streamId, identity: identity, clientIP: remoteAddress)
     }
 
-    func authorizeAdmin(_ request: HTTPRequest, state: PanelState) throws {
-        guard !state.adminUsers.isEmpty else { return }
+    // MARK: - Request context
+
+    /// Behind a reverse proxy every request arrives from the proxy's address
+    /// over plain HTTP, so taken literally the peer address is useless (one
+    /// "client" for the whole internet) and the connection looks insecure even
+    /// when the user is on HTTPS. `settings.trustedProxies` names the hops we
+    /// believe; the matching itself is the C core's, so both servers agree
+    /// exactly on what "10.0.0.0/8" covers.
+    func clientIP(_ request: HTTPRequest, state: PanelState) -> String {
+        let peer = request.remoteAddress
+        let forwarded = request.headers["x-forwarded-for"] ?? ""
+        guard let resolved = rs_client_ip(peer, forwarded, state.settings.trustedProxies) else { return peer }
+        defer { rs_free(resolved) }
+        return String(cString: resolved)
+    }
+
+    /// True if the user reached us over HTTPS — which today means a trusted
+    /// proxy terminated TLS and said so, since the listener itself is plain
+    /// HTTP.
+    func requestIsSecure(_ request: HTTPRequest, state: PanelState) -> Bool {
+        rs_request_is_secure(request.remoteAddress,
+                             request.headers["x-forwarded-proto"] ?? "",
+                             state.settings.trustedProxies,
+                             false)
+    }
+
+    /// The request-dependent security headers. `response()` already sets the
+    /// unconditional ones (nosniff, Referrer-Policy); HSTS is only meaningful —
+    /// and only safe — on a connection the user actually reached over HTTPS,
+    /// since sending it from a plain-HTTP LAN install would pin browsers to a
+    /// scheme that install does not serve. One HSTS header pins the whole
+    /// origin, so carrying it on the sign-in response covers the panel.
+    func securityHeaders(_ request: HTTPRequest, state: PanelState) -> [String: String] {
+        requestIsSecure(request, state: state) ? ["Strict-Transport-Security": "max-age=31536000"] : [:]
+    }
+
+    /// The signed-in account, or nil. Basic credentials are accepted alongside
+    /// the session cookie because scripted clients use them.
+    func currentAccount(_ request: HTTPRequest, state: PanelState) -> AdminUser? {
         if let username = authStore.username(forSessionCookie: request.headers["cookie"]),
-           state.adminUsers.contains(where: { $0.username == username }) {
-            return
+           let user = state.adminUsers.first(where: { $0.username == username }) {
+            return user
         }
         if let credentials = authStore.basicCredentials(request.headers["authorization"]),
            let user = state.adminUsers.first(where: { $0.username == credentials.username }),
            AuthStore.verifyPassword(credentials.password, hash: user.passwordHash, salt: user.salt) {
-            return
+            return user
         }
-        throw PanelError.unauthorized("Sign in required.")
+        return nil
+    }
+
+    /// The raw session token from the request's cookie, if any.
+    func sessionToken(_ request: HTTPRequest) -> String? {
+        guard let header = request.headers["cookie"] else { return nil }
+        for part in header.split(separator: ";") {
+            let pair = part.trimmingCharacters(in: .whitespaces).split(separator: "=", maxSplits: 1)
+            if pair.count == 2, pair[0] == "restreamair_session" { return String(pair[1]) }
+        }
+        return nil
+    }
+
+    /// Mirrors the live session store into state.json, so a restart resumes
+    /// sessions instead of signing everyone out. Only token hashes are written.
+    func persistSessions(_ state: PanelState) throws {
+        var updated = state
+        updated.sessions = authStore.exportSessions()
+        try writeState(updated)
+    }
+
+    /// The 200 that completes a sign-in: mints the session, persists it, and
+    /// sets the cookie with the right attributes for how the request arrived.
+    func signedInResponse(username: String, remember: Bool,
+                          request: HTTPRequest, state: PanelState) throws -> Data {
+        let token = authStore.createSession(username: username, remember: remember)
+        try persistSessions(state)
+        var headers = securityHeaders(request, state: state)
+        headers["Set-Cookie"] = authStore.setCookieHeader(token: token, remember: remember,
+                                                          secure: requestIsSecure(request, state: state))
+        return response(status: 200, body: Data("{\"ok\":true}".utf8),
+                        type: "application/json; charset=utf-8", noStore: true, extraHeaders: headers)
+    }
+
+    func settingsView(_ state: PanelState) -> [String: Any] {
+        ["port": state.settings.port,
+         "bindAddress": state.settings.bindAddress,
+         "trustedProxies": state.settings.trustedProxies]
+    }
+
+    func userView(_ user: AdminUser) -> [String: Any] {
+        ["id": user.id, "username": user.username, "role": user.role.rawValue,
+         "createdAt": ISO8601DateFormatter.sharedTimestamp.string(from: user.createdAt)]
+    }
+
+    func authorizeAdmin(_ request: HTTPRequest, state: PanelState) throws {
+        guard !state.adminUsers.isEmpty else { return }
+        guard let account = currentAccount(request, state: state) else {
+            throw PanelError.unauthorized("Sign in required.")
+        }
+        // A viewer may read the panel but not change it. Gating on the method
+        // rather than on a list of routes means a route added later is
+        // read-only for viewers by default — the safe direction to fail in.
+        // Provider export is the one GET that leaks secrets (it embeds script
+        // account passwords), so it is admin-only too.
+        guard account.role == .viewer else { return }
+        let isExport = request.path.hasSuffix("/export")
+        if request.method != "GET" || isExport {
+            throw PanelError.forbidden("This account is read-only.")
+        }
     }
 
     /// Hard ceiling on one buffered HTTP request (headers + body). Anything a
@@ -1302,6 +1448,13 @@ final class PanelServer {
     }
 
     func route(_ request: HTTPRequest) throws -> Data {
+        // Liveness probe, deliberately outside the auth gate so a supervisor,
+        // container healthcheck or uptime monitor can hit it without holding a
+        // credential. Reports the version rather than anything about the
+        // install, so it gives an unauthenticated caller nothing useful.
+        if request.path == "/ping" {
+            return jsonResponse(status: 200, ["status": "ok", "version": AppVersion.version])
+        }
         if request.path.hasPrefix("/api/") { return try api(request) }
         if request.path.hasPrefix("/play/") { return try servePlay(request) }
         if request.path.hasPrefix("/proxy/") { return try serveProxy(request) }
@@ -1874,7 +2027,7 @@ final class PanelServer {
         }
 
         if request.method == "GET", request.path == "/api/settings" {
-            return jsonResponse(status: 200, ["port": state.settings.port, "bindAddress": state.settings.bindAddress])
+            return jsonResponse(status: 200, settingsView(state))
         }
 
         if request.method == "POST", request.path == "/api/settings" {
@@ -1885,13 +2038,30 @@ final class PanelServer {
             if let newBind = input["bindAddress"]?.string {
                 state.settings.bindAddress = newBind.trimmingCharacters(in: .whitespaces)
             }
+            if let newTrusted = input["trustedProxies"]?.string {
+                // Validated on the way in: a typo here fails silently at
+                // request time — it simply never matches — leaving the operator
+                // convinced their proxy is trusted when it is not.
+                var bad = [CChar](repeating: 0, count: 80)
+                guard rs_ip_list_valid(newTrusted, &bad, bad.count) else {
+                    let offender = bad.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+                    throw PanelError.badRequest("'\(offender)' is not an address, CIDR block, 'loopback', 'private' or 'any'.")
+                }
+                state.settings.trustedProxies = newTrusted.trimmingCharacters(in: .whitespaces)
+            }
             try writeState(state)
-            return jsonResponse(status: 200, ["port": state.settings.port, "bindAddress": state.settings.bindAddress, "note": "Takes effect after restart."])
+            var view = settingsView(state)
+            view["note"] = "Takes effect after restart."
+            return jsonResponse(status: 200, view)
         }
 
         if request.method == "GET", request.path == "/api/auth/status" {
             let username = authStore.username(forSessionCookie: request.headers["cookie"])
-            return jsonResponse(status: 200, ["needsSetup": state.adminUsers.isEmpty, "authenticated": username != nil, "username": username as Any])
+            let role = username.flatMap { name in state.adminUsers.first { $0.username == name }?.role } ?? .admin
+            return jsonResponse(status: 200, ["needsSetup": state.adminUsers.isEmpty,
+                                              "authenticated": username != nil,
+                                              "username": username as Any,
+                                              "role": role.rawValue])
         }
 
         if request.method == "POST", request.path == "/api/auth/setup" {
@@ -1905,31 +2075,50 @@ final class PanelServer {
             state.adminUsers.append(AdminUser(id: safeId("user"), username: username, passwordHash: hash, salt: salt, createdAt: Date()))
             try writeState(state)
             let remember = input["remember"] == "true"
-            let token = authStore.createSession(username: username, remember: remember)
-            return response(status: 200, body: Data("{\"ok\":true}".utf8), type: "application/json; charset=utf-8", noStore: true, extraHeaders: ["Set-Cookie": authStore.setCookieHeader(token: token, remember: remember)])
+            return try signedInResponse(username: username, remember: remember, request: request, state: state)
         }
 
         if request.method == "POST", request.path == "/api/auth/login" {
             let input = try decodeJSON([String: String].self, request.body)
+            let attempted = input["username"] ?? ""
+            let address = clientIP(request, state: state)
+            // Keyed on username *and* address, so one attacker cannot lock a
+            // real operator out by guessing at their username from elsewhere,
+            // and one host cannot spread its guessing across many usernames for
+            // free.
+            let identity = "\(attempted)|\(address)"
+            let wait = authStore.throttleDelay(for: identity)
+            if wait > 0 {
+                logPanel("warn", "auth", "throttled sign-in for '\(attempted)' from \(address) (\(wait)s remaining)")
+                throw PanelError.throttled("Too many failed sign-ins. Try again in \(wait) seconds.", retryAfter: wait)
+            }
             guard let username = input["username"], let password = input["password"],
                   let user = state.adminUsers.first(where: { $0.username == username }),
                   AuthStore.verifyPassword(password, hash: user.passwordHash, salt: user.salt) else {
-                logPanel("warn", "auth", "failed sign-in for '\(input["username"] ?? "?")'")
+                let delay = authStore.recordFailedLogin(for: identity)
+                logPanel("warn", "auth", "failed sign-in for '\(attempted)' from \(address)" + (delay > 0 ? " (throttled)" : ""))
                 throw PanelError.unauthorized("Invalid username or password.")
             }
+            authStore.resetThrottle(for: identity)
             let remember = input["remember"] == "true"
-            let token = authStore.createSession(username: username, remember: remember)
-            logPanel("info", "auth", "'\(username)' signed in")
-            return response(status: 200, body: Data("{\"ok\":true}".utf8), type: "application/json; charset=utf-8", noStore: true, extraHeaders: ["Set-Cookie": authStore.setCookieHeader(token: token, remember: remember)])
+            logPanel("info", "auth", "'\(username)' signed in from \(address)")
+            return try signedInResponse(username: username, remember: remember, request: request, state: state)
         }
 
         if request.method == "POST", request.path == "/api/auth/logout" {
             logPanel("info", "auth", "signed out")
-            return response(status: 200, body: Data("{\"ok\":true}".utf8), type: "application/json; charset=utf-8", noStore: true, extraHeaders: ["Set-Cookie": authStore.clearCookieHeader()])
+            if let token = sessionToken(request) {
+                authStore.endSession(token: token)
+                try persistSessions(state)
+            }
+            var headers = securityHeaders(request, state: state)
+            headers["Set-Cookie"] = authStore.clearCookieHeader(secure: requestIsSecure(request, state: state))
+            return response(status: 200, body: Data("{\"ok\":true}".utf8),
+                            type: "application/json; charset=utf-8", noStore: true, extraHeaders: headers)
         }
 
         if request.method == "GET", request.path == "/api/users" {
-            return jsonResponse(status: 200, ["users": state.adminUsers.map { ["id": $0.id, "username": $0.username, "createdAt": ISO8601DateFormatter.sharedTimestamp.string(from: $0.createdAt)] }])
+            return jsonResponse(status: 200, ["users": state.adminUsers.map(userView)])
         }
 
         if request.method == "POST", request.path == "/api/users" {
@@ -1941,17 +2130,30 @@ final class PanelServer {
             guard !state.adminUsers.contains(where: { $0.username == username }) else {
                 throw PanelError.badRequest("That username is already taken.")
             }
+            guard let role = AdminRole(rawValue: input["role"] ?? "admin") else {
+                throw PanelError.badRequest("Role must be 'admin' or 'viewer'.")
+            }
             let (hash, salt) = try AuthStore.hashPassword(password)
-            state.adminUsers.append(AdminUser(id: safeId("user"), username: username, passwordHash: hash, salt: salt, createdAt: Date()))
+            state.adminUsers.append(AdminUser(id: safeId("user"), username: username, passwordHash: hash, salt: salt, createdAt: Date(), role: role))
             try writeState(state)
-            return jsonResponse(status: 200, ["users": state.adminUsers.map { ["id": $0.id, "username": $0.username, "createdAt": ISO8601DateFormatter.sharedTimestamp.string(from: $0.createdAt)] }])
+            return jsonResponse(status: 200, ["users": state.adminUsers.map(userView)])
         }
 
         if request.method == "DELETE", let match = match(request.path, #"^/api/users/([^/]+)$"#) {
-            guard state.adminUsers.count > 1 else { throw PanelError.badRequest("Cannot remove the last admin account.") }
+            // Only admins count towards the floor: deleting the last one would
+            // leave a panel nobody can administer, but any number of viewers
+            // may come and go.
+            let target = state.adminUsers.first { $0.id == match[0] }
+            let admins = state.adminUsers.filter { $0.role == .admin }.count
+            if target?.role == .admin, admins <= 1 {
+                throw PanelError.badRequest("Cannot remove the last admin account.")
+            }
             state.adminUsers.removeAll { $0.id == match[0] }
+            // A deleted account's cookie must stop working now, not in 30 days.
+            if let username = target?.username { authStore.endSessions(forUser: username) }
+            state.sessions = authStore.exportSessions()
             try writeState(state)
-            return jsonResponse(status: 200, ["users": state.adminUsers.map { ["id": $0.id, "username": $0.username, "createdAt": ISO8601DateFormatter.sharedTimestamp.string(from: $0.createdAt)] }])
+            return jsonResponse(status: 200, ["users": state.adminUsers.map(userView)])
         }
 
         if request.method == "GET", request.path == "/api/keys" {
@@ -3766,6 +3968,7 @@ final class PanelServer {
             "hlsKey": stream.hlsKey,
             "hlsIV": stream.hlsIV,
             "audioDelayMs": stream.audioDelayMs,
+            "tvgId": stream.tvgId,
             "running": running,
             "status": running ? "running" : stream.status,
             "lastError": stream.lastError as Any,
@@ -3971,6 +4174,7 @@ final class PanelServer {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && URL(string: $0)?.scheme?.hasPrefix("http") == true }
         stream.directSource = input["directSource"]?.bool ?? false
+        stream.tvgId = input["tvgId"]?.string?.trimmingCharacters(in: .whitespaces) ?? ""
         stream.nm3u8dlreParams = input["nm3u8dlreParams"]?.string ?? ""
         // Scripting & DRM (editor-controlled — see the update merge, which no
         // longer carries these over from the existing stream).
@@ -4030,9 +4234,22 @@ final class PanelServer {
     func writeState(_ state: PanelState) throws {
         let data = try JSONEncoder.pretty.encode(state)
         try data.write(to: stateFile, options: [.atomic])
+        restrictPermissions(stateFile)
         stateCacheLock.lock()
         cachedState = state
         stateCacheLock.unlock()
+    }
+
+    /// state.json holds admin password hashes, session token hashes, API keys
+    /// and — for script providers — account passwords in the clear, because the
+    /// script has to be handed the real thing. The default umask would leave it
+    /// world-readable. `.atomic` writes through a temp file and renames, which
+    /// drops the mode of any previous file, so this is applied after every
+    /// write rather than once at creation.
+    func restrictPermissions(_ url: URL) {
+        #if !os(Windows)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        #endif
     }
 
     func ensureData() throws {
@@ -4064,6 +4281,8 @@ final class PanelServer {
             "Content-Length: \(body.count)",
             "Access-Control-Allow-Origin: *",
             "Cache-Control: \(noStore ? "no-store" : "public, max-age=60")",
+            "X-Content-Type-Options: nosniff",
+            "Referrer-Policy: same-origin",
             "Connection: close"
         ]
         for (name, value) in extraHeaders { lines.append("\(name): \(value)") }
@@ -4263,7 +4482,8 @@ final class PanelServer {
     }
 
     func statusText(_ status: Int) -> String {
-        [200: "OK", 302: "Found", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found", 500: "Internal Server Error"][status] ?? "OK"
+        [200: "OK", 302: "Found", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
+         404: "Not Found", 429: "Too Many Requests", 500: "Internal Server Error"][status] ?? "OK"
     }
 }
 

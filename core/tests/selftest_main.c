@@ -21,6 +21,7 @@
 #include "rs_ffargs.h"
 #include "rs_json.h"
 #include "rs_m3u8.h"
+#include "rs_netmatch.h"
 #include "rs_panel.h"
 #include "rs_state.h"
 #include "rs_url.h"
@@ -692,14 +693,23 @@ static void test_auth(void) {
     check("auth/cookie-absent", rs_auth_cookie_token("theme=dark; other=1") == NULL);
 
     // Set-Cookie matches AuthStore.setCookieHeader byte for byte.
-    char *set = rs_auth_set_cookie("TOK", false);
+    char *set = rs_auth_set_cookie("TOK", false, false);
     check_str("auth/set-cookie", set ? set : "",
               "restreamair_session=TOK; HttpOnly; Path=/; SameSite=Lax");
     rs_free(set);
-    char *set_remember = rs_auth_set_cookie("TOK", true);
+    char *set_remember = rs_auth_set_cookie("TOK", true, false);
     check_str("auth/set-cookie-remember", set_remember ? set_remember : "",
               "restreamair_session=TOK; HttpOnly; Path=/; SameSite=Lax; Max-Age=2592000");
     rs_free(set_remember);
+    // Secure is appended last, and only when the request reached us over TLS.
+    char *set_secure = rs_auth_set_cookie("TOK", true, true);
+    check_str("auth/set-cookie-secure", set_secure ? set_secure : "",
+              "restreamair_session=TOK; HttpOnly; Path=/; SameSite=Lax; Max-Age=2592000; Secure");
+    rs_free(set_secure);
+    char *clear_secure = rs_auth_clear_cookie(true);
+    check_str("auth/clear-cookie-secure", clear_secure ? clear_secure : "",
+              "restreamair_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax; Secure");
+    rs_free(clear_secure);
 
     // Basic auth decode.
     char *u = NULL, *p = NULL;
@@ -707,6 +717,179 @@ static void test_auth(void) {
     check_str("auth/basic-user", u ? u : "", "admin");
     check_str("auth/basic-pass", p ? p : "", "secret");
     rs_free(u); rs_free(p);
+}
+
+// Sessions survive a save/restore cycle, and what gets written is the hash of
+// the token rather than the token — the property that makes it safe to keep
+// them in state.json at all.
+static void test_auth_sessions(void) {
+    rs_auth *auth = rs_auth_create();
+    char *token = rs_auth_create_session(auth, "alice", true);
+    char *other = rs_auth_create_session(auth, "bob", false);
+    rs_json *exported = rs_auth_export_sessions(auth);
+    check("auth/export-count", rs_json_arr_len(exported) == 2);
+
+    char *rendered = rs_json_serialize(exported, false);
+    check("auth/export-hides-token", rendered && token && strstr(rendered, token) == NULL);
+    check("auth/export-has-hash", rendered && strstr(rendered, "\"tokenHash\":\"") != NULL);
+    // Timestamps use the 2001 reference epoch, matching Swift's JSONEncoder, so
+    // a session written by either server is understood by the other. A Unix
+    // timestamp would be a ten-digit number starting with 17…; this is nine.
+    check("auth/export-uses-apple-epoch",
+          rendered && strstr(rendered, "\"expiresAt\":8") != NULL);
+    rs_free(rendered);
+
+    // A fresh store loaded from the export accepts the original cookie.
+    rs_auth *restored = rs_auth_create();
+    rs_auth_import_sessions(restored, exported);
+    char *who = rs_auth_username_for_token(restored, token);
+    check_str("auth/session-restored", who ? who : "", "alice");
+    rs_free(who);
+    check("auth/session-restored-unknown", rs_auth_username_for_token(restored, "nope") == NULL);
+
+    // Ending every session for one user leaves the others alone.
+    check("auth/end-user-sessions", rs_auth_end_sessions_for_user(restored, "alice") == 1);
+    check("auth/end-user-gone", rs_auth_username_for_token(restored, token) == NULL);
+    char *still = rs_auth_username_for_token(restored, other);
+    check_str("auth/end-user-kept-other", still ? still : "", "bob");
+    rs_free(still);
+
+    // An expired entry is dropped on import rather than resurrected.
+    rs_json *stale = rs_json_new_arr();
+    rs_json *entry = rs_json_new_obj();
+    rs_json_obj_set_str(entry, "tokenHash", "deadbeef");
+    rs_json_obj_set_str(entry, "username", "carol");
+    rs_json_obj_set_int(entry, "expiresAt", 1);  // 2001, i.e. long expired
+    rs_json_arr_push(stale, entry);
+    rs_auth *expired_store = rs_auth_create();
+    rs_auth_import_sessions(expired_store, stale);
+    rs_json *reexported = rs_auth_export_sessions(expired_store);
+    check("auth/import-drops-expired", rs_json_arr_len(reexported) == 0);
+    rs_json_free(reexported);
+    rs_json_free(stale);
+    rs_auth_destroy(expired_store);
+
+    rs_json_free(exported);
+    rs_free(token);
+    rs_free(other);
+    rs_auth_destroy(restored);
+    rs_auth_destroy(auth);
+}
+
+// The sign-in throttle: free attempts first, then a growing delay, cleared by a
+// success.
+static void test_auth_throttle(void) {
+    rs_auth *auth = rs_auth_create();
+    const char *who = "alice|203.0.113.9";
+
+    check("throttle/starts-open", rs_auth_throttle_delay(auth, who) == 0);
+    for (int i = 0; i < 5; i++) {
+        check("throttle/free-attempt", rs_auth_throttle_record_failure(auth, who) == 0);
+    }
+    check("throttle/still-open-at-limit", rs_auth_throttle_delay(auth, who) == 0);
+
+    // The sixth failure starts the backoff, and it doubles from there.
+    check("throttle/first-delay", rs_auth_throttle_record_failure(auth, who) == 2);
+    check("throttle/delay-reported", rs_auth_throttle_delay(auth, who) > 0);
+    check("throttle/second-delay", rs_auth_throttle_record_failure(auth, who) == 4);
+    check("throttle/third-delay", rs_auth_throttle_record_failure(auth, who) == 8);
+
+    // It is capped, not unbounded.
+    for (int i = 0; i < 40; i++) rs_auth_throttle_record_failure(auth, who);
+    check("throttle/capped", rs_auth_throttle_record_failure(auth, who) == 15 * 60);
+
+    // Another identity is unaffected — one attacker cannot lock out everyone.
+    check("throttle/per-identity", rs_auth_throttle_delay(auth, "alice|198.51.100.4") == 0);
+
+    rs_auth_throttle_reset(auth, who);
+    check("throttle/reset", rs_auth_throttle_delay(auth, who) == 0);
+    rs_auth_destroy(auth);
+}
+
+// --- trusted proxies --------------------------------------------------------
+
+static void test_netmatch(void) {
+    uint8_t addr[16];
+    check("ip/parse-v4", rs_ip_parse("192.168.1.7", addr));
+    check("ip/parse-v6", rs_ip_parse("2001:db8::1", addr));
+    check("ip/parse-v6-full", rs_ip_parse("2001:0db8:0000:0000:0000:0000:0000:0001", addr));
+    check("ip/parse-v6-loopback", rs_ip_parse("::1", addr));
+    check("ip/parse-v6-any", rs_ip_parse("::", addr));
+    check("ip/parse-v4-mapped", rs_ip_parse("::ffff:192.0.2.128", addr));
+    check("ip/parse-bracketed", rs_ip_parse("[2001:db8::1]", addr));
+    check("ip/parse-zone", rs_ip_parse("fe80::1%eth0", addr));
+    check("ip/reject-empty", !rs_ip_parse("", addr));
+    check("ip/reject-text", !rs_ip_parse("example.com", addr));
+    check("ip/reject-octet-range", !rs_ip_parse("192.168.1.256", addr));
+    check("ip/reject-leading-zero", !rs_ip_parse("192.168.01.1", addr));
+    check("ip/reject-short-v4", !rs_ip_parse("192.168.1", addr));
+    check("ip/reject-double-compressor", !rs_ip_parse("1::2::3", addr));
+    check("ip/reject-too-many-groups", !rs_ip_parse("1:2:3:4:5:6:7:8:9", addr));
+
+    // CIDR containment, both families.
+    check("ip/cidr-v4-in", rs_ip_matches("10.4.5.6", "10.0.0.0/8"));
+    check("ip/cidr-v4-out", !rs_ip_matches("11.4.5.6", "10.0.0.0/8"));
+    check("ip/cidr-v4-boundary", rs_ip_matches("172.31.255.255", "172.16.0.0/12"));
+    check("ip/cidr-v4-just-outside", !rs_ip_matches("172.32.0.0", "172.16.0.0/12"));
+    check("ip/cidr-v6-in", rs_ip_matches("2001:db8::dead", "2001:db8::/32"));
+    check("ip/cidr-v6-out", !rs_ip_matches("2001:db9::dead", "2001:db8::/32"));
+    check("ip/host-exact", rs_ip_matches("192.168.1.7", "192.168.1.7"));
+    check("ip/host-mismatch", !rs_ip_matches("192.168.1.8", "192.168.1.7"));
+
+    // A v4 rule never silently swallows v6 and vice versa.
+    check("ip/family-isolation", !rs_ip_matches("2001:db8::1", "0.0.0.0/0"));
+    check("ip/family-isolation-v4", !rs_ip_matches("10.0.0.1", "::/0"));
+
+    // Named groups.
+    check("ip/loopback-v4", rs_ip_matches("127.0.0.1", "loopback"));
+    check("ip/loopback-v6", rs_ip_matches("::1", "loopback"));
+    check("ip/loopback-rejects-lan", !rs_ip_matches("192.168.1.7", "loopback"));
+    check("ip/private-lan", rs_ip_matches("192.168.1.7", "private"));
+    check("ip/private-rejects-public", !rs_ip_matches("8.8.8.8", "private"));
+    check("ip/any", rs_ip_matches("8.8.8.8", "any"));
+
+    // Lists, with the separators an operator is likely to type.
+    check("ip/list", rs_ip_in_list("10.1.2.3", "loopback, 10.0.0.0/8"));
+    check("ip/list-spaces", rs_ip_in_list("10.1.2.3", "loopback 10.0.0.0/8"));
+    check("ip/list-miss", !rs_ip_in_list("8.8.8.8", "loopback, 10.0.0.0/8"));
+    check("ip/list-empty-trusts-nothing", !rs_ip_in_list("127.0.0.1", ""));
+
+    // X-Forwarded-For resolution. An untrusted peer's header is ignored
+    // outright — this is the check that stops a client forging its own address
+    // past the login throttle.
+    char *ip = rs_client_ip("203.0.113.5", "1.2.3.4", "loopback");
+    check_str("xff/untrusted-peer-ignored", ip ? ip : "", "203.0.113.5");
+    rs_free(ip);
+
+    ip = rs_client_ip("127.0.0.1", "198.51.100.7", "loopback");
+    check_str("xff/trusted-peer-honoured", ip ? ip : "", "198.51.100.7");
+    rs_free(ip);
+
+    // Rightmost untrusted hop wins: the client may have prepended anything.
+    ip = rs_client_ip("127.0.0.1", "9.9.9.9, 198.51.100.7", "loopback");
+    check_str("xff/rightmost-untrusted", ip ? ip : "", "198.51.100.7");
+    rs_free(ip);
+
+    // A chain of our own proxies is walked through to the real client.
+    ip = rs_client_ip("127.0.0.1", "198.51.100.7, 10.0.0.2, 10.0.0.3", "loopback, 10.0.0.0/8");
+    check_str("xff/skips-trusted-chain", ip ? ip : "", "198.51.100.7");
+    rs_free(ip);
+
+    ip = rs_client_ip("127.0.0.1", NULL, "loopback");
+    check_str("xff/absent-header", ip ? ip : "", "127.0.0.1");
+    rs_free(ip);
+
+    ip = rs_client_ip("127.0.0.1", "not-an-address", "loopback");
+    check_str("xff/garbage-header", ip ? ip : "", "127.0.0.1");
+    rs_free(ip);
+
+    // X-Forwarded-Proto, under the same trust rule.
+    check("proto/direct-tls", rs_request_is_secure("203.0.113.5", NULL, "", true));
+    check("proto/trusted-https", rs_request_is_secure("127.0.0.1", "https", "loopback", false));
+    check("proto/trusted-http", !rs_request_is_secure("127.0.0.1", "http", "loopback", false));
+    check("proto/untrusted-claim", !rs_request_is_secure("203.0.113.5", "https", "loopback", false));
+    check("proto/multi-value", rs_request_is_secure("127.0.0.1", "https, http", "loopback", false));
+    check("proto/absent", !rs_request_is_secure("127.0.0.1", NULL, "loopback", false));
 }
 
 // --- panel control plane ----------------------------------------------------
@@ -780,6 +963,9 @@ int main(void) {
     test_ffargs_helpers();
     test_json();
     test_auth();
+    test_auth_sessions();
+    test_auth_throttle();
+    test_netmatch();
     test_panel();
 
     for (size_t i = 0; i < sizeof(rs_goldens) / sizeof(rs_goldens[0]); i++) {

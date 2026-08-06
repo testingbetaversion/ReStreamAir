@@ -41,6 +41,7 @@ add_library(restream_base STATIC
     core/src/crypto.c
     core/src/aes.c
     core/src/url.c
+    core/src/netmatch.c
     core/src/m3u8.c
     core/src/ffargs.c
     core/src/json.c
@@ -99,6 +100,16 @@ add_test(NAME selftest COMMAND restream_selftest)
 # (libxml2). These are linked into the server executable ONLY — the core and the
 # Swift build never see them, since the probe handler is registered at runtime
 # through a function pointer (see restream_server_set_probe_handler).
+#
+# -DRS_BUILD_SERVER=OFF builds the libraries and the self-test without them, so
+# a platform where those two dev packages are awkward to get (Windows, without
+# vcpkg) can still compile and verify the core on every CI run.
+option(RS_BUILD_SERVER "Build restreamair-server (needs libcurl + libxml2)" ON)
+if(NOT RS_BUILD_SERVER)
+    message(STATUS "restreamair: RS_BUILD_SERVER=OFF — libraries and self-test only")
+    return()
+endif()
+
 find_package(CURL REQUIRED)
 find_package(LibXml2 REQUIRED)
 add_executable(restreamair-server

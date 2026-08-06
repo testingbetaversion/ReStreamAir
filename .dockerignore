@@ -1,0 +1,14 @@
+# Keep the build context to sources: everything else is either regenerated in
+# the image or is an install's private data that must never be baked into one.
+.git
+.github
+build
+build-*
+.build
+state.json
+state.json.tmp
+logo-cache.json
+runtime
+logs
+scripts/*.pyc
+*.tar.gz

@@ -15,16 +15,86 @@ env:
   STATIC_SDK_SHA: 67f765e0030e661a7450f7e4877cfe008db4f57f177d5a08a6e26fd661cdd0bd
 
 jobs:
+  # The C core, on every platform it claims to support. Until this job existed
+  # nothing in CI compiled core/ at all — the parity self-test that is supposed
+  # to prove the port matches Swift byte for byte was never run, so it could
+  # have rotted silently between releases.
+  core:
+    name: C core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libcurl + libxml2 (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libxml2-dev
+      - name: Install libxml2 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libxml2 pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix libxml2)/lib/pkgconfig" >> "$GITHUB_ENV"
+      # Windows has no libcurl/libxml2 without vcpkg, so it builds the core and
+      # the self-test only — which is the part that has to be right everywhere.
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build ${{ runner.os == 'Windows' && '-DRS_BUILD_SERVER=OFF' || '' }}
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Self-test (NIST vectors + Swift parity goldens)
+        run: ctest --test-dir build -C Release --output-on-failure
+      # The HTTP layer the self-test cannot reach: the auth gate, the viewer
+      # role, the login throttle, session persistence across a restart, cookie
+      # attributes and the mode of state.json.
+      - name: API end-to-end
+        if: runner.os != 'Windows'
+        run: python3 scripts/api-smoke.py --binary build/restreamair-server
+
+  # ASan + UBSan over the same suites. The core parses attacker-supplied bytes
+  # (MPD XML, MP4 boxes, playlists), which is exactly where a memory bug becomes
+  # a security bug, and a sanitizer build was already supported but never run.
+  core-sanitizers:
+    name: C core (sanitizers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libxml2-dev
+      - name: Configure with ASan + UBSan
+        run: cmake -S . -B build-asan -DRS_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build-asan
+      - name: Self-test under sanitizers
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-asan --output-on-failure
+      - name: API end-to-end under sanitizers
+        env:
+          # The server is killed by the harness rather than shut down cleanly,
+          # so at-exit leak reporting would flag the live state it still owns.
+          # Use-after-free and overflow detection — the bugs that matter — are
+          # unaffected.
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: python3 scripts/api-smoke.py --binary build-asan/restreamair-server
+
   build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Swift version
         run: swift --version
-      # Every .swift source except the menu-bar companion and the Package.swift
-      # manifest (which isn't a compilable source).
+      # `swift build`, not a bare swiftc over *.swift: the Swift sources now
+      # `import restream_core`, and only SwiftPM compiles and links the C core
+      # alongside them. The old swiftc line could not build this tree at all.
       - name: Build restreamair
-        run: swiftc $(ls *.swift | grep -vE 'MenuBarApp.swift|Package.swift') -o restreamair
+        run: swift build -c release --product restreamair
+      - name: Stage the binary
+        run: cp .build/release/restreamair restreamair
+      # The menu-bar companion is only HTTPClient + MenuBarApp, neither of which
+      # touches the C core, so it stays a direct swiftc invocation.
       - name: Build restreamair-menubar
         run: swiftc HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKit
       - name: Smoke test
@@ -87,7 +157,8 @@ jobs:
       - name: Build (glibc, static Swift runtime)
         run: |
           docker run --rm -v "$PWD:/src" -w /src swift:6.0 \
-            bash -c 'swiftc -O -static-stdlib $(ls *.swift | grep -vE "MenuBarApp.swift|Package.swift") -o restreamair-linux-glibc'
+            bash -c 'swift build -c release --product restreamair -Xswiftc -static-stdlib &&
+                     cp .build/release/restreamair restreamair-linux-glibc'
           file restreamair-linux-glibc
       - name: Self-contained-ish check + crypto self-test
         run: |
@@ -146,9 +217,9 @@ jobs:
         shell: pwsh
         run: |
           $STAGE = "restreamair-windows"
-          $sources = (Get-ChildItem *.swift |
-            Where-Object { $_.Name -notmatch 'MenuBarApp\.swift|Package\.swift' }).Name
-          swiftc -O $sources -o restreamair.exe
+          # SwiftPM, not a bare swiftc: the sources import restream_core.
+          swift build -c release --product restreamair
+          Copy-Item .build\release\restreamair.exe -Destination restreamair.exe
           New-Item -ItemType Directory -Path $STAGE -Force
           Copy-Item restreamair.exe -Destination "$STAGE\restreamair.exe"
           $swiftBin = Split-Path (Get-Command swiftc).Path
