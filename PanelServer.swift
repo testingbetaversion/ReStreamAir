@@ -1,4 +1,5 @@
 import Foundation
+import restream_core
 #if canImport(Network)
 import Network
 #elseif canImport(Musl)

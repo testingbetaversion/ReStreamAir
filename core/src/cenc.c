@@ -506,8 +506,14 @@ uint8_t* rs_cenc_decrypt_segment(const uint8_t *data, size_t len, size_t *out_le
 
     size_t tc = 0; rs_mp4_box *top = parse_boxes(bytes, 0, len, &tc);
     if (!top) return bytes;
-    rs_mp4_box *moof = find_box(top, tc, "moof");
-    if (moof && key) {
+    // Every top-level moof, not just the first: CMAF sources pack several
+    // moof/mdat pairs into one segment file, and stopping after the first left
+    // the rest as ciphertext feeding the decoder. Safe against the single box
+    // tree above because decrypt_sample and the neutralize_* helpers all write
+    // in place without changing any box's length, so no offset in `top` moves.
+    for (size_t m = 0; m < tc && key; m++) {
+        rs_mp4_box *moof = &top[m];
+        if (strcmp(moof->type, "moof") != 0) continue;
         for (size_t i = 0; i < moof->children_count; i++) {
             rs_mp4_box *traf = &moof->children[i];
             if (strcmp(traf->type, "traf") != 0) continue;

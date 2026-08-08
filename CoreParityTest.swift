@@ -600,6 +600,169 @@ enum CoreParitySelfTest {
         }
     }
 
+    // MARK: CENC decryptor
+    //
+    // One segment file is not one fragment: CMAF sources ship several
+    // moof/mdat pairs per segment, and both decryptors used to stop after the
+    // first moof — so half of every segment reached the player as ciphertext.
+    // It was invisible to every existing check because the container still
+    // parsed and the timestamps were still right; only the decoder saw it, as
+    // h264 failing at "MB 0 0" and AAC decoding to noise.
+    //
+    // Builds a two-fragment segment (fragment 0 subsample-encrypted the way
+    // video is, fragment 1 full-sample the way audio is) and requires both
+    // implementations to return the original plaintext, and to agree.
+
+    /// Assembles one moof+mdat pair with its samples already encrypted, and
+    /// returns it alongside the plaintext the decryptors have to recover.
+    private static func cencFragment(sequence: Int, samples: [[UInt8]], ivs: [[UInt8]],
+                                     clearPrefix: Int?, key: [UInt8]) -> (bytes: [UInt8], plaintext: [UInt8])? {
+        func box(_ type: String, _ payload: [UInt8]) -> [UInt8] {
+            var out = [UInt8](repeating: 0, count: 4)
+            writeU32(&out, 0, UInt32(8 + payload.count))
+            return out + Array(type.utf8) + payload
+        }
+        func u32(_ value: UInt32) -> [UInt8] {
+            var out = [UInt8](repeating: 0, count: 4); writeU32(&out, 0, value); return out
+        }
+        let subsampled = clearPrefix != nil
+        let sampleLength = samples[0].count
+
+        let mfhd = box("mfhd", u32(0) + u32(UInt32(sequence)))
+        let tfhd = box("tfhd", u32(0x020000) + u32(1))   // default-base-is-moof, no optional fields
+        var tfdtPayload = u32(0x0100_0000) + [UInt8](repeating: 0, count: 8)
+        writeU64(&tfdtPayload, 4, UInt64(sequence) * 10000)
+        let tfdt = box("tfdt", tfdtPayload)
+
+        // trun: data-offset-present | sample-size-present. The offset itself is
+        // moof-relative, so it can only be filled in once the moof is sized.
+        var trunPayload = u32(0x000201) + u32(UInt32(samples.count)) + u32(0)
+        for sample in samples { trunPayload += u32(UInt32(sample.count)) }
+        let trun = box("trun", trunPayload)
+
+        let auxSize = UInt8(ivs[0].count + (subsampled ? 8 : 0))
+        let saiz = box("saiz", u32(0) + [auxSize] + u32(UInt32(samples.count)))
+        let saio = box("saio", u32(0) + u32(1) + u32(0))
+
+        var sencPayload = u32(subsampled ? 0x000002 : 0) + u32(UInt32(samples.count))
+        for (index, _) in samples.enumerated() {
+            sencPayload += ivs[index]
+            if let clear = clearPrefix {
+                sencPayload += [0, 1]                                        // subsample_count
+                sencPayload += [UInt8(clear >> 8), UInt8(clear & 0xFF)]      // clear bytes
+                sencPayload += u32(UInt32(sampleLength - clear))             // protected bytes
+            }
+        }
+        let senc = box("senc", sencPayload)
+
+        var moof = box("moof", mfhd + box("traf", tfhd + tfdt + trun + saiz + saio + senc))
+        // The trun payload starts 8 bytes into the trun box; data_offset is its
+        // third field. Locate the box rather than hard-coding an offset.
+        guard let trunStart = (0..<(moof.count - 8)).first(where: {
+            Array(moof[($0 + 4)..<($0 + 8)]) == Array("trun".utf8)
+        }) else { return nil }
+        writeU32(&moof, trunStart + 8 + 8, UInt32(moof.count + 8 - 0))
+
+        var plaintext: [UInt8] = []
+        var payload: [UInt8] = []
+        for (index, sample) in samples.enumerated() {
+            plaintext += sample
+            let clear = clearPrefix ?? 0
+            var encrypted = Array(sample[clear...])
+            var context = rs_aes_ctr()
+            let status = key.withUnsafeBufferPointer { keyPtr in
+                ivs[index].withUnsafeBufferPointer { ivPtr in
+                    rs_aes_ctr_init(&context, keyPtr.baseAddress, key.count, ivPtr.baseAddress, ivs[index].count)
+                }
+            }
+            guard status == 0 else { return nil }
+            encrypted.withUnsafeMutableBufferPointer { buffer in
+                rs_aes_ctr_process(&context, buffer.baseAddress, buffer.count)
+            }
+            payload += Array(sample[..<clear]) + encrypted
+        }
+        return (moof + box("mdat", payload), plaintext)
+    }
+
+    private static func checkCENCDecryptor(_ report: (String) -> Void) {
+        var random = SeededBytes(seed: 0x43454e4300)
+        let key = random.bytes(16)
+
+        var segment: [UInt8] = []
+        var plaintext: [UInt8] = []
+        var payloadOffsets: [Int] = []
+        for fragment in 0..<2 {
+            let subsampled = fragment == 0
+            let samples = (0..<3).map { _ in random.bytes(96) }
+            let ivs = (0..<samples.count).map { [UInt8](repeating: UInt8(fragment * 16 + $0), count: 8) }
+            guard let built = cencFragment(sequence: fragment + 1, samples: samples, ivs: ivs,
+                                           clearPrefix: subsampled ? 16 : nil, key: key) else {
+                report("CENCDecryptor: could not build fragment \(fragment)")
+                return
+            }
+            // The mdat payload is the last `plaintext.count` bytes of the fragment.
+            payloadOffsets.append(segment.count + built.bytes.count - built.plaintext.count)
+            segment += built.bytes
+            plaintext += built.plaintext
+        }
+        guard segment != plaintext else {
+            report("CENCDecryptor: test segment was not actually encrypted")
+            return
+        }
+
+        let decryptor = CENCDecryptor(keys: ["00": Data(key)])
+        let swiftOutput: [UInt8]
+        do {
+            swiftOutput = [UInt8](try decryptor.decryptMediaSegment(Data(segment)))
+        } catch {
+            report("CENCDecryptor: Swift decrypt failed (\(error))")
+            return
+        }
+
+        var cOutputLength = 0
+        let cOutput: [UInt8]? = segment.withUnsafeBufferPointer { segmentPtr in
+            key.withUnsafeBufferPointer { keyPtr in
+                guard let raw = rs_cenc_decrypt_segment(segmentPtr.baseAddress, segment.count,
+                                                        &cOutputLength, keyPtr.baseAddress, 8) else { return nil }
+                defer { rs_free(raw) }
+                return Array(UnsafeBufferPointer(start: raw, count: cOutputLength))
+            }
+        }
+        guard let cOutput else {
+            report("CENCDecryptor: C decrypt returned nothing")
+            return
+        }
+
+        if swiftOutput != cOutput {
+            report("CENCDecryptor: C and Swift disagree on a two-fragment segment")
+        }
+
+        // Every fragment's samples must come back clear — not just the first.
+        var recovered: [UInt8] = []
+        for (fragment, offset) in payloadOffsets.enumerated() {
+            let length = plaintext.count / payloadOffsets.count
+            guard offset + length <= swiftOutput.count else {
+                report("CENCDecryptor: fragment \(fragment) payload is out of range")
+                return
+            }
+            recovered += Array(swiftOutput[offset..<(offset + length)])
+        }
+        if recovered != plaintext {
+            report("CENCDecryptor: a fragment was left encrypted (only the first moof is decrypted)")
+        }
+
+        // Signalling left behind on decrypted samples is self-contradictory,
+        // and Chrome rejects the fragment outright.
+        for (fragment, moof) in parseBoxes(swiftOutput, 0, swiftOutput.count)
+            .filter({ $0.type == "moof" }).enumerated() {
+            for traf in moof.children where traf.type == "traf" {
+                for child in traf.children where ["senc", "saiz", "saio"].contains(child.type) {
+                    report("CENCDecryptor: fragment \(fragment) still carries a \(child.type) box")
+                }
+            }
+        }
+    }
+
     // MARK: Provider-script value encoding
     //
     // Not a C-vs-Swift comparison like the rest of this file — it lives here
@@ -682,6 +845,7 @@ enum CoreParitySelfTest {
         checkPlaylists(report)
         checkFFmpegArguments(report)
         checkHLSDecryptor(report)
+        checkCENCDecryptor(report)
         checkScriptValueEncoding(report)
         return found
     }

@@ -459,27 +459,42 @@ final class CENCDecryptor {
         for box in boxes where box.type == "pssh" { retypeToFree(&bytes, box) }
     }
 
+    /// One segment file is not one fragment. CMAF sources routinely pack
+    /// several moof/mdat pairs into a single segment (Globo ships two ~1s
+    /// fragments per 2.002s segment), so every top-level moof has to be walked.
+    /// Decrypting only the first left the rest as ciphertext going straight to
+    /// the decoder — h264 failed at "MB 0 0" with the whole slice still
+    /// unread and full-sample-encrypted audio decoded as noise ("channel
+    /// element is not allocated"), for roughly half of every segment.
+    ///
+    /// Walking them all is safe against a single box-tree snapshot because
+    /// both mutations here preserve length: AES-CTR writes plaintext over
+    /// ciphertext in place, and retypeToFree only rewrites a 4-byte box type.
+    /// No offset in `top` moves.
     func decryptMediaSegment(_ data: Data) throws -> Data {
         var bytes = [UInt8](data)
         let top = parseBoxes(bytes, 0, bytes.count)
-        guard let moof = top.first(where: { $0.type == "moof" }) else { return data }
+        let moofs = top.filter { $0.type == "moof" }
+        guard !moofs.isEmpty else { return data }
         let key = try resolveKey()
 
-        for traf in moof.children.filter({ $0.type == "traf" }) {
-            guard let info = sampleAuxInfo(traf: traf, moofStart: moof.start, bytes: bytes), !info.isEmpty else { continue }
-            guard let trun = traf.children.first(where: { $0.type == "trun" }) else { continue }
-            let tfhd = traf.children.first(where: { $0.type == "tfhd" })
-            guard let ranges = sampleByteRanges(trun: trun, tfhd: tfhd, moofStart: moof.start, bytes: bytes), ranges.count == info.count else {
-                throw CENCError.parseFailed("Could not align senc/saiz sample count with trun sample count.")
+        for moof in moofs {
+            for traf in moof.children.filter({ $0.type == "traf" }) {
+                guard let info = sampleAuxInfo(traf: traf, moofStart: moof.start, bytes: bytes), !info.isEmpty else { continue }
+                guard let trun = traf.children.first(where: { $0.type == "trun" }) else { continue }
+                let tfhd = traf.children.first(where: { $0.type == "tfhd" })
+                guard let ranges = sampleByteRanges(trun: trun, tfhd: tfhd, moofStart: moof.start, bytes: bytes), ranges.count == info.count else {
+                    throw CENCError.parseFailed("Could not align senc/saiz sample count with trun sample count.")
+                }
+                for (index, range) in ranges.enumerated() {
+                    try decryptSample(&bytes, sampleStart: range.start, sampleSize: range.size, iv: info[index].iv, subsamples: info[index].subsamples, key: key)
+                }
+                neutralizeCENCBoxes(&bytes, traf: traf)
             }
-            for (index, range) in ranges.enumerated() {
-                try decryptSample(&bytes, sampleStart: range.start, sampleSize: range.size, iv: info[index].iv, subsamples: info[index].subsamples, key: key)
-            }
-            neutralizeCENCBoxes(&bytes, traf: traf)
+            // pssh sits at moof level, not inside traf — this source repeats the
+            // full Widevine/PlayReady headers in every single fragment.
+            neutralizePSSH(&bytes, in: moof.children)
         }
-        // pssh sits at moof level, not inside traf — this source repeats the
-        // full Widevine/PlayReady headers in every single fragment.
-        neutralizePSSH(&bytes, in: moof.children)
         return Data(bytes)
     }
 

@@ -17,6 +17,7 @@
 
 #include "rs_aes.h"
 #include "rs_auth.h"
+#include "rs_cenc.h"
 #include "rs_crypto.h"
 #include "rs_ffargs.h"
 #include "rs_json.h"
@@ -953,6 +954,142 @@ static void test_panel(void) {
     rs_json_free(st.root);
 }
 
+// A DASH segment file is not always a single fragment: CMAF sources routinely
+// ship several moof/mdat pairs per segment. The decryptor used to stop after
+// the first moof, so every later fragment reached the player as ciphertext —
+// visible as h264 failing at "MB 0 0" with the whole slice unread and AAC
+// decoding to noise, for roughly half of every segment.
+//
+// This builds a two-fragment segment by hand — fragment 0 subsample-encrypted
+// (how video is protected), fragment 1 full-sample (how audio is) — encrypts
+// it with a known key, and requires that BOTH fragments come back as the
+// original plaintext with their senc/saiz/saio retyped to 'free'. Against the
+// pre-fix decryptor, fragment 1 fails both halves of that.
+#define PUT32(p, v) do { uint8_t *_p = (p); uint32_t _v = (v); \
+    _p[0] = (uint8_t)(_v >> 24); _p[1] = (uint8_t)(_v >> 16); \
+    _p[2] = (uint8_t)(_v >> 8);  _p[3] = (uint8_t)_v; } while (0)
+
+// Appends a box header and returns the offset of its size field, so the caller
+// can patch the final length once the payload is written.
+static size_t open_box(uint8_t *b, size_t *n, const char *type) {
+    size_t at = *n;
+    PUT32(b + at, 0);
+    memcpy(b + at + 4, type, 4);
+    *n += 8;
+    return at;
+}
+static void close_box(uint8_t *b, size_t n, size_t at) { PUT32(b + at, (uint32_t)(n - at)); }
+
+static void test_cenc_multifragment(void) {
+    enum { NFRAG = 2, NSAMP = 3, SAMPLE_LEN = 96, CLEAR_PREFIX = 16, IV_SIZE = 8 };
+    uint8_t key[16];
+    for (int i = 0; i < 16; i++) key[i] = (uint8_t)i;
+
+    uint8_t seg[4096], plain[NFRAG][NSAMP][SAMPLE_LEN];
+    size_t n = 0, mdat_payload[NFRAG];
+
+    for (int f = 0; f < NFRAG; f++) {
+        bool subsampled = (f == 0);
+        uint8_t ivs[NSAMP][IV_SIZE];
+        for (int s = 0; s < NSAMP; s++)
+            for (int i = 0; i < IV_SIZE; i++) ivs[s][i] = (uint8_t)(f * 16 + s);
+
+        size_t moof = open_box(seg, &n, "moof");
+        size_t mfhd = open_box(seg, &n, "mfhd");
+        PUT32(seg + n, 0); PUT32(seg + n + 4, (uint32_t)f + 1); n += 8;
+        close_box(seg, n, mfhd);
+
+        size_t traf = open_box(seg, &n, "traf");
+        size_t tfhd = open_box(seg, &n, "tfhd");
+        PUT32(seg + n, 0x020000);  // default-base-is-moof, no optional fields
+        PUT32(seg + n + 4, 1); n += 8;
+        close_box(seg, n, tfhd);
+
+        // trun: data-offset-present | sample-size-present
+        size_t trun = open_box(seg, &n, "trun");
+        size_t trun_data_offset_at = n + 8;
+        PUT32(seg + n, 0x000201); PUT32(seg + n + 4, NSAMP); PUT32(seg + n + 8, 0); n += 12;
+        for (int s = 0; s < NSAMP; s++) { PUT32(seg + n, SAMPLE_LEN); n += 4; }
+        close_box(seg, n, trun);
+
+        size_t saiz = open_box(seg, &n, "saiz");
+        PUT32(seg + n, 0); n += 4;
+        seg[n++] = (uint8_t)(IV_SIZE + (subsampled ? 2 + 6 : 0));  // default_sample_info_size
+        PUT32(seg + n, NSAMP); n += 4;
+        close_box(seg, n, saiz);
+
+        size_t saio = open_box(seg, &n, "saio");
+        PUT32(seg + n, 0); PUT32(seg + n + 4, 1); PUT32(seg + n + 8, 0); n += 12;
+        close_box(seg, n, saio);
+
+        size_t senc = open_box(seg, &n, "senc");
+        PUT32(seg + n, subsampled ? 0x000002 : 0); PUT32(seg + n + 4, NSAMP); n += 8;
+        for (int s = 0; s < NSAMP; s++) {
+            memcpy(seg + n, ivs[s], IV_SIZE); n += IV_SIZE;
+            if (subsampled) {
+                seg[n] = 0; seg[n + 1] = 1; n += 2;                       // subsample_count
+                seg[n] = 0; seg[n + 1] = CLEAR_PREFIX; n += 2;            // bytes of clear data
+                PUT32(seg + n, SAMPLE_LEN - CLEAR_PREFIX); n += 4;        // bytes of protected data
+            }
+        }
+        close_box(seg, n, senc);
+        close_box(seg, n, traf);
+        close_box(seg, n, moof);
+
+        size_t mdat = open_box(seg, &n, "mdat");
+        PUT32(seg + trun_data_offset_at, (uint32_t)(n - moof));  // trun data_offset is moof-relative
+        mdat_payload[f] = n;
+        for (int s = 0; s < NSAMP; s++) {
+            for (int i = 0; i < SAMPLE_LEN; i++) plain[f][s][i] = (uint8_t)(f * 40 + s * 7 + i);
+            memcpy(seg + n, plain[f][s], SAMPLE_LEN);
+            // Encrypt exactly the protected span, the way a packager would.
+            rs_aes_ctr ctx;
+            rs_aes_ctr_init(&ctx, key, sizeof key, ivs[s], IV_SIZE);
+            size_t clear = subsampled ? CLEAR_PREFIX : 0;
+            rs_aes_ctr_process(&ctx, seg + n + clear, SAMPLE_LEN - clear);
+            n += SAMPLE_LEN;
+        }
+        close_box(seg, n, mdat);
+    }
+
+    size_t out_len = 0;
+    uint8_t *out = rs_cenc_decrypt_segment(seg, n, &out_len, key, IV_SIZE);
+    check("cenc/multifrag-length", out != NULL && out_len == n);
+    if (!out) return;
+
+    for (int f = 0; f < NFRAG; f++) {
+        char name[64];
+        bool samples_clear = true;
+        for (int s = 0; s < NSAMP; s++)
+            if (memcmp(out + mdat_payload[f] + (size_t)s * SAMPLE_LEN, plain[f][s], SAMPLE_LEN) != 0)
+                samples_clear = false;
+        snprintf(name, sizeof name, "cenc/multifrag-samples-clear-frag%d", f);
+        check(name, samples_clear);
+
+        // Signalling that survives decryption makes the fragment self-
+        // contradictory, and Chrome rejects it outright.
+        size_t tc = 0;
+        bool signalling_gone = true;
+        for (size_t i = 0; i + 8 <= out_len; ) {
+            uint32_t sz = ((uint32_t)out[i] << 24) | ((uint32_t)out[i + 1] << 16) |
+                          ((uint32_t)out[i + 2] << 8) | out[i + 3];
+            if (sz < 8) break;
+            if (memcmp(out + i + 4, "moof", 4) == 0) {
+                if (tc++ == (size_t)f) {
+                    for (size_t j = i; j + 8 <= i + sz; j++)
+                        if (memcmp(out + j + 4, "senc", 4) == 0 || memcmp(out + j + 4, "saiz", 4) == 0 ||
+                            memcmp(out + j + 4, "saio", 4) == 0)
+                            signalling_gone = false;
+                }
+            }
+            i += sz;
+        }
+        snprintf(name, sizeof name, "cenc/multifrag-signalling-cleared-frag%d", f);
+        check(name, signalling_gone);
+    }
+    rs_free(out);
+}
+
 int main(void) {
     test_sha256();
     test_hmac();
@@ -967,6 +1104,7 @@ int main(void) {
     test_auth_throttle();
     test_netmatch();
     test_panel();
+    test_cenc_multifragment();
 
     for (size_t i = 0; i < sizeof(rs_goldens) / sizeof(rs_goldens[0]); i++) {
         run_golden(&rs_goldens[i]);
