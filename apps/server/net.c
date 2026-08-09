@@ -93,6 +93,71 @@ static void append_body_snippet(char *errbuf, size_t errbuf_len, const char *bod
     errbuf[used + n] = '\0';
 }
 
+// --- Shared connection pool -------------------------------------------------
+//
+// Every fetch here is curl_easy_init() → perform → curl_easy_cleanup(). Without
+// a share handle each one of those opens a *fresh* TCP + TLS connection, so the
+// handshake is paid per request rather than per origin. Against a distant
+// origin that is the dominant cost of a live poll, and it is invisible in a
+// bandwidth measurement: on a 491 Mbps host, TCP connect to izzigo.tv measured
+// 0.34-0.94s with TLS adding ~0.15s, so every segment paid ~0.5-1.1s before a
+// byte of media moved. A representation publishing one 1.935s segment every
+// 1.935s cannot absorb that — the engine ran at ~0.65x realtime, its advertised
+// window shrank faster than players drained it, and playback stalled. It
+// presents as "not enough bandwidth" when it is entirely round-trip latency.
+//
+// CURL_LOCK_DATA_CONNECT lets those short-lived handles return their
+// connections to a process-wide pool instead of closing them. Measured on the
+// affected host, six sequential fetches of the same manifest: 3624ms with a new
+// connection each, 1333ms reusing one.
+//
+// DNS and TLS session state are shared for the same reason: when a new
+// connection genuinely is needed, a resumed TLS session still skips a round
+// trip. MAXLIFETIME_CONN caps how long any pooled connection is kept so the
+// pool cannot pin us to one CDN edge indefinitely.
+#ifndef _WIN32
+#include <pthread.h>
+
+static CURLSH *g_conn_share = NULL;
+static pthread_mutex_t g_share_locks[CURL_LOCK_DATA_LAST];
+
+static void share_lock_cb(CURL *handle, curl_lock_data data, curl_lock_access access, void *user) {
+    (void)handle; (void)access; (void)user;
+    if ((int)data >= 0 && data < CURL_LOCK_DATA_LAST) pthread_mutex_lock(&g_share_locks[data]);
+}
+
+static void share_unlock_cb(CURL *handle, curl_lock_data data, void *user) {
+    (void)handle; (void)user;
+    if ((int)data >= 0 && data < CURL_LOCK_DATA_LAST) pthread_mutex_unlock(&g_share_locks[data]);
+}
+
+static void share_init_once(void) {
+    for (int i = 0; i < CURL_LOCK_DATA_LAST; i++) pthread_mutex_init(&g_share_locks[i], NULL);
+    CURLSH *sh = curl_share_init();
+    if (!sh) return;  // no pool: every fetch just opens its own connection, as before
+    curl_share_setopt(sh, CURLSHOPT_LOCKFUNC, share_lock_cb);
+    curl_share_setopt(sh, CURLSHOPT_UNLOCKFUNC, share_unlock_cb);
+    curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+    curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+    curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    g_conn_share = sh;
+}
+
+// Lazily built, so this works no matter what order the app initialises things
+// in — and a failure to build it degrades to the old per-request connection
+// rather than failing the fetch.
+static CURLSH *shared_conn_pool(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, share_init_once);
+    return g_conn_share;
+}
+#else
+// Windows has no pthreads in this build (see live.c); fall back to the
+// unpooled behaviour rather than sharing a cache without locking, which
+// libcurl documents as undefined.
+static CURLSH *shared_conn_pool(void) { return NULL; }
+#endif
+
 static int fetch_libcurl(const char *url, const char *proxy, const char *headers, const char *range,
                          char **out, size_t *out_len, long *status, char **content_type,
                          char **content_range, char **effective_url, char *errbuf, size_t errbuf_len) {
@@ -125,11 +190,16 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     // Some IPTV origins (seen on izzigo.tv) run a flaky HTTP/2 stack that
     // drops mid-stream with "Stream error in the HTTP/2 framing layer" —
     // reproduced independently with plain curl against the same URL, so it's
-    // the origin, not us. Every fetch here already opens its own connection
-    // (no CURLSH connection-cache is configured), so there is no HTTP/2
-    // multiplexing benefit being traded away — forcing HTTP/1.1 just removes
-    // the broken code path.
+    // the origin, not us. HTTP/1.1 keep-alive against the shared pool below
+    // already amortises the handshake, which was the only thing HTTP/2 was
+    // buying us here, so forcing 1.1 still just removes the broken code path.
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
+    // Reuse a pooled connection to this origin when one is idle (see above).
+    CURLSH *pool = shared_conn_pool();
+    if (pool) {
+        curl_easy_setopt(curl, CURLOPT_SHARE, pool);
+        curl_easy_setopt(curl, CURLOPT_MAXLIFETIME_CONN, 60L);
+    }
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "ReStreamAir/1.0");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     if (proxy && proxy[0]) curl_easy_setopt(curl, CURLOPT_PROXY, proxy);

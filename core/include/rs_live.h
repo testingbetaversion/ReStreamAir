@@ -115,6 +115,26 @@ typedef struct {
 // segments it holds.
 int rs_live_window_size(int download_ahead, double since_last, double seg_duration);
 
+// Floor for the backoff after an origin explicitly refuses for rate reasons.
+// Below this there is no point: the complaint is about how often we ask, and a
+// poll period is exactly the quantity that is already too small.
+#define RS_LIVE_THROTTLE_BACKOFF_MIN 15.0
+
+// Ceiling on the backoff. A live stream that has been failing this long is
+// broken, but it must still notice promptly when the origin comes back.
+#define RS_LIVE_BACKOFF_MAX 60.0
+
+// How long to wait before re-polling a manifest after `consecutive_failures`
+// failed polls in a row (0 = the last one succeeded, so no backoff and the
+// caller uses its normal period). `throttled` marks a response that explicitly
+// refused for rate reasons; it raises the floor. Implemented in live_backoff.c;
+// see there for the failure this exists to prevent.
+double rs_live_backoff_delay(int consecutive_failures, int throttled, double period);
+
+// Whether an HTTP status means "you are asking too often" rather than a plain
+// error, and so should be backed off from harder.
+int rs_live_status_is_throttle(long status);
+
 rs_live *rs_live_create(rs_live_fetch_fn fetch, rs_live_dash_fn dash,
                         rs_live_log_fn log, void *log_ctx);
 void rs_live_destroy(rs_live *live);

@@ -1134,6 +1134,70 @@ static void test_live_window(void) {
     check("live-window/zero-ahead", rs_live_window_size(0, 0, 2.0) >= 1);
 }
 
+// Backoff after a failed manifest poll (live_backoff.c).
+//
+// The invariant that has to hold: a run of failures must make the next poll
+// strictly later than the normal cadence would, and a 429 must never be retried
+// on anything like the poll period — those two together are what kept a
+// rate-limited origin refusing a real stream for 364 seconds.
+static void test_live_backoff(void) {
+    // A poll that succeeded is not backed off at all: the caller keeps its
+    // normal period. This is the overwhelmingly common case and it must be
+    // exactly the old behaviour.
+    check("live-backoff/success", rs_live_backoff_delay(0, 0, 2.0) == 0);
+    check("live-backoff/success-throttle-flag-irrelevant", rs_live_backoff_delay(0, 1, 2.0) == 0);
+    check("live-backoff/negative", rs_live_backoff_delay(-3, 0, 2.0) == 0);
+
+    // Plain failures double from the poll period.
+    check("live-backoff/first", rs_live_backoff_delay(1, 0, 2.0) == 2.0);
+    check("live-backoff/second", rs_live_backoff_delay(2, 0, 2.0) == 4.0);
+    check("live-backoff/third", rs_live_backoff_delay(3, 0, 2.0) == 8.0);
+
+    // An explicit rate refusal starts at the floor instead — retrying a 429
+    // two seconds later is the behaviour that caused the problem.
+    check("live-backoff/throttled-first",
+          rs_live_backoff_delay(1, 1, 2.0) == RS_LIVE_THROTTLE_BACKOFF_MIN);
+    check("live-backoff/throttled-beats-period",
+          rs_live_backoff_delay(1, 1, 2.0) > rs_live_backoff_delay(1, 0, 2.0));
+
+    // The floor is a floor, not an override: once doubling exceeds it, the
+    // larger value wins.
+    check("live-backoff/throttled-grows", rs_live_backoff_delay(6, 1, 2.0) > RS_LIVE_THROTTLE_BACKOFF_MIN);
+
+    // Never unbounded, however long it has been failing — the stream still has
+    // to notice the origin coming back.
+    check("live-backoff/capped", rs_live_backoff_delay(500, 0, 2.0) == RS_LIVE_BACKOFF_MAX);
+    check("live-backoff/capped-throttled", rs_live_backoff_delay(500, 1, 10.0) == RS_LIVE_BACKOFF_MAX);
+    check("live-backoff/no-overflow", rs_live_backoff_delay(1000000, 0, 2.0) == RS_LIVE_BACKOFF_MAX);
+
+    // Monotonic and always positive across a long run of failures: a later
+    // failure may never be retried sooner than an earlier one.
+    bool monotonic = true, positive = true, bounded = true;
+    double prev = 0;
+    for (int n = 1; n <= 200; n++) {
+        double d = rs_live_backoff_delay(n, 0, 2.0);
+        if (d < prev) monotonic = false;
+        if (d <= 0) positive = false;
+        if (d > RS_LIVE_BACKOFF_MAX) bounded = false;
+        prev = d;
+    }
+    check("live-backoff/monotonic", monotonic);
+    check("live-backoff/positive", positive);
+    check("live-backoff/bounded", bounded);
+
+    // A zero/absent period must not collapse the backoff to nothing.
+    check("live-backoff/zero-period", rs_live_backoff_delay(1, 0, 0) > 0);
+
+    // Which statuses count as "you are asking too often".
+    check("live-backoff/429-throttles", rs_live_status_is_throttle(429));
+    check("live-backoff/503-throttles", rs_live_status_is_throttle(503));
+    check("live-backoff/403-throttles", rs_live_status_is_throttle(403));
+    check("live-backoff/404-does-not", !rs_live_status_is_throttle(404));
+    check("live-backoff/500-does-not", !rs_live_status_is_throttle(500));
+    check("live-backoff/200-does-not", !rs_live_status_is_throttle(200));
+    check("live-backoff/unknown-does-not", !rs_live_status_is_throttle(0));
+}
+
 int main(void) {
     test_sha256();
     test_hmac();
@@ -1150,6 +1214,7 @@ int main(void) {
     test_panel();
     test_cenc_multifragment();
     test_live_window();
+    test_live_backoff();
 
     for (size_t i = 0; i < sizeof(rs_goldens) / sizeof(rs_goldens[0]); i++) {
         run_golden(&rs_goldens[i]);

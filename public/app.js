@@ -715,6 +715,7 @@ function renderEditor() {
   form.elements.audioDelayMs.value = stream.audioDelayMs || 0;
   form.elements.tvgId.value = stream.tvgId || "";
   form.elements.forceOffline.checked = Boolean(stream.forceOffline);
+  form.elements.reducedManifestPolling.checked = Boolean(stream.reducedManifestPolling);
   form.elements.directSource.checked = Boolean(stream.directSource);
   form.elements.manifestHeaders.value = stream.manifestHeaders || "";
   form.elements.mediaHeaders.value = stream.mediaHeaders || "";
@@ -835,6 +836,7 @@ function streamPayload() {
     audioDelayMs: Number(form.elements.audioDelayMs.value) || 0,
     tvgId: form.elements.tvgId.value.trim(),
     forceOffline: form.elements.forceOffline.checked,
+    reducedManifestPolling: form.elements.reducedManifestPolling.checked,
     directSource: form.elements.directSource.checked,
     manifestHeaders: form.elements.manifestHeaders.value,
     mediaHeaders: form.elements.mediaHeaders.value,

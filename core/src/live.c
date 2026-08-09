@@ -69,6 +69,10 @@
 // genuine rendition-list change, rarely enough to stop being a 3rd concurrent
 // manifest fetch alongside the two representation workers.
 #define RS_LIVE_DIRECTOR_IDLE_INTERVAL 300.0
+// Base delay before the director re-reads a rendition list that failed. Doubles
+// per consecutive failure (see live_backoff.c) rather than retrying flat, which
+// is what let a rate-limited origin keep refusing indefinitely.
+#define RS_LIVE_DIRECTOR_RETRY 3.0
 
 // --- 1. helpers -------------------------------------------------------------
 
@@ -307,6 +311,13 @@ typedef struct {
     double window_anchor;
     double seg_duration;       // last observed segment duration, for sizing
     long long skipped;         // segments the window moved past, never fetched
+
+    // Consecutive failed manifest polls, and whether the last one was an
+    // explicit rate refusal. Drives the backoff in rep_main; reset to 0 by the
+    // first poll that retrieves a window. Only touched by this rep's own
+    // worker thread.
+    int manifest_failures;
+    bool manifest_throttled;
 } live_rep;
 
 typedef struct live_stream {
@@ -683,6 +694,35 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
 
 // One poll of one representation: read the manifest window, download whatever
 // is new, decrypt it, and append it in timeline order.
+// The dash callback reports failures as a message only — its signature has no
+// status out-param, and widening it would reach into restream.h, the server's
+// describe implementation and the Windows stub for one integer. But the message
+// is ours: both fetch paths in the server's net.c render an HTTP refusal as
+// "Upstream returned HTTP <n>.", so recover the code from there. A message that
+// does not carry one (a timeout, a parse failure) reads back as 0, which is
+// simply "failed, but not a rate refusal" — the generic backoff still applies.
+static long status_from_error(const char *msg) {
+    if (!msg) return 0;
+    const char *p = strstr(msg, "HTTP ");
+    if (!p) return 0;
+    p += 5;
+    long code = 0;
+    if (*p < '0' || *p > '9') return 0;
+    while (*p >= '0' && *p <= '9') code = code * 10 + (*p++ - '0');
+    return code;
+}
+
+// Records the outcome of a manifest poll for the backoff in rep_main.
+static void rep_note_manifest(live_rep *rep, bool ok, const char *err) {
+    if (ok) {
+        rep->manifest_failures = 0;
+        rep->manifest_throttled = false;
+        return;
+    }
+    if (rep->manifest_failures < 1000) rep->manifest_failures++;
+    rep->manifest_throttled = rs_live_status_is_throttle(status_from_error(err)) != 0;
+}
+
 static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interval) {
     live_stream *st = rep->owner;
     char err[256] = {0};
@@ -726,6 +766,7 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
                                want, cfg->segment_url_params, cfg->inherit_url_params,
                                err, sizeof(err));
     if (!json) {
+        rep_note_manifest(rep, false, err);
         lgf(st, "error", "manifest", cfg->mpd_url, 0, -1, "%s: %s", rep->rep_id,
             err[0] ? err : "could not read the MPD");
         return;
@@ -733,6 +774,7 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     rs_json *root = rs_json_parse(json, strlen(json));
     free(json);
     if (!root) {
+        rep_note_manifest(rep, false, NULL);
         lgf(st, "error", "manifest", cfg->mpd_url, 0, -1, "%s: malformed DASH description", rep->rep_id);
         return;
     }
@@ -742,11 +784,13 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
 
     const rs_json *plan = rs_json_obj_get(root, "plan");
     if (!plan || rs_json_type_of(plan) != RS_JSON_OBJ) {
+        rep_note_manifest(rep, false, NULL);
         lgf(st, "error", "manifest", cfg->mpd_url, 0, -1,
             "%s: representation not present in the MPD", rep->rep_id);
         rs_json_free(root);
         return;
     }
+    rep_note_manifest(rep, true, NULL);
 
     // A window is genuinely in hand now, so this poll becomes the reference
     // point the next one measures its backlog against.
@@ -1090,6 +1134,21 @@ static void *rep_main(void *arg) {
             lgf(st, "info", "pollSlow", NULL, 0, -1,
                 "%s: poll took %.2fs for a %.2fs period — polling again immediately",
                 rep->rep_id, spent, period);
+
+        // A failed poll overrides all of that. The rule above reasons about a
+        // poll that did work, and a failure that returns in 40ms looks to it
+        // like the fastest possible success — so it retried hardest exactly
+        // when it should have retried least, and against an origin that limits
+        // by IP the retries alone kept the block in place. See live_backoff.c.
+        double backoff = rs_live_backoff_delay(rep->manifest_failures, rep->manifest_throttled, period);
+        if (backoff > sleep_for) {
+            sleep_for = backoff;
+            lgf(st, "info", "pollBackoff", NULL, 0, -1,
+                "%s: %d failed poll%s in a row%s — waiting %.1fs before the next one",
+                rep->rep_id, rep->manifest_failures, rep->manifest_failures == 1 ? "" : "s",
+                rep->manifest_throttled ? " (origin is refusing for rate reasons)" : "",
+                sleep_for);
+        }
         cfg_snap_dispose(&cfg);
         if (!live_wait(st, sleep_for)) break;
     }
@@ -1130,9 +1189,22 @@ static void rep_ensure_locked(live_stream *st, const char *rep_id, const char *k
     else rep->finished = true;
 }
 
+// The director's retry-after-failure delay, on the same rule as the
+// representation workers. It polls the same MPD as they do, so a flat retry
+// here would keep an IP-based rate limit armed no matter how well the workers
+// behaved — it is the third of the three request streams that trips these
+// limits in the first place.
+static double director_retry_delay(int failures, bool throttled) {
+    double d = rs_live_backoff_delay(failures, throttled, RS_LIVE_DIRECTOR_RETRY);
+    return d > 0 ? d : RS_LIVE_DIRECTOR_RETRY;
+}
+
 static void *director_main(void *arg) {
     live_stream *st = (live_stream *)arg;
     lg(st, "info", "liveStart", NULL, 0, -1, "live DASH engine started");
+
+    int fails = 0;              // consecutive failed rendition polls
+    bool throttled = false;     // ...and whether the last was a rate refusal
 
     for (;;) {
         if (live_stopping(st)) break;
@@ -1149,23 +1221,32 @@ static void *director_main(void *arg) {
                                    cfg.downloader, cfg.dl_params, "", 0,
                                    cfg.segment_url_params, cfg.inherit_url_params, err, sizeof(err));
         if (!json) {
-            lgf(st, "error", "renditions", cfg.mpd_url, 0, -1, "%s",
-                err[0] ? err : "could not read the MPD");
+            fails++;
+            throttled = rs_live_status_is_throttle(status_from_error(err)) != 0;
+            double wait = director_retry_delay(fails, throttled);
+            lgf(st, "error", "renditions", cfg.mpd_url, 0, -1, "%s — retrying in %.1fs",
+                err[0] ? err : "could not read the MPD", wait);
             free(pinned);
             cfg_snap_dispose(&cfg);
-            if (!live_wait(st, 3.0)) break;
+            if (!live_wait(st, wait)) break;
             continue;
         }
 
         rs_json *root = rs_json_parse(json, strlen(json));
         free(json);
         if (!root) {
-            lg(st, "error", "renditions", cfg.mpd_url, 0, -1, "malformed DASH description");
+            fails++;
+            throttled = false;
+            double wait = director_retry_delay(fails, throttled);
+            lgf(st, "error", "renditions", cfg.mpd_url, 0, -1,
+                "malformed DASH description — retrying in %.1fs", wait);
             free(pinned);
             cfg_snap_dispose(&cfg);
-            if (!live_wait(st, 3.0)) break;
+            if (!live_wait(st, wait)) break;
             continue;
         }
+        fails = 0;
+        throttled = false;
 
         const rs_json *video = rs_json_obj_get(root, "video");
         const rs_json *audio = rs_json_obj_get(root, "audio");
