@@ -96,6 +96,25 @@ typedef struct {
     double poll_interval;           // 0 = follow the MPD's minimumUpdatePeriod
 } rs_live_config;
 
+// Segments asked for beyond the measured elapsed time, absorbing jitter in when
+// the origin publishes.
+#define RS_LIVE_WINDOW_MARGIN 3
+
+// Ceiling on a single manifest request. The source window is finite anyway, and
+// an unbounded ask after a long stall would try to pull the whole DVR buffer.
+#define RS_LIVE_MAX_WINDOW 60
+
+// How many segments one poll must request, given how long it has been since the
+// previous request for the same representation (`since_last`, wall seconds; <=0
+// on the first poll) and the representation's segment duration.
+//
+// The manifest request returns the NEWEST n segments, so n has to cover
+// everything the source produced since the last request or the remainder is
+// lost for good. Implemented in live_window.c; see there for the failure this
+// exists to prevent. Overshooting is harmless — the caller already skips
+// segments it holds.
+int rs_live_window_size(int download_ahead, double since_last, double seg_duration);
+
 rs_live *rs_live_create(rs_live_fetch_fn fetch, rs_live_dash_fn dash,
                         rs_live_log_fn log, void *log_ctx);
 void rs_live_destroy(rs_live *live);

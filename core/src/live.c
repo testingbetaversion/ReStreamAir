@@ -37,6 +37,16 @@
 // the live edge, which is exactly what left the player draining to the end of
 // the playlist and stalling. Matches the Swift prefetch fan-out.
 #define RS_LIVE_FETCH_PAR 6
+
+// Attempts per segment before it is written off. A segment right at the live
+// edge is routinely requested a moment before the origin has finished writing
+// it; giving up on the first error dropped it permanently and tore a hole in
+// the timeline that surfaced as an EXT-X-DISCONTINUITY.
+#define RS_LIVE_FETCH_TRIES 3
+#define RS_LIVE_FETCH_RETRY_DELAY 0.4
+
+// The window-sizing rule itself lives in live_window.c (portable, pure, and
+// therefore covered by the self-test) — see rs_live_window_size.
 // Upper bound on remembered segment URLs. This set is what stops a segment that
 // has aged out of our queue — but is still inside the manifest's much larger
 // timeShiftBufferDepth window — from being downloaded and appended a second
@@ -253,6 +263,7 @@ typedef struct {
     uint64_t start_time;   // tfdt baseMediaDecodeTime, in `timescale` units
     bool have_start;
     bool disc;             // needs an EXT-X-DISCONTINUITY before it
+    double disc_gap;       // seconds the timeline jumped, for the log line
 } live_seg;
 
 struct live_stream;
@@ -289,6 +300,13 @@ typedef struct {
     bool ready;            // a playlist has been rendered at least once
     double last_poll;
     long long polls;
+
+    // Wall clock at which the previous manifest window was requested. The gap
+    // to the next request is exactly how much media the source produced in the
+    // meantime, which is what the window has to be wide enough to cover.
+    double window_anchor;
+    double seg_duration;       // last observed segment duration, for sizing
+    long long skipped;         // segments the window moved past, never fetched
 } live_rep;
 
 typedef struct live_stream {
@@ -430,6 +448,7 @@ typedef struct {
     uint8_t *data;
     size_t len;
     bool ok;
+    int attempts;
     char err[192];
 } batch_item;
 
@@ -452,16 +471,25 @@ static void *batch_worker(void *arg) {
         if (live_stopping(b->st)) break;
 
         batch_item *it = &b->items[i];
-        char *body = NULL;
-        size_t len = 0;
-        long status = 0;
-        int rc = b->fetch(it->url, b->proxy, b->headers, NULL, b->downloader, b->dl_params,
-                          &body, &len, &status, NULL, NULL, NULL, it->err, sizeof(it->err));
-        if (rc == 0 && body) {
-            it->data = (uint8_t *)body;
-            it->len = len;
-            it->ok = true;
-        } else {
+        // Retry before writing the segment off. Every abandoned segment becomes
+        // a permanent hole in the media timeline (the window slides past it and
+        // it is never offered again), so a single transient 404/timeout at the
+        // live edge used to cost a real EXT-X-DISCONTINUITY.
+        for (int attempt = 0; attempt < RS_LIVE_FETCH_TRIES; attempt++) {
+            if (attempt > 0 && !live_wait(b->st, RS_LIVE_FETCH_RETRY_DELAY)) break;
+            char *body = NULL;
+            size_t len = 0;
+            long status = 0;
+            it->err[0] = '\0';
+            int rc = b->fetch(it->url, b->proxy, b->headers, NULL, b->downloader, b->dl_params,
+                              &body, &len, &status, NULL, NULL, NULL, it->err, sizeof(it->err));
+            it->attempts = attempt + 1;
+            if (rc == 0 && body) {
+                it->data = (uint8_t *)body;
+                it->len = len;
+                it->ok = true;
+                break;
+            }
             free(body);
             if (!it->err[0]) snprintf(it->err, sizeof(it->err), "fetch failed (status %ld)", status);
         }
@@ -506,18 +534,23 @@ static void batch_download(live_stream *st, batch_item *items, size_t n, const c
 // is 2.000s, the media actually resumes a second later, and MSE is left with a
 // hole it can never fill. ffmpeg silently re-offsets instead, which is why the
 // same stream plays from the CLI and stalls in the page.
-static bool is_timeline_break(const live_rep *rep, const live_seg *prev, uint64_t next_start,
-                              bool next_has_start) {
-    if (!prev || !prev->have_start || !next_has_start) return false;
-    if (rep->timescale == 0) return false;
+// Signed distance, in seconds, between where `prev` ends on the media timeline
+// and where the next segment starts. Zero when either side has no usable tfdt,
+// which is indistinguishable from "perfectly contiguous" and is deliberately
+// treated as such — see the comment on start==0 in rep_poll.
+static double timeline_gap(const live_rep *rep, const live_seg *prev, uint64_t next_start,
+                           bool next_has_start) {
+    if (!prev || !prev->have_start || !next_has_start) return 0;
+    if (rep->timescale == 0) return 0;
     double expected = (double)prev->start_time / (double)rep->timescale + prev->duration;
     double actual = (double)next_start / (double)rep->timescale;
-    double diff = actual - expected;
-    if (diff < 0) diff = -diff;
-    // Encoder jitter (AAC frame alignment) is single-digit milliseconds; a real
-    // splice moves the timeline by about a second.
-    return diff > 0.25;
+    return actual - expected;
 }
+
+// Encoder jitter (AAC frame alignment) is single-digit milliseconds; a real
+// splice — or a segment we failed to fetch — moves the timeline by about a
+// second or more.
+#define RS_LIVE_SPLICE_THRESHOLD 0.25
 
 // Drops the oldest segments until the queue fits both the segment count and the
 // memory ceiling. Caller holds st->mu.
@@ -556,9 +589,13 @@ static void rep_append_locked(live_rep *rep, const char *url, uint8_t *data, siz
     s->duration = duration;
     s->start_time = start;
     s->have_start = have_start;
-    s->disc = is_timeline_break(rep, prev, start, have_start);
+    s->disc_gap = timeline_gap(rep, prev, start, have_start);
+    s->disc = s->disc_gap > RS_LIVE_SPLICE_THRESHOLD || s->disc_gap < -RS_LIVE_SPLICE_THRESHOLD;
     s->seq = rep->total_queued++;
     rep->bytes += len;
+    // Segment durations drive the window sizing in rep_poll. Track the newest
+    // rather than assuming 2s, since sources vary (and vary per rendition).
+    if (duration > 0) rep->seg_duration = duration;
 }
 
 // Fetches and installs the initialization segment: patch it to a clear codec,
@@ -651,11 +688,42 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     char err[256] = {0};
     double t0 = now_seconds();
 
-    lgf(st, "info", "pollStart", cfg->mpd_url, 0, -1, "%s: requesting %d segments",
-        rep->rep_id, cfg->download_ahead);
+    // The manifest request is anchored at the live edge: it returns the NEWEST
+    // `want` segments. So `want` has to cover everything the source produced
+    // since the previous request, and a fixed download_ahead only ever covers
+    // download_ahead * segment_duration seconds. Whenever a cycle took longer
+    // than that — a slow origin, large segments, a proxy in the path — every
+    // segment older than the window was never requested, and the next one to
+    // arrive landed a few seconds further down the media timeline. That is what
+    // put a permanent EXT-X-DISCONTINUITY every few segments into the output
+    // and left the engine publishing well under 1x realtime, so any player
+    // drained its buffer and stalled no matter how good the bytes were.
+    //
+    // Widening the ask is free: `seen` skips anything already held, so the only
+    // cost of overshooting is a slightly larger manifest response.
+    int want = cfg->download_ahead;
+    pthread_mutex_lock(&st->mu);
+    double anchor = rep->window_anchor;
+    double seg_dur = rep->seg_duration > 0 ? rep->seg_duration : 2.0;
+    pthread_mutex_unlock(&st->mu);
+    // NB: the anchor only advances once a window has actually been retrieved
+    // (below, after the plan is in hand). Advancing it here would mean a failed
+    // manifest fetch silently reset the clock, so the next poll would ask for a
+    // window sized to that short interval and lose the backlog the failure
+    // created — the very hole this sizing exists to prevent.
+
+    // Wall time since the previous request == media the source produced in the
+    // meantime. Zero on the first poll, which deliberately starts at the live
+    // edge with just download_ahead rather than pulling the whole DVR window.
+    double since_last = anchor > 0 ? t0 - anchor : 0;
+    want = rs_live_window_size(cfg->download_ahead, since_last, seg_dur);
+
+    lgf(st, "info", "pollStart", cfg->mpd_url, 0, -1,
+        "%s: requesting %d segments (%.1fs since last poll, %.3fs each)",
+        rep->rep_id, want, since_last, seg_dur);
     char *json = st->mgr->dash(cfg->mpd_url, cfg->manifest_proxy, cfg->manifest_headers,
                                cfg->downloader, cfg->dl_params, rep->rep_id,
-                               cfg->download_ahead, cfg->segment_url_params, cfg->inherit_url_params,
+                               want, cfg->segment_url_params, cfg->inherit_url_params,
                                err, sizeof(err));
     if (!json) {
         lgf(st, "error", "manifest", cfg->mpd_url, 0, -1, "%s: %s", rep->rep_id,
@@ -679,6 +747,12 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
         rs_json_free(root);
         return;
     }
+
+    // A window is genuinely in hand now, so this poll becomes the reference
+    // point the next one measures its backlog against.
+    pthread_mutex_lock(&st->mu);
+    rep->window_anchor = t0;
+    pthread_mutex_unlock(&st->mu);
 
     unsigned long plan_ts = (unsigned long)rs_json_as_num(rs_json_obj_get(plan, "timescale"), 1);
     const char *init_url = rs_json_obj_str(plan, "initUrl", "");
@@ -735,6 +809,7 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     // position, decide discontinuity, append.
     size_t added = 0, failed = 0;
     long long added_bytes = 0;
+    double added_seconds = 0;
     for (size_t i = 0; i < n; i++) {
         batch_item *it = &items[i];
         char idkey[288];
@@ -744,7 +819,8 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
             // A single miss at the live edge is routine — the origin may simply
             // never produce this one. Mark it seen so we do not re-request it
             // forever, and let the window slide past it.
-            lgf(st, "error", "downloadSegment", it->url, 0, -1, "%s: %s", rep->rep_id, it->err);
+            lgf(st, "error", "downloadSegment", it->url, 0, -1,
+                "%s: gave up after %d attempts: %s", rep->rep_id, it->attempts, it->err);
             pthread_mutex_lock(&st->mu);
             seen_add(&rep->seen, idkey);
             pthread_mutex_unlock(&st->mu);
@@ -782,7 +858,7 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
         // tfdt baseMediaDecodeTime: where this segment actually starts on the
         // media timeline. A missing box reads back as 0, which is
         // indistinguishable from a genuine zero start, so 0 is treated as
-        // "unknown" throughout — is_timeline_break then skips the comparison
+        // "unknown" throughout — timeline_gap then reports no jump
         // rather than reporting a jump. Missing one real splice is recoverable;
         // a spurious EXT-X-DISCONTINUITY on every segment is not.
         uint64_t start = rs_audio_base_decode_time(data, len);
@@ -790,19 +866,39 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
 
         pthread_mutex_lock(&st->mu);
         bool was_disc = false;
+        double gap = 0;
         rep_append_locked(rep, it->url, data, len,
                           it->duration > 0 ? it->duration : 2.0, start, have_start);
-        if (rep->nsegs > 0) was_disc = rep->segs[rep->nsegs - 1].disc;
+        if (rep->nsegs > 0) {
+            was_disc = rep->segs[rep->nsegs - 1].disc;
+            gap = rep->segs[rep->nsegs - 1].disc_gap;
+        }
+        // Only a forward jump means missing content. A backward one is the
+        // source rewinding its own timeline, which loses us nothing.
+        if (was_disc && gap > 0 && seg_dur > 0)
+            rep->skipped += (long long)(gap / seg_dur + 0.5);
         seen_add(&rep->seen, idkey);
         pthread_mutex_unlock(&st->mu);
 
         added++;
         added_bytes += (long long)len;
-        lgf(st, "info", "downloadSegment", it->url, 200, (long long)len,
-            "%s: %.3fs%s", rep->rep_id, it->duration, was_disc ? " (discontinuity)" : "");
+        added_seconds += it->duration > 0 ? it->duration : 2.0;
+        if (it->attempts > 1)
+            lgf(st, "info", "downloadSegment", it->url, 200, (long long)len,
+                "%s: %.3fs (recovered on attempt %d)", rep->rep_id, it->duration, it->attempts);
+        else
+            lgf(st, "info", "downloadSegment", it->url, 200, (long long)len,
+                "%s: %.3fs%s", rep->rep_id, it->duration, was_disc ? " (discontinuity)" : "");
+        // Say which kind of break this is. A forward jump of a whole number of
+        // segments after a failed download is content we lost; anything else is
+        // the source splicing its own timeline. They look identical in the
+        // playlist, so without this the log cannot tell you which you have.
         if (was_disc)
-            lgf(st, "info", "discontinuity", it->url, 0, -1,
-                "%s: media timeline jumped — inserting EXT-X-DISCONTINUITY", rep->rep_id);
+            lgf(st, failed > 0 ? "error" : "info", "discontinuity", it->url, 0, -1,
+                "%s: media timeline jumped %+.3fs (~%.1f segments)%s", rep->rep_id, gap,
+                seg_dur > 0 ? gap / seg_dur : 0,
+                failed > 0 ? " — after a failed download, so this is content we dropped"
+                           : " — no download failed, so the source spliced");
         free(it->url);
     }
     free(items);
@@ -813,12 +909,31 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     size_t pruned = before - rep->nsegs;
     size_t held = rep->nsegs;
     size_t held_bytes = rep->bytes;
+    long long skipped = rep->skipped;
     pthread_mutex_unlock(&st->mu);
 
+    // Media published per second of wall clock. This is THE number for whether
+    // the engine is keeping up: sustained below 1.0 means the output window
+    // grows shorter than real time, so every player drains its buffer and
+    // stalls regardless of how correct the segments are. Measured across the
+    // whole inter-poll interval, not just the download, because the sleep
+    // counts against the budget too.
+    double realtime = since_last > 0 ? added_seconds / since_last : 0;
     lgf(st, added > 0 ? "info" : "error", "pollDone", NULL, 0, added_bytes,
-        "%s: +%lu segments, %lu failed, %lu pruned, %lu held (%.1f MB) in %.2fs",
-        rep->rep_id, (unsigned long)added, (unsigned long)failed, (unsigned long)pruned,
+        "%s: +%lu segments (%.1fs media) %.2fx realtime, window %d, %lu failed, %lu pruned, "
+        "%lu held (%.1f MB) in %.2fs",
+        rep->rep_id, (unsigned long)added, added_seconds, realtime, want,
+        (unsigned long)failed, (unsigned long)pruned,
         (unsigned long)held, (double)held_bytes / (1024.0 * 1024.0), now_seconds() - dl0);
+
+    // Only meaningful once there is a previous poll to measure against, and
+    // only worth reporting when segments were actually produced (a poll that
+    // legitimately found nothing new is not falling behind).
+    if (since_last > 0 && added > 0 && realtime < 0.95)
+        lgf(st, "error", "fallingBehind", NULL, 0, -1,
+            "%s: publishing %.2fx realtime (%.1fs of media in %.1fs) — the advertised window "
+            "will shrink and players will stall; %lld segments skipped so far",
+            rep->rep_id, realtime, added_seconds, since_last, skipped);
 }
 
 // --- 5. playlist rendering --------------------------------------------------

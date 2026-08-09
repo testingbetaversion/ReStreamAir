@@ -53,6 +53,7 @@ add_library(restream_base STATIC
     core/src/cenc.c
     core/src/hls_decrypt.c
     core/src/audio_delay.c
+    core/src/live_window.c
     core/src/script.c
     core/src/cdm.c
     core/src/metrics.c

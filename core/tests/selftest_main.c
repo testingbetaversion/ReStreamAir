@@ -21,6 +21,7 @@
 #include "rs_crypto.h"
 #include "rs_ffargs.h"
 #include "rs_json.h"
+#include "rs_live.h"
 #include "rs_m3u8.h"
 #include "rs_netmatch.h"
 #include "rs_panel.h"
@@ -1090,6 +1091,49 @@ static void test_cenc_multifragment(void) {
     rs_free(out);
 }
 
+// The DASH describe call is anchored at the live edge: it returns the newest N
+// segments. A fixed N only covers N * segment_duration seconds of source
+// output, so any poll cycle slower than that permanently loses everything
+// older than the window — the engine then publishes less media than real time,
+// its advertised window shrinks until players stall, and every hole shows up as
+// an EXT-X-DISCONTINUITY indistinguishable from ordinary ad-break splicing.
+//
+// The invariant that has to hold: the window always covers the elapsed time.
+static void test_live_window(void) {
+    // First poll of a representation: no backlog, so stay at the live edge
+    // rather than dragging in the whole DVR buffer.
+    check("live-window/first-poll", rs_live_window_size(8, 0, 2.0) == 8);
+    check("live-window/negative-elapsed", rs_live_window_size(8, -5, 2.0) == 8);
+
+    // Keeping up: elapsed time needs fewer segments than configured, so the
+    // configured ask wins and behaviour is unchanged from before the fix.
+    check("live-window/keeping-up", rs_live_window_size(8, 2.0, 2.0) == 8);
+
+    // Falling behind: this is the case the old fixed count got wrong. A 30s
+    // cycle over 2s segments means 15 segments were published; the ask has to
+    // cover them, not stay at 8.
+    check("live-window/slow-cycle", rs_live_window_size(8, 30.0, 2.0) == 15 + 1 + RS_LIVE_WINDOW_MARGIN);
+
+    // The whole point: whatever the numbers, the window covers the elapsed
+    // time. Sweep well past the point where the old constant broke down.
+    bool covers = true;
+    for (double elapsed = 0.5; elapsed <= 100.0; elapsed += 0.5) {
+        for (double dur = 1.0; dur <= 6.0; dur += 0.5) {
+            int n = rs_live_window_size(8, elapsed, dur);
+            if (n >= RS_LIVE_MAX_WINDOW) continue;  // clamped, checked separately
+            if ((double)n * dur < elapsed) covers = false;
+        }
+    }
+    check("live-window/always-covers-elapsed", covers);
+
+    // A long stall must not turn into an unbounded ask.
+    check("live-window/clamped", rs_live_window_size(8, 100000.0, 2.0) == RS_LIVE_MAX_WINDOW);
+
+    // Degenerate inputs must not divide by zero or return something unusable.
+    check("live-window/zero-duration", rs_live_window_size(8, 30.0, 0) > 8);
+    check("live-window/zero-ahead", rs_live_window_size(0, 0, 2.0) >= 1);
+}
+
 int main(void) {
     test_sha256();
     test_hmac();
@@ -1105,6 +1149,7 @@ int main(void) {
     test_netmatch();
     test_panel();
     test_cenc_multifragment();
+    test_live_window();
 
     for (size_t i = 0; i < sizeof(rs_goldens) / sizeof(rs_goldens[0]); i++) {
         run_golden(&rs_goldens[i]);
