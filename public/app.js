@@ -650,8 +650,8 @@ function renderEditor() {
       form.elements.playlistSegments.value = 6;
       form.elements.playbackDelaySeconds.value = 0;
       form.elements.keepSegments.value = 60;
-      form.elements.downloadAhead.value = 8;
-      form.elements.parallelDownloads.value = 3;
+      form.elements.downloadAhead.value = 16;
+      form.elements.parallelDownloads.value = 8;
       form.elements.prioritizeOldest.checked = false;
       form.elements.pollInterval.value = 2;
       $("#playLink").value = "";
@@ -712,8 +712,8 @@ function renderEditor() {
   form.elements.playlistSegments.value = stream.playlistSegments || 6;
   form.elements.playbackDelaySeconds.value = stream.playbackDelaySeconds || 0;
   form.elements.keepSegments.value = stream.keepSegments || 60;
-  form.elements.downloadAhead.value = stream.downloadAhead || 8;
-  form.elements.parallelDownloads.value = stream.parallelDownloads || 3;
+  form.elements.downloadAhead.value = stream.downloadAhead || 16;
+  form.elements.parallelDownloads.value = stream.parallelDownloads || 8;
   form.elements.prioritizeOldest.checked = stream.prioritizeOldest || false;
   form.elements.pollInterval.value = stream.pollInterval || 2;
   form.elements.audioDelayMs.value = stream.audioDelayMs || 0;
@@ -943,8 +943,8 @@ function newStream() {
   $("#streamForm").elements.playlistSegments.value = 6;
   $("#streamForm").elements.playbackDelaySeconds.value = 0;
   $("#streamForm").elements.keepSegments.value = 10;
-  $("#streamForm").elements.downloadAhead.value = 8;
-  $("#streamForm").elements.parallelDownloads.value = 3;
+  $("#streamForm").elements.downloadAhead.value = 16;
+  $("#streamForm").elements.parallelDownloads.value = 8;
   $("#streamForm").elements.prioritizeOldest.checked = false;
   $("#streamForm").elements.pollInterval.value = 2;
   $("#playLink").value = "";

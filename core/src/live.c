@@ -549,7 +549,7 @@ static void batch_download(live_stream *st, batch_item *items, size_t n, const c
         ctx.n = n - 1;
     }
 
-    int max_par = cfg->parallel_downloads > 0 ? cfg->parallel_downloads : 3;
+    int max_par = cfg->parallel_downloads > 0 ? cfg->parallel_downloads : 8;
     if (max_par > 32) max_par = 32;
     size_t nthreads = ctx.n < (size_t)max_par ? ctx.n : (size_t)max_par;
     pthread_t *threads = calloc(nthreads, sizeof(pthread_t));
@@ -1421,7 +1421,7 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     st->reduced_manifest_polling = cfg->reduced_manifest_polling;
     st->playlist_segments = cfg->playlist_segments > 0 ? cfg->playlist_segments : 6;
     if (st->playlist_segments < 3) st->playlist_segments = 3;
-    st->download_ahead = cfg->download_ahead;
+    st->download_ahead = cfg->download_ahead > 0 ? cfg->download_ahead : 16;
     st->parallel_downloads = cfg->parallel_downloads;
     st->prioritize_oldest = cfg->prioritize_oldest;
     st->playback_delay_seconds = cfg->playback_delay_seconds > 0 ? cfg->playback_delay_seconds : 0;

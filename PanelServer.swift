@@ -351,7 +351,7 @@ struct StreamConfig: Codable {
     var period: String
     var proxy: String
     var playlistSegments: Int
-    var parallelDownloads: Int = 3
+    var parallelDownloads: Int = 8
     var prioritizeOldest: Bool = false
     var keepSegments: Int
     var downloadAhead: Int
@@ -492,8 +492,8 @@ struct StreamConfig: Codable {
         proxy = try container.decode(String.self, forKey: .proxy)
         playlistSegments = try container.decode(Int.self, forKey: .playlistSegments)
         keepSegments = try container.decode(Int.self, forKey: .keepSegments)
-        downloadAhead = try container.decode(Int.self, forKey: .downloadAhead)
-        parallelDownloads = try container.decodeIfPresent(Int.self, forKey: .parallelDownloads) ?? 3
+        downloadAhead = try container.decodeIfPresent(Int.self, forKey: .downloadAhead) ?? 16
+        parallelDownloads = try container.decodeIfPresent(Int.self, forKey: .parallelDownloads) ?? 8
         prioritizeOldest = try container.decodeIfPresent(Bool.self, forKey: .prioritizeOldest) ?? false
         pollInterval = try container.decode(Double.self, forKey: .pollInterval)
         forceOffline = try container.decode(Bool.self, forKey: .forceOffline)

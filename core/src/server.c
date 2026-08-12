@@ -2391,8 +2391,8 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     cfg.reduced_manifest_polling = rs_json_obj_bool(stream, "reducedManifestPolling", false);
     cfg.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
     cfg.keep_segments = (int)rs_json_obj_int(stream, "keepSegments", 60);
-    cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 8);
-    cfg.parallel_downloads = (int)rs_json_obj_int(stream, "parallelDownloads", 3);
+    cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 16);
+    cfg.parallel_downloads = (int)rs_json_obj_int(stream, "parallelDownloads", 8);
     cfg.prioritize_oldest = rs_json_obj_bool(stream, "prioritizeOldest", false) ? 1 : 0;
     cfg.playback_delay_seconds = (int)rs_json_obj_int(stream, "playbackDelaySeconds", 0);
     cfg.audio_delay_ms = (int)rs_json_obj_int(stream, "audioDelayMs", 0);
