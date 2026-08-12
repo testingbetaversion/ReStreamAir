@@ -3523,7 +3523,17 @@ final class PanelServer {
         if !file.hasSuffix(".m3u8") && !file.hasSuffix(".mpd") {
             logStore.record(streamId: streamId, level: "info", event: "accessSegment", url: file, message: "Served segment (\(data.count) bytes)")
         }
-        return response(status: 200, body: data, type: contentType(url.path), noStore: url.pathExtension == "m3u8")
+        // Init segments (fMP4 headers, always .mp4) are immutable for the life of a
+        // stream — the same bytes are served on every request. Advertising a long
+        // max-age lets ffmpeg/ffplay's HTTP layer serve them from its in-process cache
+        // instead of opening a new TCP connection and re-downloading ~1-2 KB on every
+        // playlist refresh, saving ~150 ms of round-trip latency per poll cycle.
+        // Media segments (.m4s) and playlists (.m3u8) must stay short-lived.
+        let isInitSegment = url.pathExtension == "mp4" && url.lastPathComponent.hasPrefix("init")
+        let extraHeaders: [String: String] = isInitSegment
+            ? ["Cache-Control": "public, max-age=3600"]
+            : [:]
+        return response(status: 200, body: data, type: contentType(url.path), noStore: url.pathExtension == "m3u8", extraHeaders: extraHeaders)
     }
 
     func servePublic(_ path: String) throws -> Data {
