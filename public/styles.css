@@ -515,7 +515,7 @@ textarea {
    New Stream and editing an existing one. No split view, no extra window. */
 
 .stream-editor-dialog {
-  width: min(640px, calc(100vw - 40px));
+  width: min(960px, calc(100vw - 40px));
   max-height: min(860px, calc(100vh - 40px));
   padding: 0;
   border: 1px solid var(--line-strong);
@@ -956,6 +956,7 @@ video {
   aspect-ratio: 16 / 9;
   background: var(--video-bg);
   border-radius: var(--radius-md);
+  object-fit: contain;
 }
 
 pre {

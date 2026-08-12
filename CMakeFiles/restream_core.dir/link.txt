@@ -1,0 +1,2 @@
+/usr/bin/ar qc librestream_core.a CMakeFiles/restream_core.dir/core/src/server.c.o CMakeFiles/restream_core.dir/core/src/live.c.o CMakeFiles/restream_core.dir/core/deps/mongoose.c.o
+/usr/bin/ranlib librestream_core.a

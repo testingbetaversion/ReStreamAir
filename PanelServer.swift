@@ -351,6 +351,8 @@ struct StreamConfig: Codable {
     var period: String
     var proxy: String
     var playlistSegments: Int
+    var parallelDownloads: Int = 3
+    var prioritizeOldest: Bool = false
     var keepSegments: Int
     var downloadAhead: Int
     var pollInterval: Double
@@ -491,6 +493,8 @@ struct StreamConfig: Codable {
         playlistSegments = try container.decode(Int.self, forKey: .playlistSegments)
         keepSegments = try container.decode(Int.self, forKey: .keepSegments)
         downloadAhead = try container.decode(Int.self, forKey: .downloadAhead)
+        parallelDownloads = try container.decodeIfPresent(Int.self, forKey: .parallelDownloads) ?? 3
+        prioritizeOldest = try container.decodeIfPresent(Bool.self, forKey: .prioritizeOldest) ?? false
         pollInterval = try container.decode(Double.self, forKey: .pollInterval)
         forceOffline = try container.decode(Bool.self, forKey: .forceOffline)
         status = try container.decode(String.self, forKey: .status)
@@ -2508,6 +2512,8 @@ final class PanelServer {
                 "playlistSegments=\(stream.playlistSegments)",
                 "keepSegments=\(stream.keepSegments)",
                 "downloadAhead=\(stream.downloadAhead)",
+                "parallelDownloads=\(stream.parallelDownloads)",
+                "prioritizeOldest=\(stream.prioritizeOldest)",
                 "pollInterval=\(stream.pollInterval)",
                 "tempDir=\(tempDir.path)",
                 "output=\(output.path)"

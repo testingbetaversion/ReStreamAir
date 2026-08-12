@@ -91,6 +91,8 @@ typedef struct {
     int playlist_segments;          // advertised window (default 6)
     int keep_segments;              // segments held in memory (default 60)
     int download_ahead;             // segments requested per poll (default 8)
+    int parallel_downloads;         // max concurrent segment fetches per poll (default 3)
+    int prioritize_oldest;          // if non-zero, download the oldest segment sequentially first
     int playback_delay_seconds;     // extra live-edge hold-back, in seconds
     int audio_delay_ms;             // lip-sync shift, applied to audio only
     double poll_interval;           // 0 = follow the MPD's minimumUpdatePeriod

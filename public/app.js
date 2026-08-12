@@ -649,8 +649,10 @@ function renderEditor() {
       form.reset();
       form.elements.playlistSegments.value = 6;
       form.elements.playbackDelaySeconds.value = 0;
-      form.elements.keepSegments.value = 10;
+      form.elements.keepSegments.value = 60;
       form.elements.downloadAhead.value = 8;
+      form.elements.parallelDownloads.value = 3;
+      form.elements.prioritizeOldest.checked = false;
       form.elements.pollInterval.value = 2;
       $("#playLink").value = "";
       setLinkField($("#directLink"), {});
@@ -709,8 +711,10 @@ function renderEditor() {
   form.elements.proxy.value = stream.proxy || "";
   form.elements.playlistSegments.value = stream.playlistSegments || 6;
   form.elements.playbackDelaySeconds.value = stream.playbackDelaySeconds || 0;
-  form.elements.keepSegments.value = stream.keepSegments || 10;
+  form.elements.keepSegments.value = stream.keepSegments || 60;
   form.elements.downloadAhead.value = stream.downloadAhead || 8;
+  form.elements.parallelDownloads.value = stream.parallelDownloads || 3;
+  form.elements.prioritizeOldest.checked = stream.prioritizeOldest || false;
   form.elements.pollInterval.value = stream.pollInterval || 2;
   form.elements.audioDelayMs.value = stream.audioDelayMs || 0;
   form.elements.tvgId.value = stream.tvgId || "";
@@ -832,6 +836,8 @@ function streamPayload() {
     playbackDelaySeconds: Number(form.elements.playbackDelaySeconds.value),
     keepSegments: Number(form.elements.keepSegments.value),
     downloadAhead: Number(form.elements.downloadAhead.value),
+    parallelDownloads: Number(form.elements.parallelDownloads.value),
+    prioritizeOldest: form.elements.prioritizeOldest.checked,
     pollInterval: Number(form.elements.pollInterval.value),
     audioDelayMs: Number(form.elements.audioDelayMs.value) || 0,
     tvgId: form.elements.tvgId.value.trim(),
@@ -938,6 +944,8 @@ function newStream() {
   $("#streamForm").elements.playbackDelaySeconds.value = 0;
   $("#streamForm").elements.keepSegments.value = 10;
   $("#streamForm").elements.downloadAhead.value = 8;
+  $("#streamForm").elements.parallelDownloads.value = 3;
+  $("#streamForm").elements.prioritizeOldest.checked = false;
   $("#streamForm").elements.pollInterval.value = 2;
   $("#playLink").value = "";
   setLinkField($("#directLink"), {});
