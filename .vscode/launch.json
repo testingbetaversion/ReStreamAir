@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ReStreamAir}",
+            "name": "Debug restreamair",
+            "target": "restreamair",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug restreamair"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:ReStreamAir}",
+            "name": "Release restreamair",
+            "target": "restreamair",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release restreamair"
+        }
+    ]
+}

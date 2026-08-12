@@ -891,8 +891,12 @@ async function saveStream(event) {
 }
 
 async function toggleStreamRun(id, running) {
-  state = await request(`/api/streams/${id}/${running ? "stop" : "start"}`, { method: "POST", body: "{}" });
-  render();
+  try {
+    state = await request(`/api/streams/${id}/${running ? "stop" : "start"}`, { method: "POST", body: "{}" });
+    render();
+  } catch (error) {
+    alert(`Failed to ${running ? "stop" : "start"} stream: ${error.message || error}`);
+  }
 }
 
 async function toggleSelectedRun() {
@@ -2153,9 +2157,41 @@ async function loadLogs() {
     list.className = "log-list empty-state";
     list.textContent = String(error.message || error);
   }
+  updateLogStreamToggleBtn();
+}
+
+function updateLogStreamToggleBtn() {
+  const streamId = $("#logStreamFilter").value;
+  const btn = $("#toggleLogStreamRunBtn");
+  if (!btn) return;
+  if (!streamId || streamId === "__panel__" || streamId.startsWith("script:")) {
+    btn.disabled = true;
+    btn.innerHTML = `<span data-icon="play"></span>Start Stream`;
+    btn.className = "ghost";
+    applyIcons(btn);
+    return;
+  }
+  const stream = state.providers.flatMap(p => p.streams).find(s => s.id === streamId);
+  if (!stream) {
+    btn.disabled = true;
+    return;
+  }
+  btn.disabled = false;
+  const running = Boolean(stream.running);
+  btn.className = running ? "ghost danger-ghost" : "ghost success-ghost";
+  btn.innerHTML = `<span data-icon="${running ? "stop" : "play"}"></span>${running ? "Stop Stream" : "Start Stream"}`;
+  applyIcons(btn);
 }
 
 $("#refreshLogsBtn").addEventListener("click", loadLogs);
+$("#toggleLogStreamRunBtn")?.addEventListener("click", async () => {
+  const streamId = $("#logStreamFilter").value;
+  const stream = state.providers.flatMap(p => p.streams).find(s => s.id === streamId);
+  if (stream) {
+    await toggleStreamRun(stream.id, stream.running);
+    updateLogStreamToggleBtn();
+  }
+});
 $("#pauseLogsBtn").addEventListener("click", (event) => {
   logsPaused = !logsPaused;
   const button = event.currentTarget;

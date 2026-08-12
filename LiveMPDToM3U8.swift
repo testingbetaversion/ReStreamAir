@@ -610,7 +610,8 @@ final class LiveMPDToM3U8 {
         let resultsLock = NSLock()
         // Bounded fan-out: enough to hide per-request latency without opening an
         // unreasonable number of simultaneous connections to one origin.
-        let maxParallel = min(8, targets.count)
+        // Reduced from 8 to 3 to prevent proxy/CDN connection aborts (curl error 56).
+        let maxParallel = min(3, targets.count)
         let slots = DispatchSemaphore(value: maxParallel)
         let group = DispatchGroup()
         let workQueue = DispatchQueue(label: "restreamair.prefetch", attributes: .concurrent)
