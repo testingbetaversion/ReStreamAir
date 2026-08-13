@@ -375,16 +375,38 @@ async function bulkStreamAction(kind) {
     if (!confirm(`Delete ${rows.length} stream${rows.length === 1 ? "" : "s"}? This stops them and removes their configuration. This cannot be undone.`)) return;
   }
   let count = 0;
+  const promises = [];
+  
   for (const { stream } of rows) {
-    try {
-      if (kind === "start" && !stream.running) { state = await request(`/api/streams/${stream.id}/start`, { method: "POST", body: "{}" }); count++; }
-      else if (kind === "stop" && stream.running) { state = await request(`/api/streams/${stream.id}/stop`, { method: "POST", body: "{}" }); count++; }
-      else if (kind === "delete") { state = await request(`/api/streams/${stream.id}`, { method: "DELETE" }); count++; }
-    } catch (error) {
-      $("#streamsGridImportStatus").classList.remove("hidden");
-      $("#streamsGridImportStatus").textContent = `${kind} failed on "${stream.name}": ${error.message || error}`;
+    if (kind === "start" && !stream.running) {
+      promises.push(request(`/api/streams/${stream.id}/start`, { method: "POST", body: "{}" })
+        .then(res => { count++; return res; })
+        .catch(error => {
+          $("#streamsGridImportStatus").classList.remove("hidden");
+          $("#streamsGridImportStatus").textContent = `${kind} failed on "${stream.name}": ${error.message || error}`;
+        }));
+    } else if (kind === "stop" && stream.running) {
+      promises.push(request(`/api/streams/${stream.id}/stop`, { method: "POST", body: "{}" })
+        .then(res => { count++; return res; })
+        .catch(error => {
+          $("#streamsGridImportStatus").classList.remove("hidden");
+          $("#streamsGridImportStatus").textContent = `${kind} failed on "${stream.name}": ${error.message || error}`;
+        }));
+    } else if (kind === "delete") {
+      promises.push(request(`/api/streams/${stream.id}`, { method: "DELETE" })
+        .then(res => { count++; return res; })
+        .catch(error => {
+          $("#streamsGridImportStatus").classList.remove("hidden");
+          $("#streamsGridImportStatus").textContent = `${kind} failed on "${stream.name}": ${error.message || error}`;
+        }));
     }
   }
+
+  if (promises.length > 0) {
+    await Promise.all(promises);
+    state = await request("/api/state");
+  }
+  
   if (kind === "delete") { selectedStreamId = null; lastEditorStreamId = null; }
   render();
 }
@@ -1402,7 +1424,7 @@ function stopFfmpegInstallPoll() {
 async function pollFfmpegInstallOutput() {
   const box = $("#ffmpegInstallOutput");
   try {
-    const result = await request(`/api/logs?streamId=${encodeURIComponent("ffmpeg-install")}&limit=300`);
+    const result = await request(`/api/logs?streamId=${encodeURIComponent("ffmpeg-install")}&limit=500`);
     const lines = (result.entries || []).slice().reverse().map((entry) => entry.message || entry.event).join("\n");
     const text = lines || "(no output yet)";
     if (box.textContent === text) return;
@@ -1444,7 +1466,7 @@ function stopNm3u8dlreInstallPoll() {
 async function pollNm3u8dlreInstallOutput() {
   const box = $("#nm3u8dlreInstallOutput");
   try {
-    const result = await request(`/api/logs?streamId=${encodeURIComponent("nm3u8dlre-install")}&limit=300`);
+    const result = await request(`/api/logs?streamId=${encodeURIComponent("nm3u8dlre-install")}&limit=500`);
     const lines = (result.entries || []).slice().reverse().map((entry) => entry.message || entry.event).join("\n");
     const text = lines || "(no output yet)";
     if (box.textContent === text) return;
@@ -1773,7 +1795,7 @@ function stopScriptOutputPoll() {
 async function pollScriptOutput(providerId) {
   const box = $("#scriptOutputBox");
   try {
-    const result = await request(`/api/logs?streamId=${encodeURIComponent("script:" + providerId)}&limit=300`);
+    const result = await request(`/api/logs?streamId=${encodeURIComponent("script:" + providerId)}&limit=500`);
     const lines = (result.entries || []).slice().reverse().map((entry) => entry.message || entry.event).join("\n");
     const text = lines || "(no output yet)";
     // Reassigning textContent on every tick — even to the same text — wipes
@@ -1835,7 +1857,7 @@ async function pollGridImportStatus(providerId) {
   const status = $("#streamsGridImportStatus");
   const term = $("#streamsGridImportOutput");
   try {
-    const result = await request(`/api/logs?streamId=${encodeURIComponent("script:" + providerId)}&limit=300`);
+    const result = await request(`/api/logs?streamId=${encodeURIComponent("script:" + providerId)}&limit=500`);
     const entries = result.entries || [];
     // Full transcript, oldest→newest, into the terminal — same rendering as
     // the provider dialog's terminal (don't rewrite the DOM when unchanged, so
@@ -2143,7 +2165,7 @@ async function loadLogs() {
   $("#logStreamFilter").innerHTML = `<option value="">All streams</option>${panelOption}${options.join("")}${scriptOptions.join("")}`;
   $("#logLevelFilter").value = logLevelFilter;
   try {
-    const params = new URLSearchParams({ limit: "150" });
+    const params = new URLSearchParams({ limit: "500" });
     if (streamId) params.set("streamId", streamId);
     const result = await request(`/api/logs?${params.toString()}`);
 

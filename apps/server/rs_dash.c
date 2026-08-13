@@ -6,6 +6,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <pthread.h>
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -565,10 +566,93 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
     // Fetch the MPD via libcurl (downloader forced internal so we get the final
     // URL after any redirect — segment URLs must resolve against it).
     (void)downloader; (void)dl_params;
+    
+    #define DASH_CACHE_SIZE 8
+    typedef struct {
+        char *url;
+        char *proxy;
+        char *headers;
+        char *xml;
+        size_t len;
+        char *effurl;
+        time_t time;
+        bool fetching;
+        pthread_cond_t cv;
+    } dash_cache_entry;
+
+    static dash_cache_entry g_dash_cache[DASH_CACHE_SIZE] = {0};
+    static pthread_mutex_t g_dash_mu = PTHREAD_MUTEX_INITIALIZER;
+    static bool g_dash_cache_init = false;
+
     char *xml = NULL; size_t len = 0; char *effurl = NULL;
-    if (rs_fetch_url(url, proxy, headers, NULL, NULL, NULL, &xml, &len,
-                     NULL, NULL, NULL, &effurl, errbuf, errbuf_len) != 0)
-        return NULL;
+    
+    pthread_mutex_lock(&g_dash_mu);
+    if (!g_dash_cache_init) {
+        for (int i = 0; i < DASH_CACHE_SIZE; i++) pthread_cond_init(&g_dash_cache[i].cv, NULL);
+        g_dash_cache_init = true;
+    }
+
+    dash_cache_entry *entry = NULL;
+    dash_cache_entry *empty = NULL;
+    dash_cache_entry *oldest = NULL;
+
+    for (int i = 0; i < DASH_CACHE_SIZE; i++) {
+        if (g_dash_cache[i].url && strcmp(g_dash_cache[i].url, url) == 0) {
+            entry = &g_dash_cache[i];
+            break;
+        }
+        if (!g_dash_cache[i].url && !empty) empty = &g_dash_cache[i];
+        if (g_dash_cache[i].url && (!oldest || g_dash_cache[i].time < oldest->time)) oldest = &g_dash_cache[i];
+    }
+
+    if (!entry) {
+        entry = empty ? empty : oldest;
+        while (entry->fetching) pthread_cond_wait(&entry->cv, &g_dash_mu);
+        free(entry->url); free(entry->proxy); free(entry->headers);
+        free(entry->xml); free(entry->effurl);
+        entry->url = rs_strdup(url);
+        entry->proxy = NULL; entry->headers = NULL; entry->xml = NULL; entry->effurl = NULL;
+        entry->len = 0; entry->time = 0;
+    }
+
+    while (entry->fetching) pthread_cond_wait(&entry->cv, &g_dash_mu);
+
+    bool match = ((!proxy && !entry->proxy) || (proxy && entry->proxy && strcmp(proxy, entry->proxy) == 0)) &&
+                 ((!headers && !entry->headers) || (headers && entry->headers && strcmp(headers, entry->headers) == 0));
+    
+    if (match && (time(NULL) - entry->time <= 2) && entry->xml) {
+        xml = rs_strdup(entry->xml);
+        len = entry->len;
+        effurl = entry->effurl ? rs_strdup(entry->effurl) : NULL;
+        pthread_mutex_unlock(&g_dash_mu);
+    } else {
+        entry->fetching = true;
+        pthread_mutex_unlock(&g_dash_mu);
+
+        int rc = rs_fetch_url(url, proxy, headers, NULL, NULL, NULL, &xml, &len,
+                              NULL, NULL, NULL, &effurl, errbuf, errbuf_len);
+
+        pthread_mutex_lock(&g_dash_mu);
+        entry->fetching = false;
+        if (rc == 0) {
+            free(entry->proxy); free(entry->headers);
+            free(entry->xml); free(entry->effurl);
+            entry->proxy = proxy ? rs_strdup(proxy) : NULL;
+            entry->headers = headers ? rs_strdup(headers) : NULL;
+            entry->xml = xml ? rs_strdup(xml) : NULL;
+            entry->len = len;
+            entry->effurl = effurl ? rs_strdup(effurl) : NULL;
+            entry->time = time(NULL);
+        } else {
+            free(entry->url);
+            entry->url = NULL;
+        }
+        pthread_cond_broadcast(&entry->cv);
+        pthread_mutex_unlock(&g_dash_mu);
+
+        if (rc != 0) return NULL;
+    }
+
     const char *base = (effurl && effurl[0]) ? effurl : url;
 
     // inherit_url_params wins when set: some CDNs sign a token only onto the
