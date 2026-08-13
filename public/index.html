@@ -215,18 +215,18 @@
               <div class="form-row">
                 <label>Playlist count<span class="field-hint">At least 3 — fewer makes the live edge unstable for most players</span><input name="playlistSegments" type="number" min="3" value="6"></label>
                 <label>Playback delay (s)<span class="field-hint">Hold playback this many seconds behind the live edge — 0 = live</span><input name="playbackDelaySeconds" type="number" min="0" value="0"></label>
-                <label>Keep segments<input name="keepSegments" type="number" min="1" value="60"></label>
-                <label>Download ahead<input name="downloadAhead" type="number" min="1" value="16"></label>
+                <label>Keep segments<input name="keepSegments" type="number" min="1" value="10"></label>
+                <label>Download ahead<input name="downloadAhead" type="number" min="1" value="8"></label>
                 <label>Parallel downloads<input name="parallelDownloads" type="number" min="1" value="8"></label>
-                <label><input name="prioritizeOldest" type="checkbox"> Prioritize oldest (sequential first)</label>
+                <label><input name="prioritizeOldest" type="checkbox" checked> Prioritize oldest (sequential first)</label>
               </div>
               <div class="form-row">
-                <label>Poll seconds<input name="pollInterval" type="number" min="0.25" step="0.25" value="2"></label>
+                <label>Poll seconds<input name="pollInterval" type="number" min="0" step="0.25" value="0"></label>
                 <label>Audio delay (ms)<span class="field-hint">Lip-sync offset, can be negative. Applied to the audio track only.</span><input name="audioDelayMs" type="number" step="10" value="0"></label>
                 <label>EPG channel id<span class="field-hint">Exported as <code>tvg-id</code> in the M3U, which is how external players match guide data to this channel. Blank uses the stream id.</span><input name="tvgId" placeholder="bbc-one.uk"></label>
               </div>
               <label class="check"><input name="forceOffline" type="checkbox"> Allow offline/static MPD</label>
-              <label class="check"><input name="reducedManifestPolling" type="checkbox"> Reduce manifest polling<span class="field-hint">A video+audio stream normally makes three concurrent manifest fetches (a director plus two workers). This backs the director off once it has found the renditions, cutting that to two — use it when the origin caps concurrent sessions, or rate-limits and returns HTTP 429/403.</span></label>
+              <label class="check"><input name="reducedManifestPolling" type="checkbox" checked> Reduce manifest polling<span class="field-hint">A video+audio stream normally makes three concurrent manifest fetches (a director plus two workers). This backs the director off once it has found the renditions, cutting that to two — use it when the origin caps concurrent sessions, or rate-limits and returns HTTP 429/403.</span></label>
               <button type="button" id="showDecryptionKeysBtn" class="ghost hidden">Add decryption keys</button>
               <div id="decryptionKeysGroup" class="key-field-group hidden">
                 <label>CENC decryption keys<span class="field-hint">One KID:KEY hex pair per line. When protection is auto-detected, KIDs are pre-filled with zeroed placeholder keys — replace the zeros with the real key. Works on any CENC "cenc" (AES-CTR) stream — including ones labeled Widevine/PlayReady — as long as you already know the raw key; this doesn't acquire keys from a license server. macOS only.</span><textarea name="decryptionKeys" placeholder="1234567890abcdef1234567890abcdef:abcdef1234567890abcdef1234567890"></textarea></label>

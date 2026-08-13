@@ -19,3 +19,5 @@ restreamair-linux-arm64
 # macOS
 .DS_Store
 **/.DS_Store
+restream_selftest
+restreamair-server

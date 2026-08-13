@@ -352,7 +352,8 @@ struct StreamConfig: Codable {
     var proxy: String
     var playlistSegments: Int
     var parallelDownloads: Int = 8
-    var prioritizeOldest: Bool = false
+    var prioritizeOldest: Bool = true
+    var reducedManifestPolling: Bool = true
     var keepSegments: Int
     var downloadAhead: Int
     var pollInterval: Double
@@ -494,7 +495,8 @@ struct StreamConfig: Codable {
         keepSegments = try container.decode(Int.self, forKey: .keepSegments)
         downloadAhead = try container.decodeIfPresent(Int.self, forKey: .downloadAhead) ?? 16
         parallelDownloads = try container.decodeIfPresent(Int.self, forKey: .parallelDownloads) ?? 8
-        prioritizeOldest = try container.decodeIfPresent(Bool.self, forKey: .prioritizeOldest) ?? false
+        prioritizeOldest = try container.decodeIfPresent(Bool.self, forKey: .prioritizeOldest) ?? true
+        reducedManifestPolling = try container.decodeIfPresent(Bool.self, forKey: .reducedManifestPolling) ?? true
         pollInterval = try container.decode(Double.self, forKey: .pollInterval)
         forceOffline = try container.decode(Bool.self, forKey: .forceOffline)
         status = try container.decode(String.self, forKey: .status)
@@ -2514,6 +2516,7 @@ final class PanelServer {
                 "downloadAhead=\(stream.downloadAhead)",
                 "parallelDownloads=\(stream.parallelDownloads)",
                 "prioritizeOldest=\(stream.prioritizeOldest)",
+                "reducedManifestPolling=\(stream.reducedManifestPolling)",
                 "pollInterval=\(stream.pollInterval)",
                 "tempDir=\(tempDir.path)",
                 "output=\(output.path)"
@@ -3978,6 +3981,9 @@ final class PanelServer {
             "playlistSegments": stream.playlistSegments,
             "keepSegments": stream.keepSegments,
             "downloadAhead": stream.downloadAhead,
+            "parallelDownloads": stream.parallelDownloads,
+            "prioritizeOldest": stream.prioritizeOldest,
+            "reducedManifestPolling": stream.reducedManifestPolling,
             "pollInterval": stream.pollInterval,
             "forceOffline": stream.forceOffline,
             "logo": stream.logo,
@@ -4155,9 +4161,9 @@ final class PanelServer {
             period: input["period"]?.string ?? "",
             proxy: input["proxy"]?.string ?? "",
             playlistSegments: max(3, input["playlistSegments"]?.int ?? 6),
-            keepSegments: max(1, input["keepSegments"]?.int ?? 60),
+            keepSegments: max(1, input["keepSegments"]?.int ?? 10),
             downloadAhead: max(1, input["downloadAhead"]?.int ?? 8),
-            pollInterval: max(0.25, input["pollInterval"]?.double ?? 2),
+            pollInterval: max(0, input["pollInterval"]?.double ?? 0),
             forceOffline: input["forceOffline"]?.bool ?? false,
             status: "stopped",
             lastError: nil,
@@ -4216,6 +4222,9 @@ final class PanelServer {
         stream.proxyScript = input["proxyScript"]?.bool ?? true
         stream.proxyManifest = input["proxyManifest"]?.bool ?? true
         stream.proxyMedia = input["proxyMedia"]?.bool ?? true
+        stream.parallelDownloads = max(1, input["parallelDownloads"]?.int ?? 8)
+        stream.prioritizeOldest = input["prioritizeOldest"]?.bool ?? true
+        stream.reducedManifestPolling = input["reducedManifestPolling"]?.bool ?? true
         return stream
     }
 
