@@ -318,6 +318,7 @@ typedef struct {
     // worker thread.
     int manifest_failures;
     bool manifest_throttled;
+    long long highest_time_val;
 } live_rep;
 
 typedef struct live_stream {
@@ -540,14 +541,7 @@ static void batch_download(live_stream *st, batch_item *items, size_t n, const c
     ctx.st = st;
     pthread_mutex_init(&ctx.mu, NULL);
 
-    if (cfg->prioritize_oldest && n > 1) {
-        batch_ctx ctx0 = ctx;
-        ctx0.n = 1;
-        batch_worker(&ctx0);
-        
-        ctx.items = items + 1;
-        ctx.n = n - 1;
-    }
+    // (Removed prioritize_oldest synchronous execution to prevent pollSlow cascade)
 
     int max_par = cfg->parallel_downloads > 0 ? cfg->parallel_downloads : 8;
     if (max_par > 32) max_par = 32;
@@ -859,6 +853,21 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
         char idkey[288];
         stable_key(u, tv, idkey, sizeof(idkey));
         if (seen_has(&rep->seen, idkey)) continue;
+        if (tv >= 0) {
+            // A stale manifest from a rotating proxy might return segments from the past.
+            // If they jump backward by a small amount, ignore them so the timeline stays clean.
+            if (rep->highest_time_val >= 0 && tv < rep->highest_time_val) {
+                // If it jumped backward by an absurd amount (e.g. > 1 day), it's probably
+                // an origin reboot rather than a stale proxy, so we let it through.
+                // Otherwise, skip it.
+                long long diff = rep->highest_time_val - tv;
+                // Timescales are usually around 90000 or 10000000. 10^12 handles large timescales.
+                if (diff < 1000000000000LL) {
+                    continue;
+                }
+            }
+            if (tv > rep->highest_time_val) rep->highest_time_val = tv;
+        }
         items[n].url = rs_strdup(u);
         items[n].time_val = tv;
         items[n].duration = rs_json_as_num(rs_json_obj_get(s, "duration"), 0);
@@ -1210,6 +1219,7 @@ static void rep_ensure_locked(live_stream *st, const char *rep_id, const char *k
     rep->rep_id = rs_strdup(rep_id);
     rep->kind = rs_strdup(kind && kind[0] ? kind : "video");
     rep->iv_size = 8;
+    rep->highest_time_val = -1;
     rep->index = (int)st->nreps;
     st->reps[st->nreps++] = rep;
     if (pthread_create(&rep->thread, NULL, rep_main, rep) == 0) rep->thread_started = true;

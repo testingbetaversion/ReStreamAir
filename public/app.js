@@ -672,7 +672,7 @@ function renderEditor() {
       form.elements.playlistSegments.value = 6;
       form.elements.playbackDelaySeconds.value = 0;
       form.elements.keepSegments.value = 60;
-      form.elements.downloadAhead.value = 8;
+      form.elements.downloadAhead.value = 4;
       form.elements.parallelDownloads.value = 8;
       form.elements.prioritizeOldest.checked = true;
       form.elements.pollInterval.value = 0;
@@ -732,10 +732,12 @@ function renderEditor() {
   form.elements.representation.value = stream.representation || "";
   form.elements.period.value = stream.period || "";
   form.elements.proxy.value = stream.proxy || "";
+  form.elements.downloader.value = stream.downloader || "";
+  form.elements.downloaderParams.value = stream.downloaderParams || "";
   form.elements.playlistSegments.value = stream.playlistSegments || 6;
   form.elements.playbackDelaySeconds.value = stream.playbackDelaySeconds || 0;
   form.elements.keepSegments.value = stream.keepSegments || 60;
-  form.elements.downloadAhead.value = stream.downloadAhead || 16;
+  form.elements.downloadAhead.value = stream.downloadAhead || 4;
   form.elements.parallelDownloads.value = stream.parallelDownloads || 8;
   form.elements.prioritizeOldest.checked = stream.prioritizeOldest || false;
   form.elements.pollInterval.value = stream.pollInterval || 2;
@@ -855,6 +857,8 @@ function streamPayload() {
     representationMeta,
     period: form.elements.period.value,
     proxy: form.elements.proxy.value,
+    downloader: form.elements.downloader.value,
+    downloaderParams: form.elements.downloaderParams.value,
     playlistSegments: Number(form.elements.playlistSegments.value),
     playbackDelaySeconds: Number(form.elements.playbackDelaySeconds.value),
     keepSegments: Number(form.elements.keepSegments.value),
@@ -966,7 +970,7 @@ function newStream() {
   $("#streamForm").elements.playlistSegments.value = 6;
   $("#streamForm").elements.playbackDelaySeconds.value = 0;
   $("#streamForm").elements.keepSegments.value = 10;
-  $("#streamForm").elements.downloadAhead.value = 8;
+  $("#streamForm").elements.downloadAhead.value = 4;
   $("#streamForm").elements.prioritizeOldest.checked = true;
   $("#streamForm").elements.pollInterval.value = 0;
   $("#streamForm").elements.reducedManifestPolling.checked = true;

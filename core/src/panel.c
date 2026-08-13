@@ -108,6 +108,14 @@ static bool is_http_url(const char *s) {
     return s && (strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0);
 }
 
+static const char *normalize_downloader(const char *d) {
+    if (!d || d[0] == '\0') return "";
+    if (strcmp(d, "wget") == 0) return "wget";
+    if (strcmp(d, "aria2c") == 0) return "aria2c";
+    if (strcmp(d, "native") == 0 || strcmp(d, "internal") == 0 || strcmp(d, "libcurl") == 0) return "native";
+    return "curl";
+}
+
 // --- stream construction ---------------------------------------------------
 
 static long long clamp_ll(long long v, long long lo) { return v < lo ? lo : v; }
@@ -130,10 +138,12 @@ static rs_json *stream_from_body(const rs_json *body, const char *id, const char
     rs_json_obj_set_str(s, "representation", rs_json_obj_str(body, "representation", ""));
     rs_json_obj_set_str(s, "period", rs_json_obj_str(body, "period", ""));
     rs_json_obj_set_str(s, "proxy", rs_json_obj_str(body, "proxy", ""));
+    rs_json_obj_set_str(s, "downloader", normalize_downloader(rs_json_obj_str(body, "downloader", "")));
+    set_str_from(s, "downloaderParams", body, "");
     rs_json_obj_set_int(s, "playlistSegments", clamp_ll(rs_json_obj_int(body, "playlistSegments", 6), 3));
     rs_json_obj_set_int(s, "playbackDelaySeconds", clamp_ll(rs_json_obj_int(body, "playbackDelaySeconds", 0), 0));
     rs_json_obj_set_int(s, "keepSegments", clamp_ll(rs_json_obj_int(body, "keepSegments", 10), 1));
-    rs_json_obj_set_int(s, "downloadAhead", clamp_ll(rs_json_obj_int(body, "downloadAhead", 8), 1));
+    rs_json_obj_set_int(s, "downloadAhead", clamp_ll(rs_json_obj_int(body, "downloadAhead", 4), 1));
     rs_json_obj_set_int(s, "parallelDownloads", clamp_ll(rs_json_obj_int(body, "parallelDownloads", 8), 1));
     double poll = rs_json_obj_num(body, "pollInterval", 0.0);
     rs_json_obj_set(s, "pollInterval", rs_json_new_num(poll < 0 ? 0 : poll));
@@ -423,13 +433,7 @@ rs_json *rs_panel_keys_view(const rs_state *st) {
 // --- provider mutations ----------------------------------------------------
 
 // The download tool for a provider's manifest/segment fetches. Only curl, wget
-// and aria2c are supported; anything else (including empty) becomes "curl".
-static const char *normalize_downloader(const char *d) {
-    if (strcmp(d, "wget") == 0) return "wget";
-    if (strcmp(d, "aria2c") == 0) return "aria2c";
-    if (strcmp(d, "native") == 0 || strcmp(d, "internal") == 0 || strcmp(d, "libcurl") == 0) return "native";
-    return "curl";
-}
+// and aria2c are supported; anything else becomes "curl" (or "" to inherit).
 
 int rs_panel_create_provider(rs_state *st, const rs_json *body, const char **err) {
     const char *name = rs_json_obj_str(body, "name", "");

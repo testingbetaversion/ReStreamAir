@@ -493,7 +493,7 @@ struct StreamConfig: Codable {
         proxy = try container.decode(String.self, forKey: .proxy)
         playlistSegments = try container.decode(Int.self, forKey: .playlistSegments)
         keepSegments = try container.decode(Int.self, forKey: .keepSegments)
-        downloadAhead = try container.decodeIfPresent(Int.self, forKey: .downloadAhead) ?? 16
+        downloadAhead = try container.decodeIfPresent(Int.self, forKey: .downloadAhead) ?? 4
         parallelDownloads = try container.decodeIfPresent(Int.self, forKey: .parallelDownloads) ?? 8
         prioritizeOldest = try container.decodeIfPresent(Bool.self, forKey: .prioritizeOldest) ?? true
         reducedManifestPolling = try container.decodeIfPresent(Bool.self, forKey: .reducedManifestPolling) ?? true
@@ -4109,7 +4109,7 @@ final class PanelServer {
                 guard let dict = entry as? [String: Any],
                       let name = (dict["Name"] as? String)?.trimmingCharacters(in: .whitespaces), !name.isEmpty else { continue }
                 var stream = state.providers[providerIndex].streams.first { $0.name == name && $0.sourceType == sourceType }
-                    ?? StreamConfig(id: safeId("stream"), name: name, kind: "mpd", url: "", representation: "", period: "", proxy: "", playlistSegments: 6, keepSegments: 10, downloadAhead: 8, pollInterval: 2, forceOffline: false, status: "stopped", lastError: nil)
+                    ?? StreamConfig(id: safeId("stream"), name: name, kind: "mpd", url: "", representation: "", period: "", proxy: "", playlistSegments: 6, keepSegments: 10, downloadAhead: 4, pollInterval: 2, forceOffline: false, status: "stopped", lastError: nil)
                 stream.name = name
                 if stream.logo.trimmingCharacters(in: .whitespaces).isEmpty, let logo = logosByName[name], !logo.isEmpty {
                     stream.logo = logo
@@ -4162,7 +4162,7 @@ final class PanelServer {
             proxy: input["proxy"]?.string ?? "",
             playlistSegments: max(3, input["playlistSegments"]?.int ?? 6),
             keepSegments: max(1, input["keepSegments"]?.int ?? 10),
-            downloadAhead: max(1, input["downloadAhead"]?.int ?? 8),
+            downloadAhead: max(1, input["downloadAhead"]?.int ?? 4),
             pollInterval: max(0, input["pollInterval"]?.double ?? 0),
             forceOffline: input["forceOffline"]?.bool ?? false,
             status: "stopped",

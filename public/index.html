@@ -216,7 +216,7 @@
                 <label>Playlist count<span class="field-hint">At least 3 — fewer makes the live edge unstable for most players</span><input name="playlistSegments" type="number" min="3" value="6"></label>
                 <label>Playback delay (s)<span class="field-hint">Hold playback this many seconds behind the live edge — 0 = live</span><input name="playbackDelaySeconds" type="number" min="0" value="0"></label>
                 <label>Keep segments<input name="keepSegments" type="number" min="1" value="10"></label>
-                <label>Download ahead<input name="downloadAhead" type="number" min="1" value="8"></label>
+                <label>Download ahead<input name="downloadAhead" type="number" min="1" value="4"></label>
                 <label>Parallel downloads<input name="parallelDownloads" type="number" min="1" value="8"></label>
                 <label><input name="prioritizeOldest" type="checkbox" checked> Prioritize oldest (sequential first)</label>
               </div>
@@ -290,6 +290,18 @@
               <label class="check"><input name="proxyMedia" type="checkbox" checked> Media (segments/init)</label>
             </div>
 
+            <div class="form-row">
+              <label>Downloader<span class="field-hint">Blank = inherit from provider</span>
+                <select name="downloader">
+                  <option value="">Inherit from provider</option>
+                  <option value="native">native (in-process libcurl)</option>
+                  <option value="curl">curl</option>
+                  <option value="wget">wget</option>
+                  <option value="aria2c">aria2c</option>
+                </select>
+              </label>
+              <label>Downloader params<span class="field-hint">Extra CLI args passed to the tool, e.g. --retry 3 or aria2c -x 8</span><input name="downloaderParams" placeholder="optional"></label>
+            </div>
             <div class="field-group">
               <div class="field-group-title">Input/output pipeline<span class="field-hint">Internal remuxer needs no ffmpeg. FFmpeg modes spawn a resident ffmpeg that reads the source directly (decrypting CENC clearkey itself) and copy-remuxes to HLS, or pushes to SRT/UDP/TCP via the Output target.</span></div>
               <div class="form-row">

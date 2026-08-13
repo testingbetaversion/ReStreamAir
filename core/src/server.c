@@ -1681,11 +1681,15 @@ static char *effective_headers(const rs_json *provider, const rs_json *stream, c
 // The provider's chosen download tool ("native", i.e. in-process libcurl, by
 // default) and its extra params. Applied to this provider's manifest/segment
 // fetches; see rs_fetch_url.
-static const char *effective_downloader(const rs_json *provider) {
+static const char *effective_downloader(const rs_json *provider, const rs_json *stream) {
+    const char *sd = rs_json_obj_str(stream, "downloader", "");
+    if (sd[0]) return sd;
     const char *d = rs_json_obj_str(provider, "downloader", "");
     return d[0] ? d : "native";
 }
-static const char *effective_downloader_params(const rs_json *provider) {
+static const char *effective_downloader_params(const rs_json *provider, const rs_json *stream) {
+    const char *sd = rs_json_obj_str(stream, "downloader", "");
+    if (sd[0]) return rs_json_obj_str(stream, "downloaderParams", "");
     return rs_json_obj_str(provider, "downloaderParams", "");
 }
 
@@ -2156,8 +2160,8 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     pf->url = rs_strdup(manifest_url);
     pf->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
     pf->headers = effective_headers(provider, stream, "manifestHeaders");
-    pf->downloader = rs_strdup(effective_downloader(provider));
-    pf->downloader_params = rs_strdup(effective_downloader_params(provider));
+    pf->downloader = rs_strdup(effective_downloader(provider, stream));
+    pf->downloader_params = rs_strdup(effective_downloader_params(provider, stream));
     free(variant);
 
     if (!pending_job_dispatch(server, c, pf)) {
@@ -2314,8 +2318,8 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     pf->range = decrypt ? NULL : header_dup(hm, "Range");
     pf->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
     pf->headers = effective_headers(provider, stream, "mediaHeaders");
-    pf->downloader = rs_strdup(effective_downloader(provider));
-    pf->downloader_params = rs_strdup(effective_downloader_params(provider));
+    pf->downloader = rs_strdup(effective_downloader(provider, stream));
+    pf->downloader_params = rs_strdup(effective_downloader_params(provider, stream));
     pf->decryption_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
     pf->hls_key = rs_strdup(rs_json_obj_str(stream, "hlsKey", ""));
     pf->hls_iv = rs_strdup(rs_json_obj_str(stream, "hlsIV", ""));
@@ -2375,8 +2379,8 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     cfg.media_proxy = dproxy;
     cfg.manifest_headers = mheaders;
     cfg.media_headers = dheaders;
-    cfg.downloader = effective_downloader(provider);
-    cfg.dl_params = effective_downloader_params(provider);
+    cfg.downloader = effective_downloader(provider, stream);
+    cfg.dl_params = effective_downloader_params(provider, stream);
     cfg.decryption_keys = rs_json_obj_str(stream, "decryptionKeys", "");
     // inheritUrlParams wins: some CDNs sign a token only onto the manifest's
     // redirect target, so a segmentUrlParams typed ahead of time from the
@@ -2391,7 +2395,7 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     cfg.reduced_manifest_polling = rs_json_obj_bool(stream, "reducedManifestPolling", true);
     cfg.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
     cfg.keep_segments = (int)rs_json_obj_int(stream, "keepSegments", 10);
-    cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 8);
+    cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 4);
     cfg.parallel_downloads = (int)rs_json_obj_int(stream, "parallelDownloads", 8);
     cfg.prioritize_oldest = rs_json_obj_bool(stream, "prioritizeOldest", true) ? 1 : 0;
     cfg.playback_delay_seconds = (int)rs_json_obj_int(stream, "playbackDelaySeconds", 0);
