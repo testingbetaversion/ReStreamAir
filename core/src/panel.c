@@ -143,13 +143,13 @@ static rs_json *stream_from_body(const rs_json *body, const char *id, const char
     rs_json_obj_set_int(s, "playlistSegments", clamp_ll(rs_json_obj_int(body, "playlistSegments", 6), 3));
     rs_json_obj_set_int(s, "playbackDelaySeconds", clamp_ll(rs_json_obj_int(body, "playbackDelaySeconds", 0), 0));
     rs_json_obj_set_int(s, "keepSegments", clamp_ll(rs_json_obj_int(body, "keepSegments", 10), 1));
-    rs_json_obj_set_int(s, "downloadAhead", clamp_ll(rs_json_obj_int(body, "downloadAhead", 4), 1));
-    rs_json_obj_set_int(s, "parallelDownloads", clamp_ll(rs_json_obj_int(body, "parallelDownloads", 8), 1));
+    rs_json_obj_set_int(s, "downloadAhead", clamp_ll(rs_json_obj_int(body, "downloadAhead", 20), 1));
+    rs_json_obj_set_int(s, "parallelDownloads", clamp_ll(rs_json_obj_int(body, "parallelDownloads", 50), 1));
     double poll = rs_json_obj_num(body, "pollInterval", 0.0);
     rs_json_obj_set(s, "pollInterval", rs_json_new_num(poll < 0 ? 0 : poll));
     rs_json_obj_set_bool(s, "forceOffline", rs_json_obj_bool(body, "forceOffline", false));
     rs_json_obj_set_bool(s, "reducedManifestPolling", rs_json_obj_bool(body, "reducedManifestPolling", true));
-    rs_json_obj_set_bool(s, "prioritizeOldest", rs_json_obj_bool(body, "prioritizeOldest", true));
+    rs_json_obj_set_bool(s, "prioritizeOldest", rs_json_obj_bool(body, "prioritizeOldest", false));
     rs_json_obj_set_str(s, "status", "stopped");
     rs_json_obj_set(s, "lastError", rs_json_new_null());
     rs_json_obj_set_str(s, "logo", rs_json_obj_str(body, "logo", ""));

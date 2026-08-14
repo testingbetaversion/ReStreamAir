@@ -351,8 +351,8 @@ struct StreamConfig: Codable {
     var period: String
     var proxy: String
     var playlistSegments: Int
-    var parallelDownloads: Int = 8
-    var prioritizeOldest: Bool = true
+    var parallelDownloads: Int = 50
+    var prioritizeOldest: Bool = false
     var reducedManifestPolling: Bool = true
     var keepSegments: Int
     var downloadAhead: Int
@@ -493,9 +493,9 @@ struct StreamConfig: Codable {
         proxy = try container.decode(String.self, forKey: .proxy)
         playlistSegments = try container.decode(Int.self, forKey: .playlistSegments)
         keepSegments = try container.decode(Int.self, forKey: .keepSegments)
-        downloadAhead = try container.decodeIfPresent(Int.self, forKey: .downloadAhead) ?? 4
-        parallelDownloads = try container.decodeIfPresent(Int.self, forKey: .parallelDownloads) ?? 8
-        prioritizeOldest = try container.decodeIfPresent(Bool.self, forKey: .prioritizeOldest) ?? true
+        downloadAhead = try container.decodeIfPresent(Int.self, forKey: .downloadAhead) ?? 20
+        parallelDownloads = try container.decodeIfPresent(Int.self, forKey: .parallelDownloads) ?? 50
+        prioritizeOldest = try container.decodeIfPresent(Bool.self, forKey: .prioritizeOldest) ?? false
         reducedManifestPolling = try container.decodeIfPresent(Bool.self, forKey: .reducedManifestPolling) ?? true
         pollInterval = try container.decode(Double.self, forKey: .pollInterval)
         forceOffline = try container.decode(Bool.self, forKey: .forceOffline)
@@ -3339,10 +3339,18 @@ final class PanelServer {
             if let variant = request.query["variant"], let variantURL = URL(string: variant) {
                 manifestURL = variantURL
             } else if let configured = URL(string: stream.url) ?? URL(string: stream.url.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                // Never force-unwrap a user-entered URL: a stream saved with a
-                // stray space used to trap here and kill the whole panel the
-                // moment any player requested the playlist.
-                manifestURL = configured
+                var url = configured
+                var comps = URLComponents(url: url, resolvingAgainstBaseURL: true)
+                if var c = comps {
+                    var items = c.queryItems ?? []
+                    for (k, v) in request.query {
+                        if k != "variant" && !items.contains(where: { $0.name == k }) {
+                            items.append(URLQueryItem(name: k, value: v.isEmpty ? nil : v))
+                        }
+                    }
+                    if !items.isEmpty { c.queryItems = items; url = c.url ?? url }
+                }
+                manifestURL = url
             } else {
                 logStore.record(streamId: stream.id, level: "error", event: "fetchManifest", url: stream.url, message: "stream URL is not a valid URL")
                 throw PanelError.badRequest("Stream URL is not a valid URL — fix it in the stream editor.")
@@ -4109,7 +4117,7 @@ final class PanelServer {
                 guard let dict = entry as? [String: Any],
                       let name = (dict["Name"] as? String)?.trimmingCharacters(in: .whitespaces), !name.isEmpty else { continue }
                 var stream = state.providers[providerIndex].streams.first { $0.name == name && $0.sourceType == sourceType }
-                    ?? StreamConfig(id: safeId("stream"), name: name, kind: "mpd", url: "", representation: "", period: "", proxy: "", playlistSegments: 6, keepSegments: 10, downloadAhead: 4, pollInterval: 2, forceOffline: false, status: "stopped", lastError: nil)
+                    ?? StreamConfig(id: safeId("stream"), name: name, kind: "mpd", url: "", representation: "", period: "", proxy: "", playlistSegments: 6, keepSegments: 10, downloadAhead: 20, pollInterval: 2, forceOffline: false, status: "stopped", lastError: nil)
                 stream.name = name
                 if stream.logo.trimmingCharacters(in: .whitespaces).isEmpty, let logo = logosByName[name], !logo.isEmpty {
                     stream.logo = logo
@@ -4162,7 +4170,7 @@ final class PanelServer {
             proxy: input["proxy"]?.string ?? "",
             playlistSegments: max(3, input["playlistSegments"]?.int ?? 6),
             keepSegments: max(1, input["keepSegments"]?.int ?? 10),
-            downloadAhead: max(1, input["downloadAhead"]?.int ?? 4),
+            downloadAhead: max(1, input["downloadAhead"]?.int ?? 20),
             pollInterval: max(0, input["pollInterval"]?.double ?? 0),
             forceOffline: input["forceOffline"]?.bool ?? false,
             status: "stopped",
@@ -4222,8 +4230,8 @@ final class PanelServer {
         stream.proxyScript = input["proxyScript"]?.bool ?? true
         stream.proxyManifest = input["proxyManifest"]?.bool ?? true
         stream.proxyMedia = input["proxyMedia"]?.bool ?? true
-        stream.parallelDownloads = max(1, input["parallelDownloads"]?.int ?? 8)
-        stream.prioritizeOldest = input["prioritizeOldest"]?.bool ?? true
+        stream.parallelDownloads = max(1, input["parallelDownloads"]?.int ?? 50)
+        stream.prioritizeOldest = input["prioritizeOldest"]?.bool ?? false
         stream.reducedManifestPolling = input["reducedManifestPolling"]?.bool ?? true
         return stream
     }

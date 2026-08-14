@@ -672,9 +672,9 @@ function renderEditor() {
       form.elements.playlistSegments.value = 6;
       form.elements.playbackDelaySeconds.value = 0;
       form.elements.keepSegments.value = 60;
-      form.elements.downloadAhead.value = 4;
-      form.elements.parallelDownloads.value = 8;
-      form.elements.prioritizeOldest.checked = true;
+      form.elements.downloadAhead.value = 20;
+      form.elements.parallelDownloads.value = 50;
+      form.elements.prioritizeOldest.checked = false;
       form.elements.pollInterval.value = 0;
       form.elements.reducedManifestPolling.checked = true;
       $("#playLink").value = "";
@@ -737,9 +737,9 @@ function renderEditor() {
   form.elements.playlistSegments.value = stream.playlistSegments || 6;
   form.elements.playbackDelaySeconds.value = stream.playbackDelaySeconds || 0;
   form.elements.keepSegments.value = stream.keepSegments || 60;
-  form.elements.downloadAhead.value = stream.downloadAhead || 4;
-  form.elements.parallelDownloads.value = stream.parallelDownloads || 8;
-  form.elements.prioritizeOldest.checked = stream.prioritizeOldest || false;
+  form.elements.downloadAhead.value = stream.downloadAhead ?? 20;
+  form.elements.parallelDownloads.value = stream.parallelDownloads ?? 50;
+  form.elements.prioritizeOldest.checked = stream.prioritizeOldest ?? false;
   form.elements.pollInterval.value = stream.pollInterval || 2;
   form.elements.audioDelayMs.value = stream.audioDelayMs || 0;
   form.elements.tvgId.value = stream.tvgId || "";
@@ -970,8 +970,9 @@ function newStream() {
   $("#streamForm").elements.playlistSegments.value = 6;
   $("#streamForm").elements.playbackDelaySeconds.value = 0;
   $("#streamForm").elements.keepSegments.value = 10;
-  $("#streamForm").elements.downloadAhead.value = 4;
-  $("#streamForm").elements.prioritizeOldest.checked = true;
+  $("#streamForm").elements.downloadAhead.value = 20;
+  $("#streamForm").elements.parallelDownloads.value = 50;
+  $("#streamForm").elements.prioritizeOldest.checked = false;
   $("#streamForm").elements.pollInterval.value = 0;
   $("#streamForm").elements.reducedManifestPolling.checked = true;
   $("#playLink").value = "";
@@ -1647,9 +1648,10 @@ async function detectSource() {
   detecting = true;
   $("#detectStatus").textContent = "Detecting…";
   try {
+    const proxy = form.elements.proxy.value || selectedProvider()?.proxy || "";
     const result = await request("/api/probe", {
       method: "POST",
-      body: JSON.stringify({ url, proxy: form.elements.proxy.value, headers: form.elements.manifestHeaders.value }),
+      body: JSON.stringify({ url, proxy, headers: form.elements.manifestHeaders.value }),
     });
     probeResult = result;
     selectedRepIds = new Set();

@@ -132,7 +132,7 @@ struct LiveM3U8ActionRuntime {
                 M3U8ArgumentDoc(name: "tempDir", required: false, description: "Download directory. Defaults to a folder in the system temp directory."),
                 M3U8ArgumentDoc(name: "playlistSegments", required: false, description: "Number of media segments to keep in the written playlist. Default 6."),
                 M3U8ArgumentDoc(name: "keepSegments", required: false, description: "Number of downloaded old media segments to keep on disk — the recovery cushion for a player (or the ingest itself) that stalls briefly. Deliberately much bigger than the advertised playlist window. Default 60."),
-                M3U8ArgumentDoc(name: "downloadAhead", required: false, description: "Number of MPD media segments requested per poll. Default playlistSegments + 2."),
+                M3U8ArgumentDoc(name: "downloadAhead", required: false, description: "Number of MPD media segments requested per poll. Default 20."),
                 M3U8ArgumentDoc(name: "pollInterval", required: false, description: "Seconds between MPD polls. Defaults to MPD minimumUpdatePeriod or 2."),
                 M3U8ArgumentDoc(name: "defaultDuration", required: false, description: "Fallback EXTINF duration when MPD and ffprobe do not provide one. Default 4."),
                 M3U8ArgumentDoc(name: "probeDuration", required: false, description: "true to use ffprobe duration as a last-resort fallback when a segment has no declared duration. Off by default — no ffmpeg/ffprobe dependency unless explicitly opted into."),
@@ -259,7 +259,7 @@ struct LiveM3U8ActionRuntime {
         // small multiple of the advertised window (previously a flat +4,
         // ~20s total) gave almost no margin for that.
         let keepSegments = max(try positiveInt("keepSegments", args, defaultValue: 60), playlistSegments)
-        let downloadAhead = max(try positiveInt("downloadAhead", args, defaultValue: playlistSegments + 2), playlistSegments)
+        let downloadAhead = max(try positiveInt("downloadAhead", args, defaultValue: 20), playlistSegments)
         // Hold-back can never be so large that fewer than one full advertised
         // window remains on disk (keepSegments >= playlistSegments already).
         let holdBackDefault = max(0, downloadAhead - playlistSegments)
