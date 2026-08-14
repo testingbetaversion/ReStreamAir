@@ -883,103 +883,115 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     }
 
     double dl0 = now_seconds();
-    batch_download(st, items, n, cfg);
 
-    // Serial pass, strictly in timeline order: decrypt, read the media timeline
-    // position, decide discontinuity, append.
+    size_t processed = 0;
     size_t added = 0, failed = 0;
     long long added_bytes = 0;
     double added_seconds = 0;
-    for (size_t i = 0; i < n; i++) {
-        batch_item *it = &items[i];
-        char idkey[288];
-        stable_key(it->url, it->time_val, idkey, sizeof(idkey));
-        if (!it->ok) {
-            failed++;
-            // A single miss at the live edge is routine — the origin may simply
-            // never produce this one. Mark it seen so we do not re-request it
-            // forever, and let the window slide past it.
-            lgf(st, "error", "downloadSegment", it->url, 0, -1,
-                "%s: gave up after %d attempts: %s", rep->rep_id, it->attempts, it->err);
+
+    while (processed < n && !live_stopping(st)) {
+        size_t batch = n - processed;
+        // Limit batch size to 4 to incrementally expose segments to the player
+        // and prevent bufferbloat on the network connection.
+        size_t chunk_limit = 4;
+        if (batch > chunk_limit) batch = chunk_limit;
+
+        batch_download(st, items + processed, batch, cfg);
+
+        // Serial pass, strictly in timeline order: decrypt, read the media timeline
+        // position, decide discontinuity, append.
+        for (size_t i = processed; i < processed + batch; i++) {
+            batch_item *it = &items[i];
+            char idkey[288];
+            stable_key(it->url, it->time_val, idkey, sizeof(idkey));
+            if (!it->ok) {
+                failed++;
+                // A single miss at the live edge is routine — the origin may simply
+                // never produce this one. Mark it seen so we do not re-request it
+                // forever, and let the window slide past it.
+                lgf(st, "error", "downloadSegment", it->url, 0, -1,
+                    "%s: gave up after %d attempts: %s", rep->rep_id, it->attempts, it->err);
+                pthread_mutex_lock(&st->mu);
+                seen_add(&rep->seen, idkey);
+                pthread_mutex_unlock(&st->mu);
+                free(it->url);
+                continue;
+            }
+
             pthread_mutex_lock(&st->mu);
+            bool have_key = rep->have_key;
+            int iv_size = rep->iv_size > 0 ? rep->iv_size : 8;
+            uint8_t key[16];
+            if (have_key) memcpy(key, rep->key, 16);
+            uint32_t ts = rep->timescale;
+            pthread_mutex_unlock(&st->mu);
+
+            uint8_t *data = it->data;
+            size_t len = it->len;
+            if (have_key) {
+                size_t out_len = 0;
+                uint8_t *clear = rs_cenc_decrypt_segment(data, len, &out_len, key, iv_size);
+                if (clear) { free(data); data = clear; len = out_len; }
+                else lgf(st, "error", "decryptSegment", it->url, 0, -1,
+                         "%s: CENC decrypt failed, serving as-is", rep->rep_id);
+            }
+
+            // Lip-sync offset, audio track only — the same knob the Swift worker
+            // applies to whichever worker owns the audio representation.
+            if (cfg->audio_delay_ms != 0 && ts > 0 && strcmp(rep->kind, "audio") == 0) {
+                int64_t delta = (int64_t)cfg->audio_delay_ms * (int64_t)ts / 1000;
+                size_t out_len = 0;
+                uint8_t *shifted = rs_audio_shift_segment(data, len, delta, &out_len);
+                if (shifted) { free(data); data = shifted; len = out_len; }
+            }
+
+            // tfdt baseMediaDecodeTime: where this segment actually starts on the
+            // media timeline. A missing box reads back as 0, which is
+            // indistinguishable from a genuine zero start, so 0 is treated as
+            // "unknown" throughout — timeline_gap then reports no jump
+            // rather than reporting a jump. Missing one real splice is recoverable;
+            // a spurious EXT-X-DISCONTINUITY on every segment is not.
+            uint64_t start = rs_audio_base_decode_time(data, len);
+            bool have_start = start != 0;
+
+            pthread_mutex_lock(&st->mu);
+            bool was_disc = false;
+            double gap = 0;
+            rep_append_locked(rep, it->url, data, len,
+                              it->duration > 0 ? it->duration : 2.0, start, have_start);
+            if (rep->nsegs > 0) {
+                was_disc = rep->segs[rep->nsegs - 1].disc;
+                gap = rep->segs[rep->nsegs - 1].disc_gap;
+            }
+            // Only a forward jump means missing content. A backward one is the
+            // source rewinding its own timeline, which loses us nothing.
+            if (was_disc && gap > 0 && seg_dur > 0)
+                rep->skipped += (long long)(gap / seg_dur + 0.5);
             seen_add(&rep->seen, idkey);
             pthread_mutex_unlock(&st->mu);
+
+            added++;
+            added_bytes += (long long)len;
+            added_seconds += it->duration > 0 ? it->duration : 2.0;
+            if (it->attempts > 1)
+                lgf(st, "info", "downloadSegment", it->url, 200, (long long)len,
+                    "%s: %.3fs (recovered on attempt %d)", rep->rep_id, it->duration, it->attempts);
+            else
+                lgf(st, "info", "downloadSegment", it->url, 200, (long long)len,
+                    "%s: %.3fs%s", rep->rep_id, it->duration, was_disc ? " (discontinuity)" : "");
+            // Say which kind of break this is. A forward jump of a whole number of
+            // segments after a failed download is content we lost; anything else is
+            // the source splicing its own timeline. They look identical in the
+            // playlist, so without this the log cannot tell you which you have.
+            if (was_disc)
+                lgf(st, failed > 0 ? "error" : "info", "discontinuity", it->url, 0, -1,
+                    "%s: media timeline jumped %+.3fs (~%.1f segments)%s", rep->rep_id, gap,
+                    seg_dur > 0 ? gap / seg_dur : 0,
+                    failed > 0 ? " — after a failed download, so this is content we dropped"
+                               : " — no download failed, so the source spliced");
             free(it->url);
-            continue;
         }
-
-        pthread_mutex_lock(&st->mu);
-        bool have_key = rep->have_key;
-        int iv_size = rep->iv_size > 0 ? rep->iv_size : 8;
-        uint8_t key[16];
-        if (have_key) memcpy(key, rep->key, 16);
-        uint32_t ts = rep->timescale;
-        pthread_mutex_unlock(&st->mu);
-
-        uint8_t *data = it->data;
-        size_t len = it->len;
-        if (have_key) {
-            size_t out_len = 0;
-            uint8_t *clear = rs_cenc_decrypt_segment(data, len, &out_len, key, iv_size);
-            if (clear) { free(data); data = clear; len = out_len; }
-            else lgf(st, "error", "decryptSegment", it->url, 0, -1,
-                     "%s: CENC decrypt failed, serving as-is", rep->rep_id);
-        }
-
-        // Lip-sync offset, audio track only — the same knob the Swift worker
-        // applies to whichever worker owns the audio representation.
-        if (cfg->audio_delay_ms != 0 && ts > 0 && strcmp(rep->kind, "audio") == 0) {
-            int64_t delta = (int64_t)cfg->audio_delay_ms * (int64_t)ts / 1000;
-            size_t out_len = 0;
-            uint8_t *shifted = rs_audio_shift_segment(data, len, delta, &out_len);
-            if (shifted) { free(data); data = shifted; len = out_len; }
-        }
-
-        // tfdt baseMediaDecodeTime: where this segment actually starts on the
-        // media timeline. A missing box reads back as 0, which is
-        // indistinguishable from a genuine zero start, so 0 is treated as
-        // "unknown" throughout — timeline_gap then reports no jump
-        // rather than reporting a jump. Missing one real splice is recoverable;
-        // a spurious EXT-X-DISCONTINUITY on every segment is not.
-        uint64_t start = rs_audio_base_decode_time(data, len);
-        bool have_start = start != 0;
-
-        pthread_mutex_lock(&st->mu);
-        bool was_disc = false;
-        double gap = 0;
-        rep_append_locked(rep, it->url, data, len,
-                          it->duration > 0 ? it->duration : 2.0, start, have_start);
-        if (rep->nsegs > 0) {
-            was_disc = rep->segs[rep->nsegs - 1].disc;
-            gap = rep->segs[rep->nsegs - 1].disc_gap;
-        }
-        // Only a forward jump means missing content. A backward one is the
-        // source rewinding its own timeline, which loses us nothing.
-        if (was_disc && gap > 0 && seg_dur > 0)
-            rep->skipped += (long long)(gap / seg_dur + 0.5);
-        seen_add(&rep->seen, idkey);
-        pthread_mutex_unlock(&st->mu);
-
-        added++;
-        added_bytes += (long long)len;
-        added_seconds += it->duration > 0 ? it->duration : 2.0;
-        if (it->attempts > 1)
-            lgf(st, "info", "downloadSegment", it->url, 200, (long long)len,
-                "%s: %.3fs (recovered on attempt %d)", rep->rep_id, it->duration, it->attempts);
-        else
-            lgf(st, "info", "downloadSegment", it->url, 200, (long long)len,
-                "%s: %.3fs%s", rep->rep_id, it->duration, was_disc ? " (discontinuity)" : "");
-        // Say which kind of break this is. A forward jump of a whole number of
-        // segments after a failed download is content we lost; anything else is
-        // the source splicing its own timeline. They look identical in the
-        // playlist, so without this the log cannot tell you which you have.
-        if (was_disc)
-            lgf(st, failed > 0 ? "error" : "info", "discontinuity", it->url, 0, -1,
-                "%s: media timeline jumped %+.3fs (~%.1f segments)%s", rep->rep_id, gap,
-                seg_dur > 0 ? gap / seg_dur : 0,
-                failed > 0 ? " — after a failed download, so this is content we dropped"
-                           : " — no download failed, so the source spliced");
-        free(it->url);
+        processed += batch;
     }
     free(items);
 
