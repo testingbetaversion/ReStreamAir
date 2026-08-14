@@ -74,6 +74,7 @@ final class HTTPClient {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
+        configuration.httpMaximumConnectionsPerHost = 100 // Allow up to 100 concurrent connections per CDN to prevent head-of-line blocking on segment batches
         // A Basic-auth proxy (`http://user:pass@host:port`) answers CONNECT
         // with 407 before anything else happens — `connectionProxyDictionary`
         // only carries host/port, so without a delegate to answer that

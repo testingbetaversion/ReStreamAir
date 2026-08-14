@@ -140,6 +140,9 @@ static void share_init_once(void) {
     curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
     curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
     curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+#ifdef CURLSHOPT_MAXCONNECTS
+    curl_share_setopt(sh, CURLSHOPT_MAXCONNECTS, 128L);
+#endif
     g_conn_share = sh;
 }
 

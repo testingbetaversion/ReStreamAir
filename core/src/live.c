@@ -544,7 +544,7 @@ static void batch_download(live_stream *st, batch_item *items, size_t n, const c
     // (Removed prioritize_oldest synchronous execution to prevent pollSlow cascade)
 
     int max_par = cfg->parallel_downloads > 0 ? cfg->parallel_downloads : 8;
-    if (max_par > 32) max_par = 32;
+    if (max_par > 64) max_par = 64;
     size_t nthreads = ctx.n < (size_t)max_par ? ctx.n : (size_t)max_par;
     pthread_t *threads = calloc(nthreads, sizeof(pthread_t));
     size_t started = 0;
