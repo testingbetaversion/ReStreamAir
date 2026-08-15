@@ -891,9 +891,16 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
 
     while (processed < n && !live_stopping(st)) {
         size_t batch = n - processed;
-        // Limit batch size to 4 to incrementally expose segments to the player
-        // and prevent bufferbloat on the network connection.
-        size_t chunk_limit = 4;
+        // Chunk to incrementally expose segments to the player and prevent
+        // bufferbloat, but the chunk size has to track parallel_downloads —
+        // a hardcoded 4 here silently capped every poll's concurrency at 4
+        // regardless of that setting, since batch_download() only ever gets
+        // `batch` items to fan out over its thread pool. A backlog of ~25
+        // segments (a normal catch-up after one slow poll) then took
+        // ceil(25/4) = 7 sequential network round-trips instead of
+        // ceil(25/parallel_downloads) — the direct cause of pollDone times
+        // in the tens of seconds and the resulting fallingBehind warnings.
+        size_t chunk_limit = (size_t)(cfg->parallel_downloads > 0 ? cfg->parallel_downloads : 8);
         if (batch > chunk_limit) batch = chunk_limit;
 
         batch_download(st, items + processed, batch, cfg);
