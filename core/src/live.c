@@ -1695,6 +1695,82 @@ uint8_t *rs_live_take_indexed(rs_live *live, const char *stream_id, int rep_inde
     return copy;
 }
 
+size_t rs_live_reps(rs_live *live, const char *stream_id, rs_live_rep_desc **out) {
+    if (out) *out = NULL;
+    if (!live || !stream_id || !out) return 0;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    size_t n = 0;
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        if (st->nreps) {
+            rs_live_rep_desc *descs = (rs_live_rep_desc *)calloc(st->nreps, sizeof(*descs));
+            if (descs) {
+                for (size_t i = 0; i < st->nreps; i++) {
+                    descs[i].rep_id = rs_strdup(st->reps[i]->rep_id ? st->reps[i]->rep_id : "");
+                    descs[i].kind = rs_strdup(st->reps[i]->kind ? st->reps[i]->kind : "");
+                    descs[i].index = st->reps[i]->index;
+                    descs[i].timescale = st->reps[i]->timescale;
+                    descs[i].held = st->reps[i]->nsegs;
+                    if (st->reps[i]->nsegs) {
+                        descs[i].oldest_seq = st->reps[i]->segs[0].seq;
+                        descs[i].newest_seq = st->reps[i]->segs[st->reps[i]->nsegs - 1].seq;
+                    }
+                }
+                *out = descs;
+                n = st->nreps;
+            }
+        }
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    return n;
+}
+
+void rs_live_reps_free(rs_live_rep_desc *reps, size_t count) {
+    if (!reps) return;
+    for (size_t i = 0; i < count; i++) {
+        free(reps[i].rep_id);
+        free(reps[i].kind);
+    }
+    free(reps);
+}
+
+uint8_t *rs_live_take_after(rs_live *live, const char *stream_id, int rep_index,
+                            long long after_seq, long long *out_seq,
+                            double *out_duration, size_t *out_len) {
+    if (!live || !stream_id || !out_len || !out_seq || rep_index < 0) return NULL;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    uint8_t *copy = NULL;
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        if ((size_t)rep_index < st->nreps) {
+            live_rep *r = st->reps[rep_index];
+            // segs is kept in ascending sequence order by rep_append_locked, so
+            // the first entry past the cursor is the one to send. A tail that
+            // fell behind far enough for its next segment to have been pruned
+            // lands on the oldest one still held instead — the gap is real and
+            // already lost, and stalling forever would be worse.
+            for (size_t j = 0; j < r->nsegs; j++) {
+                if (r->segs[j].seq <= after_seq) continue;
+                size_t len = r->segs[j].len;
+                copy = (uint8_t *)malloc(len ? len : 1);
+                if (copy) {
+                    memcpy(copy, r->segs[j].data, len);
+                    *out_len = len;
+                    *out_seq = r->segs[j].seq;
+                    if (out_duration) *out_duration = r->segs[j].duration;
+                }
+                break;
+            }
+        }
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    return copy;
+}
+
 char *rs_live_status_line(rs_live *live, const char *stream_id) {
     if (!live || !stream_id) return NULL;
     pthread_mutex_lock(&live->mu);
@@ -1743,6 +1819,19 @@ char *rs_live_media_playlist(rs_live *live, const char *stream_id, const char *r
 uint8_t *rs_live_take_indexed(rs_live *live, const char *stream_id, int rep_index,
                               long long seq, bool want_init, size_t *out_len) {
     (void)live; (void)stream_id; (void)rep_index; (void)seq; (void)want_init; (void)out_len;
+    return NULL;
+}
+size_t rs_live_reps(rs_live *live, const char *stream_id, rs_live_rep_desc **out) {
+    (void)live; (void)stream_id;
+    if (out) *out = NULL;
+    return 0;
+}
+void rs_live_reps_free(rs_live_rep_desc *reps, size_t count) { (void)reps; (void)count; }
+uint8_t *rs_live_take_after(rs_live *live, const char *stream_id, int rep_index,
+                            long long after_seq, long long *out_seq,
+                            double *out_duration, size_t *out_len) {
+    (void)live; (void)stream_id; (void)rep_index; (void)after_seq;
+    (void)out_seq; (void)out_duration; (void)out_len;
     return NULL;
 }
 char *rs_live_status_line(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return NULL; }

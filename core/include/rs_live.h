@@ -184,6 +184,49 @@ char *rs_live_media_playlist(rs_live *live, const char *stream_id, const char *r
 uint8_t *rs_live_take_indexed(rs_live *live, const char *stream_id, int rep_index,
                               long long seq, bool want_init, size_t *out_len);
 
+// --- tailing a rendition ----------------------------------------------------
+//
+// The HLS routes address segments the way a playlist advertises them: the
+// player reads a media playlist, learns the sequence numbers, and asks for one
+// at a time. A direct link has no playlist to read — it opens one connection
+// and expects bytes to keep arriving — so it needs the opposite shape: "what is
+// the next thing after the one I already sent?" That is what the two calls
+// below add, and they are the whole reason /direct can work off the in-memory
+// queue instead of the on-disk one the Swift build tailed.
+
+// Description of one of a stream's renditions. `index` is the same slot
+// rs_live_take_indexed takes and the public URLs carry.
+typedef struct {
+    char *rep_id;        // the manifest's Representation@id
+    char *kind;          // "video" | "audio"
+    int index;
+    uint32_t timescale;  // mdhd timescale of the media track, 0 until the init lands
+    // The sequence range currently held. A viewer that wants the live edge
+    // rather than the whole buffered window starts from `newest_seq` and works
+    // back, instead of from -1 — the queue holds keepSegments of history, which
+    // is a minute or more of latency to hand someone who just connected.
+    long long oldest_seq, newest_seq;
+    size_t held;         // segments in the queue; 0 means the range is meaningless
+} rs_live_rep_desc;
+
+// Enumerates a running stream's renditions, newest config first. Returns the
+// count and points *out at a malloc'd array released with rs_live_reps_free;
+// 0 (and *out NULL) when the stream isn't running or has no renditions yet.
+size_t rs_live_reps(rs_live *live, const char *stream_id, rs_live_rep_desc **out);
+void rs_live_reps_free(rs_live_rep_desc *reps, size_t count);
+
+// Hands out a copy of the oldest held segment whose sequence is greater than
+// `after_seq` — pass a negative value for "the oldest still held" — or NULL
+// when the rendition has nothing newer yet. `*out_seq` receives the sequence
+// actually taken, so the caller passes it back as `after_seq` next time;
+// `*out_duration` (optional) the segment's duration in seconds. A caller that
+// falls far enough behind for its next segment to be pruned skips the gap
+// rather than stalling, which is the right failure for a live tail. Caller
+// frees the bytes with rs_free; `*out_len` receives the length.
+uint8_t *rs_live_take_after(rs_live *live, const char *stream_id, int rep_index,
+                            long long after_seq, long long *out_seq,
+                            double *out_duration, size_t *out_len);
+
 // A one-line health summary for the logs/diagnostics ("video 12 segs, seq 431,
 // 3 disc; audio 12 segs …"). Caller frees with rs_free, or NULL if unknown.
 char *rs_live_status_line(rs_live *live, const char *stream_id);

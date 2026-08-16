@@ -335,6 +335,15 @@ static rs_json *stream_view(const rs_state *st, const rs_json *stream, const cha
             }
         }
     }
+    // The muxed link. Unlike the per-rendition fMP4 tails above it carries
+    // video and audio together, so it is the one to hand a player that wants a
+    // single URL — hence one entry for the stream rather than one per
+    // rendition. DASH only: an m3u8 source has no separate renditions here to
+    // mux, and its /source link already is one stream.
+    if (strcmp(kind, "m3u8") != 0) {
+        snprintf(url, sizeof(url), "http://%s/direct/%s.ts", host, id);
+        rs_json_obj_set_str(direct, "muxed (mpeg-ts)", url);
+    }
     rs_json_obj_set(v, "directStreamUrls", direct);
     rs_json_obj_set(v, "downloadUrls", download);
     free(slug);
