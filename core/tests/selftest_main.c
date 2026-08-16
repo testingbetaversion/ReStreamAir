@@ -23,6 +23,7 @@
 #include "rs_json.h"
 #include "rs_live.h"
 #include "rs_m3u8.h"
+#include "rs_mpegts.h"
 #include "rs_netmatch.h"
 #include "rs_panel.h"
 #include "rs_state.h"
@@ -1099,6 +1100,288 @@ static void test_cenc_multifragment(void) {
 // an EXT-X-DISCONTINUITY indistinguishable from ordinary ad-break splicing.
 //
 // The invariant that has to hold: the window always covers the elapsed time.
+// --- MPEG-TS muxer ----------------------------------------------------------
+//
+// Builds a minimal but structurally real fMP4 (an init with an avcC carrying
+// one SPS and one PPS, then fragments of length-prefixed NALs) and checks the
+// bytes that come out are a stream a decoder can actually follow: the packet
+// grid, the tables, the PES timestamps, and the two indicators that make a live
+// stream joinable and splice-tolerant.
+
+// Reads the PID out of a TS packet header.
+static uint16_t ts_pid(const uint8_t *pkt) {
+    return (uint16_t)(((pkt[1] & 0x1Fu) << 8) | pkt[2]);
+}
+
+// The adaptation field's flags byte, or 0 when the packet has no adaptation
+// field (or an empty one).
+static uint8_t ts_af_flags(const uint8_t *pkt) {
+    if (!((pkt[3] >> 4) & 0x2u)) return 0;
+    return pkt[4] > 0 ? pkt[5] : 0u;
+}
+
+// Writes an init segment for one track. `video` picks an avc1/avcC sample entry
+// with parameter sets, otherwise an mp4a/esds with an AudioSpecificConfig.
+static size_t build_init(uint8_t *b, bool video, uint32_t track_id, uint32_t timescale) {
+    size_t n = 0;
+    size_t ftyp = open_box(b, &n, "ftyp");
+    memcpy(b + n, "isom", 4); n += 4;
+    PUT32(b + n, 0); n += 4;
+    close_box(b, n, ftyp);
+
+    size_t moov = open_box(b, &n, "moov");
+    size_t trak = open_box(b, &n, "trak");
+
+    size_t tkhd = open_box(b, &n, "tkhd");
+    PUT32(b + n, 0); n += 4;                      // version 0 + flags
+    PUT32(b + n, 0); PUT32(b + n + 4, 0); n += 8; // creation / modification
+    PUT32(b + n, track_id); n += 4;
+    PUT32(b + n, 0); PUT32(b + n + 4, 0); n += 8; // reserved + duration
+    close_box(b, n, tkhd);
+
+    size_t mdia = open_box(b, &n, "mdia");
+    size_t mdhd = open_box(b, &n, "mdhd");
+    PUT32(b + n, 0); n += 4;
+    PUT32(b + n, 0); PUT32(b + n + 4, 0); n += 8;
+    PUT32(b + n, timescale); n += 4;
+    PUT32(b + n, 0); n += 4;                      // duration
+    PUT32(b + n, 0); n += 4;                      // language + pre_defined
+    close_box(b, n, mdhd);
+
+    size_t minf = open_box(b, &n, "minf");
+    size_t stbl = open_box(b, &n, "stbl");
+    size_t stsd = open_box(b, &n, "stsd");
+    PUT32(b + n, 0); n += 4;                      // version + flags
+    PUT32(b + n, 1); n += 4;                      // entry_count
+
+    if (video) {
+        size_t avc1 = open_box(b, &n, "avc1");
+        memset(b + n, 0, 6); n += 6;              // reserved
+        b[n] = 0; b[n + 1] = 1; n += 2;           // data_reference_index
+        memset(b + n, 0, 70); n += 70;            // VisualSampleEntry body
+        size_t avcC = open_box(b, &n, "avcC");
+        b[n++] = 1;                               // configurationVersion
+        b[n++] = 0x64; b[n++] = 0x00; b[n++] = 0x1E;
+        b[n++] = 0xFF;                            // lengthSizeMinusOne = 3 -> 4 bytes
+        b[n++] = 0xE1;                            // numOfSPS = 1
+        b[n++] = 0; b[n++] = 4;                   // SPS length
+        b[n++] = 0x67; b[n++] = 0x64; b[n++] = 0x00; b[n++] = 0x1E;
+        b[n++] = 1;                               // numOfPPS
+        b[n++] = 0; b[n++] = 3;                   // PPS length
+        b[n++] = 0x68; b[n++] = 0xEE; b[n++] = 0x3C;
+        close_box(b, n, avcC);
+        close_box(b, n, avc1);
+    } else {
+        size_t mp4a = open_box(b, &n, "mp4a");
+        memset(b + n, 0, 6); n += 6;
+        b[n] = 0; b[n + 1] = 1; n += 2;           // data_reference_index
+        memset(b + n, 0, 20); n += 20;            // AudioSampleEntry body (version 0)
+        size_t esds = open_box(b, &n, "esds");
+        PUT32(b + n, 0); n += 4;                  // version + flags
+        b[n++] = 0x03; b[n++] = 0x19;             // ES_Descriptor
+        b[n++] = 0; b[n++] = 1;                   // ES_ID
+        b[n++] = 0x00;                            // flags: no dependency/URL/OCR
+        b[n++] = 0x04; b[n++] = 0x11;             // DecoderConfigDescriptor
+        b[n++] = 0x40; b[n++] = 0x15;             // AAC, audio stream
+        memset(b + n, 0, 11); n += 11;            // bufferSize + bitrates
+        b[n++] = 0x05; b[n++] = 0x02;             // DecSpecificInfo, 2 bytes
+        // AudioSpecificConfig: AAC-LC (2), 48 kHz (index 3), stereo (2).
+        b[n++] = 0x11; b[n++] = 0x90;
+        close_box(b, n, esds);
+        close_box(b, n, mp4a);
+    }
+    close_box(b, n, stsd);
+    close_box(b, n, stbl);
+    close_box(b, n, minf);
+    close_box(b, n, mdia);
+    close_box(b, n, trak);
+    close_box(b, n, moov);
+    return n;
+}
+
+// One fragment of `nsamp` samples, each a single length-prefixed NAL of
+// `sample_len` bytes of payload, starting at decode time `base_time`.
+static size_t build_frag(uint8_t *b, uint32_t track_id, uint64_t base_time,
+                         int nsamp, uint32_t duration, size_t payload_len, bool key) {
+    size_t n = 0;
+    const size_t sample_len = payload_len + 4;  // 4-byte AVCC length prefix
+
+    size_t moof = open_box(b, &n, "moof");
+    size_t mfhd = open_box(b, &n, "mfhd");
+    PUT32(b + n, 0); PUT32(b + n + 4, 1); n += 8;
+    close_box(b, n, mfhd);
+
+    size_t traf = open_box(b, &n, "traf");
+    size_t tfhd = open_box(b, &n, "tfhd");
+    PUT32(b + n, 0x020000);                       // default-base-is-moof
+    PUT32(b + n + 4, track_id); n += 8;
+    close_box(b, n, tfhd);
+
+    size_t tfdt = open_box(b, &n, "tfdt");
+    b[n] = 1; b[n + 1] = 0; b[n + 2] = 0; b[n + 3] = 0; n += 4;  // version 1
+    PUT32(b + n, (uint32_t)(base_time >> 32));
+    PUT32(b + n + 4, (uint32_t)base_time); n += 8;
+    close_box(b, n, tfdt);
+
+    // trun: data-offset + first-sample-flags + duration + size + flags
+    size_t trun = open_box(b, &n, "trun");
+    PUT32(b + n, 0x000705); n += 4;
+    PUT32(b + n, (uint32_t)nsamp); n += 4;
+    size_t data_offset_at = n;
+    PUT32(b + n, 0); n += 4;                      // patched once mdat is placed
+    // first_sample_flags: sample_is_non_sync_sample clear on a keyframe.
+    PUT32(b + n, key ? 0x02000000u : 0x01010000u); n += 4;
+    for (int s = 0; s < nsamp; s++) {
+        PUT32(b + n, duration); n += 4;
+        PUT32(b + n, (uint32_t)sample_len); n += 4;
+        PUT32(b + n, (s == 0 && key) ? 0x02000000u : 0x01010000u); n += 4;
+    }
+    close_box(b, n, trun);
+    close_box(b, n, traf);
+    close_box(b, n, moof);
+
+    size_t mdat = open_box(b, &n, "mdat");
+    PUT32(b + data_offset_at, (uint32_t)(n - moof));  // relative to the moof
+    for (int s = 0; s < nsamp; s++) {
+        PUT32(b + n, (uint32_t)payload_len); n += 4;
+        b[n] = key && s == 0 ? 0x65 : 0x41;           // IDR / non-IDR NAL header
+        for (size_t i = 1; i < payload_len; i++) b[n + i] = (uint8_t)(s + i);
+        n += payload_len;
+    }
+    close_box(b, n, mdat);
+    return n;
+}
+
+static void test_mpegts(void) {
+    // The MPEG-2 section CRC over a known PAT body. Same polynomial ffmpeg and
+    // every broadcast muxer stamp their sections with; a wrong CRC makes every
+    // player discard the table and see an empty program.
+    static const uint8_t pat[] = {
+        0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xF0, 0x00
+    };
+    check("mpegts/crc32", rs_ts_crc32(pat, sizeof pat) == 0x2AB104B2u);
+
+    static uint8_t vinit[1024], ainit[1024], frag[8192];
+    size_t vlen = build_init(vinit, true, 1, 90000);
+    size_t alen = build_init(ainit, false, 1, 48000);
+
+    rs_ts_mux *m = rs_ts_mux_create();
+    int vt = rs_ts_mux_add_track(m, "video", vinit, vlen);
+    int at = rs_ts_mux_add_track(m, "audio", ainit, alen);
+    check("mpegts/add video track", vt == 0);
+    check("mpegts/add audio track", at == 1);
+    check("mpegts/reject garbage init", rs_ts_mux_add_track(m, "video", vinit, 8) < 0);
+
+    // Two seconds of each track, video first sample a keyframe.
+    size_t n = build_frag(frag, 1, 0, 4, 22500, 64, true);
+    check("mpegts/push video", rs_ts_mux_push(m, vt, frag, n) == 4);
+    n = build_frag(frag, 1, 0, 4, 12000, 32, true);
+    check("mpegts/push audio", rs_ts_mux_push(m, at, frag, n) == 4);
+
+    size_t out_len = 0;
+    uint8_t *out = rs_ts_mux_take(m, true, &out_len);
+    check("mpegts/produced output", out != NULL && out_len > 0);
+    if (!out) { rs_ts_mux_destroy(m); return; }
+
+    check("mpegts/188-byte grid", out_len % RS_TS_PACKET_SIZE == 0);
+    bool sync_ok = true, cc_ok = true, saw_pat = false, saw_pmt = false;
+    bool saw_video_pes = false, saw_audio_pes = false, saw_pcr = false, saw_rai = false;
+    uint8_t expect_cc[0x2000];
+    bool seen_pid[0x2000];
+    memset(expect_cc, 0, sizeof expect_cc);
+    memset(seen_pid, 0, sizeof seen_pid);
+    uint8_t stream_type_video = 0, stream_type_audio = 0;
+
+    for (size_t off = 0; off + RS_TS_PACKET_SIZE <= out_len; off += RS_TS_PACKET_SIZE) {
+        const uint8_t *pkt = out + off;
+        if (pkt[0] != 0x47) { sync_ok = false; continue; }
+        uint16_t pid = ts_pid(pkt);
+        uint8_t cc = pkt[3] & 0x0Fu;
+        if (seen_pid[pid] && cc != expect_cc[pid]) cc_ok = false;
+        seen_pid[pid] = true;
+        expect_cc[pid] = (uint8_t)((cc + 1) & 0x0Fu);
+
+        uint8_t af = ts_af_flags(pkt);
+        if (af & 0x10u) saw_pcr = true;
+        if (af & 0x40u) saw_rai = true;
+
+        bool pusi = (pkt[1] & 0x40u) != 0;
+        size_t payload = 4;
+        if ((pkt[3] >> 4) & 0x2u) payload += (size_t)pkt[4] + 1;
+        if (pid == 0x0000 && pusi) {
+            saw_pat = true;
+            // pointer_field, then the PAT: program 1 must point at the PMT PID.
+            const uint8_t *sec = pkt + payload + 1;
+            check("mpegts/pat table id", sec[0] == 0x00);
+            uint16_t pmt_pid = (uint16_t)(((sec[10] & 0x1Fu) << 8) | sec[11]);
+            check("mpegts/pat points at pmt", pmt_pid == 0x1000);
+        }
+        if (pid == 0x1000 && pusi) {
+            saw_pmt = true;
+            const uint8_t *sec = pkt + payload + 1;
+            check("mpegts/pmt table id", sec[0] == 0x02);
+            stream_type_video = sec[12];
+            stream_type_audio = sec[17];
+        }
+        if (pusi && (pid == 0x0100 || pid == 0x0101)) {
+            const uint8_t *pes = pkt + payload;
+            check("mpegts/pes start code",
+                  pes[0] == 0x00 && pes[1] == 0x00 && pes[2] == 0x01);
+            if (pid == 0x0100) {
+                saw_video_pes = true;
+                check("mpegts/video stream id", pes[3] == 0xE0);
+            } else {
+                saw_audio_pes = true;
+                check("mpegts/audio stream id", pes[3] == 0xC0);
+                // ADTS sync word right after the PES header.
+                size_t hdr = 9 + (size_t)pes[8];
+                check("mpegts/adts syncword",
+                      pes[hdr] == 0xFF && (pes[hdr + 1] & 0xF0u) == 0xF0u);
+                check("mpegts/adts sampling index", ((pes[hdr + 2] >> 2) & 0x0Fu) == 3);
+            }
+        }
+    }
+    check("mpegts/sync bytes", sync_ok);
+    check("mpegts/continuity counters", cc_ok);
+    check("mpegts/pat present", saw_pat);
+    check("mpegts/pmt present", saw_pmt);
+    check("mpegts/h264 stream type", stream_type_video == 0x1B);
+    check("mpegts/aac stream type", stream_type_audio == 0x0F);
+    check("mpegts/video pes", saw_video_pes);
+    check("mpegts/audio pes", saw_audio_pes);
+    check("mpegts/pcr emitted", saw_pcr);
+    check("mpegts/random access flagged", saw_rai);
+
+    // A keyframe is a join point, and the parameter sets from the avcC must be
+    // in the elementary stream there — a viewer that starts at one has never
+    // seen the init segment.
+    const size_t *joins = NULL;
+    check("mpegts/join point recorded", rs_ts_mux_join_points(m, &joins) > 0);
+    bool found_sps = false;
+    for (size_t i = 0; i + 8 < out_len; i++)
+        if (out[i] == 0 && out[i + 1] == 0 && out[i + 2] == 0 && out[i + 3] == 1 &&
+            out[i + 4] == 0x67) found_sps = true;
+    check("mpegts/sps in stream", found_sps);
+    rs_free(out);
+
+    // A timeline jump (a splice, or segments the engine skipped) has to be
+    // flagged, or a decoder reads it as a broken clock.
+    n = build_frag(frag, 1, 90000ull * 30, 4, 22500, 64, true);
+    rs_ts_mux_push(m, vt, frag, n);
+    n = build_frag(frag, 1, 48000ull * 30, 4, 12000, 32, true);
+    rs_ts_mux_push(m, at, frag, n);
+    out = rs_ts_mux_take(m, true, &out_len);
+    bool saw_disc = false;
+    if (out) {
+        for (size_t off = 0; off + RS_TS_PACKET_SIZE <= out_len; off += RS_TS_PACKET_SIZE)
+            if (ts_af_flags(out + off) & 0x80u) saw_disc = true;
+        rs_free(out);
+    }
+    check("mpegts/discontinuity flagged", saw_disc);
+
+    rs_ts_mux_destroy(m);
+}
+
 static void test_live_window(void) {
     // First poll of a representation: no backlog, so stay at the live edge
     // rather than dragging in the whole DVR buffer.
@@ -1213,6 +1496,7 @@ int main(void) {
     test_netmatch();
     test_panel();
     test_cenc_multifragment();
+    test_mpegts();
     test_live_window();
     test_live_backoff();
 
