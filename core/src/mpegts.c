@@ -88,6 +88,42 @@ static bool box_child(const mp4span *in, const char *type, mp4span *out) {
     return box_find(in->data, in->len, type, out);
 }
 
+// Iterates every box of `type` at one level. `*cursor` starts at 0 and is
+// advanced past each hit, so repeated calls walk them all.
+//
+// Boxes that can legitimately repeat are the reason this exists rather than
+// box_find alone: a CMAF low-latency segment is a *sequence* of moof+mdat
+// chunks, not one of each, and a traf may carry several truns. Parsing only
+// the first of each silently drops the rest of the segment — which presents as
+// a periodic hole in the output, not as an error.
+static bool box_next(const uint8_t *base, size_t len, const char *type,
+                     size_t *cursor, mp4span *out, size_t *out_box_start) {
+    size_t off = *cursor;
+    while (off + 8 <= len) {
+        uint64_t size = rd_u32(base + off);
+        size_t hdr = 8;
+        if (size == 1) {
+            if (off + 16 > len) return false;
+            size = rd_u64(base + off + 8);
+            hdr = 16;
+        } else if (size == 0) {
+            size = len - off;
+        }
+        if (size < hdr || off + size > len) return false;
+        size_t this_start = off;
+        off += (size_t)size;
+        if (memcmp(base + this_start + 4, type, 4) == 0) {
+            out->data = base + this_start + hdr;
+            out->len = (size_t)size - hdr;
+            if (out_box_start) *out_box_start = this_start;
+            *cursor = off;
+            return true;
+        }
+    }
+    *cursor = off;
+    return false;
+}
+
 // --- codec configuration ----------------------------------------------------
 
 enum { TS_CODEC_NONE = 0, TS_CODEC_H264, TS_CODEC_H265, TS_CODEC_AAC };
@@ -448,18 +484,12 @@ static int64_t to_90k(uint64_t v, uint32_t timescale) {
     return (int64_t)((v * 90000ull) / timescale);
 }
 
-int rs_ts_mux_push(rs_ts_mux *m, int track, const uint8_t *frag, size_t frag_len) {
-    if (!m || track < 0 || (size_t)track >= m->ntracks || !frag) return -1;
-    ts_track *t = &m->tracks[track];
-    if (!t->used) return -1;
-
-    mp4span moof, traf, tfhd, trun;
-    if (!box_find(frag, frag_len, "moof", &moof)) return -1;
-    // moof's offset within the fragment is the default base for sample data.
-    size_t moof_start = (size_t)(moof.data - frag) - 8;
-
-    if (!box_child(&moof, "traf", &traf)) return -1;
-    if (!box_child(&traf, "tfhd", &tfhd) || tfhd.len < 8) return -1;
+// Parses one traf: its tfhd defaults, its tfdt decode time, and every trun it
+// carries. Returns the number of samples queued.
+static int push_traf(rs_ts_mux *m, ts_track *t, const uint8_t *frag, size_t frag_len,
+                     const mp4span *traf, size_t moof_start) {
+    mp4span tfhd, trun;
+    if (!box_child(traf, "tfhd", &tfhd) || tfhd.len < 8) return 0;
 
     uint32_t tf_flags = rd_u24(tfhd.data + 1);
     uint32_t track_id = rd_u32(tfhd.data + 4);
@@ -469,33 +499,41 @@ int rs_ts_mux_push(rs_ts_mux *m, int track, const uint8_t *frag, size_t frag_len
     uint64_t base_offset = moof_start;
     uint32_t def_duration = 0, def_size = 0, def_flags = 0;
     if (tf_flags & 0x000001u) {  // base-data-offset-present
-        if (off + 8 > tfhd.len) return -1;
+        if (off + 8 > tfhd.len) return 0;
         base_offset = rd_u64(tfhd.data + off);
         off += 8;
     }
     if (tf_flags & 0x000002u) off += 4;  // sample-description-index
     if (tf_flags & 0x000008u) {
-        if (off + 4 > tfhd.len) return -1;
+        if (off + 4 > tfhd.len) return 0;
         def_duration = rd_u32(tfhd.data + off);
         off += 4;
     }
     if (tf_flags & 0x000010u) {
-        if (off + 4 > tfhd.len) return -1;
+        if (off + 4 > tfhd.len) return 0;
         def_size = rd_u32(tfhd.data + off);
         off += 4;
     }
     if (tf_flags & 0x000020u) {
-        if (off + 4 > tfhd.len) return -1;
+        if (off + 4 > tfhd.len) return 0;
         def_flags = rd_u32(tfhd.data + off);
     }
 
     uint64_t base_media_decode_time = 0;
     mp4span tfdt;
-    if (box_child(&traf, "tfdt", &tfdt) && tfdt.len >= 8) {
+    if (box_child(traf, "tfdt", &tfdt) && tfdt.len >= 8) {
         base_media_decode_time = tfdt.data[0] == 1 ? rd_u64(tfdt.data + 4) : rd_u32(tfdt.data + 4);
     }
 
-    if (!box_child(&traf, "trun", &trun) || trun.len < 8) return -1;
+    uint64_t dts_ticks = base_media_decode_time;
+    // Where the next trun's samples start when it declares no data-offset of its
+    // own: immediately after the previous one's.
+    uint64_t running_pos = base_offset;
+    int queued = 0;
+    size_t trun_cursor = 0;
+
+    while (box_next(traf->data, traf->len, "trun", &trun_cursor, &trun, NULL)) {
+    if (trun.len < 8) continue;
     uint32_t tr_flags = rd_u24(trun.data + 1);
     uint8_t trun_version = trun.data[0];
     uint32_t sample_count = rd_u32(trun.data + 4);
@@ -504,20 +542,20 @@ int rs_ts_mux_push(rs_ts_mux *m, int track, const uint8_t *frag, size_t frag_len
     uint32_t first_flags = 0;
     bool have_first_flags = false;
     if (tr_flags & 0x000001u) {
-        if (toff + 4 > trun.len) return -1;
+        if (toff + 4 > trun.len) continue;
         data_offset = (int32_t)rd_u32(trun.data + toff);
         toff += 4;
     }
     if (tr_flags & 0x000004u) {
-        if (toff + 4 > trun.len) return -1;
+        if (toff + 4 > trun.len) continue;
         first_flags = rd_u32(trun.data + toff);
         have_first_flags = true;
         toff += 4;
     }
 
-    uint64_t data_pos = base_offset + (uint64_t)(int64_t)data_offset;
-    uint64_t dts_ticks = base_media_decode_time;
-    int queued = 0;
+    uint64_t data_pos = (tr_flags & 0x000001u)
+        ? base_offset + (uint64_t)(int64_t)data_offset
+        : running_pos;
 
     for (uint32_t i = 0; i < sample_count; i++) {
         frag_sample s = { def_duration, def_size, def_flags, 0 };
@@ -585,7 +623,34 @@ int rs_ts_mux_push(rs_ts_mux *m, int track, const uint8_t *frag, size_t frag_len
         data_pos += s.size;
         dts_ticks += s.duration;
     }
+    running_pos = data_pos;
+    }
     return queued;
+}
+
+int rs_ts_mux_push(rs_ts_mux *m, int track, const uint8_t *frag, size_t frag_len) {
+    if (!m || track < 0 || (size_t)track >= m->ntracks || !frag) return -1;
+    ts_track *t = &m->tracks[track];
+    if (!t->used) return -1;
+
+    // A segment is a *sequence* of moof+mdat chunks under CMAF low-latency
+    // packaging (claro's DASH publishes two per 2s segment), each with its own
+    // traf and its own decode time. Taking only the first drops the rest of the
+    // segment — silently, since what remains still parses and still plays.
+    int queued = 0;
+    bool saw_moof = false;
+    size_t moof_cursor = 0, moof_start = 0;
+    mp4span moof;
+    while (box_next(frag, frag_len, "moof", &moof_cursor, &moof, &moof_start)) {
+        saw_moof = true;
+        // Sample data offsets default to being relative to this moof, which is
+        // why each chunk has to carry its own base rather than the segment's.
+        size_t traf_cursor = 0;
+        mp4span traf;
+        while (box_next(moof.data, moof.len, "traf", &traf_cursor, &traf, NULL))
+            queued += push_traf(m, t, frag, frag_len, &traf, moof_start);
+    }
+    return saw_moof ? queued : -1;
 }
 
 // --- TS packet emission -----------------------------------------------------

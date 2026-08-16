@@ -1364,6 +1364,23 @@ static void test_mpegts(void) {
     check("mpegts/sps in stream", found_sps);
     rs_free(out);
 
+    // CMAF low-latency packaging puts several moof+mdat chunks in one segment
+    // (claro's DASH ships two per 2s segment). Parsing only the first drops
+    // half the media without erroring — it presents as a periodic hole in the
+    // output, so nothing catches it except a check that every sample arrives.
+    {
+        static uint8_t multi[8192];
+        size_t a = build_frag(multi, 1, 90000ull * 100, 4, 22500, 64, true);
+        size_t b = build_frag(multi + a, 1, 90000ull * 100 + 90000, 4, 22500, 64, false);
+        rs_ts_mux *cm = rs_ts_mux_create();
+        static uint8_t vi2[1024];
+        size_t vl2 = build_init(vi2, true, 1, 90000);
+        int ct = rs_ts_mux_add_track(cm, "video", vi2, vl2);
+        check("mpegts/chunked: both chunks parsed",
+              rs_ts_mux_push(cm, ct, multi, a + b) == 8);
+        rs_ts_mux_destroy(cm);
+    }
+
     // A timeline jump (a splice, or segments the engine skipped) has to be
     // flagged, or a decoder reads it as a broken clock.
     n = build_frag(frag, 1, 90000ull * 30, 4, 22500, 64, true);
