@@ -1634,3 +1634,23 @@ pre {
     flex-wrap: wrap;
   }
 }
+
+/* Controls the C engine stores but does not act on yet (see INACTIVE_FIELDS in
+   app.js). Dimmed rather than disabled: the value still persists, and starts
+   taking effect as soon as the engine reads it. */
+.field-inactive { opacity: 0.55; }
+.field-inactive:hover { opacity: 0.8; }
+.inactive-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+  opacity: 0.75;
+  cursor: help;
+}

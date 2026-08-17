@@ -71,6 +71,14 @@ typedef void (*rs_live_log_fn)(void *ctx, const char *stream_id, const char *lev
 // treated as "". Mirrors the argv PanelServer.swift builds for the Swift worker.
 typedef struct {
     const char *mpd_url;
+    // Fallback sources carrying the same content on other CDNs, tried in order
+    // when the primary manifest stops answering. The panel has always collected
+    // these ("if the primary manifest fails, the stream fails over to these in
+    // order") and the Swift worker rotated through them; the engine ignoring
+    // them meant a stream whose origin refused simply stalled with a perfectly
+    // good mirror configured and unused.
+    const char *const *cdn_urls;
+    size_t cdn_url_count;
     const char *representation;     // "" = auto-select video + audio renditions
     const char *manifest_proxy;
     const char *media_proxy;
@@ -121,6 +129,17 @@ int rs_live_window_size(int download_ahead, double since_last, double seg_durati
 // Below this there is no point: the complaint is about how often we ask, and a
 // poll period is exactly the quantity that is already too small.
 #define RS_LIVE_THROTTLE_BACKOFF_MIN 15.0
+
+// Attempts one manifest poll makes before giving up and backing off. Segment
+// fetches have always retried (an abandoned segment is a permanent hole); the
+// manifest did not, so one transient refusal failed the whole poll — and since
+// 403 counts as a throttle, the engine then waited 15s+ and did it again.
+// Against an origin behind a rotating-exit proxy, where a refusal is random
+// rather than a real rate cap, that alone is enough to stall a stream
+// indefinitely: at a 35% per-request failure rate, one attempt fails a poll 35%
+// of the time, three attempts 4%. A genuine rate cap refuses every attempt, so
+// the backoff still engages where it should.
+#define RS_LIVE_MANIFEST_TRIES 3
 
 // Ceiling on the backoff. A live stream that has been failing this long is
 // broken, but it must still notice promptly when the origin comes back.

@@ -331,6 +331,13 @@ typedef struct live_stream {
 
     // Config, replaced wholesale by rs_live_start. Guarded by `mu`.
     char *mpd_url, *representation;
+    // [primary] + cdnUrls. `source` is the one currently in use; it advances
+    // when a manifest poll exhausts its retries, and stays there — a mirror
+    // that answers is as good as the primary, and flapping back to a source
+    // that just failed would only re-pay the failure every poll.
+    char **sources;
+    size_t nsources;
+    size_t source;
     char *manifest_proxy, *media_proxy;
     char *manifest_headers, *media_headers;
     char *downloader, *dl_params, *keys;
@@ -365,6 +372,9 @@ struct rs_live {
 // strings out from under an in-flight fetch.
 typedef struct {
     char *mpd_url, *manifest_proxy, *media_proxy;
+    // [primary] + cdnUrls, in the order they are tried. Always at least one.
+    char **sources;
+    size_t nsources;
     char *manifest_headers, *media_headers;
     char *downloader, *dl_params, *keys;
     char *segment_url_params;
@@ -382,6 +392,8 @@ static void cfg_snap_dispose(cfg_snap *c) {
     free(c->manifest_headers); free(c->media_headers);
     free(c->downloader); free(c->dl_params); free(c->keys);
     free(c->segment_url_params);
+    for (size_t i = 0; i < c->nsources; i++) free(c->sources[i]);
+    free(c->sources);
     memset(c, 0, sizeof(*c));
 }
 
@@ -389,6 +401,16 @@ static void cfg_snap_dispose(cfg_snap *c) {
 static void cfg_snapshot_locked(const live_stream *st, cfg_snap *out) {
     memset(out, 0, sizeof(*out));
     out->mpd_url = rs_strdup(st->mpd_url ? st->mpd_url : "");
+    // The primary always leads; the mirrors follow in configured order.
+    out->sources = (char **)calloc(st->nsources ? st->nsources : 1, sizeof(char *));
+    if (out->sources) {
+        for (size_t i = 0; i < st->nsources; i++)
+            out->sources[out->nsources++] = rs_strdup(st->sources[i] ? st->sources[i] : "");
+        if (out->nsources == 0) {
+            out->sources[0] = rs_strdup(out->mpd_url);
+            out->nsources = 1;
+        }
+    }
     out->manifest_proxy = rs_strdup(st->manifest_proxy ? st->manifest_proxy : "");
     out->media_proxy = rs_strdup(st->media_proxy ? st->media_proxy : "");
     out->manifest_headers = rs_strdup(st->manifest_headers ? st->manifest_headers : "");
@@ -733,6 +755,60 @@ static long status_from_error(const char *msg) {
     return code;
 }
 
+// Fetches and expands the manifest, retrying a refusal before writing the poll
+// off and rotating to a CDN mirror when the current source keeps failing.
+//
+// This is the one place both the director and the representation workers read
+// the MPD, so the retry and the failover apply to every manifest read in the
+// engine. `rep_id` is "" for the director (rendition discovery); `want` is
+// ignored there. Returns malloc'd JSON (caller frees) or NULL once every
+// attempt has failed, with `err` describing the last failure.
+static char *manifest_fetch(live_stream *st, const cfg_snap *cfg, const char *rep_id,
+                            int want, char *err, size_t errlen) {
+    if (cfg->nsources == 0) return NULL;
+
+    pthread_mutex_lock(&st->mu);
+    size_t idx = st->source < cfg->nsources ? st->source : 0;
+    pthread_mutex_unlock(&st->mu);
+
+    // Enough attempts to retry a flaky source and still give every mirror a
+    // turn, so a dead primary cannot hide a working mirror behind the retries.
+    size_t tries = RS_LIVE_MANIFEST_TRIES;
+    if (cfg->nsources > tries) tries = cfg->nsources;
+
+    for (size_t attempt = 0; attempt < tries; attempt++) {
+        if (attempt > 0 && !live_wait(st, RS_LIVE_FETCH_RETRY_DELAY)) return NULL;
+        const char *url = cfg->sources[idx];
+        err[0] = '\0';
+        char *json = st->mgr->dash(url, cfg->manifest_proxy, cfg->manifest_headers,
+                                   cfg->downloader, cfg->dl_params, rep_id, want,
+                                   cfg->segment_url_params, cfg->inherit_url_params,
+                                   err, errlen);
+        if (json) {
+            // Stick to whatever answered, and say so when it is not the primary.
+            pthread_mutex_lock(&st->mu);
+            bool moved = st->source != idx;
+            st->source = idx;
+            pthread_mutex_unlock(&st->mu);
+            if (moved)
+                lgf(st, "info", "cdnFailover", url, 0, -1,
+                    "source %lu of %lu answered — staying on it",
+                    (unsigned long)(idx + 1), (unsigned long)cfg->nsources);
+            if (attempt > 0)
+                lgf(st, "info", "manifestRetry", url, 0, -1,
+                    "%s%smanifest recovered on attempt %lu",
+                    rep_id && rep_id[0] ? rep_id : "renditions",
+                    rep_id && rep_id[0] ? ": " : ": ", (unsigned long)(attempt + 1));
+            return json;
+        }
+        // Move to the next mirror for the following attempt. With a single
+        // source this is a plain retry, which is the case that matters most:
+        // a refusal there is usually transient, not a verdict.
+        if (cfg->nsources > 1) idx = (idx + 1) % cfg->nsources;
+    }
+    return NULL;
+}
+
 // Records the outcome of a manifest poll for the backoff in rep_main.
 static void rep_note_manifest(live_rep *rep, bool ok, const char *err) {
     if (ok) {
@@ -782,10 +858,7 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     lgf(st, "info", "pollStart", cfg->mpd_url, 0, -1,
         "%s: requesting %d segments (%.1fs since last poll, %.3fs each)",
         rep->rep_id, want, since_last, seg_dur);
-    char *json = st->mgr->dash(cfg->mpd_url, cfg->manifest_proxy, cfg->manifest_headers,
-                               cfg->downloader, cfg->dl_params, rep->rep_id,
-                               want, cfg->segment_url_params, cfg->inherit_url_params,
-                               err, sizeof(err));
+    char *json = manifest_fetch(st, cfg, rep->rep_id, want, err, sizeof(err));
     if (!json) {
         rep_note_manifest(rep, false, err);
         lgf(st, "error", "manifest", cfg->mpd_url, 0, -1, "%s: %s", rep->rep_id,
@@ -1273,9 +1346,7 @@ static void *director_main(void *arg) {
         pthread_mutex_unlock(&st->mu);
 
         char err[256] = {0};
-        char *json = st->mgr->dash(cfg.mpd_url, cfg.manifest_proxy, cfg.manifest_headers,
-                                   cfg.downloader, cfg.dl_params, "", 0,
-                                   cfg.segment_url_params, cfg.inherit_url_params, err, sizeof(err));
+        char *json = manifest_fetch(st, &cfg, "", 0, err, sizeof(err));
         if (!json) {
             fails++;
             throttled = rs_live_status_is_throttle(status_from_error(err)) != 0;
@@ -1406,6 +1477,8 @@ static void stream_dispose(live_stream *st) {
     free(st->manifest_headers); free(st->media_headers);
     free(st->downloader); free(st->dl_params); free(st->keys);
     free(st->segment_url_params);
+    for (size_t i = 0; i < st->nsources; i++) free(st->sources[i]);
+    free(st->sources);
     free(st->master);
     pthread_mutex_destroy(&st->mu);
     pthread_cond_destroy(&st->cv);
@@ -1446,6 +1519,25 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     SET(keys, cfg->decryption_keys);
     SET(segment_url_params, cfg->segment_url_params);
 #undef SET
+
+    // Rebuild the source list: primary first, then the mirrors. A config edit
+    // resets the cursor to the primary, since the operator changing the sources
+    // is the one case where "whatever answered last" is not the right memory.
+    for (size_t i = 0; i < st->nsources; i++) free(st->sources[i]);
+    free(st->sources);
+    st->sources = NULL;
+    st->nsources = 0;
+    st->source = 0;
+    size_t want_sources = 1 + cfg->cdn_url_count;
+    st->sources = (char **)calloc(want_sources, sizeof(char *));
+    if (st->sources) {
+        st->sources[st->nsources++] = rs_strdup(cfg->mpd_url ? cfg->mpd_url : "");
+        for (size_t i = 0; i < cfg->cdn_url_count; i++) {
+            const char *u = cfg->cdn_urls ? cfg->cdn_urls[i] : NULL;
+            if (u && u[0]) st->sources[st->nsources++] = rs_strdup(u);
+        }
+    }
+
     st->inherit_url_params = cfg->inherit_url_params;
     st->reduced_manifest_polling = cfg->reduced_manifest_polling;
     st->playlist_segments = cfg->playlist_segments > 0 ? cfg->playlist_segments : 6;

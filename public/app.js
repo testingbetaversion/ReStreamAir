@@ -992,11 +992,59 @@ function newStream() {
 // window is one more window to manage and gets blocked/hidden by browsers
 // too easily, so this stays in the same window/tab.
 
+// Stream settings the C server persists but does not act on yet.
+//
+// The panel and the engine are separate ports: the panel stores every field the
+// Swift build ever had, while the C engine reads the subset it has implemented.
+// A control that silently does nothing is worse than a missing one — the
+// rendition picker looked like it worked for months while the engine ignored it
+// and auto-selected the top 1080p rendition, so "I selected 720p" and "it plays
+// 1080p" were both true. Marking them is the cheap half of the fix; the values
+// are still stored and start working the moment the engine reads them.
+const INACTIVE_FIELDS = {
+  outputMode: "only HLS/Direct output is implemented in this build",
+  outputTarget: "used by the SRT/UDP output modes, which aren't in this build",
+  period: "the engine reads every DASH period; selection isn't implemented",
+  forceOffline: "not implemented in this build",
+  onDemand: "not implemented in this build",
+  autostart: "streams marked running resume on restart regardless",
+  speedUp: "not implemented in this build",
+  recordEvent: "not implemented in this build",
+  nm3u8dlreParams: "the N_m3u8DL-RE input mode isn't in this build",
+  useCdm: "CDM/script key resolution isn't in this build",
+  cdmType: "CDM/script key resolution isn't in this build",
+  heartbeatEnabled: "provider scripts aren't in this build",
+  heartbeatSeconds: "provider scripts aren't in this build",
+  scriptParams: "provider scripts aren't in this build",
+  scriptAudioSelector: "provider scripts aren't in this build",
+  scriptVideoSelector: "provider scripts aren't in this build",
+};
+
+// Dims each unimplemented control and appends the reason to its hint, so the
+// operator can tell "this does nothing yet" from "this isn't working".
+function markInactiveFields(form) {
+  for (const [name, why] of Object.entries(INACTIVE_FIELDS)) {
+    for (const el of form.querySelectorAll(`[name="${name}"]`)) {
+      const label = el.closest("label") || el.parentElement;
+      if (!label || label.dataset.inactiveMarked) continue;
+      label.dataset.inactiveMarked = "1";
+      label.classList.add("field-inactive");
+      label.title = `Not active in this build — ${why}`;
+      const badge = document.createElement("span");
+      badge.className = "inactive-badge";
+      badge.textContent = "inactive";
+      badge.title = label.title;
+      label.appendChild(badge);
+    }
+  }
+}
+
 function openStreamEditorDialog(createNew) {
   if (createNew) newStream();
   $("#streamEditorTitle").textContent = selectedStream()?.name || "New stream";
   switchTab("editor");
   $("#streamEditorDialog").showModal();
+  markInactiveFields($("#streamForm"));
   $("#streamForm").elements.name.focus();
   fetchFfmpegStatus();
 }

@@ -2418,9 +2418,25 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     char *mheaders = effective_headers(provider, stream, "manifestHeaders");
     char *dheaders = effective_headers(provider, stream, "mediaHeaders");
 
+    // CDN mirrors, in configured order. The panel has always collected these and
+    // promised failover; the engine now actually rotates through them.
+    const rs_json *mirrors = rs_json_obj_get(stream, "cdnUrls");
+    size_t mirror_count = rs_json_arr_len(mirrors);
+    const char **mirror_urls = NULL;
+    size_t mirror_used = 0;
+    if (mirror_count) {
+        mirror_urls = (const char **)calloc(mirror_count, sizeof(char *));
+        for (size_t i = 0; mirror_urls && i < mirror_count; i++) {
+            const char *u = rs_json_as_str(rs_json_arr_at(mirrors, i), "");
+            if (u && u[0]) mirror_urls[mirror_used++] = u;
+        }
+    }
+
     rs_live_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.mpd_url = src;
+    cfg.cdn_urls = mirror_urls;
+    cfg.cdn_url_count = mirror_used;
     cfg.representation = selected_video_rep(stream);
     cfg.manifest_proxy = mproxy;
     cfg.media_proxy = dproxy;
@@ -2457,17 +2473,20 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     } else if (!already) {
         log_recordf(s, stream_id, "info", "liveStart", src, 0, -1,
                     "engine starting: window %d, ahead %d, keep %d, delay %ds, "
-                    "audio offset %dms, keys %s, rep %s",
+                    "audio offset %dms, keys %s, rep %s, %lu CDN mirror%s",
                     cfg.playlist_segments, cfg.download_ahead, cfg.keep_segments,
                     cfg.playback_delay_seconds, cfg.audio_delay_ms,
                     cfg.decryption_keys[0] ? "set" : "none",
-                    cfg.representation[0] ? cfg.representation : "auto");
+                    cfg.representation[0] ? cfg.representation : "auto",
+                    (unsigned long)cfg.cdn_url_count,
+                    cfg.cdn_url_count == 1 ? "" : "s");
     } else {
         log_record(s, stream_id, "info", "liveConfig", src, 0, -1,
                    "settings updated — the workers pick them up on the next poll");
     }
 
     free(mproxy); free(dproxy); free(mheaders); free(dheaders);
+    free((void *)mirror_urls);  // the strings belong to the state DOM
 }
 
 static void live_stop_stream(restream_server_t *s, const char *stream_id) {
