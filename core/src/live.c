@@ -15,6 +15,7 @@
 #include "rs_audio_delay.h"
 #include "rs_cenc.h"
 #include "rs_json.h"
+#include "rs_ttml.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -29,9 +30,10 @@
 
 // Live engines tracked at once.
 #define RS_LIVE_MAX_STREAMS 64
-// Renditions per stream (video + audio is the shape every source we handle
-// uses; the extra slots leave room for a pinned representation alongside them).
-#define RS_LIVE_MAX_REPS 4
+// Renditions per stream (video + audio + sidecar subtitles is the shape every
+// source we handle uses; the extra slots leave room for a pinned
+// representation alongside them).
+#define RS_LIVE_MAX_REPS 6
 // Parallel segment downloads per poll. The origin round-trip is the bottleneck
 // and segments are independent files; serial fetching could not keep up with
 // the live edge, which is exactly what left the player draining to the end of
@@ -141,6 +143,25 @@ static char *qenc(const char *s) {
     }
     out[o] = '\0';
     return out;
+}
+
+// Appends a LANGUAGE attribute for an EXT-X-MEDIA line, or nothing when the
+// manifest gave no language. The value comes from the MPD, so it is filtered to
+// the RFC 5646 subset a tag can hold rather than interpolated as-is — an
+// embedded quote would otherwise end the attribute early and corrupt every
+// attribute after it on that line.
+static void sb_add_lang(sbuf *b, const char *lang) {
+    if (!lang || !lang[0]) return;
+    char safe[32];
+    size_t o = 0;
+    for (size_t i = 0; lang[i] && o + 1 < sizeof(safe); i++) {
+        char c = lang[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-')
+            safe[o++] = c;
+    }
+    safe[o] = '\0';
+    if (o) sb_addf(b, ",LANGUAGE=\"%s\"", safe);
 }
 
 static double now_seconds(void) {
@@ -275,7 +296,7 @@ struct live_stream;
 typedef struct {
     struct live_stream *owner;
     char *rep_id;
-    char *kind;            // "video" | "audio"
+    char *kind;            // "video" | "audio" | "text"
     int index;             // slot in owner->reps, used as the public URL token
 
     pthread_t thread;
@@ -1034,6 +1055,42 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
             uint64_t start = rs_audio_base_decode_time(data, len);
             bool have_start = start != 0;
 
+            // Timed text becomes WebVTT here, once, rather than on every
+            // request: TTML — plain or wrapped in stpp fMP4 — is legal to hand
+            // an HLS player directly but only Safari and recent hls.js render
+            // it, while every player made this century reads WebVTT. The cues
+            // have to be anchored to the media timeline, so the segment's own
+            // start comes from its tfdt where there is one and from the
+            // manifest's $Time$ otherwise (a bare TTML or .vtt segment has no
+            // fMP4 boxes to read a tfdt out of).
+            if (strcmp(rep->kind, "text") == 0) {
+                double seg_start = -1;
+                if (have_start && ts > 0) seg_start = (double)start / (double)ts;
+                else if (it->time_val >= 0 && plan_ts > 0)
+                    seg_start = (double)it->time_val / (double)plan_ts;
+                char *vtt = rs_ttml_to_webvtt(data, len,
+                                              seg_start,
+                                              it->duration > 0 ? it->duration : 2.0);
+                if (vtt) {
+                    free(data);
+                    data = (uint8_t *)vtt;
+                    len = strlen(vtt);
+                } else {
+                    // Not timed text we recognise. Serving the original bytes
+                    // under a .vtt name would only give the player something it
+                    // cannot parse, so drop the segment and say so.
+                    lgf(st, "error", "subtitleConvert", it->url, 0, (long long)len,
+                        "%s: segment is not TTML or WebVTT — skipped", rep->rep_id);
+                    pthread_mutex_lock(&st->mu);
+                    seen_add(&rep->seen, idkey);
+                    pthread_mutex_unlock(&st->mu);
+                    free(data);
+                    free(it->url);
+                    failed++;
+                    continue;
+                }
+            }
+
             pthread_mutex_lock(&st->mu);
             bool was_disc = false;
             double gap = 0;
@@ -1186,7 +1243,14 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
     //
     // The filename still ends in a real media extension because ffmpeg's HLS
     // demuxer rejects any segment URL whose extension is not on its allow-list.
-    if (rep->init_data && rep->init_len) {
+    //
+    // A subtitle rendition is the exception: its segments left the worker as
+    // WebVTT documents, which are self-contained text with no initialization
+    // segment to map. Advertising the source's stpp init here would hand the
+    // player an fMP4 header for a track it is about to receive as text.
+    bool is_text = rep->kind && strcmp(rep->kind, "text") == 0;
+    const char *ext = is_text ? "vtt" : "m4s";
+    if (!is_text && rep->init_data && rep->init_len) {
         sb_addf(&b, "#EXT-X-MAP:URI=\"/restream/%s/%d_init.mp4\"\n",
                 rep->owner->id, rep->index);
     }
@@ -1196,8 +1260,8 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
         // the first one in the window — that break is already carried by
         // EXT-X-DISCONTINUITY-SEQUENCE above.
         if (s->disc && i > window_start) sb_add(&b, "#EXT-X-DISCONTINUITY\n");
-        sb_addf(&b, "#EXTINF:%.3f,\n/restream/%s/%d_%lld.m4s\n",
-                s->duration, rep->owner->id, rep->index, s->seq);
+        sb_addf(&b, "#EXTINF:%.3f,\n/restream/%s/%d_%lld.%s\n",
+                s->duration, rep->owner->id, rep->index, s->seq, ext);
     }
     return b.p;
 }
@@ -1377,20 +1441,30 @@ static void *director_main(void *arg) {
 
         const rs_json *video = rs_json_obj_get(root, "video");
         const rs_json *audio = rs_json_obj_get(root, "audio");
+        const rs_json *text = rs_json_obj_get(root, "text");
+        const rs_json *cc = rs_json_obj_get(root, "cc");
         bool have_video = video && rs_json_type_of(video) == RS_JSON_OBJ;
         bool have_audio = audio && rs_json_type_of(audio) == RS_JSON_OBJ;
+        bool have_text = text && rs_json_type_of(text) == RS_JSON_OBJ;
+        size_t ncc = (cc && rs_json_type_of(cc) == RS_JSON_ARR) ? rs_json_arr_len(cc) : 0;
         bool dynamic = rs_json_as_bool(rs_json_obj_get(root, "dynamic"), true);
 
         // A pinned representation overrides the auto-selected video rendition;
-        // the audio rendition is still picked up so the master keeps its
-        // separate audio group.
+        // the audio and subtitle renditions are still picked up so the master
+        // keeps its separate groups.
         const char *vid = have_video ? rs_json_obj_str(video, "id", "") : "";
         if (pinned && pinned[0]) vid = pinned;
         const char *vcodecs = have_video ? rs_json_obj_str(video, "codecs", "") : "";
         long long vbw = have_video ? (long long)rs_json_as_num(rs_json_obj_get(video, "bandwidth"), 0) : 0;
         const char *aid = have_audio ? rs_json_obj_str(audio, "id", "") : "";
         const char *acodecs = have_audio ? rs_json_obj_str(audio, "codecs", "") : "";
+        const char *alang = have_audio ? rs_json_obj_str(audio, "lang", "") : "";
         if (aid[0] && vid[0] && strcmp(aid, vid) == 0) { aid = ""; acodecs = ""; have_audio = false; }
+        const char *tid = have_text ? rs_json_obj_str(text, "id", "") : "";
+        const char *tlang = have_text ? rs_json_obj_str(text, "lang", "") : "";
+        if (tid[0] && ((vid[0] && strcmp(tid, vid) == 0) || (aid[0] && strcmp(tid, aid) == 0))) {
+            tid = ""; have_text = false;
+        }
 
         if (!vid[0]) {
             lg(st, "error", "renditions", cfg.mpd_url, 0, -1, "no video representation in the MPD");
@@ -1407,15 +1481,49 @@ static void *director_main(void *arg) {
         sb_add(&b, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
         if (have_audio && aid[0]) {
             char *aenc = qenc(aid);
-            sb_addf(&b, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,"
-                        "AUTOSELECT=YES,URI=\"/play/%s/index.m3u8?rep=%s&mtype=audio\"\n",
+            sb_add(&b, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\"");
+            sb_add_lang(&b, alang);
+            sb_addf(&b, ",DEFAULT=YES,AUTOSELECT=YES,"
+                        "URI=\"/play/%s/index.m3u8?rep=%s&mtype=audio\"\n",
                     st->id, aenc ? aenc : "");
             free(aenc);
         }
+        // Sidecar subtitles (TTML/stpp or WebVTT), converted to WebVTT by the
+        // rendition worker. DEFAULT=NO so a player does not switch them on
+        // unasked; AUTOSELECT=YES so it still picks them when the viewer's
+        // language preference asks for them.
+        if (have_text && tid[0]) {
+            char *tenc = qenc(tid);
+            sb_add(&b, "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Subtitles\"");
+            sb_add_lang(&b, tlang);
+            sb_addf(&b, ",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,"
+                        "URI=\"/play/%s/index.m3u8?rep=%s&mtype=text\"\n",
+                    st->id, tenc ? tenc : "");
+            free(tenc);
+        }
+        // In-band CEA-608/708. These have no URI: the caption bytes are already
+        // inside the video segments we pass through untouched, so this tag is
+        // the whole of the work — without it a player has no reason to look for
+        // them and shows nothing.
+        for (size_t i = 0; i < ncc; i++) {
+            const rs_json *entry = rs_json_arr_at(cc, i);
+            const char *iid = rs_json_obj_str(entry, "instreamId", "");
+            const char *clang = rs_json_obj_str(entry, "lang", "");
+            if (!iid[0]) continue;
+            sb_addf(&b, "#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID=\"cc\",NAME=\"%s\"", iid);
+            sb_add_lang(&b, clang);
+            sb_addf(&b, ",AUTOSELECT=YES,INSTREAM-ID=\"%s\"\n", iid);
+        }
+
         sb_addf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%lld", vbw > 0 ? vbw : 3000000);
         if (vcodecs[0] && acodecs[0]) sb_addf(&b, ",CODECS=\"%s,%s\"", vcodecs, acodecs);
         else if (vcodecs[0]) sb_addf(&b, ",CODECS=\"%s\"", vcodecs);
         if (have_audio && aid[0]) sb_add(&b, ",AUDIO=\"aud\"");
+        if (have_text && tid[0]) sb_add(&b, ",SUBTITLES=\"subs\"");
+        // RFC 8216 4.3.4.2: the attribute must be NONE when there are no
+        // in-band captions, or a player is entitled to go looking for them
+        // anyway — which some do, on every segment, for nothing.
+        sb_add(&b, ncc > 0 ? ",CLOSED-CAPTIONS=\"cc\"" : ",CLOSED-CAPTIONS=NONE");
         char *venc = qenc(vid);
         sb_addf(&b, "\n/play/%s/index.m3u8?rep=%s&mtype=video\n", st->id, venc ? venc : "");
         free(venc);
@@ -1426,16 +1534,21 @@ static void *director_main(void *arg) {
         st->master = b.p;  // ownership moves to the stream
         rep_ensure_locked(st, vid, "video");
         if (have_audio && aid[0]) rep_ensure_locked(st, aid, "audio");
+        if (have_text && tid[0]) rep_ensure_locked(st, tid, "text");
         pthread_cond_broadcast(&st->cv);
         pthread_mutex_unlock(&st->mu);
 
         if (first)
             lgf(st, "info", "renditions", cfg.mpd_url, 0, -1,
-                "%s MPD — video \"%s\"%s%s%s, master playlist ready",
+                "%s MPD — video \"%s\"%s%s%s%s%s%s%s, master playlist ready",
                 dynamic ? "dynamic" : "static", vid,
                 (have_audio && aid[0]) ? ", audio \"" : "",
                 (have_audio && aid[0]) ? aid : "",
-                (have_audio && aid[0]) ? "\"" : "");
+                (have_audio && aid[0]) ? "\"" : "",
+                (have_text && tid[0]) ? ", subtitles \"" : "",
+                (have_text && tid[0]) ? tid : "",
+                (have_text && tid[0]) ? "\"" : "",
+                ncc > 0 ? ", in-band closed captions" : "");
 
         bool reduced = cfg.reduced_manifest_polling != 0;
         rs_json_free(root);
@@ -1704,11 +1817,20 @@ void rs_live_destroy(rs_live *live) {
 // Caller holds st->mu. The master is only usable once every rendition it points
 // at can actually answer: a player that fetches a variant playlist and gets a
 // 404 abandons the stream instead of retrying.
+// Subtitles are the exception: they are an optional, DEFAULT=NO rendition a
+// player only fetches once a viewer asks for them, so a slow or broken text
+// track must not hold back the video and audio the stream actually exists to
+// deliver. Its EXT-X-MEDIA line is advertised either way — a player that finds
+// it not ready yet retries, which is the same thing it does for any rendition.
 static bool stream_ready_locked(const live_stream *st) {
     if (!st->master || st->nreps == 0) return false;
-    for (size_t i = 0; i < st->nreps; i++)
+    bool any_media = false;
+    for (size_t i = 0; i < st->nreps; i++) {
+        if (strcmp(st->reps[i]->kind, "text") == 0) continue;
         if (!st->reps[i]->ready) return false;
-    return true;
+        any_media = true;
+    }
+    return any_media;
 }
 
 bool rs_live_is_ready(rs_live *live, const char *stream_id) {

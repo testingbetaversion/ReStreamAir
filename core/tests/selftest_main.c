@@ -27,6 +27,7 @@
 #include "rs_netmatch.h"
 #include "rs_panel.h"
 #include "rs_state.h"
+#include "rs_ttml.h"
 #include "rs_url.h"
 
 #include "fixtures.h"
@@ -580,6 +581,62 @@ static void test_ffargs_helpers(void) {
         check_str("ffargs/tokenize-4", tokens[4], "e");
     }
     rs_free_strv(tokens, count);
+}
+
+// Subtitle mapping. This is not a golden: the Swift original never mapped
+// subtitles at all, so there is nothing to be equal to — the rule being checked
+// is that the map appears exactly where a subtitle track can survive the remux
+// and nowhere else, because a bad `-map` fails ffmpeg at startup rather than
+// dropping the track.
+static void test_ffargs_subtitles(void) {
+    struct {
+        const char *name;
+        const char *source;
+        const char *output_mode;
+        const char *target;
+        bool expect;
+    } cases[] = {
+        // MPEG-TS in, MPEG-TS out: DVB subtitles and teletext copy straight
+        // across, which is the whole case this exists for.
+        {"srt-source-srt-out", "srt://feed.example.com:9000", "srtServer", "9100", true},
+        {"udp-source-udp-out", "udp://239.0.0.1:1234", "udpSrt", "udp://239.0.0.2:1234", true},
+        {"ts-over-http", "https://origin.example.com/live/stream.ts", "udpSrt", "udp://239.0.0.2:1234", true},
+        // A query string naming another format must not decide the question.
+        {"ts-with-query", "https://origin.example.com/s.ts?fallback=x.m3u8", "udpSrt", "udp://h:1", true},
+        // HLS and DASH sources carry WebVTT or TTML, neither of which has an
+        // MPEG-TS mapping — mapping them would abort the process.
+        {"hls-source-srt-out", "https://origin.example.com/live/stream.m3u8", "srtServer", "9100", false},
+        {"dash-source-udp-out", "https://origin.example.com/live/stream.mpd", "udpSrt", "udp://h:1", false},
+        // HLS output has nowhere to put a bitmap subtitle regardless of source.
+        {"ts-source-hls-out", "srt://feed.example.com:9000", "hls", "", false},
+        // A custom output supplies its own maps; adding one behind the user's
+        // back would duplicate or contradict them.
+        {"ts-source-custom-out", "srt://feed.example.com:9000", "custom", "-f flv rtmp://x/y", false},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        rs_ffargs_inputs in;
+        memset(&in, 0, sizeof(in));
+        in.source_url = cases[i].source;
+        in.kind = "m3u8";
+        in.input_mode = "ffmpegResident";
+        in.output_mode = cases[i].output_mode;
+        in.output_target = cases[i].target;
+        in.temp_dir = "/tmp/restreamair-fixture";
+        in.output_playlist = "/tmp/restreamair-fixture/live.m3u8";
+        in.playlist_segments = 6;
+        in.segment_seconds = 4;
+
+        rs_ffargs_command cmd;
+        char name[96];
+        snprintf(name, sizeof(name), "ffargs/subtitles-%s", cases[i].name);
+        if (rs_ffargs_build(&in, &cmd) != 0) { fail(name, "build failed"); continue; }
+        bool mapped = false;
+        for (size_t j = 0; j + 1 < cmd.argc; j++)
+            if (strcmp(cmd.argv[j], "-map") == 0 && strcmp(cmd.argv[j + 1], "0:s?") == 0) mapped = true;
+        check(name, mapped == cases[i].expect);
+        rs_ffargs_command_dispose(&cmd);
+    }
 }
 
 // --- JSON DOM ---------------------------------------------------------------
@@ -1498,6 +1555,122 @@ static void test_live_backoff(void) {
     check("live-backoff/unknown-does-not", !rs_live_status_is_throttle(0));
 }
 
+// TTML -> WebVTT. Unlike the modules above, this one has no Swift original to
+// capture goldens from, so the expectations are read off the TTML1 timing rules
+// (section 10.3.1) and the WebVTT syntax directly.
+static void test_ttml(void) {
+    // Namespace-prefixed elements, clock times, a hard break, entities, and the
+    // one styling case WebVTT can express. Every one of these is something a
+    // real broadcast packager emits.
+    const char *doc =
+        "<?xml version=\"1.0\"?>"
+        "<tt:tt xmlns:tt=\"http://www.w3.org/ns/ttml\" xmlns:tts=\"http://www.w3.org/ns/ttml#styling\">"
+        "<tt:head><tt:styling/></tt:head><tt:body><tt:div>"
+        "<tt:p begin=\"00:00:10.500\" end=\"00:00:13\">Hello   &amp; goodbye<tt:br/>second line</tt:p>"
+        "<tt:p begin=\"00:00:14\" end=\"00:00:16\">a <tt:span tts:fontStyle=\"italic\">whisper</tt:span> here</tt:p>"
+        "<tt:p begin=\"00:00:17\" dur=\"2s\">5 &lt; 6</tt:p>"
+        "</tt:div></tt:body></tt:tt>";
+    char *vtt = rs_ttml_to_webvtt((const uint8_t *)doc, strlen(doc), -1, 0);
+    check("ttml/parsed", vtt != NULL);
+    if (vtt) {
+        check("ttml/header", strncmp(vtt, "WEBVTT\n", 7) == 0);
+        check("ttml/no-timestamp-map-without-start", strstr(vtt, "X-TIMESTAMP-MAP") == NULL);
+        check("ttml/clock-time", strstr(vtt, "00:00:10.500 --> 00:00:13.000") != NULL);
+        // Whitespace collapses (xml:space="default"), <br/> is a hard newline,
+        // and a decoded '&' is re-escaped because WebVTT reads it as markup.
+        check("ttml/collapse-and-break", strstr(vtt, "Hello &amp; goodbye\nsecond line") != NULL);
+        // The space before a styled span belongs outside the tag.
+        check("ttml/italic-span", strstr(vtt, "a <i>whisper</i> here") != NULL);
+        check("ttml/dur", strstr(vtt, "00:00:17.000 --> 00:00:19.000") != NULL);
+        check("ttml/lt-escaped", strstr(vtt, "5 &lt; 6") != NULL);
+        rs_free(vtt);
+    }
+
+    // Offset times against ttp:tickRate, plus a <div begin> that shifts its
+    // children (TTML's default time container is `par`).
+    const char *ticks =
+        "<tt xmlns=\"http://www.w3.org/ns/ttml\" ttp:tickRate=\"10000000\"><body><div begin=\"5s\">"
+        "<p begin=\"10000000t\" end=\"30000000t\">ticks</p></div></body></tt>";
+    vtt = rs_ttml_to_webvtt((const uint8_t *)ticks, strlen(ticks), -1, 0);
+    check("ttml/tick-rate-and-container-offset",
+          vtt && strstr(vtt, "00:00:06.000 --> 00:00:08.000") != NULL);
+    rs_free(vtt);
+
+    // "hh:mm:ss:ff" counts frames in the fourth field, and
+    // frameRateMultiplier turns 30 into 29.97 — worth a second of drift over
+    // half an hour if it is ignored.
+    const char *frames =
+        "<tt ttp:frameRate=\"30\" ttp:frameRateMultiplier=\"1000 1001\"><body><div>"
+        "<p begin=\"00:00:01:15\" end=\"00:00:02:00\">frames</p></div></body></tt>";
+    vtt = rs_ttml_to_webvtt((const uint8_t *)frames, strlen(frames), -1, 0);
+    check("ttml/frame-clock-time", vtt && strstr(vtt, "00:00:01.501 --> 00:00:02.000") != NULL);
+    rs_free(vtt);
+
+    // stpp carriage: the document arrives inside an fMP4 fragment's mdat, and
+    // the segment's own start becomes the X-TIMESTAMP-MAP anchor.
+    const char *inner =
+        "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><div>"
+        "<p begin=\"00:01:40.000\" end=\"00:01:42.000\">wrapped</p></div></body></tt>";
+    size_t inner_len = strlen(inner);
+    uint8_t frag[512];
+    size_t o = 0;
+    memcpy(frag + o, "\0\0\0\10styp", 8); o += 8;
+    memcpy(frag + o, "\0\0\0\10moof", 8); o += 8;
+    uint32_t mdat_size = (uint32_t)(8 + inner_len);
+    frag[o++] = (uint8_t)(mdat_size >> 24); frag[o++] = (uint8_t)(mdat_size >> 16);
+    frag[o++] = (uint8_t)(mdat_size >> 8);  frag[o++] = (uint8_t)mdat_size;
+    memcpy(frag + o, "mdat", 4); o += 4;
+    memcpy(frag + o, inner, inner_len); o += inner_len;
+    vtt = rs_ttml_to_webvtt(frag, o, 100.0, 2.0);
+    check("ttml/stpp-mdat", vtt && strstr(vtt, "00:01:40.000 --> 00:01:42.000") != NULL);
+    // 100s at 90 kHz, and the same instant as a local clock time.
+    check("ttml/timestamp-map",
+          vtt && strstr(vtt, "X-TIMESTAMP-MAP=MPEGTS:9000000,LOCAL:00:01:40.000") != NULL);
+    rs_free(vtt);
+
+    // The same fragment authored from zero instead of on the presentation
+    // timeline — cues bounded by one segment while the segment starts much
+    // later can only be fragment-relative, so they are lifted onto it.
+    const char *rel = "<tt><body><div><p begin=\"0.5s\" end=\"1.5s\">rel</p></div></body></tt>";
+    vtt = rs_ttml_to_webvtt((const uint8_t *)rel, strlen(rel), 100.0, 2.0);
+    check("ttml/fragment-relative-lift",
+          vtt && strstr(vtt, "00:01:40.500 --> 00:01:41.500") != NULL);
+    rs_free(vtt);
+
+    // A text/vtt rendition passes through this same call untouched.
+    const char *already = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n";
+    vtt = rs_ttml_to_webvtt((const uint8_t *)already, strlen(already), 5.0, 2.0);
+    check_str("ttml/webvtt-passthrough", vtt, already);
+    rs_free(vtt);
+
+    // An empty subtitle fragment is normal and must still render a valid
+    // document; input that is not timed text at all must be refused, so the
+    // caller can fall back to serving the original bytes.
+    const char *empty = "<tt><body><div/></body></tt>";
+    vtt = rs_ttml_to_webvtt((const uint8_t *)empty, strlen(empty), -1, 0);
+    check("ttml/empty-fragment", vtt && strncmp(vtt, "WEBVTT", 6) == 0);
+    rs_free(vtt);
+    vtt = rs_ttml_to_webvtt((const uint8_t *)"not xml", 7, -1, 0);
+    check("ttml/rejects-non-ttml", vtt == NULL);
+    rs_free(vtt);
+
+    // A comment ends at "-->", not at the next '>', or parsing resumes inside
+    // it — and "-->" is also the WebVTT cue arrow, so getting this wrong
+    // corrupts output rather than merely dropping it.
+    const char *cm = "<tt><body><div><!-- a > b --><p begin=\"1s\" end=\"2s\">ok</p></div></body></tt>";
+    vtt = rs_ttml_to_webvtt((const uint8_t *)cm, strlen(cm), -1, 0);
+    check("ttml/comment-with-gt",
+          vtt && strstr(vtt, "00:00:01.000 --> 00:00:02.000\nok\n") != NULL);
+    rs_free(vtt);
+
+    // Cues with no begin are skipped rather than guessed at.
+    const char *nobegin = "<tt><body><div><p>floating</p><p begin=\"1s\" end=\"2s\">kept</p></div></body></tt>";
+    vtt = rs_ttml_to_webvtt((const uint8_t *)nobegin, strlen(nobegin), -1, 0);
+    check("ttml/skips-untimed-cue", vtt && strstr(vtt, "floating") == NULL);
+    check("ttml/keeps-timed-cue", vtt && strstr(vtt, "kept") != NULL);
+    rs_free(vtt);
+}
+
 int main(void) {
     test_sha256();
     test_hmac();
@@ -1506,6 +1679,7 @@ int main(void) {
     test_aes_ctr();
     test_aes_cbc();
     test_ffargs_helpers();
+    test_ffargs_subtitles();
     test_json();
     test_auth();
     test_auth_sessions();
@@ -1516,6 +1690,7 @@ int main(void) {
     test_mpegts();
     test_live_window();
     test_live_backoff();
+    test_ttml();
 
     for (size_t i = 0; i < sizeof(rs_goldens) / sizeof(rs_goldens[0]); i++) {
         run_golden(&rs_goldens[i]);

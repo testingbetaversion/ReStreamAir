@@ -144,6 +144,34 @@ int rs_ffargs_tokenize(const char *text, char ***tokens, size_t *count) {
     return 0;
 }
 
+// True when the source is itself an MPEG-TS stream — the only case where
+// mapping subtitles into a TS output is safe.
+//
+// DVB subtitles and teletext exist only in MPEG-TS, and `-c copy` remuxes them
+// into another TS output without complaint. Every other subtitle codec a source
+// can carry (WebVTT from HLS, TTML/stpp from DASH) has no MPEG-TS mapping at
+// all, and asking ffmpeg to copy one into `-f mpegts` does not skip the track —
+// it fails the whole process at startup. So the mapping is added only where the
+// stream that could be there is one that can travel: a TS-family scheme, or a
+// TS file extension over HTTP.
+static bool source_is_mpegts(const char *url) {
+    if (!url || !url[0]) return false;
+    static const char *schemes[] = {"srt://", "udp://", "rtp://", "tcp://"};
+    for (size_t i = 0; i < sizeof(schemes) / sizeof(schemes[0]); i++) {
+        size_t n = strlen(schemes[i]);
+        if (strncmp(url, schemes[i], n) == 0) return true;
+    }
+    // Compare against the path only: a query string routinely mentions other
+    // formats ("?fallback=stream.m3u8") and must not decide this.
+    size_t path_len = strcspn(url, "?#");
+    static const char *exts[] = {".ts", ".m2ts", ".mts", ".mpegts", ".trp"};
+    for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+        size_t n = strlen(exts[i]);
+        if (path_len >= n && strncmp(url + path_len - n, exts[i], n) == 0) return true;
+    }
+    return false;
+}
+
 // Appends the query fragment to the source URL, trimming any leading or
 // trailing " ?&" the caller left on it.
 static char *with_params(const char *url, const char *params) {
@@ -287,6 +315,18 @@ int rs_ffargs_build(const rs_ffargs_inputs *in, rs_ffargs_command *out) {
         rs_strv_push(&args, "0:v:0?");
         rs_strv_push(&args, "-map");
         rs_strv_push(&args, "0:a:0?");
+    }
+    // Carry DVB subtitles and teletext through to a TS output. The "?" keeps a
+    // source without any non-fatal, exactly as it does for the audio map above.
+    // There is deliberately no equivalent for the HLS output modes: HLS has no
+    // container that can hold a bitmap subtitle, so there is nowhere for the
+    // track to go and the only way to keep those captions is to burn them into
+    // the video, which would mean transcoding a pipeline that is copy-only by
+    // design.
+    bool ts_output = str_equal(in->output_mode, "srtServer") || str_equal(in->output_mode, "udpSrt");
+    if (ts_output && source_is_mpegts(source)) {
+        rs_strv_push(&args, "-map");
+        rs_strv_push(&args, "0:s?");
     }
     rs_strv_push(&args, "-c");
     rs_strv_push(&args, "copy");

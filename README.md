@@ -126,6 +126,21 @@ No Detect button and no type dropdown — paste a source URL and the panel probe
 
 **Multi-quality** — every track is selected by default. Select more than one and the stream serves an HLS master playlist, one worker per representation. Each variant gets a distinct `BANDWIDTH`, real when detected and a placeholder otherwise, since some clients collapse identical-bandwidth entries into one.
 
+### Subtitles and captions
+
+Picked up automatically — there is nothing to configure.
+
+| Source form | What happens |
+|---|---|
+| **TTML / IMSC1**, either plain `application/ttml+xml` segments or wrapped per-sample in `stpp` fMP4 | Converted to **WebVTT** by the rendition worker and served as an HLS `TYPE=SUBTITLES` group. Handles namespace-prefixed documents, clock and offset times (`ttp:tickRate`, `ttp:frameRate` with its multiplier), `hh:mm:ss:ff` frame counts, `<br/>`, entities, and italic/bold spans. |
+| **WebVTT** | Passed through as-is. |
+| **CEA-608 / CEA-708** | Already inside the video's SEI messages, and segments are passed through byte-for-byte, so nothing has to be demuxed. The MPD's SCTE 214 `<Accessibility>` descriptor is read and republished as `EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS` with the right `INSTREAM-ID` — without that tag a player has no reason to look for them. Streams that declare none get `CLOSED-CAPTIONS=NONE` rather than leaving players to hunt. |
+| **DVB subtitles** | MPEG-TS only, and only on the ffmpeg input modes with an **SRT/UDP** output, where `-map 0:s?` copies them across. There is no HLS container that can carry a bitmap subtitle, so an HLS output cannot keep them without burning them into the video — which would mean transcoding a pipeline that is copy-only by design. |
+
+TTML becomes WebVTT rather than being passed through because IMSC1-in-fMP4 is legal HLS that only Safari and recent hls.js actually render; the conversion happens once per segment on the way in, not per request. Cue times are anchored to the media timeline from the segment's `tfdt` (or the manifest's `$Time$` for a bare text segment), and a fragment authored from zero instead of on the presentation timeline is detected and lifted onto it.
+
+The subtitle rendition never blocks playback: it is `DEFAULT=NO`, and a text track that is slow or broken is not counted when deciding whether the stream is ready to serve.
+
 **Direct source** makes `/play/<id>/index.m3u8` answer with a `302` to the source URL (or the CDN mirror a resident ffmpeg last rotated to) instead of restreaming. That flips an existing stream to direct delivery without re-pointing clients. The API-key gate still applies to the redirect.
 
 **Logo** — leave blank and the server looks one up by name via [Clearbit's](https://clearbit.com) keyless autocomplete endpoint, caching results in `logo-cache.json`. Best effort; falls back to the name's first letter. Note this sends the provider or channel name to Clearbit. **Find logo** does the same lookup on demand (`GET /api/logo-lookup?name=`).
@@ -225,8 +240,9 @@ Events worth recognising:
 | Event | Means |
 |---|---|
 | `manifest` | An MPD/playlist poll, with the URL that answered it. |
-| `renditions` | The director thread settled on the video/audio representations; the master playlist is ready. |
+| `renditions` | The director thread settled on the video/audio/subtitle representations; the master playlist is ready. |
 | `discontinuity` | A timeline splice was detected from `tfdt` and marked in the playlist. |
+| `subtitleConvert` | A subtitle segment was neither TTML nor WebVTT, so it was skipped instead of being served as something the player can't parse. |
 | `pollSlow` | A poll cycle overran its own interval, so the engine went straight back to the origin instead of sleeping. Consistently slow means a longer **Poll seconds** or fewer segments per poll, not more polling. |
 | `error` | Includes the origin's own response body when it sent one — a `403` from a CDN that explains itself (`{"status":"FRUITION_EXCEED","message":"Limit of concurrent streams reached."}`) now shows that text instead of just the status code. |
 

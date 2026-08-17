@@ -2398,9 +2398,15 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
                         NULL, 200, (long long)clen, "rep %d %s to %s",
                         rep_index, fname, cip);
             free(cua); free(ckey);
-            mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: %lu\r\n"
+            // A subtitle rendition's segments are WebVTT documents, not fMP4 —
+            // the live engine converted them on the way in. Serving them as
+            // video/mp4 makes a browser refuse to parse the track.
+            const char *fext = strrchr(fname, '.');
+            const char *ctype = (fext && strcmp(fext, ".vtt") == 0)
+                                    ? "text/vtt; charset=utf-8" : "video/mp4";
+            mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
                          "Accept-Ranges: bytes\r\nCache-Control: no-store\r\n"
-                         "Access-Control-Allow-Origin: *\r\n\r\n", (unsigned long)clen);
+                         "Access-Control-Allow-Origin: *\r\n\r\n", ctype, (unsigned long)clen);
             mg_send(c, cached, clen);
             // Without this, mongoose leaves the connection marked as still
             // generating a response (mg_http_reply would have cleared it) and
@@ -2926,9 +2932,31 @@ static void ts_session_close(restream_server_t *s, const char *stream_id) {
 // player re-reads a PMT it has already accepted.
 static void ts_session_bind(restream_server_t *server, rs_ts_session *sess) {
     if (sess->bound) return;
-    rs_live_rep_desc *reps = NULL;
-    size_t n = rs_live_reps(server->live, sess->stream_id, &reps);
-    if (!n) return;
+    rs_live_rep_desc *all = NULL;
+    size_t total = rs_live_reps(server->live, sess->stream_id, &all);
+    if (!total) return;
+
+    // Subtitle renditions are moved out of the way before anything else looks
+    // at them. This muxer emits video and audio PES only, so a text track could
+    // never be carried — and a sidecar WebVTT rendition has no initialization
+    // segment at all, which would leave the completeness check below
+    // permanently false and stop the .ts link ever binding for a stream that
+    // merely has subtitles.
+    //
+    // Swapped rather than overwritten so every allocation stays in the array
+    // exactly once and the whole of it is still released below.
+    rs_live_rep_desc *reps = all;
+    size_t n = 0;
+    for (size_t i = 0; i < total; i++) {
+        if (strcmp(all[i].kind, "text") == 0) continue;
+        if (n != i) {
+            rs_live_rep_desc tmp = reps[n];
+            reps[n] = reps[i];
+            reps[i] = tmp;
+        }
+        n++;
+    }
+    if (!n) { rs_live_reps_free(all, total); return; }
     if (n > RS_TS_MAX_TRACKS) n = RS_TS_MAX_TRACKS;
 
     // Every init must be in hand before the first one is registered, so a
@@ -2972,7 +3000,9 @@ static void ts_session_bind(restream_server_t *server, rs_ts_session *sess) {
                         "muxing %lu renditions into MPEG-TS", (unsigned long)sess->ntracks);
     }
     for (size_t i = 0; i < n; i++) rs_free(inits[i]);
-    rs_live_reps_free(reps, n);
+    // `total`, not `n`: `n` skips the text renditions and is clamped to the
+    // muxer's track limit, and freeing by it would leak everything past it.
+    rs_live_reps_free(all, total);
 }
 
 // Appends muxed output to the ring, dropping the oldest bytes when it is full.

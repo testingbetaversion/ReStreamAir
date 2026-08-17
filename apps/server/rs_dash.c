@@ -470,13 +470,149 @@ void rs_dash_plan_dispose(rs_dash_plan *plan) {
 
 // --- describe (fetch + enumerate + expand) ---------------------------------
 
-// Picks the default video/audio renditions: the highest-bandwidth video
-// Representation and the first audio Representation, with their codecs.
-static void pick_default_reps(xmlNode *root,
-                              char **video_id, char **video_codecs, long long *video_bw,
-                              char **audio_id, char **audio_codecs) {
-    *video_id = *video_codecs = *audio_id = *audio_codecs = NULL;
-    *video_bw = -1;
+// Closed captions carried inside the video elementary stream, as announced by
+// SCTE 214's Accessibility descriptor. Nothing has to be demuxed for these —
+// the caption bytes ride in H.264/H.265 SEI messages and survive our
+// byte-for-byte segment passthrough — so all that is missing downstream is the
+// HLS tag that tells a player to go looking for them.
+#define RS_DASH_MAX_CC 8
+
+typedef struct {
+    char *instream_id;  // HLS INSTREAM-ID: "CC1".."CC4" or "SERVICE1".."SERVICE63"
+    char *lang;         // may be NULL
+} cc_track;
+
+typedef struct {
+    char *video_id, *video_codecs;
+    long long video_bw;
+    char *audio_id, *audio_codecs, *audio_lang;
+    char *text_id, *text_codecs, *text_lang, *text_mime;
+    cc_track cc[RS_DASH_MAX_CC];
+    size_t cc_count;
+} rendition_set;
+
+static void rendition_set_dispose(rendition_set *r) {
+    free(r->video_id); free(r->video_codecs);
+    free(r->audio_id); free(r->audio_codecs); free(r->audio_lang);
+    free(r->text_id); free(r->text_codecs); free(r->text_lang); free(r->text_mime);
+    for (size_t i = 0; i < r->cc_count; i++) { free(r->cc[i].instream_id); free(r->cc[i].lang); }
+    memset(r, 0, sizeof(*r));
+}
+
+// Copies `len` bytes of `s`, trimmed of surrounding whitespace, or NULL if
+// nothing is left.
+static char *dup_trimmed(const char *s, size_t len) {
+    while (len && (*s == ' ' || *s == '\t')) { s++; len--; }
+    while (len && (s[len - 1] == ' ' || s[len - 1] == '\t')) len--;
+    if (!len) return NULL;
+    char *out = (char *)malloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, s, len);
+    out[len] = '\0';
+    return out;
+}
+
+// Parses an Accessibility@value listing caption services and appends them.
+//
+// SCTE 214-1 writes these two ways and both are in the wild:
+//   cea-608: "CC1=eng;CC3=swe"        or a bare "eng;swe" (services in order)
+//   cea-708: "1=lang:eng;2=lang:spa"  or a bare "eng;spa"
+// The right-hand side of a 708 entry can carry more than the language
+// ("1=lang:eng,war:1,er:1"), so only the lang token is read out of it.
+static void parse_cc_value(const char *value, bool is_708, rendition_set *out) {
+    if (!value || !value[0]) {
+        // A descriptor with no value still asserts that captions are present.
+        // CC1 is where a single 608 service always lives, and service 1 is the
+        // 708 equivalent, so advertising that beats advertising nothing.
+        if (out->cc_count < RS_DASH_MAX_CC) {
+            out->cc[out->cc_count].instream_id = rs_strdup(is_708 ? "SERVICE1" : "CC1");
+            out->cc[out->cc_count].lang = NULL;
+            out->cc_count++;
+        }
+        return;
+    }
+
+    int implicit = 0;
+    const char *p = value;
+    while (*p && out->cc_count < RS_DASH_MAX_CC) {
+        const char *semi = strchr(p, ';');
+        size_t tok_len = semi ? (size_t)(semi - p) : strlen(p);
+        const char *tok = p;
+        p = semi ? semi + 1 : p + tok_len;
+
+        char *id = NULL, *lang = NULL;
+        const char *eq = (const char *)memchr(tok, '=', tok_len);
+        if (eq) {
+            char *left = dup_trimmed(tok, (size_t)(eq - tok));
+            const char *rhs = eq + 1;
+            size_t rhs_len = tok_len - (size_t)(eq + 1 - tok);
+            // Take the lang token out of a comma-separated parameter list.
+            const char *comma = (const char *)memchr(rhs, ',', rhs_len);
+            size_t first_len = comma ? (size_t)(comma - rhs) : rhs_len;
+            if (first_len > 5 && strncmp(rhs, "lang:", 5) == 0) {
+                lang = dup_trimmed(rhs + 5, first_len - 5);
+            } else {
+                lang = dup_trimmed(rhs, first_len);
+            }
+            if (left) {
+                // 608 names the service ("CC1"); 708 numbers it ("1").
+                if (left[0] >= '0' && left[0] <= '9') {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), is_708 ? "SERVICE%s" : "CC%s", left);
+                    id = rs_strdup(buf);
+                } else {
+                    id = left;
+                    left = NULL;
+                }
+                free(left);
+            }
+        } else {
+            lang = dup_trimmed(tok, tok_len);
+            if (lang) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), is_708 ? "SERVICE%d" : "CC%d", implicit + 1);
+                id = rs_strdup(buf);
+            }
+        }
+        implicit++;
+
+        if (!id) { free(lang); continue; }
+        // A service already listed by an earlier descriptor wins; the same
+        // stream is often tagged with both the 608 and 708 scheme.
+        bool dup = false;
+        for (size_t i = 0; i < out->cc_count; i++)
+            if (strcmp(out->cc[i].instream_id, id) == 0) { dup = true; break; }
+        if (dup) { free(id); free(lang); continue; }
+        out->cc[out->cc_count].instream_id = id;
+        out->cc[out->cc_count].lang = lang;
+        out->cc_count++;
+    }
+}
+
+// Reads the SCTE caption descriptors off one node (an AdaptationSet or a
+// Representation).
+static void scan_cc_descriptors(xmlNode *node, rendition_set *out) {
+    for (xmlNode *c = node->children; c; c = c->next) {
+        if (!node_is(c, "Accessibility")) continue;
+        char *scheme = attr(c, "schemeIdUri");
+        if (!scheme) continue;
+        bool is_608 = strcmp(scheme, "urn:scte:dash:cc:cea-608:2015") == 0;
+        bool is_708 = strcmp(scheme, "urn:scte:dash:cc:cea-708:2015") == 0;
+        if (is_608 || is_708) {
+            char *value = attr(c, "value");
+            parse_cc_value(value, is_708, out);
+            free(value);
+        }
+        free(scheme);
+    }
+}
+
+// Picks the default renditions: the highest-bandwidth video Representation, the
+// first audio one, and the first timed-text one, with their codecs — plus any
+// in-band closed captions the video AdaptationSet declares.
+static void pick_default_reps(xmlNode *root, rendition_set *out) {
+    memset(out, 0, sizeof(*out));
+    out->video_bw = -1;
     for (xmlNode *period = root->children; period; period = period->next) {
         if (!node_is(period, "Period")) continue;
         for (xmlNode *adap = period->children; adap; adap = adap->next) {
@@ -484,7 +620,9 @@ static void pick_default_reps(xmlNode *root,
             char *mime = attr(adap, "mimeType");
             char *ctype = attr(adap, "contentType");
             char *adap_codecs = attr(adap, "codecs");
+            char *lang = attr(adap, "lang");
             const char *type = classify(mime, ctype);
+            if (strcmp(type, "video") == 0) scan_cc_descriptors(adap, out);
             for (xmlNode *rep = adap->children; rep; rep = rep->next) {
                 if (!node_is(rep, "Representation")) continue;
                 char *rid = attr(rep, "id");
@@ -494,19 +632,27 @@ static void pick_default_reps(xmlNode *root,
                 char *bw = attr(rep, "bandwidth");
                 long long bwv = bw ? strtoll(bw, NULL, 10) : 0;
                 if (strcmp(type, "video") == 0) {
-                    if (bwv > *video_bw) {
-                        free(*video_id); free(*video_codecs);
-                        *video_id = rs_strdup(rid);
-                        *video_codecs = codecs ? rs_strdup(codecs) : NULL;
-                        *video_bw = bwv;
+                    scan_cc_descriptors(rep, out);
+                    if (bwv > out->video_bw) {
+                        free(out->video_id); free(out->video_codecs);
+                        out->video_id = rs_strdup(rid);
+                        out->video_codecs = codecs ? rs_strdup(codecs) : NULL;
+                        out->video_bw = bwv;
                     }
-                } else if (strcmp(type, "audio") == 0 && !*audio_id) {
-                    *audio_id = rs_strdup(rid);
-                    *audio_codecs = codecs ? rs_strdup(codecs) : NULL;
+                } else if (strcmp(type, "audio") == 0 && !out->audio_id) {
+                    out->audio_id = rs_strdup(rid);
+                    out->audio_codecs = codecs ? rs_strdup(codecs) : NULL;
+                    out->audio_lang = lang ? rs_strdup(lang) : NULL;
+                } else if (strcmp(type, "text") == 0 && !out->text_id) {
+                    char *rep_mime = attr(rep, "mimeType");
+                    out->text_id = rs_strdup(rid);
+                    out->text_codecs = codecs ? rs_strdup(codecs) : NULL;
+                    out->text_lang = lang ? rs_strdup(lang) : NULL;
+                    out->text_mime = rep_mime ? rep_mime : (mime ? rs_strdup(mime) : NULL);
                 }
                 free(codecs); free(bw); free(rid);
             }
-            free(mime); free(ctype); free(adap_codecs);
+            free(mime); free(ctype); free(adap_codecs); free(lang);
         }
     }
 }
@@ -676,21 +822,45 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
     char *mup = attr(root, "minimumUpdatePeriod"); rs_json_obj_set(obj, "mup", rs_json_new_num(parse_duration(mup))); free(mup);
     char *tsb = attr(root, "timeShiftBufferDepth"); rs_json_obj_set(obj, "tsb", rs_json_new_num(parse_duration(tsb))); free(tsb);
 
-    char *vid, *vcodecs, *aid, *acodecs; long long vbw;
-    pick_default_reps(root, &vid, &vcodecs, &vbw, &aid, &acodecs);
-    if (vid) {
+    rendition_set reps;
+    pick_default_reps(root, &reps);
+    if (reps.video_id) {
         rs_json *v = rs_json_new_obj();
-        rs_json_obj_set_str(v, "id", vid);
-        if (vcodecs) rs_json_obj_set_str(v, "codecs", vcodecs); else rs_json_obj_set(v, "codecs", rs_json_new_null());
-        rs_json_obj_set_int(v, "bandwidth", vbw > 0 ? vbw : 0);
+        rs_json_obj_set_str(v, "id", reps.video_id);
+        if (reps.video_codecs) rs_json_obj_set_str(v, "codecs", reps.video_codecs);
+        else rs_json_obj_set(v, "codecs", rs_json_new_null());
+        rs_json_obj_set_int(v, "bandwidth", reps.video_bw > 0 ? reps.video_bw : 0);
         rs_json_obj_set(obj, "video", v);
     } else rs_json_obj_set(obj, "video", rs_json_new_null());
-    if (aid) {
+    if (reps.audio_id) {
         rs_json *a = rs_json_new_obj();
-        rs_json_obj_set_str(a, "id", aid);
-        if (acodecs) rs_json_obj_set_str(a, "codecs", acodecs); else rs_json_obj_set(a, "codecs", rs_json_new_null());
+        rs_json_obj_set_str(a, "id", reps.audio_id);
+        if (reps.audio_codecs) rs_json_obj_set_str(a, "codecs", reps.audio_codecs);
+        else rs_json_obj_set(a, "codecs", rs_json_new_null());
+        if (reps.audio_lang) rs_json_obj_set_str(a, "lang", reps.audio_lang);
+        else rs_json_obj_set(a, "lang", rs_json_new_null());
         rs_json_obj_set(obj, "audio", a);
     } else rs_json_obj_set(obj, "audio", rs_json_new_null());
+    if (reps.text_id) {
+        rs_json *t = rs_json_new_obj();
+        rs_json_obj_set_str(t, "id", reps.text_id);
+        if (reps.text_codecs) rs_json_obj_set_str(t, "codecs", reps.text_codecs);
+        else rs_json_obj_set(t, "codecs", rs_json_new_null());
+        if (reps.text_lang) rs_json_obj_set_str(t, "lang", reps.text_lang);
+        else rs_json_obj_set(t, "lang", rs_json_new_null());
+        if (reps.text_mime) rs_json_obj_set_str(t, "mime", reps.text_mime);
+        else rs_json_obj_set(t, "mime", rs_json_new_null());
+        rs_json_obj_set(obj, "text", t);
+    } else rs_json_obj_set(obj, "text", rs_json_new_null());
+    rs_json *ccs = rs_json_new_arr();
+    for (size_t i = 0; i < reps.cc_count; i++) {
+        rs_json *cc = rs_json_new_obj();
+        rs_json_obj_set_str(cc, "instreamId", reps.cc[i].instream_id);
+        if (reps.cc[i].lang) rs_json_obj_set_str(cc, "lang", reps.cc[i].lang);
+        else rs_json_obj_set(cc, "lang", rs_json_new_null());
+        rs_json_arr_push(ccs, cc);
+    }
+    rs_json_obj_set(obj, "cc", ccs);
     xmlFreeDoc(doc);
 
     // Expand the requested representation's segment window.
@@ -722,7 +892,7 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         }
     }
 
-    free(vid); free(vcodecs); free(aid); free(acodecs);
+    rendition_set_dispose(&reps);
     free(xml); free(effurl); free(inherited_params);
     char *json = rs_json_serialize(obj, false);
     rs_json_free(obj);

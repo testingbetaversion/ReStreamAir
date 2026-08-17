@@ -53,10 +53,17 @@ void rs_dash_plan_dispose(rs_dash_plan *plan);
 //
 //   { "dynamic":bool, "mup":num, "tsb":num,
 //     "video": {"id","codecs","bandwidth"} | null,   // default video rendition
-//     "audio": {"id","codecs"} | null,               // default audio rendition
+//     "audio": {"id","codecs","lang"} | null,        // default audio rendition
+//     "text":  {"id","codecs","lang","mime"} | null, // default subtitle rendition
+//     "cc":    [ {"instreamId","lang"} ... ],        // in-band CEA-608/708 services
 //     "plan":  {                                       // only when `rep` matched
 //        "repId","type","timescale","initUrl",
 //        "segments":[ {"url","time","duration"} ... ] } }
+//
+// "text" is a sidecar subtitle AdaptationSet (TTML/stpp or WebVTT), which the
+// caller fetches as its own rendition. "cc" is captions embedded in the video
+// elementary stream, which need no fetching at all — only the HLS tag that
+// tells a player they are in there.
 //
 // Redirects are followed and segment URLs resolve against the final URL.
 //
