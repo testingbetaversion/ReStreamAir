@@ -327,6 +327,7 @@
               <label id="nm3u8dlreParamsField" class="hidden">N_m3u8DL-RE Params<span class="field-hint">Command-line arguments appended to the N_m3u8DL-RE execution</span><input name="nm3u8dlreParams"></label>
               <label id="outputTargetField" class="hidden">Output target<span class="field-hint" id="outputTargetHint"></span><input name="outputTarget"></label>
               <div id="ffmpegNotice" class="field-hint hidden"></div>
+              <div id="ffmpegCapsNotice" class="field-hint warn hidden"></div>
               <div id="ffmpegInstallRow" class="actions hidden">
                 <button type="button" class="ghost" id="ffmpegInstallBtn"><span data-icon="download"></span>Install ffmpeg</button>
               </div>
@@ -475,6 +476,15 @@
                 <label>Trusted proxies<span class="field-hint">Blank = trust nothing. Set to <code>loopback</code> when a reverse proxy in front of ReStreamAir terminates HTTPS, so the real client address and https:// scheme are honoured. Accepts addresses, CIDR blocks, <code>loopback</code>, <code>private</code> or <code>any</code>.</span><input name="trustedProxies" placeholder="loopback"></label>
                 <div class="actions"><button type="submit">Save</button></div>
               </form>
+              <div id="servicePanel" class="hidden">
+                <h3>Service</h3>
+                <div id="serviceStatus" class="field-hint"></div>
+                <div class="actions">
+                  <button type="button" id="serviceRestartBtn">Restart service</button>
+                  <button type="button" id="serviceInstallBtn" class="ghost">Install systemd service</button>
+                </div>
+                <div id="serviceNote" class="field-hint"></div>
+              </div>
               <h3>Accounts</h3>
               <form id="userForm" class="form-row">
                 <label>Username<input name="username" required></label>

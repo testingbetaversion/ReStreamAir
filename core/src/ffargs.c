@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <fcntl.h>
 
 #include "rs_internal.h"
 
@@ -437,4 +438,133 @@ char *rs_ffmpeg_install_plan(void) {
 #else
     return NULL;
 #endif
+}
+
+// --- capability probing ------------------------------------------------------
+//
+// See rs_ffmpeg_caps in the header for why this exists: an ffmpeg that is
+// present but built without libxml2 has no DASH demuxer, and the resulting
+// failure looks like a broken stream rather than a missing feature.
+
+#ifndef _WIN32
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char **environ;
+
+// Runs `path arg...` and returns its stdout. NULL if it could not be run.
+// Bounded: these outputs are a few kilobytes and anything longer is truncated.
+static char *ff_capture(const char *path, const char *const *args) {
+    int fds[2];
+    if (pipe(fds) != 0) return NULL;
+
+    size_t argc = 0;
+    while (args[argc]) argc++;
+    const char **argv = (const char **)calloc(argc + 2, sizeof(char *));
+    if (!argv) { close(fds[0]); close(fds[1]); return NULL; }
+    argv[0] = path;
+    for (size_t i = 0; i < argc; i++) argv[i + 1] = args[i];
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    pid_t pid = -1;
+    int rc = posix_spawn(&pid, path, &fa, NULL, (char *const *)argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    free((void *)argv);
+    close(fds[1]);
+    if (rc != 0) { close(fds[0]); return NULL; }
+
+    size_t cap = 65536, used = 0;
+    char *buf = (char *)malloc(cap);
+    if (buf) {
+        for (;;) {
+            if (used + 1 >= cap) break;   // truncate rather than grow unbounded
+            ssize_t n = read(fds[0], buf + used, cap - used - 1);
+            if (n <= 0) break;
+            used += (size_t)n;
+        }
+        buf[used] = '\0';
+    }
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return buf;
+}
+
+int rs_ffmpeg_probe_caps(const char *path, rs_ffmpeg_caps *out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    char *owned = NULL;
+    if (!path || !path[0]) {
+        owned = rs_ffmpeg_resolve();
+        path = owned;
+    }
+    if (!path) return -1;
+
+    const char *ver_args[] = {"-hide_banner", "-version", NULL};
+    char *ver = ff_capture(path, ver_args);
+    if (ver) {
+        out->has_libxml2 = strstr(ver, "--enable-libxml2") != NULL;
+        // First line is "ffmpeg version N.N ...".
+        char *nl = strchr(ver, '\n');
+        if (nl) *nl = '\0';
+        out->version = rs_strdup(ver);
+        free(ver);
+    }
+
+    // The demuxer list is the authority on whether a DASH input can be opened at
+    // all. Matching on line starts keeps "webm_dash_manifest" from counting.
+    const char *dem_args[] = {"-hide_banner", "-demuxers", NULL};
+    char *dem = ff_capture(path, dem_args);
+    if (dem) {
+        for (char *line = dem; line && *line;) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+            const char *p = line;
+            while (*p == ' ' || *p == '\t' || *p == 'D' || *p == 'E') p++;
+            if (strncmp(p, "dash", 4) == 0 && (p[4] == ' ' || p[4] == '\t' || p[4] == '\0'))
+                out->has_dash = true;
+            if (strncmp(p, "hls", 3) == 0 && (p[3] == ' ' || p[3] == '\t' || p[3] == ',' || p[3] == '\0'))
+                out->has_hls = true;
+            line = nl ? nl + 1 : NULL;
+        }
+        free(dem);
+    }
+
+    const char *proto_args[] = {"-hide_banner", "-protocols", NULL};
+    char *proto = ff_capture(path, proto_args);
+    if (proto) {
+        for (char *line = proto; line && *line;) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+            const char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (strcmp(p, "srt") == 0) out->has_srt = true;
+            if (strcmp(p, "https") == 0) out->has_https = true;
+            line = nl ? nl + 1 : NULL;
+        }
+        free(proto);
+    }
+
+    free(owned);
+    return 0;
+}
+
+#else  // _WIN32
+
+int rs_ffmpeg_probe_caps(const char *path, rs_ffmpeg_caps *out) {
+    (void)path;
+    if (out) memset(out, 0, sizeof(*out));
+    return -1;
+}
+
+#endif
+
+void rs_ffmpeg_caps_dispose(rs_ffmpeg_caps *caps) {
+    if (!caps) return;
+    rs_free(caps->version);
+    memset(caps, 0, sizeof(*caps));
 }

@@ -71,6 +71,31 @@ int rs_ffargs_tokenize(const char *text, char ***tokens, size_t *count);
 
 // Locate ffmpeg on PATH and standard locations (returns malloc'd path or NULL).
 char *rs_ffmpeg_resolve(void);
+
+// What a located ffmpeg can actually do, as opposed to whether it exists.
+//
+// "ffmpeg is installed" is not the question that matters. A DASH source needs
+// the `dash` demuxer, which libavformat only builds when configured with
+// --enable-libxml2 — and plenty of distribution and Homebrew builds omit it. On
+// such a build `-i whatever.mpd` fails outright, which looks like a broken
+// stream rather than a missing feature, so the panel checks for the capability
+// and says so. Package names are deliberately not consulted: "ffmpeg-full"
+// means something only to Homebrew, while the demuxer list is the truth on every
+// platform.
+typedef struct {
+    bool has_dash;      // the dash demuxer (requires libxml2)
+    bool has_hls;       // the hls demuxer
+    bool has_libxml2;   // --enable-libxml2 in the build configuration
+    bool has_srt;       // srt:// protocol, for the SRT output modes
+    bool has_https;     // https:// protocol
+    char *version;      // first line of `ffmpeg -version`, or NULL
+} rs_ffmpeg_caps;
+
+// Probes `path` (or a resolved ffmpeg when NULL) by running it. Costs two short
+// subprocess invocations, so callers should cache the result. Release with
+// rs_ffmpeg_caps_dispose.
+int rs_ffmpeg_probe_caps(const char *path, rs_ffmpeg_caps *out);
+void rs_ffmpeg_caps_dispose(rs_ffmpeg_caps *caps);
 // Generate installation plan for ffmpeg (returns malloc'd shell command string or NULL).
 char *rs_ffmpeg_install_plan(void);
 

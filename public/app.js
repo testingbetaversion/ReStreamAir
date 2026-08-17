@@ -1451,6 +1451,28 @@ function updatePipelineFieldVisibility() {
     }
   }
 
+  // Installed is not the same as capable. libavformat only builds the DASH
+  // demuxer when configured with --enable-libxml2, and a good number of stock
+  // builds leave it out — on those, an .mpd source cannot be opened at all and
+  // ffmpeg fails in a way that reads as a broken stream rather than a missing
+  // feature. Warn about the specific capability rather than a package name,
+  // which is Homebrew-only trivia and wrong everywhere else.
+  const capNotice = $("#ffmpegCapsNotice");
+  if (capNotice) {
+    const missing = [];
+    const isDash = (form.elements.kind?.value || "mpd") === "mpd";
+    if (available && ffmpegStatus.hasDash === false && isDash && needsFfmpeg) {
+      missing.push("no DASH demuxer — this build was compiled without --enable-libxml2, so an .mpd input cannot be opened (and -cenc_decryption_key has nothing to decrypt). On Homebrew use ffmpeg-full; on Debian/Ubuntu a distribution ffmpeg normally has it");
+    }
+    if (available && ffmpegStatus.hasSrt === false && (outputMode === "srtServer" || outputMode === "udpSrt")) {
+      missing.push("no srt:// protocol — this build lacks libsrt, so the SRT output modes cannot connect");
+    }
+    capNotice.classList.toggle("hidden", missing.length === 0);
+    capNotice.textContent = missing.length
+      ? `ffmpeg is installed${ffmpegStatus.version ? ` (${ffmpegStatus.version})` : ""} but ${missing.join("; ")}.`
+      : "";
+  }
+
   const nmNotice = $("#nm3u8dlreNotice");
   const nmInstallRow = $("#nm3u8dlreInstallRow");
   if (nmNotice && nmInstallRow) {
@@ -2403,8 +2425,82 @@ async function loadSettingsView() {
     $("#portForm").elements.bindAddress.value = settings.bindAddress || "";
     $("#portForm").elements.trustedProxies.value = settings.trustedProxies || "";
   } catch (error) { /* ignore */ }
+  await refreshServiceStatus();
   await refreshUserList();
 }
+
+// Service panel. The port setting says "takes effect after restart", so the
+// restart has to be reachable from the same page; and a fresh install often has
+// no unit at all — just a binary someone started by hand, which does not survive
+// a reboot — so offer to create one from the paths already in use.
+async function refreshServiceStatus() {
+  const panel = $("#servicePanel");
+  if (!panel) return;
+  let s;
+  try { s = await request("/api/service"); } catch { panel.classList.add("hidden"); return; }
+  if (!s.systemdAvailable) { panel.classList.add("hidden"); return; }
+  panel.classList.remove("hidden");
+
+  const bits = [];
+  bits.push(s.unitInstalled ? `${s.unitName} installed` : "no unit installed");
+  if (s.unitInstalled) {
+    bits.push(s.active ? "running" : "not running");
+    bits.push(s.enabled ? "starts on boot" : "does not start on boot");
+  }
+  $("#serviceStatus").textContent = bits.join(" · ");
+
+  const note = $("#serviceNote");
+  if (!s.canManage) {
+    note.textContent = "Managing the service needs root; these buttons are disabled.";
+  } else if (s.unitInstalled && s.execStart) {
+    note.textContent = `ExecStart: ${s.execStart}`;
+  } else if (!s.unitInstalled) {
+    note.textContent = `Would install a unit running ${s.selfPath || "this binary"} from ${s.workingDir || "the current directory"}.`;
+  } else {
+    note.textContent = "";
+  }
+
+  $("#serviceRestartBtn").disabled = !s.canManage || !s.unitInstalled;
+  $("#serviceInstallBtn").disabled = !s.canManage;
+  $("#serviceInstallBtn").textContent = s.unitInstalled ? "Reinstall systemd service" : "Install systemd service";
+}
+
+$("#serviceRestartBtn")?.addEventListener("click", async (event) => {
+  if (!confirm("Restart the panel service now? The panel will be briefly unreachable and any running stream is interrupted.")) return;
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await request("/api/service/restart", { method: "POST" });
+    $("#serviceNote").textContent = "Restarting — reconnecting…";
+    // The server goes away mid-restart, so poll /ping until it answers again
+    // rather than leaving the page looking hung.
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      try {
+        const res = await fetch("/ping", { cache: "no-store" });
+        if (res.ok) { $("#serviceNote").textContent = "Back up."; await refreshServiceStatus(); return; }
+      } catch { /* still down */ }
+    }
+    $("#serviceNote").textContent = "Still not answering — check `systemctl status` on the host.";
+  } catch (error) {
+    $("#serviceNote").textContent = `Restart failed: ${error.message || error}`;
+    button.disabled = false;
+  }
+});
+
+$("#serviceInstallBtn")?.addEventListener("click", async () => {
+  const form = $("#portForm");
+  const port = Number(form.elements.port.value) || undefined;
+  const bindAddress = form.elements.bindAddress.value || "";
+  if (!confirm("Write a systemd unit for this install and enable it at boot?")) return;
+  try {
+    await request("/api/service/install", { method: "POST", body: JSON.stringify({ port, bindAddress }) });
+    $("#serviceNote").textContent = "Unit installed and enabled.";
+    await refreshServiceStatus();
+  } catch (error) {
+    $("#serviceNote").textContent = `Install failed: ${error.message || error}`;
+  }
+});
 
 async function refreshUserList() {
   const list = $("#userList");

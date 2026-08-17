@@ -21,6 +21,17 @@ restream_server_t* restream_server_create(void);
 // message. The path is copied. NULL or "" clears it.
 void restream_server_set_web_root(restream_server_t* server, const char* path);
 
+// Service management, registered by the app so core/ stays free of anything
+// platform-specific (the same arrangement as the probe/fetch/dash handlers).
+// `status` returns a malloc'd JSON object describing the service, or NULL when
+// this build cannot manage one. `action` performs "restart" or "install" and
+// returns 0 on success, filling errbuf otherwise.
+typedef char* (*restream_service_status_fn)(void);
+typedef int (*restream_service_action_fn)(const char* action, unsigned port,
+                                         const char* bind, char* errbuf, size_t errbuf_len);
+void restream_server_set_service_handler(restream_service_status_fn status,
+                                         restream_service_action_fn action);
+
 // The panel's stored Server Settings, read after create and before start so the
 // caller can honour them when no command-line override was given — the panel
 // tells the operator these "take effect after restart", which is only true if

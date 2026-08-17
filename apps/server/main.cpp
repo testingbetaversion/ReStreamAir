@@ -28,6 +28,7 @@
 #include "net.h"
 #include "probe.h"
 #include "rs_dash.h"
+#include "service.h"
 #include "restream.h"
 
 namespace {
@@ -83,6 +84,80 @@ bool needs_value(const char *arg, int index, int argc, const char *flag) {
 }
 
 }  // namespace
+
+// --- service management bridge ----------------------------------------------
+//
+// core/ knows nothing about systemd; these two adapt rs_service_* to the
+// function-pointer hook, the same way probe/fetch/dash are wired.
+
+static void json_escape_into(std::string &out, const char *s) {
+    for (const char *p = s ? s : ""; *p; p++) {
+        switch (*p) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if ((unsigned char)*p < 0x20) { char b[8]; std::snprintf(b, sizeof(b), "\\u%04x", *p); out += b; }
+                else out += *p;
+        }
+    }
+}
+
+static char *service_status_json(void) {
+    rs_service_info info;
+    rs_service_probe(nullptr, &info);
+    std::string j = "{";
+    auto boolean = [&](const char *k, bool v) { j += "\""; j += k; j += "\":"; j += v ? "true" : "false"; j += ","; };
+    auto text = [&](const char *k, const char *v) {
+        j += "\""; j += k; j += "\":";
+        if (!v) { j += "null,"; return; }
+        j += "\""; json_escape_into(j, v); j += "\",";
+    };
+    boolean("systemdAvailable", info.systemd_available);
+    boolean("unitInstalled", info.unit_installed);
+    boolean("active", info.active);
+    boolean("enabled", info.enabled);
+    boolean("canManage", info.can_manage);
+    text("unitName", info.unit_name);
+    text("unitPath", info.unit_path);
+    text("execStart", info.exec_start);
+    text("selfPath", info.self_path);
+    text("workingDir", info.working_dir);
+    if (j.size() > 1 && j.back() == ',') j.pop_back();
+    j += "}";
+    rs_service_info_dispose(&info);
+    return rs_strdup(j.c_str());
+}
+
+static int service_action(const char *action, unsigned port, const char *bind,
+                         char *errbuf, size_t errbuf_len) {
+    if (!action) return -1;
+    // "restart-check" validates without acting, so the route can fail the request
+    // before it promises the operator a restart it cannot perform.
+    if (std::strcmp(action, "restart-check") == 0) {
+        rs_service_info info;
+        rs_service_probe(nullptr, &info);
+        int rc = 0;
+        if (!info.systemd_available) {
+            std::snprintf(errbuf, errbuf_len, "systemd is not available on this host");
+            rc = -1;
+        } else if (!info.unit_installed) {
+            std::snprintf(errbuf, errbuf_len, "no systemd unit is installed yet — install it first");
+            rc = -1;
+        } else if (!info.can_manage) {
+            std::snprintf(errbuf, errbuf_len, "restarting the service needs root");
+            rc = -1;
+        }
+        rs_service_info_dispose(&info);
+        return rc;
+    }
+    if (std::strcmp(action, "restart") == 0) return rs_service_restart(nullptr, errbuf, errbuf_len);
+    if (std::strcmp(action, "install") == 0) return rs_service_install(nullptr, port, bind, errbuf, errbuf_len);
+    std::snprintf(errbuf, errbuf_len, "unknown service action");
+    return -1;
+}
 
 int main(int argc, char **argv) {
     unsigned short port = 8080;
@@ -146,6 +221,8 @@ int main(int argc, char **argv) {
     restream_server_set_probe_handler(rs_probe_source);
     restream_server_set_fetch_handler(rs_fetch_url);
     restream_server_set_dash_handler(rs_dash_describe);
+
+    restream_server_set_service_handler(service_status_json, service_action);
 
     restream_server_t *server = restream_server_create();
     if (!server) {

@@ -88,6 +88,11 @@ struct restream_server {
     pthread_cond_t pending_cv;      // signalled whenever a job unlinks itself; wakes restream_server_destroy's drain
     pthread_mutex_t logo_mu;        // serialises RS_PENDING_LOGO workers' access to logo_cache (not itself thread-safe)
     uint16_t listen_port;   // the port actually bound, which is what /api/state must report
+    // A restart requested from Settings. Restarting replaces this process, so it
+    // cannot happen inside the request handler — the reply would never reach the
+    // browser. The one-second timer performs it instead, by which point mongoose
+    // has flushed the response and the operator has seen it succeed.
+    bool restart_pending;
     rs_live *live;          // background DASH->HLS engines, one per running stream
     rs_direct_client *direct_head;  // open fMP4 byte-tail viewers
     rs_ts_client *ts_head;          // open muxed-MPEG-TS viewers
@@ -113,6 +118,8 @@ struct restream_server {
 static restream_probe_fn g_probe_handler = NULL;
 static restream_fetch_fn g_fetch_handler = NULL;
 static restream_dash_fn g_dash_handler = NULL;
+static restream_service_status_fn g_service_status = NULL;
+static restream_service_action_fn g_service_action = NULL;
 
 // The live-engine control plane is defined with the playback handlers, further
 // down, but the /api/streams/*/start|stop|update|delete routes above them have
@@ -911,6 +918,15 @@ static void handle_events(restream_server_t *s, struct mg_connection *c) {
 // The 1s timer: push a fresh metrics frame to every SSE subscriber.
 static void broadcast_metrics(void *arg) {
     restream_server_t *s = (restream_server_t *)arg;
+    // A restart asked for from Settings. Deferred to here so the HTTP reply has
+    // been flushed — systemd stops this process the moment it accepts.
+    if (s->restart_pending) {
+        s->restart_pending = false;
+        char err[256] = {0};
+        if (!g_service_action || g_service_action("restart", 0, NULL, err, sizeof(err)) != 0)
+            log_record(s, "__panel__", "error", "serviceRestart", NULL, 0, -1,
+                       err[0] ? err : "the restart could not be handed to systemd");
+    }
     rs_metrics_prune(s->metrics);  // expire stale clients/rate windows every tick
     // Join and free any engine that finished winding down since the last tick.
     // Doing it here rather than in the stop handler is what makes Stop return
@@ -1271,6 +1287,61 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         reply_json(c, 200, log_view(s, sid, 150), NULL);
         return true;
     }
+    // --- service management ---
+    // GET reports what systemd knows; POST restart/install act on it. Both are
+    // behind the same admin auth as the rest of /api, and the action names are a
+    // fixed pair rather than anything the caller composes.
+    if (mg_match(hm->uri, mg_str("/api/service"), NULL) && method_is(hm, "GET")) {
+        char *json = g_service_status ? g_service_status() : NULL;
+        if (!json) {
+            mg_http_reply(c, 200, JSON_HEADERS, "{\"systemdAvailable\":false}");
+        } else {
+            mg_http_reply(c, 200, JSON_HEADERS, "%s", json);
+            rs_free(json);
+        }
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/service/restart"), NULL) && method_is(hm, "POST")) {
+        if (!g_service_action) {
+            reply_error(c, 501, "Service management isn't available in this build.");
+            return true;
+        }
+        char err[256] = {0};
+        // Ask first, act on the timer: a successful restart replaces this
+        // process, so the reply has to be on its way out before it happens.
+        if (g_service_action("restart-check", 0, NULL, err, sizeof(err)) != 0) {
+            reply_error(c, 400, err[0] ? err : "cannot restart the service");
+            return true;
+        }
+        s->restart_pending = true;
+        log_record(s, "__panel__", "info", "serviceRestart", NULL, 0, -1,
+                   "restart requested from Settings — handing over to systemd");
+        mg_http_reply(c, 200, JSON_HEADERS, "{\"restarting\":true}");
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/service/install"), NULL) && method_is(hm, "POST")) {
+        if (!g_service_action) {
+            reply_error(c, 501, "Service management isn't available in this build.");
+            return true;
+        }
+        rs_json *body = parse_body(hm);
+        double port = rs_json_as_num(rs_json_obj_get(body, "port"), 0);
+        char *bind = body_str(body, "bindAddress");
+        rs_json_free(body);
+        if (port <= 0 || port > 65535) port = s->listen_port;
+        char err[256] = {0};
+        int rc = g_service_action("install", (unsigned)port, bind, err, sizeof(err));
+        free(bind);
+        if (rc != 0) {
+            reply_error(c, 400, err[0] ? err : "could not install the service");
+            return true;
+        }
+        log_recordf(s, "__panel__", "info", "serviceInstall", NULL, 0, -1,
+                    "systemd unit installed and enabled (port %u)", (unsigned)port);
+        mg_http_reply(c, 200, JSON_HEADERS, "{\"installed\":true}");
+        return true;
+    }
+
     if (mg_match(hm->uri, mg_str("/api/probe"), NULL) && method_is(hm, "POST")) {
         if (!g_probe_handler) {
             reply_error(c, 501, "Source auto-detect isn't in the C server build. "
@@ -1542,6 +1613,21 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         rs_json *o = rs_json_new_obj();
         rs_json_obj_set_str(o, "status", path ? "available" : "missing");
         if (path) rs_json_obj_set_str(o, "path", path);
+        // Presence is not capability. A build without libxml2 has no DASH
+        // demuxer, so an .mpd source cannot be opened at all — a failure that
+        // reads as a broken stream unless the panel names it.
+        if (path) {
+            rs_ffmpeg_caps caps;
+            if (rs_ffmpeg_probe_caps(path, &caps) == 0) {
+                rs_json_obj_set_bool(o, "hasDash", caps.has_dash);
+                rs_json_obj_set_bool(o, "hasHls", caps.has_hls);
+                rs_json_obj_set_bool(o, "hasLibxml2", caps.has_libxml2);
+                rs_json_obj_set_bool(o, "hasSrt", caps.has_srt);
+                rs_json_obj_set_bool(o, "hasHttps", caps.has_https);
+                if (caps.version) rs_json_obj_set_str(o, "version", caps.version);
+                rs_ffmpeg_caps_dispose(&caps);
+            }
+        }
         free(path);
         reply_json(c, 200, o, NULL);
         return true;
@@ -3547,6 +3633,12 @@ restream_server_t* restream_server_create(void) {
                 "ReStreamAir C server started (build %s %s, live DASH engine %s)",
                 __DATE__, __TIME__, server->live ? "available" : "unavailable");
     return server;
+}
+
+void restream_server_set_service_handler(restream_service_status_fn status,
+                                         restream_service_action_fn action) {
+    g_service_status = status;
+    g_service_action = action;
 }
 
 void restream_server_set_web_root(restream_server_t* server, const char* path) {

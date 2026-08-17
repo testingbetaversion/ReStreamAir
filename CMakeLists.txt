@@ -121,8 +121,9 @@ add_executable(restreamair-server
     apps/server/probe.c
     apps/server/rs_dash.c
     apps/server/ffrun.c
+    apps/server/service.c
 )
 target_link_libraries(restreamair-server PRIVATE restream_core CURL::libcurl LibXml2::LibXml2)
 target_include_directories(restreamair-server PRIVATE apps/server)
 target_compile_options(restreamair-server PRIVATE ${RS_WARNINGS})
-set_source_files_properties(apps/server/probe.c apps/server/net.c apps/server/rs_dash.c apps/server/ffrun.c PROPERTIES COMPILE_OPTIONS "${RS_WARNINGS}")
+set_source_files_properties(apps/server/probe.c apps/server/net.c apps/server/rs_dash.c apps/server/ffrun.c apps/server/service.c PROPERTIES COMPILE_OPTIONS "${RS_WARNINGS}")
