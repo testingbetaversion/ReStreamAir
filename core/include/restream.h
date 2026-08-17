@@ -21,6 +21,14 @@ restream_server_t* restream_server_create(void);
 // message. The path is copied. NULL or "" clears it.
 void restream_server_set_web_root(restream_server_t* server, const char* path);
 
+// The panel's stored Server Settings, read after create and before start so the
+// caller can honour them when no command-line override was given — the panel
+// tells the operator these "take effect after restart", which is only true if
+// startup actually consults them. Returns 0 when unset. `out_bind` points at
+// server-owned storage valid until the next state write; NULL to skip it.
+uint16_t restream_server_stored_port(const restream_server_t* server);
+const char* restream_server_stored_bind(const restream_server_t* server);
+
 // Mongoose logs at INFO by default, which is a wall of per-connection noise for
 // anyone just running the binary. This turns it down to errors only (verbose =
 // false, the default once main sets it) or restores the full trace (true).

@@ -2388,7 +2388,18 @@ document.querySelectorAll(".log-mode-btn").forEach((button) => {
 async function loadSettingsView() {
   try {
     const settings = await request("/api/settings");
-    $("#portForm").elements.port.value = settings.port;
+    // `port` is the port actually bound; `storedPort` is the saved preference.
+    // Show the saved value (it is what this form edits) but say so when the
+    // running server is on a different one, which is exactly the state that
+    // used to make this field look wrong.
+    const stored = settings.storedPort ?? settings.port;
+    $("#portForm").elements.port.value = stored;
+    const note = $("#portRunningNote");
+    if (note) {
+      const differs = settings.port && Number(stored) !== Number(settings.port);
+      note.textContent = differs ? `currently listening on ${settings.port} — restart to apply ${stored}` : "";
+      note.classList.toggle("hidden", !differs);
+    }
     $("#portForm").elements.bindAddress.value = settings.bindAddress || "";
     $("#portForm").elements.trustedProxies.value = settings.trustedProxies || "";
   } catch (error) { /* ignore */ }

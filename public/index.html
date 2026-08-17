@@ -470,7 +470,7 @@
             <div class="panel-head"><h3>Server settings</h3></div>
             <div class="keys-body">
               <form id="portForm" class="form-row">
-                <label>Panel port<span class="field-hint">Takes effect after restart</span><input name="port" type="number" min="1" max="65535"></label>
+                <label>Panel port<span class="field-hint">Takes effect after restart. A <code>--port</code> flag on the command line overrides it.</span><input name="port" type="number" min="1" max="65535"><span id="portRunningNote" class="field-hint warn hidden"></span></label>
                 <label>Bind address<span class="field-hint">Blank = all interfaces. Use 127.0.0.1 to only accept local connections.</span><input name="bindAddress" placeholder="0.0.0.0"></label>
                 <label>Trusted proxies<span class="field-hint">Blank = trust nothing. Set to <code>loopback</code> when a reverse proxy in front of ReStreamAir terminates HTTPS, so the real client address and https:// scheme are honoured. Accepts addresses, CIDR blocks, <code>loopback</code>, <code>private</code> or <code>any</code>.</span><input name="trustedProxies" placeholder="loopback"></label>
                 <div class="actions"><button type="submit">Save</button></div>

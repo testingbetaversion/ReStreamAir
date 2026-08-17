@@ -1654,3 +1654,6 @@ pre {
   opacity: 0.75;
   cursor: help;
 }
+
+/* Settings note shown when the saved port differs from the one in use. */
+.field-hint.warn { color: #d98b3a; }

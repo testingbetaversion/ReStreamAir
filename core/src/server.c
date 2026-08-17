@@ -87,6 +87,7 @@ struct restream_server {
     pthread_mutex_t pending_mu;     // guards pending_head and each entry's `cancelled` flag
     pthread_cond_t pending_cv;      // signalled whenever a job unlinks itself; wakes restream_server_destroy's drain
     pthread_mutex_t logo_mu;        // serialises RS_PENDING_LOGO workers' access to logo_cache (not itself thread-safe)
+    uint16_t listen_port;   // the port actually bound, which is what /api/state must report
     rs_live *live;          // background DASH->HLS engines, one per running stream
     rs_direct_client *direct_head;  // open fMP4 byte-tail viewers
     rs_ts_client *ts_head;          // open muxed-MPEG-TS viewers
@@ -780,8 +781,15 @@ static rs_json *parse_body(struct mg_http_message *hm) {
 static rs_json *settings_view(restream_server_t *s) {
     const rs_json *settings = rs_json_obj_get(s->state.root, "settings");
     rs_json *out = rs_json_new_obj();
-    rs_json_obj_set(out, "port",
-                    rs_json_new_int((long long)rs_json_as_num(rs_json_obj_get(settings, "port"), 8787)));
+    // The port actually bound, not the stored preference. Reporting the stored
+    // value meant the Settings page showed 8787 (the default nobody had ever
+    // changed) while the operator was connected on the real port — the field
+    // claimed to describe the running server and described nothing at all.
+    // `storedPort` keeps the preference visible for the "takes effect after
+    // restart" case, where the two legitimately differ.
+    long long stored = (long long)rs_json_as_num(rs_json_obj_get(settings, "port"), 0);
+    rs_json_obj_set(out, "port", rs_json_new_int((long long)s->listen_port));
+    rs_json_obj_set(out, "storedPort", rs_json_new_int(stored > 0 ? stored : (long long)s->listen_port));
     rs_json_obj_set(out, "bindAddress",
                     rs_json_new_str(rs_json_as_str(rs_json_obj_get(settings, "bindAddress"), "")));
     rs_json_obj_set(out, "trustedProxies",
@@ -3563,6 +3571,21 @@ void restream_server_set_dash_handler(restream_dash_fn handler) {
     g_dash_handler = handler;
 }
 
+uint16_t restream_server_stored_port(const restream_server_t* server) {
+    if (!server) return 0;
+    const rs_json *settings = rs_json_obj_get(server->state.root, "settings");
+    double v = rs_json_as_num(rs_json_obj_get(settings, "port"), 0);
+    if (v <= 0 || v > 65535) return 0;
+    return (uint16_t)v;
+}
+
+const char* restream_server_stored_bind(const restream_server_t* server) {
+    if (!server) return NULL;
+    const rs_json *settings = rs_json_obj_get(server->state.root, "settings");
+    const char *v = rs_json_as_str(rs_json_obj_get(settings, "bindAddress"), "");
+    return (v && v[0]) ? v : NULL;
+}
+
 bool restream_server_start(restream_server_t* server, uint16_t port, const char* bind_address) {
     if (!server) return false;
     
@@ -3572,6 +3595,8 @@ bool restream_server_start(restream_server_t* server, uint16_t port, const char*
     } else {
         snprintf(listen_url, sizeof(listen_url), "http://0.0.0.0:%d", port);
     }
+
+    server->listen_port = port;
 
     // Pass the server through as fn_data so ev_handler can read the web root.
     server->c = mg_http_listen(&server->mgr, listen_url, ev_handler, server);

@@ -90,6 +90,13 @@ int main(int argc, char **argv) {
     std::string web_root;
     bool web_root_set = false;
     bool verbose = false;
+    // Whether the port/bind came from the command line. The panel's Settings
+    // page stores both and tells the operator they "take effect after restart" —
+    // which was untrue, because startup only ever looked at argv. An explicit
+    // flag still wins (that is what a flag is for); otherwise the stored
+    // setting is honoured, so the promise the UI makes is now kept.
+    bool port_from_argv = false;
+    bool bind_from_argv = false;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -107,9 +114,11 @@ int main(int argc, char **argv) {
                 return 2;
             }
             port = static_cast<unsigned short>(value);
+            port_from_argv = true;
         } else if (std::strcmp(arg, "-b") == 0 || std::strcmp(arg, "--bind") == 0) {
             if (!needs_value(arg, i, argc, arg)) return 2;
             bind_address = argv[++i];
+            bind_from_argv = true;
         } else if (std::strcmp(arg, "--root") == 0) {
             if (!needs_value(arg, i, argc, arg)) return 2;
             web_root = argv[++i];
@@ -146,6 +155,14 @@ int main(int argc, char **argv) {
     if (!web_root.empty()) {
         restream_server_set_web_root(server, web_root.c_str());
     }
+    // Honour the panel's stored settings unless the command line overrode them.
+    if (!port_from_argv) {
+        if (uint16_t stored = restream_server_stored_port(server)) port = stored;
+    }
+    if (!bind_from_argv) {
+        if (const char *stored = restream_server_stored_bind(server)) bind_address = stored;
+    }
+
     if (!restream_server_start(server, port, bind_address.c_str())) {
         std::fprintf(stderr, "restreamair-server: cannot listen on %s:%u\n", bind_address.c_str(), port);
         restream_server_destroy(server);
