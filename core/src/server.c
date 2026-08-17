@@ -1689,6 +1689,42 @@ static char *effective_headers(const rs_json *provider, const rs_json *stream, c
     return out;
 }
 
+// The video rendition the panel has selected, to pin the engine to.
+//
+// The panel writes the checkbox selection to `representations` (an array that
+// holds the chosen video AND audio ids); `representation` is the older single
+// field. panel.c already documents the precedence — "representations if any,
+// else the single representation field" — and the whole panel view is built on
+// it, but the live-engine config read only the singular field. So every stream
+// started with rep "auto" no matter what was ticked, and auto-select takes the
+// *highest* bitrate video in the ladder. Selecting 720p silently got you 1080p
+// at 4.5 Mbps, which is also why bandwidth demand never matched the config.
+//
+// The array is not ordered video-first (GLOBO BH stores ["stream_07",
+// "stream_04"] — audio, then video), so the entry has to be identified by its
+// type from representationMeta rather than by position. Returning "" leaves the
+// engine on auto, which is the right fallback when nothing is typed: the engine
+// picks the audio rendition itself either way (see the director's `pinned`).
+static const char *selected_video_rep(const rs_json *stream) {
+    const rs_json *reps = rs_json_obj_get(stream, "representations");
+    size_t n = rs_json_arr_len(reps);
+    const rs_json *meta = rs_json_obj_get(stream, "representationMeta");
+    for (size_t i = 0; i < n; i++) {
+        const char *id = rs_json_as_str(rs_json_arr_at(reps, i), "");
+        if (!id[0]) continue;
+        const rs_json *m = meta ? rs_json_obj_get(meta, id) : NULL;
+        const char *type = m ? rs_json_obj_str(m, "type", "") : "";
+        if (strcmp(type, "video") == 0) return id;
+    }
+    // No typing available (an older stream, or a probe that never ran): a
+    // single entry is unambiguous enough to honour, more than one is not.
+    if (n == 1) {
+        const char *only = rs_json_as_str(rs_json_arr_at(reps, 0), "");
+        if (only[0] && !meta) return only;
+    }
+    return rs_json_obj_str(stream, "representation", "");
+}
+
 // The provider's chosen download tool ("native", i.e. in-process libcurl, by
 // default) and its extra params. Applied to this provider's manifest/segment
 // fetches; see rs_fetch_url.
@@ -2385,7 +2421,7 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     rs_live_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.mpd_url = src;
-    cfg.representation = rs_json_obj_str(stream, "representation", "");
+    cfg.representation = selected_video_rep(stream);
     cfg.manifest_proxy = mproxy;
     cfg.media_proxy = dproxy;
     cfg.manifest_headers = mheaders;
