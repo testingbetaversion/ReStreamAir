@@ -3518,6 +3518,17 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
 }
 
 // Mongoose event handler
+// The front-end router's view addresses (VIEW_ROUTES in public/app.js). Kept in
+// step with PanelServer.panelViewPaths on the Swift side.
+static bool is_panel_view_path(struct mg_str uri) {
+    static const char *const views[] = {
+        "/providers", "/streams", "/server", "/logs", "/keys", "/settings", "/help",
+    };
+    for (size_t i = 0; i < sizeof(views) / sizeof(views[0]); i++)
+        if (mg_strcmp(uri, mg_str(views[i])) == 0) return true;
+    return false;
+}
+
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     restream_server_t *server = (restream_server_t *)c->fn_data;
     // A connection with an in-flight async job (see pending_job_dispatch)
@@ -3597,6 +3608,18 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         struct mg_http_serve_opts opts = {0};
         opts.root_dir = server->web_root;
         opts.extra_headers = g_request_security;
+        // The panel is a single page that gives every view its own address, so
+        // each of those addresses has to return index.html and let the
+        // front-end router pick the view up from the path. A fixed list, not a
+        // catch-all fallback: an unknown path must still 404 rather than
+        // silently answer with the panel's HTML, which would make a mistyped
+        // asset or API path look like a broken JSON response instead of a 404.
+        if (is_panel_view_path(hm->uri)) {
+            char index_path[1024];
+            snprintf(index_path, sizeof(index_path), "%s/index.html", server->web_root);
+            mg_http_serve_file(c, hm, index_path, &opts);
+            return;
+        }
         mg_http_serve_dir(c, hm, &opts);
         return;
     }

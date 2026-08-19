@@ -1468,8 +1468,21 @@ final class PanelServer {
         if request.path.hasPrefix("/restream/") { return try serveRestream(request) }
         if request.path.hasPrefix("/download/") { return try handleDownloadStream(request) }
         if request.path.hasPrefix("/source/") { return try serveSourceRedirect(request) }
+        // The panel is a single page with a real address per view, so each of
+        // its view paths has to serve index.html and let the front-end router
+        // take it from there. Deliberately a fixed list rather than a catch-all
+        // fallback: an unknown path still 404s instead of quietly returning the
+        // panel HTML, which would turn every typo'd asset or API path into a
+        // confusing "why is this JSON an HTML page".
+        if PanelServer.panelViewPaths.contains(request.path) { return try servePublic("/index.html") }
         return try servePublic(request.path == "/" ? "/index.html" : request.path)
     }
+
+    /// The front-end router's view addresses (see VIEW_ROUTES in public/app.js).
+    /// Kept in step with the same list in the C server's `is_panel_view_path`.
+    static let panelViewPaths: Set<String> = [
+        "/providers", "/streams", "/server", "/logs", "/keys", "/settings", "/help",
+    ]
 
     /// `/source/<id>` — a 302 redirect straight to the stream's origin source
     /// URL. This is the "direct link" for an m3u8 passthrough: instead of

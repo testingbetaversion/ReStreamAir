@@ -171,9 +171,95 @@ function renderViewHeader() {
 
 let logsPollTimer = null;
 
-function switchView(view) {
+// MARK: - URL routing
+//
+// Every view has its own address, so the browser's back/forward buttons work,
+// a page can be reloaded where you left it, and a view can be linked to or
+// bookmarked. The two views that carry context put it in the query string
+// (?provider= on All Streams, ?stream= on Logs) so a deep link lands
+// pre-filtered exactly the way the in-app shortcuts do.
+//
+// Real paths rather than a hash, so the URLs read like pages; both servers
+// serve index.html for this fixed list (an unknown path still 404s, so a typo
+// is not silently swallowed by the SPA). A "#/logs" hash is still honoured on
+// the way in, which keeps deep links working if the panel is ever opened from
+// a file:// copy or behind a proxy that cannot rewrite paths.
+const VIEW_ROUTES = {
+  providers: "/providers",
+  grid: "/streams",
+  monitor: "/server",
+  logs: "/logs",
+  keys: "/keys",
+  settings: "/settings",
+  help: "/help",
+};
+const ROUTE_VIEWS = Object.fromEntries(Object.entries(VIEW_ROUTES).map(([view, path]) => [path, view]));
+const DEFAULT_VIEW = "monitor";
+
+// The address that represents the app's current state, including the filter
+// context of whichever view is showing.
+function urlForView(view) {
+  const path = VIEW_ROUTES[view] || VIEW_ROUTES[DEFAULT_VIEW];
+  const params = new URLSearchParams();
+  if (view === "grid" && streamsGridProviderId) params.set("provider", streamsGridProviderId);
+  if (view === "logs") {
+    const streamId = pendingLogStreamId !== null
+      ? pendingLogStreamId
+      : ($("#logStreamFilter")?.value || "");
+    if (streamId) params.set("stream", streamId);
+  }
+  const query = params.toString();
+  return path + (query ? `?${query}` : "");
+}
+
+// Which view the current address names, plus any filter it carries.
+function routeFromLocation() {
+  const hash = location.hash.replace(/^#/, "");
+  const usingHash = hash.startsWith("/");
+  const raw = usingHash ? hash : location.pathname;
+  const [rawPath, rawQuery] = raw.split("?");
+  const path = rawPath.replace(/\/+$/, "") || "/";
+  const params = new URLSearchParams(usingHash ? (rawQuery || "") : location.search);
+  return {
+    view: ROUTE_VIEWS[path] || DEFAULT_VIEW,
+    provider: params.get("provider") || "",
+    stream: params.get("stream") || "",
+  };
+}
+
+// Point the address bar at `view` without navigating. Replace rather than push
+// when the entry is only being corrected (boot, or a filter change inside the
+// view already showing), so the back button does not collect duplicates.
+function syncUrl(view, replace) {
+  const url = urlForView(view);
+  const current = location.pathname + location.search;
+  if (url === current) return;
+  if (replace) history.replaceState({ view }, "", url);
+  else history.pushState({ view }, "", url);
+}
+
+// Adopt whatever view the address names — used at boot and on back/forward.
+function applyRoute() {
+  const route = routeFromLocation();
+  if (route.view === "grid") streamsGridProviderId = route.provider;
+  if (route.view === "logs" && route.stream) pendingLogStreamId = route.stream;
+  // "replace", not "none": adopting the route should also canonicalise the
+  // address, so "/" and the "#/logs" hash form land on the same URL every other
+  // navigation produces — without pushing a duplicate history entry.
+  switchView(route.view, { history: "replace" });
+}
+
+window.addEventListener("popstate", applyRoute);
+
+// `history` is "push" (a normal navigation), "replace" (correcting the current
+// entry), or "none" (the address already says this — we are following it).
+function switchView(view, { history: historyMode = "push" } = {}) {
+  // Before the view transition, not inside it: startViewTransition defers the
+  // callback, so anything that read currentView straight after a switchView()
+  // call got the previous view.
+  currentView = view;
+  if (historyMode !== "none") syncUrl(view, historyMode === "replace");
   const apply = () => {
-    currentView = view;
     document.querySelectorAll(".nav-btn").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
     $("#providersView").classList.toggle("hidden", view !== "providers");
     $("#streamsGridView").classList.toggle("hidden", view !== "grid");
@@ -332,6 +418,17 @@ function updateStreamCardDynamic(card, stream) {
     toggle.innerHTML = `<span data-icon="${stream.running ? "stop" : "play"}"></span>${stream.running ? "Stop" : "Start"}`;
     applyIcons(toggle);
   }
+}
+
+// Look a stream up in the current state by id. Click handlers must resolve the
+// stream at click time rather than closing over the object they were rendered
+// with — see the toggle handler in renderStreamsGrid.
+function findStreamById(id) {
+  for (const provider of state.providers) {
+    const found = provider.streams.find((s) => s.id === id);
+    if (found) return found;
+  }
+  return null;
 }
 
 // The currently-visible stream rows after all filters (provider, type, search,
@@ -523,11 +620,20 @@ function renderStreamsGrid() {
     });
     card.querySelector('[data-action="toggle"]').addEventListener("click", async (event) => {
       event.stopPropagation();
-      await toggleStreamRun(stream.id, stream.running);
+      // Re-read the stream from the live state instead of the object this card
+      // was built from. The fast-path refresh above (updateStreamCardDynamic)
+      // relabels an existing card without rebuilding it — orderKey deliberately
+      // ignores `running` so the grid does not churn — so the captured object
+      // goes stale the moment the stream starts or stops. Acting on it sent the
+      // opposite request to what the button said: press Stop, then press the
+      // button again (now reading "Start") and it POSTed /stop a second time.
+      const live = findStreamById(stream.id) || stream;
+      await toggleStreamRun(live.id, live.running);
     });
     card.querySelector('[data-action="delete"]').addEventListener("click", async (event) => {
       event.stopPropagation();
-      await deleteStreamId(stream.id, stream.name);
+      const live = findStreamById(stream.id) || stream;
+      await deleteStreamId(live.id, live.name);
     });
     applyIcons(card);
     container.appendChild(card);
@@ -2334,6 +2440,9 @@ $("#providerSearch").addEventListener("input", (event) => {
 $("#streamsGridProviderFilter").addEventListener("change", (event) => {
   streamsGridProviderId = event.currentTarget.value;
   renderStreamsGrid();
+  // The provider filter is part of this view's address; replace rather than
+  // push so flicking through providers does not fill up the back button.
+  syncUrl("grid", true);
 });
 $("#streamsGridTypeFilter").addEventListener("change", (event) => {
   streamsGridTypeFilter = event.currentTarget.value;
@@ -2392,7 +2501,10 @@ $("#connectionsSearch").addEventListener("input", (event) => {
   connectionsSearchQuery = event.currentTarget.value;
   renderConnectionsTable();
 });
-$("#logStreamFilter").addEventListener("change", loadLogs);
+$("#logStreamFilter").addEventListener("change", () => {
+  syncUrl("logs", true);
+  loadLogs();
+});
 $("#logLevelFilter").addEventListener("change", (event) => {
   logLevelFilter = event.currentTarget.value;
   loadLogs();
@@ -3007,6 +3119,11 @@ async function boot() {
   refresh()
     .then(() => {
       document.querySelectorAll(".skeleton").forEach((el) => el.classList.remove("skeleton"));
+      // Once state exists, open whichever view the address names. Deferred to
+      // here because the per-view loaders (logs, settings) need state and an
+      // authenticated session, and because the log/provider filters are only
+      // populated after the first render.
+      applyRoute();
     })
     .catch((error) => {
       document.querySelectorAll(".skeleton").forEach((el) => el.classList.remove("skeleton"));

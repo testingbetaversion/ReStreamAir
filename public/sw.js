@@ -1,4 +1,4 @@
-const CACHE_NAME = "restreamair-shell-v30";
+const CACHE_NAME = "restreamair-shell-v31";
 const SHELL_FILES = [
   "/",
   "/app.js",
@@ -29,6 +29,18 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== "GET" || url.origin !== self.location.origin) return;
   if (PASSTHROUGH_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))) return;
+
+  // Every panel view has its own address now (/logs, /streams?provider=…), and
+  // all of them are the same index.html. Answer navigations from the one cached
+  // "/" entry rather than letting the generic handler below store a separate
+  // copy of the shell per path — and per query string, since caches.match keys
+  // on the full URL.
+  if (event.request.mode === "navigate") {
+    event.respondWith(
+      caches.match("/").then((cached) => cached || fetch(event.request))
+    );
+    return;
+  }
 
   event.respondWith(
     caches.match(event.request).then((cached) => {
