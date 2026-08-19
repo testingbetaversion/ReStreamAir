@@ -34,11 +34,18 @@
 // source we handle uses; the extra slots leave room for a pinned
 // representation alongside them).
 #define RS_LIVE_MAX_REPS 6
-// Active segment downloads across one stream. Video and audio share this
-// budget: treating the value as a separate allowance for every rendition can
-// turn a configured value of four into eight simultaneous origin requests.
-// Several signed CDNs and proxies slow down sharply under that fan-out.
-#define RS_LIVE_FETCH_PAR 3
+// Active segment downloads across one stream when nothing is configured. Video
+// and audio share this budget: treating the value as a separate allowance for
+// every rendition can turn a configured value of four into eight simultaneous
+// origin requests, and several signed CDNs and proxies slow down under that.
+//
+// Sharing the budget is right; setting it to three was not. On a proxied path
+// the per-connection rate is what it is — measured on the production proxy at
+// roughly 60 KB/s — so aggregate throughput comes almost entirely from how many
+// connections are open. A 3 Mbps video rendition needs ~370 KB/s, which is six
+// connections at that rate and cannot be had from two, whatever the timeouts
+// are set to.
+#define RS_LIVE_FETCH_PAR 6
 
 // Ceiling on a representation's persistent download threads, whatever
 // parallelDownloads is set to. Each thread keeps its own HTTP connection alive
@@ -47,7 +54,7 @@
 // "how many segments are outstanding" — and past a handful that stops buying
 // throughput and starts costing congestion and CDN concurrency refusals.
 // streamlink defaults to one download thread and keeps up fine.
-#define RS_LIVE_MAX_DL_THREADS 3
+#define RS_LIVE_MAX_DL_THREADS 8
 // Hard ceiling on segments queued but not yet committed. The configured
 // downloadAhead sets the working depth; this only bounds the allocation.
 #define RS_LIVE_PENDING_MAX 128
@@ -88,7 +95,19 @@
 // wall clock on a stream that has to stay in real time.
 #define RS_LIVE_FETCH_TRIES 2
 #define RS_LIVE_FETCH_RETRY_DELAY 0.4
-#define RS_LIVE_MEDIA_TIMEOUT_MIN_MS 12000L
+// Backstop for one media request. NOT the liveness guard — that is the
+// head-of-line rule, which asks the question that actually matters ("is this
+// holding up segments already downloaded") instead of watching a clock.
+//
+// This floor was 12s and it was cutting transfers off at the knees. The
+// timeout has to cover a segment's BYTES, and it was being derived from the
+// segment's DURATION, which says nothing about size: on the production proxy a
+// 2s video segment is ~745 KB and needs about twelve and a half seconds at the
+// rate that path delivers, so nearly every one died fractionally short while
+// the 25 KB audio segments beside it sailed through. The giveaway in the logs
+// was the split — audio 62 of 63 successful, video 4 of 17 — on one proxy at
+// one moment. Failure that tracks segment size is bandwidth, not a dead link.
+#define RS_LIVE_MEDIA_TIMEOUT_MIN_MS 20000L
 #define RS_LIVE_MEDIA_TIMEOUT_MAX_MS 30000L
 
 // The window-sizing rule itself lives in live_window.c (portable, pure, and
@@ -358,6 +377,7 @@ typedef struct {
     int attempts;
     pend_state state;
     double started;          // when a download thread claimed it
+    double fetch_seconds;    // wall time the successful transfer took
     // Stamped when the slot is filled and re-stamped whenever it is reused. A
     // download thread captures it alongside the slot pointer and only writes
     // its result back if it still matches, so a slot can be abandoned out from
@@ -747,7 +767,7 @@ static int download_should_cancel(void *opaque) {
 }
 
 static long media_timeout_ms(double duration) {
-    long timeout = duration > 0 ? (long)(duration * 6000.0) : RS_LIVE_MEDIA_TIMEOUT_MIN_MS;
+    long timeout = duration > 0 ? (long)(duration * 10000.0) : RS_LIVE_MEDIA_TIMEOUT_MIN_MS;
     if (timeout < RS_LIVE_MEDIA_TIMEOUT_MIN_MS) timeout = RS_LIVE_MEDIA_TIMEOUT_MIN_MS;
     if (timeout > RS_LIVE_MEDIA_TIMEOUT_MAX_MS) timeout = RS_LIVE_MEDIA_TIMEOUT_MAX_MS;
     return timeout;
@@ -775,7 +795,11 @@ static int rep_active_limit_locked(const live_rep *rep) {
             break;
         }
     }
-    if (budget > 1 && have_audio) {
+    // Only worth reserving when there is something to reserve from. At a budget
+    // of three this handed video two connections, which is below what any real
+    // video rendition needs on a slow path — the reservation protected audio by
+    // starving the thing the stream exists to deliver.
+    if (budget >= 4 && have_audio) {
         if (rep->kind && strcmp(rep->kind, "video") == 0) return budget - 1;
         return 1;
     }
@@ -823,6 +847,7 @@ static void *download_main(void *arg) {
         uint8_t *data = NULL;
         size_t len = 0;
         int attempts = 0;
+        double fetch_seconds = 0;
         char err[192] = {0};
         bool ok = false;
 
@@ -858,6 +883,7 @@ static void *download_main(void *arg) {
             long status = 0;
             err[0] = '\0';
             download_cancel_ctx cancel = {st, slot, slot_gen, request_gen};
+            double attempt_start = now_seconds();
             int rc = st->mgr->fetch(url, cfg.media_proxy, cfg.media_headers, NULL,
                                     cfg.downloader, cfg.dl_params,
                                     &body, &blen, &status, NULL, NULL, NULL, err, sizeof(err),
@@ -868,6 +894,7 @@ static void *download_main(void *arg) {
                 data = (uint8_t *)body;
                 len = blen;
                 ok = true;
+                fetch_seconds = now_seconds() - attempt_start;
                 break;
             }
             if (!err[0]) snprintf(err, sizeof(err), "fetch failed (status %ld)", status);
@@ -888,6 +915,7 @@ static void *download_main(void *arg) {
             if (c == slot && c->gen == slot_gen && c->state == PEND_FETCHING) { dst = c; break; }
         }
         if (dst) {
+            dst->fetch_seconds = fetch_seconds;
             dst->data = data;
             dst->len = len;
             dst->attempts = attempts;
@@ -1532,10 +1560,15 @@ static void commit_one(live_rep *rep, const cfg_snap *cfg, pend_item *it,
     *added_seconds += it->duration > 0 ? it->duration : 2.0;
     if (it->attempts > 1)
         lgf(st, "info", "downloadSegment", it->url, 200, (long long)len,
-            "%s: %.3fs (recovered on attempt %d)", rep->rep_id, it->duration, it->attempts);
+            "%s: %.3fs media in %.1fs (%.0f KB/s), recovered on attempt %d",
+            rep->rep_id, it->duration, it->fetch_seconds,
+            it->fetch_seconds > 0 ? (double)len / it->fetch_seconds / 1024.0 : 0.0, it->attempts);
     else
         lgf(st, "info", "downloadSegment", it->url, 200, (long long)len,
-            "%s: %.3fs%s", rep->rep_id, it->duration, was_disc ? " (discontinuity)" : "");
+            "%s: %.3fs media in %.1fs (%.0f KB/s)%s", rep->rep_id, it->duration,
+            it->fetch_seconds,
+            it->fetch_seconds > 0 ? (double)len / it->fetch_seconds / 1024.0 : 0.0,
+            was_disc ? " — discontinuity" : "");
     // Say which kind of break this is. A forward jump of a whole number of
     // segments after a failed download is content we lost; anything else is
     // the source splicing its own timeline. They look identical in the
