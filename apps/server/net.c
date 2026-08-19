@@ -291,6 +291,15 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    // Abort a transfer that has connected but is not actually moving. The
+    // overall 30s timeout is the wrong instrument for this: a CDN handed an
+    // expired signed URL does not refuse it, it simply never answers, so the
+    // request sat for the full thirty seconds — per attempt — while the live
+    // engine's queue backed up behind it. Anything below 1 KB/s for five
+    // seconds is not a slow segment, it is a dead request. A genuinely slow
+    // but progressing transfer keeps its full 30s.
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 5L);
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION,
                      force_http11 ? (long)CURL_HTTP_VERSION_1_1 : (long)CURL_HTTP_VERSION_2TLS);
     // Keep-alive is the whole point of the per-thread handle; make the probes

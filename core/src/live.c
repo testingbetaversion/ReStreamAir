@@ -62,12 +62,29 @@
 // Judging that over five seconds turned fallingBehind — which is supposed to
 // mean "this stream is going to stall" — into noise.
 #define RS_LIVE_SUSTAIN_INTERVAL 30.0
+// How long the segment at the head of the queue may hold up everything behind
+// it before it is abandoned. The writer commits in queue order, which is what
+// keeps the timeline honest — but it also means one unanswerable request stops
+// all publishing even when the next twenty segments are downloaded and waiting.
+// Seen in production: an expired URL that the CDN simply never answered held a
+// rendition at "+0 segments, 20 in flight" for a minute at a time, then dumped
+// +19 at once. Scaled off the segment duration, because a segment that has
+// taken four times its own playing time to arrive is already too late to matter.
+#define RS_LIVE_HEAD_STALL_FACTOR 4.0
+#define RS_LIVE_HEAD_STALL_MIN 8.0
 
 // Attempts per segment before it is written off. A segment right at the live
 // edge is routinely requested a moment before the origin has finished writing
 // it; giving up on the first error dropped it permanently and tore a hole in
 // the timeline that surfaced as an EXT-X-DISCONTINUITY.
-#define RS_LIVE_FETCH_TRIES 3
+//
+// Two, not three. Every attempt can cost a full transfer timeout, and against a
+// CDN that answers an expired URL with silence rather than a refusal that is
+// the difference between spending ten seconds on a dead segment and spending a
+// minute and a half on it. A second attempt still covers the case this exists
+// for — the live edge arriving a moment late — and nothing beyond that is worth
+// the wall clock on a stream that has to stay in real time.
+#define RS_LIVE_FETCH_TRIES 2
 #define RS_LIVE_FETCH_RETRY_DELAY 0.4
 
 // The window-sizing rule itself lives in live_window.c (portable, pure, and
@@ -327,7 +344,8 @@ typedef enum {
 } pend_state;
 
 typedef struct {
-    char *url;
+    char *url;               // refreshed from every poll while still WAITING
+    char idkey[288];         // token-independent identity (see stable_key)
     long long time_val;      // the manifest's $Time$, for the stable identity
     double duration;
     unsigned long plan_ts;   // manifest timescale, for anchoring text cues
@@ -335,6 +353,13 @@ typedef struct {
     size_t len;
     int attempts;
     pend_state state;
+    double started;          // when a download thread claimed it
+    // Stamped when the slot is filled and re-stamped whenever it is reused. A
+    // download thread captures it alongside the slot pointer and only writes
+    // its result back if it still matches, so a slot can be abandoned out from
+    // under an in-flight fetch (see the head-of-line rule in writer_main)
+    // without the late result landing on whatever occupies the slot next.
+    uint64_t gen;
     char err[192];
 } pend_item;
 
@@ -382,6 +407,7 @@ typedef struct {
     size_t pend_head;      // index into `pending` of the next item to commit
     size_t pend_count;     // items live in the ring
     size_t pend_cap;
+    uint64_t pend_gen;     // monotonic stamp source for pend_item.gen
     pthread_t *dl_threads;
     size_t ndl;
     pthread_t wr_thread;
@@ -602,16 +628,27 @@ static pend_item *pend_at_locked(live_rep *rep, size_t i) {
 }
 
 // Appends one segment. Caller has already checked there is room.
-static void pend_push_locked(live_rep *rep, const char *url, long long time_val,
-                             double duration, unsigned long plan_ts) {
+static void pend_push_locked(live_rep *rep, const char *url, const char *idkey,
+                             long long time_val, double duration, unsigned long plan_ts) {
     pend_item *it = pend_at_locked(rep, rep->pend_count);
     memset(it, 0, sizeof(*it));
     it->url = rs_strdup(url);
+    snprintf(it->idkey, sizeof(it->idkey), "%s", idkey);
     it->time_val = time_val;
     it->duration = duration;
     it->plan_ts = plan_ts;
     it->state = PEND_WAITING;
+    it->gen = ++rep->pend_gen;
     rep->pend_count++;
+}
+
+// The queued item with this identity, whatever state it is in.
+static pend_item *pend_find_locked(live_rep *rep, const char *idkey) {
+    for (size_t i = 0; i < rep->pend_count; i++) {
+        pend_item *it = pend_at_locked(rep, i);
+        if (strcmp(it->idkey, idkey) == 0) return it;
+    }
+    return NULL;
 }
 
 static void pend_item_dispose(pend_item *it) {
@@ -642,7 +679,14 @@ static size_t pend_evict_waiting_locked(live_rep *rep, size_t evict) {
     size_t avail = rep->pend_count - first;
     if (evict > avail) evict = avail;
     if (evict == 0) return 0;
-    for (size_t i = 0; i < evict; i++) pend_item_dispose(pend_at_locked(rep, first + i));
+    for (size_t i = 0; i < evict; i++) {
+        // Mark seen on the way out. Without this the very next poll finds it
+        // in the manifest again, queues it again, and the engine spends its
+        // whole budget re-fetching what it just decided to skip.
+        pend_item *it = pend_at_locked(rep, first + i);
+        seen_add(&rep->seen, it->idkey);
+        pend_item_dispose(it);
+    }
     for (size_t i = first + evict; i < rep->pend_count; i++)
         *pend_at_locked(rep, i - evict) = *pend_at_locked(rep, i);
     rep->pend_count -= evict;
@@ -685,6 +729,8 @@ static void *download_main(void *arg) {
         // past an item that is still FETCHING. Copy what the fetch needs so the
         // lock can be dropped.
         pend_item *slot = pend_at_locked(rep, (size_t)idx);
+        slot->started = now_seconds();
+        uint64_t slot_gen = slot->gen;
         char *url = rs_strdup(slot->url);
         cfg_snap cfg;
         cfg_snapshot_locked(st, &cfg);
@@ -722,14 +768,14 @@ static void *download_main(void *arg) {
         free(url);
 
         pthread_mutex_lock(&st->mu);
-        // Re-find the slot by identity rather than trusting the index: the ring
-        // head only moves when the writer commits, and it cannot have committed
-        // this item while it was FETCHING — but a stop can have cleared the
-        // queue underneath us, and then there is nothing to fill in.
+        // The slot may no longer be ours: a stop can have cleared the queue,
+        // and the writer can have abandoned this item for holding up everything
+        // behind it. The generation stamp is what makes that safe to check —
+        // the slot address alone would still match after the slot was reused.
         pend_item *dst = NULL;
         for (size_t i = 0; i < rep->pend_count; i++) {
             pend_item *c = pend_at_locked(rep, i);
-            if (c->state == PEND_FETCHING && c == slot) { dst = c; break; }
+            if (c == slot && c->gen == slot_gen && c->state == PEND_FETCHING) { dst = c; break; }
         }
         if (dst) {
             dst->data = data;
@@ -1083,6 +1129,11 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     cand *found = (cand *)calloc(total ? total : 1, sizeof(cand));
     if (!found) { rs_json_free(root); return; }
     size_t n = 0;
+    unsigned long refreshed = 0;
+    // Which manifest entries correspond to something already queued, so the
+    // sweep below can tell "still offered by the origin" from "gone".
+    bool *still_advertised = (bool *)calloc(total ? total : 1, sizeof(bool));
+    if (!still_advertised) { free(found); rs_json_free(root); return; }
     pthread_mutex_lock(&st->mu);
     for (size_t i = 0; i < total; i++) {
         const rs_json *sg = rs_json_arr_at(segs, i);
@@ -1092,6 +1143,24 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
         char idkey[288];
         stable_key(u, tv, idkey, sizeof(idkey));
         if (seen_has(&rep->seen, idkey)) continue;
+        // Already queued? Then this is not new — but the URL almost certainly
+        // is. Claro (and every CDN like it) signs each segment URL with a
+        // short-lived token; the ones in this manifest are valid for about a
+        // minute. Freezing the URL at queue time and fetching it later meant
+        // requesting links that had expired 37-81 seconds earlier, which the
+        // CDN does not refuse cleanly — it just never answers, so the fetch
+        // burned its whole timeout and blocked everything behind it. Take the
+        // fresh URL every poll for anything not yet started.
+        pend_item *queued_already = pend_find_locked(rep, idkey);
+        if (queued_already) {
+            if (queued_already->state == PEND_WAITING) {
+                free(queued_already->url);
+                queued_already->url = rs_strdup(u);
+                refreshed++;
+            }
+            still_advertised[i] = true;
+            continue;
+        }
         if (tv >= 0) {
             // A stale manifest from a rotating proxy might return segments from the past.
             // If they jump backward by a small amount, ignore them so the timeline stays clean.
@@ -1133,6 +1202,38 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     // The dropped segments are marked seen so the engine never comes back for
     // them, and the tfdt jump they leave behind surfaces honestly as an
     // EXT-X-DISCONTINUITY rather than as silent corruption.
+    // Anything queued that the origin no longer advertises is unreachable: its
+    // URL can never be refreshed again, so it will sit there until its token
+    // dies and then eat a timeout. Drop it now instead. This is the age bound —
+    // expressed as "is it still on offer" rather than as a number of seconds,
+    // which is the same question and needs no tuning.
+    size_t stale = 0;
+    if (total > 0) {
+        for (size_t i = 0; i < rep->pend_count;) {
+            pend_item *it = pend_at_locked(rep, i);
+            bool advertised = false;
+            for (size_t j = 0; j < total && !advertised; j++)
+                if (still_advertised[j]) {
+                    const rs_json *sg = rs_json_arr_at(segs, j);
+                    const char *u = rs_json_obj_str(sg, "url", "");
+                    long long tv = (long long)rs_json_as_num(rs_json_obj_get(sg, "time"), -1);
+                    char k[288];
+                    stable_key(u, tv, k, sizeof(k));
+                    if (strcmp(k, it->idkey) == 0) advertised = true;
+                }
+            if (it->state == PEND_WAITING && !advertised) {
+                seen_add(&rep->seen, it->idkey);
+                pend_item_dispose(it);
+                for (size_t m = i + 1; m < rep->pend_count; m++)
+                    *pend_at_locked(rep, m - 1) = *pend_at_locked(rep, m);
+                rep->pend_count--;
+                stale++;
+                continue;
+            }
+            i++;
+        }
+    }
+
     size_t inflight = 0;
     for (size_t i = 0; i < rep->pend_count; i++)
         if (pend_at_locked(rep, i)->state != PEND_WAITING) inflight++;
@@ -1145,35 +1246,42 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     // Everything discarded is marked seen, so the engine never comes back for
     // it — the point is to be at the live edge, not to retry history.
     for (size_t i = 0; i < dropped; i++) seen_add(&rep->seen, found[i].idkey);
-    rep->skipped += (long long)(dropped + evicted);
+    rep->skipped += (long long)(dropped + evicted + stale);
     unsigned long queued = 0;
     for (size_t i = dropped; i < n; i++) {
-        pend_push_locked(rep, found[i].url, found[i].tv, found[i].dur, plan_ts);
-        seen_add(&rep->seen, found[i].idkey);
+        // Deliberately NOT marked seen here. A queued segment has to stay
+        // visible to later polls so its signed URL can be refreshed; the writer
+        // marks it seen at the moment it leaves the queue, under the same lock,
+        // so it is never both un-queued and un-seen.
+        pend_push_locked(rep, found[i].url, found[i].idkey, found[i].tv, found[i].dur, plan_ts);
         queued++;
     }
     size_t queue_depth = rep->pend_count;
-    if (queued || evicted) pthread_cond_broadcast(&st->cv);
+    if (queued || evicted || stale) pthread_cond_broadcast(&st->cv);
     pthread_mutex_unlock(&st->mu);
     free(found);
+    free(still_advertised);
     rs_json_free(root);
 
-    if (dropped || evicted)
+    if (dropped || evicted || stale)
         lgf(st, "error", "liveEdgeSkip", NULL, 0, -1,
-            "%s: skipped %lu segments (%.1fs) to stay at the live edge — %lu evicted from a full "
-            "queue (depth %lu), %lu never queued. %lu download connection%s cannot pull this "
-            "rendition in real time on this path; raise parallelDownloads or pick a lower bitrate",
-            rep->rep_id, (unsigned long)(dropped + evicted),
-            (double)(dropped + evicted) * seg_dur, (unsigned long)evicted, (unsigned long)depth,
-            (unsigned long)dropped, (unsigned long)rep->ndl, rep->ndl == 1 ? "" : "s");
+            "%s: skipped %lu segments (%.1fs) to stay at the live edge — %lu never queued, "
+            "%lu evicted from a full queue, %lu dropped out of the source's window. Queue is "
+            "%lu/%lu deep. This rendition is arriving slower than it plays; a smaller "
+            "downloadAhead keeps the delay down, a lower bitrate is the real fix",
+            rep->rep_id, (unsigned long)(dropped + evicted + stale),
+            (double)(dropped + evicted + stale) * seg_dur,
+            (unsigned long)dropped, (unsigned long)evicted, (unsigned long)stale,
+            (unsigned long)rep->pend_count, (unsigned long)depth);
 
-    if (queued == 0 && dropped == 0 && evicted == 0) {
+    if (queued == 0 && dropped == 0 && evicted == 0 && stale == 0) {
         lgf(st, "info", "pollIdle", NULL, 0, -1, "%s: no new segments this poll", rep->rep_id);
         return;
     }
     lgf(st, "info", "pollQueued", NULL, 0, -1,
-        "%s: queued %lu segments (%lu in flight, depth %lu) in %.2fs",
-        rep->rep_id, queued, (unsigned long)queue_depth, (unsigned long)depth, now_seconds() - t0);
+        "%s: queued %lu segments, refreshed %lu stale URLs (%lu in flight, depth %lu) in %.2fs",
+        rep->rep_id, queued, refreshed, (unsigned long)queue_depth, (unsigned long)depth,
+        now_seconds() - t0);
 }
 
 // --- the writer -------------------------------------------------------------
@@ -1347,19 +1455,51 @@ static void *writer_main(void *arg) {
             if (now_seconds() - report_anchor >= RS_LIVE_REPORT_INTERVAL) break;
         }
 
+        double seg_dur = rep->seg_duration > 0 ? rep->seg_duration : 2.0;
+
+        // Head-of-line rule. If the head has been fetching far longer than the
+        // segment is worth, and there is finished work stuck behind it, give up
+        // on it and let the rest through. Re-stamping the generation is what
+        // makes this safe: the download thread that still owns this slot will
+        // find its stamp no longer matches and drop its result instead of
+        // writing it into whatever occupies the slot by then.
+        bool abandoned = false;
+        if (rep->pend_count > 1) {
+            pend_item *head = pend_at_locked(rep, 0);
+            double stall = seg_dur * RS_LIVE_HEAD_STALL_FACTOR;
+            if (stall < RS_LIVE_HEAD_STALL_MIN) stall = RS_LIVE_HEAD_STALL_MIN;
+            bool ready_behind = false;
+            for (size_t i = 1; i < rep->pend_count && !ready_behind; i++)
+                if (pend_at_locked(rep, i)->state == PEND_READY) ready_behind = true;
+            if (head->state == PEND_FETCHING && ready_behind &&
+                head->started > 0 && now_seconds() - head->started > stall) {
+                head->gen = ++rep->pend_gen;
+                head->state = PEND_FAILED;
+                snprintf(head->err, sizeof(head->err),
+                         "abandoned after %.1fs — it was holding up segments already downloaded",
+                         now_seconds() - head->started);
+                abandoned = true;
+            }
+        }
+
         pend_item item;
         bool have_item = false;
         if (rep->pend_count > 0) {
             pend_state hs = pend_at_locked(rep, 0)->state;
             if (hs == PEND_READY || hs == PEND_FAILED) {
                 item = *pend_at_locked(rep, 0);
+                // Seen at the moment it leaves the queue, under the same lock
+                // that removes it: the poller refreshes the URL of anything
+                // still queued, so an item must be either in the queue or in
+                // the seen set at every instant, never in neither.
+                seen_add(&rep->seen, item.idkey);
                 memset(pend_at_locked(rep, 0), 0, sizeof(pend_item));
                 rep->pend_head = (rep->pend_head + 1) % rep->pend_cap;
                 rep->pend_count--;
                 have_item = true;
             }
         }
-        double seg_dur = rep->seg_duration > 0 ? rep->seg_duration : 2.0;
+
         cfg_snap cfg;
         cfg_snapshot_locked(st, &cfg);
         pthread_mutex_unlock(&st->mu);
@@ -1367,6 +1507,9 @@ static void *writer_main(void *arg) {
         if (have_item) pthread_cond_broadcast(&st->cv);
 
         if (have_item) {
+            if (abandoned)
+                lgf(st, "error", "headOfLine", item.url, 0, -1,
+                    "%s: %s", rep->rep_id, item.err);
             commit_one(rep, &cfg, &item, seg_dur, &failed, &added, &added_bytes,
                        &added_seconds, &prev_failed);
             free(item.url);
