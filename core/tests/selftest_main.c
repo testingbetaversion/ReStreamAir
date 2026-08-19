@@ -1495,47 +1495,75 @@ static void test_live_window(void) {
 //
 // rs_live_window_size deliberately asks for a WIDER window the later a poll is,
 // so nothing is missed while the engine is merely a little behind. That is only
-// safe because this function refuses to let the backlog grow without bound: it
-// is what turns "we are behind" into "publish the live edge" instead of "try to
-// fetch two minutes of history at 1x".
+// safe because this refuses to let the backlog grow without bound.
+//
+// The direction matters more than the bound. Dropping the NEW segments to
+// protect a queue full of old ones pins the engine a fixed distance behind the
+// live edge forever — it keeps publishing stale media and discarding current
+// media, and never recovers even once the path does. Observed in production
+// exactly that way: a video rendition sat at "20 in flight, depth 20" and 0.31x
+// realtime indefinitely while every fresh segment was thrown away.
 static void test_live_catch_up(void) {
-    // Keeping up: everything new fits, nothing is thrown away.
-    check("live-catchup/keeping-up", rs_live_catch_up_drop(8, 0, 4) == 0);
-    check("live-catchup/exactly-full", rs_live_catch_up_drop(8, 0, 8) == 0);
-    check("live-catchup/partly-occupied", rs_live_catch_up_drop(8, 5, 3) == 0);
-    check("live-catchup/nothing-new", rs_live_catch_up_drop(8, 8, 0) == 0);
+    int ev = -1, dr = -1;
 
-    // Behind: only the newest `depth` are kept.
-    check("live-catchup/overflow", rs_live_catch_up_drop(8, 0, 20) == 12);
-    check("live-catchup/queue-partly-full", rs_live_catch_up_drop(8, 6, 10) == 8);
-    // Queue already full — this poll's entire find is discarded, which is
-    // exactly the "snap to the live edge" case.
-    check("live-catchup/queue-full", rs_live_catch_up_drop(8, 8, 5) == 5);
-    check("live-catchup/queue-overfull", rs_live_catch_up_drop(8, 99, 5) == 5);
+    // Keeping up: everything fits, nothing is thrown away.
+    rs_live_catch_up_plan(8, 0, 0, 4, &ev, &dr);
+    check("live-catchup/keeping-up", ev == 0 && dr == 0);
+    rs_live_catch_up_plan(8, 2, 2, 4, &ev, &dr);
+    check("live-catchup/exactly-full", ev == 0 && dr == 0);
+    rs_live_catch_up_plan(8, 0, 8, 0, &ev, &dr);
+    check("live-catchup/nothing-new", ev == 0 && dr == 0);
 
-    // The invariant that matters: after applying the drop, what is actually
-    // taken never pushes the queue past `depth`, for any combination. This is
-    // the property the spiral violated — there was no bound at all.
-    bool bounded = true, keeps_newest = true;
-    for (int depth = 1; depth <= 40; depth++) {
-        for (int queued = 0; queued <= depth + 5; queued++) {
-            for (int fresh = 0; fresh <= 80; fresh++) {
-                int drop = rs_live_catch_up_drop(depth, queued, fresh);
-                if (drop < 0 || drop > fresh) { bounded = false; continue; }
-                int taken = fresh - drop;
-                if (queued + taken > depth && taken > 0) bounded = false;
-                // Never discard anything while there is room for it: dropping
-                // is a last resort, not a throttle.
-                if (queued + fresh <= depth && drop != 0) keeps_newest = false;
+    // Behind, with room made by evicting old queued segments rather than by
+    // refusing the new ones. This is the case that was backwards.
+    rs_live_catch_up_plan(8, 0, 8, 3, &ev, &dr);
+    check("live-catchup/evicts-old-not-new", ev == 3 && dr == 0);
+    rs_live_catch_up_plan(20, 2, 18, 4, &ev, &dr);
+    check("live-catchup/production-shape", ev == 4 && dr == 0);
+
+    // In-flight work is never thrown away, and it eats the budget.
+    rs_live_catch_up_plan(8, 8, 0, 3, &ev, &dr);
+    check("live-catchup/inflight-is-untouchable", ev == 0 && dr == 3);
+    rs_live_catch_up_plan(8, 6, 2, 4, &ev, &dr);
+    check("live-catchup/inflight-eats-budget", ev == 2 && dr == 4 - 2);
+
+    // More new segments than the queue could ever hold: keep the newest, and
+    // the oldest of the fresh batch go too.
+    rs_live_catch_up_plan(8, 0, 0, 20, &ev, &dr);
+    check("live-catchup/huge-find", ev == 0 && dr == 12);
+
+    // Invariants over the whole space.
+    bool bounded = true, newest_first = true, no_waste = true, sane = true;
+    for (int depth = 1; depth <= 30; depth++) {
+        for (int infl = 0; infl <= depth + 3; infl++) {
+            for (int wait = 0; wait <= depth + 3; wait++) {
+                for (int fresh = 0; fresh <= 40; fresh++) {
+                    int e = -1, d = -1;
+                    rs_live_catch_up_plan(depth, infl, wait, fresh, &e, &d);
+                    if (e < 0 || e > wait || d < 0 || d > fresh) { sane = false; continue; }
+                    int held = infl + (wait - e) + (fresh - d);
+                    // Never leaves more queued than the depth allows, unless
+                    // in-flight work alone already exceeds it.
+                    if (held > depth && held > infl) bounded = false;
+                    // Never discards anything while there is room for it.
+                    if (infl + wait + fresh <= depth && (e || d)) no_waste = false;
+                    // Never drops a fresh segment while an older queued one
+                    // survives — that is the failure this exists to prevent.
+                    if (d > 0 && (wait - e) > 0) newest_first = false;
+                }
             }
         }
     }
+    check("live-catchup/sane-outputs", sane);
     check("live-catchup/never-exceeds-depth", bounded);
-    check("live-catchup/only-drops-when-full", keeps_newest);
+    check("live-catchup/only-drops-when-full", no_waste);
+    check("live-catchup/prefers-newest", newest_first);
 
     // Degenerate inputs.
-    check("live-catchup/zero-depth", rs_live_catch_up_drop(0, 0, 3) <= 3);
-    check("live-catchup/negative-fresh", rs_live_catch_up_drop(8, 0, -1) == 0);
+    rs_live_catch_up_plan(0, 0, 0, 3, &ev, &dr);
+    check("live-catchup/zero-depth", ev == 0 && dr >= 0 && dr <= 3);
+    rs_live_catch_up_plan(8, -1, -1, -1, &ev, &dr);
+    check("live-catchup/negative-inputs", ev == 0 && dr == 0);
 }
 
 // Backoff after a failed manifest poll (live_backoff.c).

@@ -38,12 +38,30 @@ int rs_live_window_size(int download_ahead, double since_last, double seg_durati
     return want;
 }
 
-int rs_live_catch_up_drop(int depth, int queued, int fresh) {
-    if (fresh <= 0) return 0;
+void rs_live_catch_up_plan(int depth, int inflight, int waiting, int fresh,
+                           int *evict_waiting, int *drop_fresh) {
+    if (evict_waiting) *evict_waiting = 0;
+    if (drop_fresh) *drop_fresh = 0;
     if (depth < 1) depth = 1;
-    if (queued < 0) queued = 0;
-    int room = depth - queued;
+    if (inflight < 0) inflight = 0;
+    if (waiting < 0) waiting = 0;
+    if (fresh < 0) fresh = 0;
+
+    // What is in flight cannot be given back, so it eats into the budget.
+    int room = depth - inflight;
     if (room < 0) room = 0;
-    if (fresh <= room) return 0;
-    return fresh - room;
+
+    int total = waiting + fresh;
+    if (total <= room) return;  // it all fits; nothing to throw away
+
+    // Keep the newest `room` of (waiting ++ fresh), which are ordered oldest to
+    // newest. Fresh are newer than anything already queued, so they are kept
+    // first and the older queued ones give way.
+    int keep = room;
+    int fresh_kept = fresh < keep ? fresh : keep;
+    int waiting_kept = keep - fresh_kept;
+    if (waiting_kept > waiting) waiting_kept = waiting;
+
+    if (drop_fresh) *drop_fresh = fresh - fresh_kept;
+    if (evict_waiting) *evict_waiting = waiting - waiting_kept;
 }

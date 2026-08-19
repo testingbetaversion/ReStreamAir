@@ -627,6 +627,28 @@ static void pend_clear_locked(live_rep *rep) {
     rep->pend_head = 0;
 }
 
+// Throws away the oldest `evict` segments that are still WAITING, to make room
+// for newer ones. Items already being fetched are left alone: the work is
+// already paid for, and a download thread holds a pointer to its slot for the
+// duration of the fetch — moving one would invalidate that pointer.
+//
+// Downloads always claim the oldest WAITING item, so everything in progress is
+// a prefix of the ring and the WAITING items are a contiguous suffix. Only
+// those get shifted, which is exactly the set no thread holds a pointer into.
+static size_t pend_evict_waiting_locked(live_rep *rep, size_t evict) {
+    if (evict == 0 || rep->pend_count == 0) return 0;
+    size_t first = 0;
+    while (first < rep->pend_count && pend_at_locked(rep, first)->state != PEND_WAITING) first++;
+    size_t avail = rep->pend_count - first;
+    if (evict > avail) evict = avail;
+    if (evict == 0) return 0;
+    for (size_t i = 0; i < evict; i++) pend_item_dispose(pend_at_locked(rep, first + i));
+    for (size_t i = first + evict; i < rep->pend_count; i++)
+        *pend_at_locked(rep, i - evict) = *pend_at_locked(rep, i);
+    rep->pend_count -= evict;
+    return evict;
+}
+
 // --- download threads -------------------------------------------------------
 
 // Takes the oldest item nobody has started yet. Oldest-first matters: the head
@@ -1111,35 +1133,47 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     // The dropped segments are marked seen so the engine never comes back for
     // them, and the tfdt jump they leave behind surfaces honestly as an
     // EXT-X-DISCONTINUITY rather than as silent corruption.
-    size_t dropped = (size_t)rs_live_catch_up_drop((int)depth, (int)rep->pend_count, (int)n);
+    size_t inflight = 0;
+    for (size_t i = 0; i < rep->pend_count; i++)
+        if (pend_at_locked(rep, i)->state != PEND_WAITING) inflight++;
+    int evict_n = 0, drop_n = 0;
+    rs_live_catch_up_plan((int)depth, (int)inflight, (int)(rep->pend_count - inflight), (int)n,
+                          &evict_n, &drop_n);
+    size_t evicted = pend_evict_waiting_locked(rep, (size_t)(evict_n > 0 ? evict_n : 0));
+    size_t dropped = (size_t)(drop_n > 0 ? drop_n : 0);
     if (dropped > n) dropped = n;
+    // Everything discarded is marked seen, so the engine never comes back for
+    // it — the point is to be at the live edge, not to retry history.
     for (size_t i = 0; i < dropped; i++) seen_add(&rep->seen, found[i].idkey);
-    rep->skipped += (long long)dropped;
+    rep->skipped += (long long)(dropped + evicted);
     unsigned long queued = 0;
     for (size_t i = dropped; i < n; i++) {
         pend_push_locked(rep, found[i].url, found[i].tv, found[i].dur, plan_ts);
         seen_add(&rep->seen, found[i].idkey);
         queued++;
     }
-    size_t inflight = rep->pend_count;
-    if (queued) pthread_cond_broadcast(&st->cv);
+    size_t queue_depth = rep->pend_count;
+    if (queued || evicted) pthread_cond_broadcast(&st->cv);
     pthread_mutex_unlock(&st->mu);
     free(found);
     rs_json_free(root);
 
-    if (dropped)
+    if (dropped || evicted)
         lgf(st, "error", "liveEdgeSkip", NULL, 0, -1,
-            "%s: %lu segments (%.1fs) discarded unfetched — the queue is full at %lu, so the "
-            "engine is skipping to the live edge instead of falling further behind",
-            rep->rep_id, (unsigned long)dropped, (double)dropped * seg_dur, (unsigned long)depth);
+            "%s: skipped %lu segments (%.1fs) to stay at the live edge — %lu evicted from a full "
+            "queue (depth %lu), %lu never queued. %lu download connection%s cannot pull this "
+            "rendition in real time on this path; raise parallelDownloads or pick a lower bitrate",
+            rep->rep_id, (unsigned long)(dropped + evicted),
+            (double)(dropped + evicted) * seg_dur, (unsigned long)evicted, (unsigned long)depth,
+            (unsigned long)dropped, (unsigned long)rep->ndl, rep->ndl == 1 ? "" : "s");
 
-    if (queued == 0 && dropped == 0) {
+    if (queued == 0 && dropped == 0 && evicted == 0) {
         lgf(st, "info", "pollIdle", NULL, 0, -1, "%s: no new segments this poll", rep->rep_id);
         return;
     }
     lgf(st, "info", "pollQueued", NULL, 0, -1,
         "%s: queued %lu segments (%lu in flight, depth %lu) in %.2fs",
-        rep->rep_id, queued, (unsigned long)inflight, (unsigned long)depth, now_seconds() - t0);
+        rep->rep_id, queued, (unsigned long)queue_depth, (unsigned long)depth, now_seconds() - t0);
 }
 
 // --- the writer -------------------------------------------------------------

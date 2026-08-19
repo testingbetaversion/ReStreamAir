@@ -142,9 +142,8 @@ typedef struct {
 // segments it holds.
 int rs_live_window_size(int download_ahead, double since_last, double seg_duration);
 
-// How many of `fresh` newly-seen segments to DISCARD unfetched, oldest first,
-// so a representation with `queued` segments already in flight never holds more
-// than `depth`.
+// What to throw away so a representation's pending queue always holds the
+// NEWEST segments it knows about, never more than `depth` of them.
 //
 // This is the catch-up policy, and it is the difference between a bad minute
 // and a stream that never recovers. Fetching every segment the manifest ever
@@ -152,19 +151,28 @@ int rs_live_window_size(int download_ahead, double since_last, double seg_durati
 // poll must request grows with how late the poll is (see rs_live_window_size),
 // so a slow cycle makes the next request bigger, which makes it slower — the
 // production symptom was a poll asking for 60 segments because it was 139s
-// late, taking 135s, and asking for 60 again. It cannot converge, and every
-// second spent on media that has already scrolled out of every player's reach
-// is a second not spent on the live edge.
+// late, taking 135s, and asking for 60 again.
 //
-// So the queue is bounded and the OLDEST are dropped. Both reference
-// implementations do exactly this: streamlink's HLSStreamWorker.valid_segment
-// ignores anything below its cursor and merely logs a sequence gap, and
-// N_m3u8DL-RE only ever takes what the current manifest window holds. The
-// dropped segments leave a tfdt jump behind, which surfaces honestly as an
-// EXT-X-DISCONTINUITY.
+// Which end to drop from is the subtle part, and getting it backwards is worse
+// than not dropping at all. Refusing the NEW segments because the queue is full
+// of old ones pins the engine at a fixed distance behind the live edge forever:
+// it keeps publishing forty-second-old media, keeps discarding everything
+// current, and never recovers even when the path does. So old queued segments
+// are evicted to make room for new ones, not the other way round.
 //
-// Returns 0 when everything fits.
-int rs_live_catch_up_drop(int depth, int queued, int fresh);
+//   `inflight`  items already being fetched, or fetched and awaiting commit.
+//               Never dropped: the work is paid for, and a download thread
+//               holds a pointer to its slot.
+//   `waiting`   queued but not yet started. Droppable, oldest first.
+//   `fresh`     what this poll just found. Droppable, oldest first.
+//
+// Both reference implementations amount to the same rule: streamlink's
+// HLSStreamWorker.valid_segment ignores anything below its cursor and merely
+// logs a sequence gap, and N_m3u8DL-RE only ever takes what the current
+// manifest window holds. What is dropped leaves a tfdt jump behind, which
+// surfaces honestly as an EXT-X-DISCONTINUITY.
+void rs_live_catch_up_plan(int depth, int inflight, int waiting, int fresh,
+                           int *evict_waiting, int *drop_fresh);
 
 // Floor for the backoff after an origin explicitly refuses for rate reasons.
 // Below this there is no point: the complaint is about how often we ask, and a
