@@ -1066,6 +1066,20 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     double since_last = anchor > 0 ? t0 - anchor : 0;
     want = rs_live_window_size(cfg->download_ahead, since_last, seg_dur);
 
+    // First poll: take a short run-up at the live edge rather than the whole
+    // downloadAhead window. Asking for twenty segments before a single byte has
+    // been fetched hands the download threads twenty seconds of backlog on a
+    // path that manages roughly one segment a second, so the stream opens
+    // already behind and spends its first minute clawing back. Enough to render
+    // a playlist and no more; the window widens by itself from the next poll,
+    // which is sized off elapsed time. streamlink does the same thing with
+    // --hls-live-edge, defaulting to three segments.
+    if (anchor <= 0) {
+        int start = cfg->playlist_segments > 0 ? cfg->playlist_segments + 2 : 8;
+        if (start < 4) start = 4;
+        if (want > start) want = start;
+    }
+
     lgf(st, "info", "pollStart", cfg->mpd_url, 0, -1,
         "%s: requesting %d segments (%.1fs since last poll, %.3fs each)",
         rep->rep_id, want, since_last, seg_dur);
@@ -1303,8 +1317,13 @@ static void commit_one(live_rep *rep, const cfg_snap *cfg, pend_item *it,
         *prev_failed = true;
         // A single miss at the live edge is routine — the origin may simply
         // never produce this one. The window slides past it.
-        lgf(st, "error", "downloadSegment", it->url, 0, -1,
-            "%s: gave up after %d attempts: %s", rep->rep_id, it->attempts, it->err);
+        if (it->attempts > 0)
+            lgf(st, "error", "downloadSegment", it->url, 0, -1,
+                "%s: gave up after %d attempt%s: %s", rep->rep_id, it->attempts,
+                it->attempts == 1 ? "" : "s", it->err);
+        else
+            lgf(st, "error", "downloadSegment", it->url, 0, -1,
+                "%s: %s", rep->rep_id, it->err);
         return;
     }
 
@@ -1471,13 +1490,22 @@ static void *writer_main(void *arg) {
             bool ready_behind = false;
             for (size_t i = 1; i < rep->pend_count && !ready_behind; i++)
                 if (pend_at_locked(rep, i)->state == PEND_READY) ready_behind = true;
-            if (head->state == PEND_FETCHING && ready_behind &&
-                head->started > 0 && now_seconds() - head->started > stall) {
+            double waited = head->started > 0 ? now_seconds() - head->started : 0;
+            // Normally we only give up on the head once something behind it is
+            // finished — that is the proof it is the head, not the path, that
+            // is the problem. But when every thread is stuck on unanswerable
+            // requests nothing ever becomes ready, so there is a second, looser
+            // bound: past a few times the stall threshold the segment is too
+            // old to be worth having whatever the rest of the queue is doing.
+            bool overdue = ready_behind ? waited > stall : waited > stall * 3.0;
+            if (head->state == PEND_FETCHING && overdue && head->started > 0) {
                 head->gen = ++rep->pend_gen;
                 head->state = PEND_FAILED;
                 snprintf(head->err, sizeof(head->err),
-                         "abandoned after %.1fs — it was holding up segments already downloaded",
-                         now_seconds() - head->started);
+                         ready_behind
+                             ? "abandoned after %.1fs — it was holding up segments already downloaded"
+                             : "abandoned after %.1fs — no answer, and the whole queue is behind it",
+                         waited);
                 abandoned = true;
             }
         }

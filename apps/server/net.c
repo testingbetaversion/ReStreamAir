@@ -291,15 +291,19 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    // Abort a transfer that has connected but is not actually moving. The
-    // overall 30s timeout is the wrong instrument for this: a CDN handed an
-    // expired signed URL does not refuse it, it simply never answers, so the
-    // request sat for the full thirty seconds — per attempt — while the live
-    // engine's queue backed up behind it. Anything below 1 KB/s for five
-    // seconds is not a slow segment, it is a dead request. A genuinely slow
-    // but progressing transfer keeps its full 30s.
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 5L);
+    // NO low-speed abort here, and that is deliberate. Cutting transfers that
+    // move less than 1 KB/s for five seconds looked like the right way to kill
+    // a request the CDN was never going to answer — but libcurl's low-speed
+    // clock also runs while waiting for the first byte, and on the proxied
+    // paths this server actually uses, time-to-first-byte is routinely several
+    // seconds and manifest fetches have been observed taking seventeen. It
+    // killed requests that were about to succeed: every segment paid a wasted
+    // attempt before the retry got through, and the init segment — the one
+    // fetch that must not fail, since it carries the timescale and the
+    // decryption key — timed out outright. Dead requests are bounded by the
+    // live engine's head-of-line rule instead, which measures the thing that
+    // actually matters: whether this segment is holding up ones already
+    // downloaded.
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION,
                      force_http11 ? (long)CURL_HTTP_VERSION_1_1 : (long)CURL_HTTP_VERSION_2TLS);
     // Keep-alive is the whole point of the per-thread handle; make the probes
