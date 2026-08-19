@@ -37,3 +37,13 @@ int rs_live_window_size(int download_ahead, double since_last, double seg_durati
     if (want > RS_LIVE_MAX_WINDOW) want = RS_LIVE_MAX_WINDOW;
     return want;
 }
+
+int rs_live_catch_up_drop(int depth, int queued, int fresh) {
+    if (fresh <= 0) return 0;
+    if (depth < 1) depth = 1;
+    if (queued < 0) queued = 0;
+    int room = depth - queued;
+    if (room < 0) room = 0;
+    if (fresh <= room) return 0;
+    return fresh - room;
+}

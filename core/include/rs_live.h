@@ -27,9 +27,26 @@
 //
 //   * a director thread that polls the MPD for the rendition list and renders
 //     the HLS master playlist, and
-//   * one worker thread per representation that polls the MPD, downloads and
-//     CENC-decrypts new segments in the background, keeps them in a bounded
-//     in-memory queue, and renders that representation's media playlist.
+//   * per representation, three roles: a POLLER that re-reads the manifest on a
+//     strict cadence and queues whatever is new, a small pool of persistent
+//     DOWNLOAD threads that fetch queued segments concurrently, and a WRITER
+//     that CENC-decrypts and commits them strictly in queue order, keeps them
+//     in a bounded in-memory queue, and renders the media playlist.
+//
+// Those three used to be one thread doing poll -> download -> publish in a
+// loop, and that coupling was the single worst thing about the engine. A poll
+// whose downloads took 135 seconds did not merely deliver late: it stopped the
+// manifest being re-read for 135 seconds, by which time the source window had
+// moved on entirely, so the next poll asked for a wider window, which took
+// longer again. Splitting the roles is what both reference implementations do
+// (streamlink's HLSStreamWorker/HLSStreamWriter, N_m3u8DL-RE's
+// PlayListProduceAsync feeding a BufferBlock), and it is why they hold a live
+// stream on a path this engine used to lose.
+//
+// Committing in queue order without waiting for each batch is the other half:
+// segment N+3 can finish downloading long before N and simply waits its turn,
+// so a slow segment never leaves the network idle. The queue is bounded, and
+// that bound is the catch-up policy — see rs_live_catch_up_drop.
 //
 // Request handlers never touch the network: a playlist reload is a string
 // render under a mutex, and a segment request is a memcpy out of the queue.
@@ -124,6 +141,30 @@ typedef struct {
 // exists to prevent. Overshooting is harmless — the caller already skips
 // segments it holds.
 int rs_live_window_size(int download_ahead, double since_last, double seg_duration);
+
+// How many of `fresh` newly-seen segments to DISCARD unfetched, oldest first,
+// so a representation with `queued` segments already in flight never holds more
+// than `depth`.
+//
+// This is the catch-up policy, and it is the difference between a bad minute
+// and a stream that never recovers. Fetching every segment the manifest ever
+// showed sounds like the conservative choice; it is the opposite. The window a
+// poll must request grows with how late the poll is (see rs_live_window_size),
+// so a slow cycle makes the next request bigger, which makes it slower — the
+// production symptom was a poll asking for 60 segments because it was 139s
+// late, taking 135s, and asking for 60 again. It cannot converge, and every
+// second spent on media that has already scrolled out of every player's reach
+// is a second not spent on the live edge.
+//
+// So the queue is bounded and the OLDEST are dropped. Both reference
+// implementations do exactly this: streamlink's HLSStreamWorker.valid_segment
+// ignores anything below its cursor and merely logs a sequence gap, and
+// N_m3u8DL-RE only ever takes what the current manifest window holds. The
+// dropped segments leave a tfdt jump behind, which surfaces honestly as an
+// EXT-X-DISCONTINUITY.
+//
+// Returns 0 when everything fits.
+int rs_live_catch_up_drop(int depth, int queued, int fresh);
 
 // Floor for the backoff after an origin explicitly refuses for rate reasons.
 // Below this there is no point: the complaint is about how often we ask, and a

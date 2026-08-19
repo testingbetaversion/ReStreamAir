@@ -93,28 +93,33 @@ static void append_body_snippet(char *errbuf, size_t errbuf_len, const char *bod
     errbuf[used + n] = '\0';
 }
 
-// --- Shared connection pool -------------------------------------------------
+// --- Connection reuse ------------------------------------------------------
 //
-// Every fetch here is curl_easy_init() → perform → curl_easy_cleanup(). Without
-// a share handle each one of those opens a *fresh* TCP + TLS connection, so the
-// handshake is paid per request rather than per origin. Against a distant
-// origin that is the dominant cost of a live poll, and it is invisible in a
-// bandwidth measurement: on a 491 Mbps host, TCP connect to izzigo.tv measured
-// 0.34-0.94s with TLS adding ~0.15s, so every segment paid ~0.5-1.1s before a
-// byte of media moved. A representation publishing one 1.935s segment every
-// 1.935s cannot absorb that — the engine ran at ~0.65x realtime, its advertised
-// window shrank faster than players drained it, and playback stalled. It
-// presents as "not enough bandwidth" when it is entirely round-trip latency.
+// The cost that decides whether a live stream keeps up is the per-request round
+// trip, not throughput: on a 491 Mbps host, TCP connect to izzigo.tv measured
+// 0.34-0.94s with TLS adding ~0.15s, so a fresh connection per segment paid
+// ~0.5-1.1s before a byte of media moved. A representation publishing one
+// 1.935s segment every 1.935s cannot absorb that. It presents as "not enough
+// bandwidth" when it is entirely latency.
 //
-// CURL_LOCK_DATA_CONNECT lets those short-lived handles return their
-// connections to a process-wide pool instead of closing them. Measured on the
-// affected host, six sequential fetches of the same manifest: 3624ms with a new
-// connection each, 1333ms reusing one.
+// This used to be solved with a CURLSH sharing CURL_LOCK_DATA_CONNECT across
+// every thread. libcurl's own documentation rules that out — CURLSHOPT_SHARE(3)
+// on CURL_LOCK_DATA_CONNECT: "It is not supported to share connections between
+// multiple concurrent threads." — and the live engine calls this from a pool of
+// download threads, which is exactly the unsupported case.
 //
-// DNS and TLS session state are shared for the same reason: when a new
-// connection genuinely is needed, a resumed TLS session still skips a round
-// trip. MAXLIFETIME_CONN caps how long any pooled connection is kept so the
-// pool cannot pin us to one CDN edge indefinitely.
+// So connections are now reused the way every library that does this properly
+// reuses them (N_m3u8DL-RE's single pooled HttpClient, streamlink's
+// requests.Session): one long-lived easy handle per thread, reset between
+// requests. curl_easy_reset(3) clears the options but explicitly keeps "live
+// connections, the Session ID cache, the DNS cache" — so a thread that fetches
+// segment after segment from one origin pays the handshake once, and no
+// connection is ever touched by two threads. The engine's download threads are
+// persistent for the life of a stream, which is what makes this pay.
+//
+// DNS and TLS session state are still shared process-wide: both are documented
+// as safe to share, and a resumed TLS session skips a round trip on the
+// connections that genuinely do have to be opened.
 #ifndef _WIN32
 #include <pthread.h>
 
@@ -134,44 +139,140 @@ static void share_unlock_cb(CURL *handle, curl_lock_data data, void *user) {
 static void share_init_once(void) {
     for (int i = 0; i < CURL_LOCK_DATA_LAST; i++) pthread_mutex_init(&g_share_locks[i], NULL);
     CURLSH *sh = curl_share_init();
-    if (!sh) return;  // no pool: every fetch just opens its own connection, as before
+    if (!sh) return;  // degrade to no sharing rather than failing the fetch
     curl_share_setopt(sh, CURLSHOPT_LOCKFUNC, share_lock_cb);
     curl_share_setopt(sh, CURLSHOPT_UNLOCKFUNC, share_unlock_cb);
-    curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+    // Deliberately NOT CURL_LOCK_DATA_CONNECT — see above.
     curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
     curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
-#ifdef CURLSHOPT_MAXCONNECTS
-    curl_share_setopt(sh, CURLSHOPT_MAXCONNECTS, 128L);
-#endif
     g_conn_share = sh;
 }
 
-// Lazily built, so this works no matter what order the app initialises things
-// in — and a failure to build it degrades to the old per-request connection
-// rather than failing the fetch.
-static CURLSH *shared_conn_pool(void) {
+static CURLSH *shared_dns_cache(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, share_init_once);
     return g_conn_share;
 }
+
+// The per-thread handle. Freed by the pthread_key destructor when the thread
+// exits, so a stream that stops does not leak its download threads' sockets.
+static pthread_key_t g_handle_key;
+static bool g_handle_key_ok = false;
+
+static void handle_destructor(void *h) {
+    if (h) curl_easy_cleanup((CURL *)h);
+}
+
+static void handle_key_init_once(void) {
+    g_handle_key_ok = pthread_key_create(&g_handle_key, handle_destructor) == 0;
+}
+
+// A handle owned by, and only ever used by, the calling thread. Reset on every
+// call so no option survives from the previous request.
+static CURL *thread_handle(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, handle_key_init_once);
+    if (!g_handle_key_ok) return curl_easy_init();  // caller cleans up (see own_handle)
+    CURL *h = (CURL *)pthread_getspecific(g_handle_key);
+    if (h) { curl_easy_reset(h); return h; }
+    h = curl_easy_init();
+    if (h) pthread_setspecific(g_handle_key, h);
+    return h;
+}
+
+static bool thread_handle_is_owned(void) { return g_handle_key_ok; }
+
 #else
-// Windows has no pthreads in this build (see live.c); fall back to the
-// unpooled behaviour rather than sharing a cache without locking, which
-// libcurl documents as undefined.
-static CURLSH *shared_conn_pool(void) { return NULL; }
+// Windows in this build has no pthreads (see live.c), and the fetch path there
+// is single-threaded, so a plain per-request handle is both correct and no
+// slower than it was.
+static CURLSH *shared_dns_cache(void) { return NULL; }
+static CURL *thread_handle(void) { return curl_easy_init(); }
+static bool thread_handle_is_owned(void) { return false; }
 #endif
 
-static int fetch_libcurl(const char *url, const char *proxy, const char *headers, const char *range,
-                         char **out, size_t *out_len, long *status, char **content_type,
-                         char **content_range, char **effective_url, char *errbuf, size_t errbuf_len) {
-    if (content_type) *content_type = NULL;
-    if (content_range) *content_range = NULL;
-    if (effective_url) *effective_url = NULL;
-    if (status) *status = 0;
+// --- HTTP/2, and the origins that cannot do it ------------------------------
+//
+// HTTP/2 multiplexes every request for one origin onto a single connection, so
+// a burst of segment fetches costs one handshake and one round trip rather than
+// one each. That is the single biggest win available on a high-latency path,
+// and it is why N_m3u8DL-RE sets DefaultRequestVersion = HTTP/2.
+//
+// It was previously disabled for everything because one origin (izzigo.tv) runs
+// a broken HTTP/2 stack that drops mid-stream with "Stream error in the HTTP/2
+// framing layer" — reproduced with plain curl, so it is the origin, not us.
+// Turning it off globally to route around one origin gave up the win everywhere
+// else, so instead: try HTTP/2, and when a host answers with an HTTP/2-specific
+// framing error, remember that host and use 1.1 for it from then on. The
+// request that hit the error is retried immediately, so the downgrade costs one
+// request once per host rather than a failure.
+#define RS_H2_DENY_MAX 32
 
-    CURL *curl = curl_easy_init();
-    if (!curl) { snprintf(errbuf, errbuf_len, "Could not initialise HTTP client."); return -1; }
+static char *g_h2_deny[RS_H2_DENY_MAX];
+static size_t g_h2_deny_n = 0;
+#ifndef _WIN32
+static pthread_mutex_t g_h2_mu = PTHREAD_MUTEX_INITIALIZER;
+#define H2_LOCK()   pthread_mutex_lock(&g_h2_mu)
+#define H2_UNLOCK() pthread_mutex_unlock(&g_h2_mu)
+#else
+#define H2_LOCK()   ((void)0)
+#define H2_UNLOCK() ((void)0)
+#endif
 
+// The host part of an absolute URL, lowercased, into `out`.
+static void url_host(const char *url, char *out, size_t outlen) {
+    out[0] = '\0';
+    const char *p = strstr(url, "://");
+    if (!p) return;
+    p += 3;
+    const char *at = NULL;
+    size_t i = 0;
+    for (const char *q = p; *q && *q != '/' && *q != '?'; q++) if (*q == '@') at = q;
+    if (at) p = at + 1;
+    for (; p[i] && p[i] != '/' && p[i] != '?' && p[i] != ':' && i + 1 < outlen; i++)
+        out[i] = (char)tolower((unsigned char)p[i]);
+    out[i] = '\0';
+}
+
+static bool h2_denied(const char *host) {
+    if (!host[0]) return false;
+    bool found = false;
+    H2_LOCK();
+    for (size_t i = 0; i < g_h2_deny_n; i++)
+        if (strcmp(g_h2_deny[i], host) == 0) { found = true; break; }
+    H2_UNLOCK();
+    return found;
+}
+
+static void h2_deny(const char *host) {
+    if (!host[0]) return;
+    H2_LOCK();
+    bool found = false;
+    for (size_t i = 0; i < g_h2_deny_n; i++)
+        if (strcmp(g_h2_deny[i], host) == 0) { found = true; break; }
+    // Full table: stop adding rather than evicting. A 33rd broken-HTTP/2 origin
+    // is not a real deployment, and evicting would let the two of them flap.
+    if (!found && g_h2_deny_n < RS_H2_DENY_MAX) g_h2_deny[g_h2_deny_n++] = rs_strdup(host);
+    H2_UNLOCK();
+}
+
+// Errors that mean "this origin's HTTP/2 is broken", as opposed to any of the
+// ordinary network failures that say nothing about the protocol version.
+static bool is_http2_failure(CURLcode rc) {
+    if (rc == CURLE_HTTP2) return true;
+#ifdef CURLE_HTTP2_STREAM
+    if (rc == CURLE_HTTP2_STREAM) return true;
+#endif
+    return false;
+}
+
+// One transfer on the calling thread's handle. `force_http11` is set by the
+// caller when retrying after an HTTP/2 framing error.
+static int fetch_once(CURL *curl, const char *url, const char *proxy, const char *headers,
+                      const char *range, bool force_http11,
+                      char **out, size_t *out_len, long *status, char **content_type,
+                      char **content_range, char **effective_url,
+                      CURLcode *out_rc, char *errbuf, size_t errbuf_len) {
     http_buf buf = {NULL, 0, 0};
     struct curl_slist *header_list = NULL;
     if (headers && headers[0]) {
@@ -190,19 +291,16 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    // Some IPTV origins (seen on izzigo.tv) run a flaky HTTP/2 stack that
-    // drops mid-stream with "Stream error in the HTTP/2 framing layer" —
-    // reproduced independently with plain curl against the same URL, so it's
-    // the origin, not us. HTTP/1.1 keep-alive against the shared pool below
-    // already amortises the handshake, which was the only thing HTTP/2 was
-    // buying us here, so forcing 1.1 still just removes the broken code path.
-    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
-    // Reuse a pooled connection to this origin when one is idle (see above).
-    CURLSH *pool = shared_conn_pool();
-    if (pool) {
-        curl_easy_setopt(curl, CURLOPT_SHARE, pool);
-        curl_easy_setopt(curl, CURLOPT_MAXLIFETIME_CONN, 60L);
-    }
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION,
+                     force_http11 ? (long)CURL_HTTP_VERSION_1_1 : (long)CURL_HTTP_VERSION_2TLS);
+    // Keep-alive is the whole point of the per-thread handle; make the probes
+    // frequent enough that an idle connection through a tunnel is not silently
+    // dropped between segments.
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
+    CURLSH *dns = shared_dns_cache();
+    if (dns) curl_easy_setopt(curl, CURLOPT_SHARE, dns);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "ReStreamAir/1.0");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     if (proxy && proxy[0]) curl_easy_setopt(curl, CURLOPT_PROXY, proxy);
@@ -219,6 +317,7 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     }
 
     CURLcode rc = curl_easy_perform(curl);
+    *out_rc = rc;
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
     if (status) *status = code;
@@ -232,13 +331,13 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     }
     if (content_range) *content_range = captured_range;
     if (header_list) curl_slist_free_all(header_list);
-    curl_easy_cleanup(curl);
 
     if (rc != CURLE_OK) {
         snprintf(errbuf, errbuf_len, "Fetch failed: %s", curl_easy_strerror(rc));
         free(buf.data);
         if (content_type) { free(*content_type); *content_type = NULL; }
         if (content_range) { free(*content_range); *content_range = NULL; }
+        if (effective_url) { free(*effective_url); *effective_url = NULL; }
         return -1;
     }
     if (code < 200 || code >= 400) {
@@ -247,6 +346,7 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
         free(buf.data);
         if (content_type) { free(*content_type); *content_type = NULL; }
         if (content_range) { free(*content_range); *content_range = NULL; }
+        if (effective_url) { free(*effective_url); *effective_url = NULL; }
         return -1;
     }
     if (!buf.data) {
@@ -257,6 +357,41 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     *out = buf.data;
     *out_len = buf.len;
     return 0;
+}
+
+static int fetch_libcurl(const char *url, const char *proxy, const char *headers, const char *range,
+                         char **out, size_t *out_len, long *status, char **content_type,
+                         char **content_range, char **effective_url, char *errbuf, size_t errbuf_len) {
+    if (content_type) *content_type = NULL;
+    if (content_range) *content_range = NULL;
+    if (effective_url) *effective_url = NULL;
+    if (status) *status = 0;
+
+    CURL *curl = thread_handle();
+    if (!curl) { snprintf(errbuf, errbuf_len, "Could not initialise HTTP client."); return -1; }
+    bool borrowed = thread_handle_is_owned();  // false: this handle is ours to free
+
+    char host[256];
+    url_host(url, host, sizeof(host));
+    bool force11 = h2_denied(host);
+
+    CURLcode rc = CURLE_OK;
+    int result = fetch_once(curl, url, proxy, headers, range, force11,
+                            out, out_len, status, content_type, content_range, effective_url,
+                            &rc, errbuf, errbuf_len);
+
+    // This origin's HTTP/2 is broken. Record it so every later request to the
+    // same host goes straight to 1.1, and retry this one now.
+    if (result != 0 && !force11 && is_http2_failure(rc)) {
+        h2_deny(host);
+        if (borrowed) curl_easy_reset(curl);
+        result = fetch_once(curl, url, proxy, headers, range, true,
+                            out, out_len, status, content_type, content_range, effective_url,
+                            &rc, errbuf, errbuf_len);
+    }
+
+    if (!borrowed) curl_easy_cleanup(curl);
+    return result;
 }
 
 // --- External downloader (curl / wget / aria2c) -----------------------------
