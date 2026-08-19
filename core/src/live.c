@@ -68,10 +68,12 @@
 // all publishing even when the next twenty segments are downloaded and waiting.
 // Seen in production: an expired URL that the CDN simply never answered held a
 // rendition at "+0 segments, 20 in flight" for a minute at a time, then dumped
-// +19 at once. Scaled off the segment duration, because a segment that has
-// taken four times its own playing time to arrive is already too late to matter.
-#define RS_LIVE_HEAD_STALL_FACTOR 4.0
-#define RS_LIVE_HEAD_STALL_MIN 8.0
+// +19 at once. Scaled off the segment duration. Six times leaves enough room
+// for a large video segment that is progressing through a slow proxy, while a
+// request that is truly silent is still removed before it can age out a signed
+// live URL.
+#define RS_LIVE_HEAD_STALL_FACTOR 6.0
+#define RS_LIVE_HEAD_STALL_MIN 12.0
 
 // Attempts per segment before it is written off. A segment right at the live
 // edge is routinely requested a moment before the origin has finished writing
@@ -80,14 +82,14 @@
 //
 // Two, not three. Every attempt can cost a full transfer timeout, and against a
 // CDN that answers an expired URL with silence rather than a refusal that is
-// the difference between spending ten seconds on a dead segment and spending a
-// minute and a half on it. A second attempt still covers the case this exists
-// for — the live edge arriving a moment late — and nothing beyond that is worth
-// the wall clock on a stream that has to stay in real time.
+// the difference between a bounded 12-30 seconds per try and spending a minute
+// and a half on it. A second attempt still covers the case this exists for —
+// the live edge arriving a moment late — and nothing beyond that is worth the
+// wall clock on a stream that has to stay in real time.
 #define RS_LIVE_FETCH_TRIES 2
 #define RS_LIVE_FETCH_RETRY_DELAY 0.4
-#define RS_LIVE_MEDIA_TIMEOUT_MIN_MS 6000L
-#define RS_LIVE_MEDIA_TIMEOUT_MAX_MS 15000L
+#define RS_LIVE_MEDIA_TIMEOUT_MIN_MS 12000L
+#define RS_LIVE_MEDIA_TIMEOUT_MAX_MS 30000L
 
 // The window-sizing rule itself lives in live_window.c (portable, pure, and
 // therefore covered by the self-test) — see rs_live_window_size.
@@ -485,6 +487,11 @@ typedef struct live_stream {
     int reduced_manifest_polling;
     int playlist_segments, keep_segments, download_ahead;
     int parallel_downloads;
+    // Effective pool size captured when this engine instance was created.
+    // Unlike poll/window settings, a pthread pool cannot adopt a new size by
+    // merely replacing the config snapshot; rs_live_start uses this to decide
+    // whether a running engine needs a controlled restart.
+    int worker_parallel_downloads;
     int prioritize_oldest;
     int playback_delay_seconds, audio_delay_ms;
     double poll_interval;
@@ -727,7 +734,7 @@ typedef struct {
 
 // Called by libcurl's progress hook. It turns a logical queue cancellation into
 // a real network cancellation, so a dead CDN request no longer owns a worker
-// connection until the generic 30-second timeout expires.
+// connection until the request timeout expires.
 static int download_should_cancel(void *opaque) {
     download_cancel_ctx *ctx = (download_cancel_ctx *)opaque;
     pthread_mutex_lock(&ctx->st->mu);
@@ -739,10 +746,17 @@ static int download_should_cancel(void *opaque) {
 }
 
 static long media_timeout_ms(double duration) {
-    long timeout = duration > 0 ? (long)(duration * 3000.0) : RS_LIVE_MEDIA_TIMEOUT_MIN_MS;
+    long timeout = duration > 0 ? (long)(duration * 6000.0) : RS_LIVE_MEDIA_TIMEOUT_MIN_MS;
     if (timeout < RS_LIVE_MEDIA_TIMEOUT_MIN_MS) timeout = RS_LIVE_MEDIA_TIMEOUT_MIN_MS;
     if (timeout > RS_LIVE_MEDIA_TIMEOUT_MAX_MS) timeout = RS_LIVE_MEDIA_TIMEOUT_MAX_MS;
     return timeout;
+}
+
+static int effective_parallel_downloads(int configured) {
+    int want = configured > 0 ? configured : RS_LIVE_FETCH_PAR;
+    if (want > RS_LIVE_MAX_DL_THREADS) want = RS_LIVE_MAX_DL_THREADS;
+    if (want < 1) want = 1;
+    return want;
 }
 
 static void *download_main(void *arg) {
@@ -1801,9 +1815,7 @@ static bool rep_start_workers(live_rep *rep, const cfg_snap *cfg) {
     rep->pending = (pend_item *)calloc(rep->pend_cap, sizeof(pend_item));
     if (!rep->pending) return false;
 
-    size_t want = (size_t)(cfg->parallel_downloads > 0 ? cfg->parallel_downloads : RS_LIVE_FETCH_PAR);
-    if (want > RS_LIVE_MAX_DL_THREADS) want = RS_LIVE_MAX_DL_THREADS;
-    if (want < 1) want = 1;
+    size_t want = (size_t)effective_parallel_downloads(cfg->parallel_downloads);
 
     rep->dl_threads = (pthread_t *)calloc(want, sizeof(pthread_t));
     if (!rep->dl_threads) return false;
@@ -2293,13 +2305,33 @@ int rs_live_start(rs_live *live, const char *stream_id, const rs_live_config *cf
     pthread_mutex_lock(&live->mu);
     live_stream *st = stream_find_locked(live, stream_id);
     if (st) {
-        // Already running: re-apply the config, which the workers pick up on
-        // their next poll. Restarting would throw away a warm segment queue.
         pthread_mutex_lock(&st->mu);
-        stream_apply_config_locked(st, cfg);
+        int desired_workers = effective_parallel_downloads(cfg->parallel_downloads);
+        if (st->worker_parallel_downloads == desired_workers) {
+            // Polling, headers and window settings are snapshots and can change
+            // in place without throwing away the warm segment queue.
+            stream_apply_config_locked(st, cfg);
+            pthread_mutex_unlock(&st->mu);
+            pthread_mutex_unlock(&live->mu);
+            return 0;
+        }
+
+        // The download pool is structural: changing parallelDownloads after a
+        // stream started used to update only the number stored in the config,
+        // leaving the old pthread count alive indefinitely. Mark this instance
+        // for asynchronous teardown and create its replacement immediately.
+        // stream_find_locked deliberately hides stopping instances, so playback
+        // and later config updates address the replacement while rs_live_reap
+        // joins the old one in the background.
+        if (live->nstreams >= RS_LIVE_MAX_STREAMS) {
+            pthread_mutex_unlock(&st->mu);
+            pthread_mutex_unlock(&live->mu);
+            return -1;
+        }
+        st->stop = true;
+        pthread_cond_broadcast(&st->cv);
         pthread_mutex_unlock(&st->mu);
-        pthread_mutex_unlock(&live->mu);
-        return 0;
+        st = NULL;
     }
     if (live->nstreams >= RS_LIVE_MAX_STREAMS) {
         pthread_mutex_unlock(&live->mu);
@@ -2313,6 +2345,7 @@ int rs_live_start(rs_live *live, const char *stream_id, const rs_live_config *cf
     pthread_mutex_init(&st->mu, NULL);
     pthread_cond_init(&st->cv, NULL);
     stream_apply_config_locked(st, cfg);
+    st->worker_parallel_downloads = effective_parallel_downloads(cfg->parallel_downloads);
     live->streams[live->nstreams++] = st;
     pthread_mutex_unlock(&live->mu);
 

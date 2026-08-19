@@ -1520,8 +1520,10 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         rs_json_free(body);
         if (rc == 0 && id) {
             log_record(s, id, "info", "streamUpdate", NULL, 0, -1, "settings saved");
-            // A running stream keeps its warm queue and adopts the new settings
-            // on the next poll; a stream that was just switched off winds down.
+            // A running stream adopts ordinary settings on the next poll. A
+            // connection-pool size change performs the controlled restart that
+            // is required to replace its pthread pool; a stream switched off
+            // simply winds down.
             const rs_json *stream = rs_panel_find_stream(&s->state, id);
             if (stream && strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0)
                 live_sync_stream(s, id);
@@ -2494,9 +2496,9 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
 
 // Brings the live engine for `stream_id` in line with the stored config:
 // starts it if the stream is a running internal-mode MPD, and otherwise leaves
-// it alone. Safe (and cheap) to call repeatedly — an already-running engine
-// just picks the new settings up on its next poll instead of restarting and
-// throwing away a warm segment queue.
+// it alone. Safe (and cheap) to call repeatedly — ordinary settings are picked
+// up on the next poll. A changed connection-pool size performs a controlled
+// engine restart because an existing pthread pool cannot resize in place.
 static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     if (!s || !s->live || !stream_id || !stream_id[0]) return;
     const rs_json *stream = rs_panel_find_stream(&s->state, stream_id);
@@ -2583,7 +2585,8 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
                     cfg.cdn_url_count == 1 ? "" : "s");
     } else {
         log_record(s, stream_id, "info", "liveConfig", src, 0, -1,
-                   "settings updated — the workers pick them up on the next poll");
+                   "settings applied — polling options update on the next poll; "
+                   "a changed connection count restarts the worker pool");
     }
 
     free(mproxy); free(dproxy); free(mheaders); free(dheaders);
