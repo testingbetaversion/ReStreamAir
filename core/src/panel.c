@@ -144,7 +144,7 @@ static rs_json *stream_from_body(const rs_json *body, const char *id, const char
     rs_json_obj_set_int(s, "playbackDelaySeconds", clamp_ll(rs_json_obj_int(body, "playbackDelaySeconds", 0), 0));
     rs_json_obj_set_int(s, "keepSegments", clamp_ll(rs_json_obj_int(body, "keepSegments", 10), 1));
     rs_json_obj_set_int(s, "downloadAhead", clamp_ll(rs_json_obj_int(body, "downloadAhead", 20), 1));
-    rs_json_obj_set_int(s, "parallelDownloads", clamp_ll(rs_json_obj_int(body, "parallelDownloads", 4), 1));
+    rs_json_obj_set_int(s, "parallelDownloads", clamp_ll(rs_json_obj_int(body, "parallelDownloads", 3), 1));
     double poll = rs_json_obj_num(body, "pollInterval", 0.0);
     rs_json_obj_set(s, "pollInterval", rs_json_new_num(poll < 0 ? 0 : poll));
     rs_json_obj_set_bool(s, "forceOffline", rs_json_obj_bool(body, "forceOffline", false));

@@ -217,7 +217,7 @@
                 <label>Playback delay (s)<span class="field-hint">Hold playback this many seconds behind the live edge — 0 = live</span><input name="playbackDelaySeconds" type="number" min="0" value="0"></label>
                 <label>Keep segments<input name="keepSegments" type="number" min="1" value="10"></label>
                 <label>Download ahead<input name="downloadAhead" type="number" min="1" value="20"></label>
-                <label>Parallel downloads<span class="field-hint">In-flight segment fetches per rendition. Each one holds its connection open, so the engine caps this at 4 — past that you get congestion, not throughput.</span><input name="parallelDownloads" type="number" min="1" value="4"></label>
+                <label>Parallel downloads<span class="field-hint">In-flight segment fetches shared by video and audio. The engine caps this at 3 — past that many CDNs and proxies add congestion instead of throughput.</span><input name="parallelDownloads" type="number" min="1" value="3"></label>
                 <label><input name="prioritizeOldest" type="checkbox"> Prioritize oldest (sequential first)<span class="field-hint">No longer needed — download threads always take the oldest queued segment first, because that is the one the playlist is waiting on.</span></label>
               </div>
               <div class="form-row">

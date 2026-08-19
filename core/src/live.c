@@ -34,11 +34,11 @@
 // source we handle uses; the extra slots leave room for a pinned
 // representation alongside them).
 #define RS_LIVE_MAX_REPS 6
-// Parallel segment downloads per poll. The origin round-trip is the bottleneck
-// and segments are independent files; serial fetching could not keep up with
-// the live edge, which is exactly what left the player draining to the end of
-// the playlist and stalling. Matches the Swift prefetch fan-out.
-#define RS_LIVE_FETCH_PAR 4
+// Active segment downloads across one stream. Video and audio share this
+// budget: treating the value as a separate allowance for every rendition can
+// turn a configured value of four into eight simultaneous origin requests.
+// Several signed CDNs and proxies slow down sharply under that fan-out.
+#define RS_LIVE_FETCH_PAR 3
 
 // Ceiling on a representation's persistent download threads, whatever
 // parallelDownloads is set to. Each thread keeps its own HTTP connection alive
@@ -47,7 +47,7 @@
 // "how many segments are outstanding" — and past a handful that stops buying
 // throughput and starts costing congestion and CDN concurrency refusals.
 // streamlink defaults to one download thread and keeps up fine.
-#define RS_LIVE_MAX_DL_THREADS 4
+#define RS_LIVE_MAX_DL_THREADS 3
 // Hard ceiling on segments queued but not yet committed. The configured
 // downloadAhead sets the working depth; this only bounds the allocation.
 #define RS_LIVE_PENDING_MAX 128
@@ -418,6 +418,7 @@ typedef struct {
     uint64_t pend_gen;     // monotonic stamp source for pend_item.gen
     pthread_t *dl_threads;
     size_t ndl;
+    int active_downloads;  // requests currently owned by this rendition
     pthread_t wr_thread;
     bool wr_started;
     bool poller_done;      // no more items will be queued; writer may drain+exit
@@ -487,11 +488,11 @@ typedef struct live_stream {
     int reduced_manifest_polling;
     int playlist_segments, keep_segments, download_ahead;
     int parallel_downloads;
-    // Effective pool size captured when this engine instance was created.
-    // Unlike poll/window settings, a pthread pool cannot adopt a new size by
-    // merely replacing the config snapshot; rs_live_start uses this to decide
-    // whether a running engine needs a controlled restart.
+    // Effective stream-wide request budget captured when this engine instance
+    // was created. Each rendition has enough waiting workers to use the budget,
+    // but active_downloads below prevents the pools multiplying it.
     int worker_parallel_downloads;
+    int active_downloads;  // active media requests across every rendition
     int prioritize_oldest;
     int playback_delay_seconds, audio_delay_ms;
     double poll_interval;
@@ -759,18 +760,56 @@ static int effective_parallel_downloads(int configured) {
     return want;
 }
 
+// Keep one slot available to audio when both media kinds are present. Without
+// this split, the video queue (normally much deeper and slower) can repeatedly
+// win every stream-wide slot and starve audio. Text shares the non-video side
+// of the global budget and is uncommon enough not to need another reservation.
+// Caller holds st->mu.
+static int rep_active_limit_locked(const live_rep *rep) {
+    const live_stream *st = rep->owner;
+    int budget = st->worker_parallel_downloads;
+    bool have_audio = false;
+    for (size_t i = 0; i < st->nreps; i++) {
+        if (st->reps[i]->kind && strcmp(st->reps[i]->kind, "audio") == 0) {
+            have_audio = true;
+            break;
+        }
+    }
+    if (budget > 1 && have_audio) {
+        if (rep->kind && strcmp(rep->kind, "video") == 0) return budget - 1;
+        return 1;
+    }
+    return budget;
+}
+
+// Caller holds st->mu.
+static bool pend_has_waiting_locked(live_rep *rep) {
+    for (size_t i = 0; i < rep->pend_count; i++)
+        if (pend_at_locked(rep, i)->state == PEND_WAITING) return true;
+    return false;
+}
+
 static void *download_main(void *arg) {
     live_rep *rep = (live_rep *)arg;
     live_stream *st = rep->owner;
 
     for (;;) {
         pthread_mutex_lock(&st->mu);
-        long idx;
-        while (!st->stop && (idx = pend_claim_locked(rep)) < 0) {
-            if (rep->poller_done) { pthread_mutex_unlock(&st->mu); return NULL; }
+        long idx = -1;
+        while (!st->stop) {
+            if (st->active_downloads < st->worker_parallel_downloads &&
+                rep->active_downloads < rep_active_limit_locked(rep))
+                idx = pend_claim_locked(rep);
+            if (idx >= 0) break;
+            if (rep->poller_done && !pend_has_waiting_locked(rep)) {
+                pthread_mutex_unlock(&st->mu);
+                return NULL;
+            }
             pthread_cond_wait(&st->cv, &st->mu);
         }
         if (st->stop) { pthread_mutex_unlock(&st->mu); return NULL; }
+        st->active_downloads++;
+        rep->active_downloads++;
         // The claimed item cannot move while we work: the ring only ever grows
         // at the tail and shrinks at the head, and the writer will not advance
         // past an item that is still FETCHING.
@@ -837,6 +876,8 @@ static void *download_main(void *arg) {
         cfg_snap_dispose(&cfg);
 
         pthread_mutex_lock(&st->mu);
+        if (st->active_downloads > 0) st->active_downloads--;
+        if (rep->active_downloads > 0) rep->active_downloads--;
         // The slot may no longer be ours: a stop can have cleared the queue,
         // and the writer can have abandoned this item for holding up everything
         // behind it. The generation stamp is what makes that safe to check —
@@ -1290,11 +1331,12 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     // The dropped segments are marked seen so the engine never comes back for
     // them, and the tfdt jump they leave behind surfaces honestly as an
     // EXT-X-DISCONTINUITY rather than as silent corruption.
-    // Anything queued that the origin no longer advertises is unreachable: its
-    // URL can never be refreshed again, so it will sit there until its token
-    // dies and then eat a timeout. Drop it now instead. This is the age bound —
-    // expressed as "is it still on offer" rather than as a number of seconds,
-    // which is the same question and needs no tuning.
+    // Anything still WAITING that the origin no longer advertises is
+    // unreachable, so drop it now. An item already FETCHING is different: its
+    // worker owns a private URL and may still complete even after the manifest
+    // slides. Cancelling it here caused slow requests to be killed just before
+    // completion and turned ordinary lag into a permanent discontinuity. The
+    // request timeout and the writer's head-of-line rule already bound it.
     size_t stale = 0;
     if (total > 0) {
         for (size_t i = 0; i < rep->pend_count;) {
@@ -1318,13 +1360,6 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
                     rep->pend_count--;
                     stale++;
                     continue;
-                }
-                if (it->state == PEND_FETCHING) {
-                    it->gen = ++rep->pend_gen;
-                    it->state = PEND_FAILED;
-                    snprintf(it->err, sizeof(it->err),
-                             "segment left the live MPD window while its request was still pending");
-                    stale++;
                 }
             }
             i++;
