@@ -780,30 +780,30 @@ static int effective_parallel_downloads(int configured) {
     return want;
 }
 
-// Keep one slot available to audio when both media kinds are present. Without
-// this split, the video queue (normally much deeper and slower) can repeatedly
-// win every stream-wide slot and starve audio. Text shares the non-video side
-// of the global budget and is uncommon enough not to need another reservation.
+// How many of the stream's shared connections this rendition may hold at once.
+//
+// The rule is a FLOOR for everyone else, not a ceiling here. It used to be the
+// other way round: audio was pinned at exactly one connection whenever video
+// was present. That protects audio from being shut out by the much deeper video
+// queue, which is a real hazard — but one connection on a slow path is bare
+// break-even for a 2s audio rendition (one fetch per segment period, no
+// headroom), so audio spent its time skipping to the live edge too. Reserve a
+// slot for each OTHER rendition that actually has work waiting, and let this
+// one have everything else.
 // Caller holds st->mu.
-static int rep_active_limit_locked(const live_rep *rep) {
-    const live_stream *st = rep->owner;
-    int budget = st->worker_parallel_downloads;
-    bool have_audio = false;
+static bool pend_has_waiting_locked(live_rep *rep);
+
+static int rep_active_limit_locked(live_rep *rep) {
+    live_stream *st = rep->owner;
+    int others = 0;
     for (size_t i = 0; i < st->nreps; i++) {
-        if (st->reps[i]->kind && strcmp(st->reps[i]->kind, "audio") == 0) {
-            have_audio = true;
-            break;
-        }
+        live_rep *o = st->reps[i];
+        if (o == rep) continue;
+        if (pend_has_waiting_locked(o)) others++;
     }
-    // Only worth reserving when there is something to reserve from. At a budget
-    // of three this handed video two connections, which is below what any real
-    // video rendition needs on a slow path — the reservation protected audio by
-    // starving the thing the stream exists to deliver.
-    if (budget >= 4 && have_audio) {
-        if (rep->kind && strcmp(rep->kind, "video") == 0) return budget - 1;
-        return 1;
-    }
-    return budget;
+    int limit = st->worker_parallel_downloads - others;
+    if (limit < 1) limit = 1;
+    return limit;
 }
 
 // Caller holds st->mu.
