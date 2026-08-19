@@ -38,7 +38,7 @@
 // and segments are independent files; serial fetching could not keep up with
 // the live edge, which is exactly what left the player draining to the end of
 // the playlist and stalling. Matches the Swift prefetch fan-out.
-#define RS_LIVE_FETCH_PAR 6
+#define RS_LIVE_FETCH_PAR 4
 
 // Ceiling on a representation's persistent download threads, whatever
 // parallelDownloads is set to. Each thread keeps its own HTTP connection alive
@@ -47,7 +47,7 @@
 // "how many segments are outstanding" — and past a handful that stops buying
 // throughput and starts costing congestion and CDN concurrency refusals.
 // streamlink defaults to one download thread and keeps up fine.
-#define RS_LIVE_MAX_DL_THREADS 8
+#define RS_LIVE_MAX_DL_THREADS 4
 // Hard ceiling on segments queued but not yet committed. The configured
 // downloadAhead sets the working depth; this only bounds the allocation.
 #define RS_LIVE_PENDING_MAX 128
@@ -86,6 +86,8 @@
 // the wall clock on a stream that has to stay in real time.
 #define RS_LIVE_FETCH_TRIES 2
 #define RS_LIVE_FETCH_RETRY_DELAY 0.4
+#define RS_LIVE_MEDIA_TIMEOUT_MIN_MS 6000L
+#define RS_LIVE_MEDIA_TIMEOUT_MAX_MS 15000L
 
 // The window-sizing rule itself lives in live_window.c (portable, pure, and
 // therefore covered by the self-test) — see rs_live_window_size.
@@ -344,7 +346,7 @@ typedef enum {
 } pend_state;
 
 typedef struct {
-    char *url;               // refreshed from every poll while still WAITING
+    char *url;               // refreshed from every poll until the bytes arrive
     char idkey[288];         // token-independent identity (see stable_key)
     long long time_val;      // the manifest's $Time$, for the stable identity
     double duration;
@@ -360,6 +362,10 @@ typedef struct {
     // under an in-flight fetch (see the head-of-line rule in writer_main)
     // without the late result landing on whatever occupies the slot next.
     uint64_t gen;
+    // The writer increments this to abort one slow network attempt without
+    // abandoning the segment. The download thread then retries the same stable
+    // segment identity using the URL most recently read from the MPD.
+    uint64_t request_gen;
     char err[192];
 } pend_item;
 
@@ -712,6 +718,33 @@ static long pend_claim_locked(live_rep *rep) {
     return -1;
 }
 
+typedef struct {
+    live_stream *st;
+    pend_item *slot;
+    uint64_t slot_gen;
+    uint64_t request_gen;
+} download_cancel_ctx;
+
+// Called by libcurl's progress hook. It turns a logical queue cancellation into
+// a real network cancellation, so a dead CDN request no longer owns a worker
+// connection until the generic 30-second timeout expires.
+static int download_should_cancel(void *opaque) {
+    download_cancel_ctx *ctx = (download_cancel_ctx *)opaque;
+    pthread_mutex_lock(&ctx->st->mu);
+    bool cancel = ctx->st->stop || ctx->slot->gen != ctx->slot_gen ||
+                  ctx->slot->state != PEND_FETCHING ||
+                  ctx->slot->request_gen != ctx->request_gen;
+    pthread_mutex_unlock(&ctx->st->mu);
+    return cancel ? 1 : 0;
+}
+
+static long media_timeout_ms(double duration) {
+    long timeout = duration > 0 ? (long)(duration * 3000.0) : RS_LIVE_MEDIA_TIMEOUT_MIN_MS;
+    if (timeout < RS_LIVE_MEDIA_TIMEOUT_MIN_MS) timeout = RS_LIVE_MEDIA_TIMEOUT_MIN_MS;
+    if (timeout > RS_LIVE_MEDIA_TIMEOUT_MAX_MS) timeout = RS_LIVE_MEDIA_TIMEOUT_MAX_MS;
+    return timeout;
+}
+
 static void *download_main(void *arg) {
     live_rep *rep = (live_rep *)arg;
     live_stream *st = rep->owner;
@@ -726,12 +759,10 @@ static void *download_main(void *arg) {
         if (st->stop) { pthread_mutex_unlock(&st->mu); return NULL; }
         // The claimed item cannot move while we work: the ring only ever grows
         // at the tail and shrinks at the head, and the writer will not advance
-        // past an item that is still FETCHING. Copy what the fetch needs so the
-        // lock can be dropped.
+        // past an item that is still FETCHING.
         pend_item *slot = pend_at_locked(rep, (size_t)idx);
         slot->started = now_seconds();
         uint64_t slot_gen = slot->gen;
-        char *url = rs_strdup(slot->url);
         cfg_snap cfg;
         cfg_snapshot_locked(st, &cfg);
         pthread_mutex_unlock(&st->mu);
@@ -747,13 +778,38 @@ static void *download_main(void *arg) {
         // the live edge used to cost a real EXT-X-DISCONTINUITY.
         for (int attempt = 0; attempt < RS_LIVE_FETCH_TRIES; attempt++) {
             if (attempt > 0 && !live_wait(st, RS_LIVE_FETCH_RETRY_DELAY)) break;
+
+            // Re-read the URL for every attempt. Segment identity is based on
+            // $Time$/path, while the query string is a short-lived signature;
+            // the poller can therefore replace this URL safely while the item
+            // remains queued. In particular, attempt two must not repeat the
+            // expired URL that made attempt one time out.
+            pthread_mutex_lock(&st->mu);
+            if (st->stop || slot->gen != slot_gen || slot->state != PEND_FETCHING) {
+                pthread_mutex_unlock(&st->mu);
+                break;
+            }
+            char *url = rs_strdup(slot->url);
+            uint64_t request_gen = slot->request_gen;
+            slot->attempts = attempt + 1;
+            slot->started = now_seconds();
+            double duration = slot->duration;
+            pthread_mutex_unlock(&st->mu);
+            if (!url) {
+                snprintf(err, sizeof(err), "out of memory copying the current segment URL");
+                break;
+            }
+
             char *body = NULL;
             size_t blen = 0;
             long status = 0;
             err[0] = '\0';
+            download_cancel_ctx cancel = {st, slot, slot_gen, request_gen};
             int rc = st->mgr->fetch(url, cfg.media_proxy, cfg.media_headers, NULL,
                                     cfg.downloader, cfg.dl_params,
-                                    &body, &blen, &status, NULL, NULL, NULL, err, sizeof(err));
+                                    &body, &blen, &status, NULL, NULL, NULL, err, sizeof(err),
+                                    media_timeout_ms(duration), download_should_cancel, &cancel);
+            free(url);
             attempts = attempt + 1;
             if (rc == 0 && body) {
                 data = (uint8_t *)body;
@@ -765,7 +821,6 @@ static void *download_main(void *arg) {
             free(body);
         }
         cfg_snap_dispose(&cfg);
-        free(url);
 
         pthread_mutex_lock(&st->mu);
         // The slot may no longer be ours: a stop can have cleared the queue,
@@ -876,7 +931,8 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
     lg(st, "info", "initFetch", init_url, 0, -1, rep->rep_id);
     int rc = st->mgr->fetch(init_url, cfg->media_proxy, cfg->media_headers, NULL,
                             cfg->downloader, cfg->dl_params,
-                            &body, &len, &status, NULL, NULL, NULL, err, sizeof(err));
+                            &body, &len, &status, NULL, NULL, NULL, err, sizeof(err),
+                            30000, NULL, NULL);
     if (rc != 0 || !body) {
         free(body);
         lgf(st, "error", "initFetch", init_url, status, -1, "%s: %s", rep->rep_id,
@@ -1164,10 +1220,14 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
         // requesting links that had expired 37-81 seconds earlier, which the
         // CDN does not refuse cleanly — it just never answers, so the fetch
         // burned its whole timeout and blocked everything behind it. Take the
-        // fresh URL every poll for anything not yet started.
+        // fresh URL every poll for anything whose bytes are not already in
+        // hand. FETCHING is safe too: the request owns a private URL copy, and
+        // a retry will snapshot this replacement.
         pend_item *queued_already = pend_find_locked(rep, idkey);
         if (queued_already) {
-            if (queued_already->state == PEND_WAITING) {
+            if ((queued_already->state == PEND_WAITING ||
+                 queued_already->state == PEND_FETCHING) &&
+                strcmp(queued_already->url, u) != 0) {
                 free(queued_already->url);
                 queued_already->url = rs_strdup(u);
                 refreshed++;
@@ -1235,14 +1295,23 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
                     stable_key(u, tv, k, sizeof(k));
                     if (strcmp(k, it->idkey) == 0) advertised = true;
                 }
-            if (it->state == PEND_WAITING && !advertised) {
-                seen_add(&rep->seen, it->idkey);
-                pend_item_dispose(it);
-                for (size_t m = i + 1; m < rep->pend_count; m++)
-                    *pend_at_locked(rep, m - 1) = *pend_at_locked(rep, m);
-                rep->pend_count--;
-                stale++;
-                continue;
+            if (!advertised) {
+                if (it->state == PEND_WAITING) {
+                    seen_add(&rep->seen, it->idkey);
+                    pend_item_dispose(it);
+                    for (size_t m = i + 1; m < rep->pend_count; m++)
+                        *pend_at_locked(rep, m - 1) = *pend_at_locked(rep, m);
+                    rep->pend_count--;
+                    stale++;
+                    continue;
+                }
+                if (it->state == PEND_FETCHING) {
+                    it->gen = ++rep->pend_gen;
+                    it->state = PEND_FAILED;
+                    snprintf(it->err, sizeof(it->err),
+                             "segment left the live MPD window while its request was still pending");
+                    stale++;
+                }
             }
             i++;
         }
@@ -1499,14 +1568,22 @@ static void *writer_main(void *arg) {
             // old to be worth having whatever the rest of the queue is doing.
             bool overdue = ready_behind ? waited > stall : waited > stall * 3.0;
             if (head->state == PEND_FETCHING && overdue && head->started > 0) {
-                head->gen = ++rep->pend_gen;
-                head->state = PEND_FAILED;
-                snprintf(head->err, sizeof(head->err),
-                         ready_behind
-                             ? "abandoned after %.1fs — it was holding up segments already downloaded"
-                             : "abandoned after %.1fs — no answer, and the whole queue is behind it",
-                         waited);
-                abandoned = true;
+                if (head->attempts < RS_LIVE_FETCH_TRIES) {
+                    // Abort only this request. The worker keeps ownership of
+                    // the segment and its next attempt takes the URL refreshed
+                    // by the newest MPD poll.
+                    head->request_gen++;
+                    head->started = now_seconds();
+                } else {
+                    head->gen = ++rep->pend_gen;
+                    head->state = PEND_FAILED;
+                    snprintf(head->err, sizeof(head->err),
+                             ready_behind
+                                 ? "abandoned after %.1fs — it was holding up segments already downloaded"
+                                 : "abandoned after %.1fs — no answer, and the whole queue is behind it",
+                             waited);
+                    abandoned = true;
+                }
             }
         }
 

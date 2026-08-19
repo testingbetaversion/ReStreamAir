@@ -723,6 +723,8 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         char *effurl;
         time_t time;
         bool fetching;
+        bool failed;
+        char error[256];
         pthread_cond_t cv;
     } dash_cache_entry;
 
@@ -758,7 +760,7 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         free(entry->xml); free(entry->effurl);
         entry->url = rs_strdup(url);
         entry->proxy = NULL; entry->headers = NULL; entry->xml = NULL; entry->effurl = NULL;
-        entry->len = 0; entry->time = 0;
+        entry->len = 0; entry->time = 0; entry->failed = false; entry->error[0] = '\0';
     }
 
     while (entry->fetching) pthread_cond_wait(&entry->cv, &g_dash_mu);
@@ -766,7 +768,13 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
     bool match = ((!proxy && !entry->proxy) || (proxy && entry->proxy && strcmp(proxy, entry->proxy) == 0)) &&
                  ((!headers && !entry->headers) || (headers && entry->headers && strcmp(headers, entry->headers) == 0));
     
-    if (match && (time(NULL) - entry->time <= 2) && entry->xml) {
+    if (match && (time(NULL) - entry->time <= 2) && (entry->xml || entry->failed)) {
+        if (entry->failed) {
+            snprintf(errbuf, errbuf_len, "%s",
+                     entry->error[0] ? entry->error : "The shared MPD fetch failed.");
+            pthread_mutex_unlock(&g_dash_mu);
+            return NULL;
+        }
         xml = rs_strdup(entry->xml);
         len = entry->len;
         effurl = entry->effurl ? rs_strdup(entry->effurl) : NULL;
@@ -776,7 +784,8 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         pthread_mutex_unlock(&g_dash_mu);
 
         int rc = rs_fetch_url(url, proxy, headers, NULL, NULL, NULL, &xml, &len,
-                              NULL, NULL, NULL, &effurl, errbuf, errbuf_len);
+                              NULL, NULL, NULL, &effurl, errbuf, errbuf_len,
+                              30000, NULL, NULL);
 
         pthread_mutex_lock(&g_dash_mu);
         entry->fetching = false;
@@ -789,9 +798,22 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
             entry->len = len;
             entry->effurl = effurl ? rs_strdup(effurl) : NULL;
             entry->time = time(NULL);
+            entry->failed = false;
+            entry->error[0] = '\0';
         } else {
-            free(entry->url);
-            entry->url = NULL;
+            // Keep a short negative cache just like the successful MPD cache.
+            // Video, audio and the director all ask for the same manifest; if
+            // one 30-second fetch fails, the waiters must receive that result
+            // instead of serially starting two more identical 30-second calls.
+            free(entry->proxy); free(entry->headers);
+            free(entry->xml); free(entry->effurl);
+            entry->proxy = proxy ? rs_strdup(proxy) : NULL;
+            entry->headers = headers ? rs_strdup(headers) : NULL;
+            entry->xml = NULL; entry->effurl = NULL; entry->len = 0;
+            entry->time = time(NULL);
+            entry->failed = true;
+            snprintf(entry->error, sizeof(entry->error), "%s",
+                     errbuf[0] ? errbuf : "The MPD fetch failed.");
         }
         pthread_cond_broadcast(&entry->cv);
         pthread_mutex_unlock(&g_dash_mu);

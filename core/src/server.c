@@ -163,7 +163,8 @@ static char *logo_fetch_wrapper(const char *url, void *ctx) {
     size_t body_len = 0;
     long status = 0;
     char err[128] = {0};
-    int rc = g_fetch_handler(url, NULL, NULL, NULL, NULL, NULL, &body, &body_len, &status, NULL, NULL, NULL, err, sizeof(err));
+    int rc = g_fetch_handler(url, NULL, NULL, NULL, NULL, NULL, &body, &body_len, &status,
+                             NULL, NULL, NULL, err, sizeof(err), 30000, NULL, NULL);
     if (rc == 0 && status == 200 && body) return body;
     free(body);
     return NULL;
@@ -1986,7 +1987,7 @@ static void *pending_job_worker(void *arg) {
                                  pf->downloader, pf->downloader_params,
                                  &pf->body, &pf->body_len, &pf->status,
                                  &pf->content_type, &pf->content_range, NULL,
-                                 pf->err, sizeof(pf->err));
+                                 pf->err, sizeof(pf->err), 30000, NULL, NULL);
         break;
     case RS_PENDING_LOGO:
         // The cache itself isn't thread-safe (a plain cJSON tree, no locking —
@@ -2559,7 +2560,7 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     cfg.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
     cfg.keep_segments = (int)rs_json_obj_int(stream, "keepSegments", 10);
     cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 20);
-    cfg.parallel_downloads = (int)rs_json_obj_int(stream, "parallelDownloads", 50);
+    cfg.parallel_downloads = (int)rs_json_obj_int(stream, "parallelDownloads", 4);
     cfg.prioritize_oldest = rs_json_obj_bool(stream, "prioritizeOldest", false) ? 1 : 0;
     cfg.playback_delay_seconds = (int)rs_json_obj_int(stream, "playbackDelaySeconds", 0);
     cfg.audio_delay_ms = (int)rs_json_obj_int(stream, "audioDelayMs", 0);
@@ -3056,11 +3057,57 @@ static uint64_t ts_newest_join(const rs_ts_session *sess) {
     return sess->ring_base + sess->ring_len;
 }
 
+// A track cannot be added back to an MPEG-TS mux after it has been ended: its
+// PID and codec belong in the PMT emitted at mux creation. Rebuild the shared
+// mux when a stalled rendition starts producing again, and re-seat every
+// viewer on the first keyframe from the rebuilt stream.
+static bool ts_session_rebuild(restream_server_t *server, rs_ts_session *sess,
+                               int recovered_rep) {
+    rs_ts_mux *replacement = rs_ts_mux_create();
+    if (!replacement) return false;
+
+    rs_ts_mux_destroy(sess->mux);
+    sess->mux = replacement;
+    sess->bound = false;
+    sess->ntracks = 0;
+    sess->ring_base += sess->ring_len;
+    sess->ring_len = 0;
+    sess->njoins = 0;
+
+    for (rs_ts_client *client = server->ts_head; client; client = client->next)
+        if (strcmp(client->stream_id, sess->stream_id) == 0) client->seated = false;
+
+    log_recordf(server, sess->stream_id, "info", "tsMuxRecovered", NULL, 0, -1,
+                "rendition %d resumed — rebuilding the MPEG-TS mux with all tracks",
+                recovered_rep);
+    return true;
+}
+
 // Pulls whatever the live engine has produced since last tick into the mux, and
 // pushes the muxed result into the ring.
 static void ts_session_pump(restream_server_t *server, rs_ts_session *sess) {
     ts_session_bind(server, sess);
     if (!sess->bound) return;
+
+    // rs_ts_mux_end_track permanently removes a stalled track from the current
+    // mux. Probe ended tracks before pushing anything; if one has new media,
+    // rebuild so the recovered audio/video is not silently discarded forever.
+    for (size_t i = 0; i < sess->ntracks; i++) {
+        if (!sess->tracks[i].ended) continue;
+        size_t len = 0;
+        long long seq = 0;
+        uint8_t *seg = rs_live_take_after(server->live, sess->stream_id,
+                                          sess->tracks[i].rep_index,
+                                          sess->tracks[i].last_seq, &seq, NULL, &len);
+        bool resumed = seg != NULL;
+        rs_free(seg);
+        if (!resumed) continue;
+        int recovered_rep = sess->tracks[i].rep_index;
+        if (!ts_session_rebuild(server, sess, recovered_rep)) return;
+        ts_session_bind(server, sess);
+        if (!sess->bound) return;
+        break;
+    }
 
     for (size_t i = 0; i < sess->ntracks; i++) {
         int taken = 0;

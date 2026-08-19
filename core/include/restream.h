@@ -70,11 +70,16 @@ void restream_server_set_probe_handler(restream_probe_fn handler);
 // `effective_url` (may be NULL) receives a malloc'd copy of the final URL after
 // redirects — needed to resolve a DASH MPD's relative segment URLs when the
 // manifest 302s to a session-tokenized host. Only the libcurl path fills it.
+// `timeout_ms` is the whole-request timeout (<= 0 uses 30 seconds). For the
+// in-process client, `should_cancel(cancel_ctx)` is polled during the transfer;
+// returning non-zero aborts it. External downloader processes cannot use that
+// callback and retain their own timeout behaviour.
 typedef int (*restream_fetch_fn)(const char *url, const char *proxy, const char *headers,
                                  const char *range, const char *downloader, const char *dl_params,
                                  char **out, size_t *out_len,
                                  long *status, char **content_type, char **content_range,
-                                 char **effective_url, char *errbuf, size_t errbuf_len);
+                                 char **effective_url, char *errbuf, size_t errbuf_len,
+                                 long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx);
 void restream_server_set_fetch_handler(restream_fetch_fn handler);
 
 // A DASH describe handler: fetches an MPD (through proxy/headers/downloader),

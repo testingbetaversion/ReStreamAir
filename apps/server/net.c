@@ -266,10 +266,23 @@ static bool is_http2_failure(CURLcode rc) {
     return false;
 }
 
+typedef struct {
+    int (*should_cancel)(void *);
+    void *ctx;
+} fetch_cancel;
+
+static int transfer_progress(void *opaque, curl_off_t dltotal, curl_off_t dlnow,
+                             curl_off_t ultotal, curl_off_t ulnow) {
+    (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    fetch_cancel *cancel = (fetch_cancel *)opaque;
+    return cancel && cancel->should_cancel && cancel->should_cancel(cancel->ctx) ? 1 : 0;
+}
+
 // One transfer on the calling thread's handle. `force_http11` is set by the
 // caller when retrying after an HTTP/2 framing error.
 static int fetch_once(CURL *curl, const char *url, const char *proxy, const char *headers,
-                      const char *range, bool force_http11,
+                      const char *range, bool force_http11, long timeout_ms,
+                      int (*should_cancel)(void *), void *cancel_ctx,
                       char **out, size_t *out_len, long *status, char **content_type,
                       char **content_range, char **effective_url,
                       CURLcode *out_rc, char *errbuf, size_t errbuf_len) {
@@ -289,8 +302,15 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    if (timeout_ms <= 0) timeout_ms = 30000;
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, timeout_ms < 10000 ? timeout_ms : 10000);
+    fetch_cancel cancel = {should_cancel, cancel_ctx};
+    if (should_cancel) {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, transfer_progress);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &cancel);
+    }
     // NO low-speed abort here, and that is deliberate. Cutting transfers that
     // move less than 1 KB/s for five seconds looked like the right way to kill
     // a request the CDN was never going to answer — but libcurl's low-speed
@@ -346,7 +366,10 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     if (header_list) curl_slist_free_all(header_list);
 
     if (rc != CURLE_OK) {
-        snprintf(errbuf, errbuf_len, "Fetch failed: %s", curl_easy_strerror(rc));
+        if (rc == CURLE_ABORTED_BY_CALLBACK)
+            snprintf(errbuf, errbuf_len, "Fetch cancelled because the segment is no longer current.");
+        else
+            snprintf(errbuf, errbuf_len, "Fetch failed: %s", curl_easy_strerror(rc));
         free(buf.data);
         if (content_type) { free(*content_type); *content_type = NULL; }
         if (content_range) { free(*content_range); *content_range = NULL; }
@@ -374,7 +397,8 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
 
 static int fetch_libcurl(const char *url, const char *proxy, const char *headers, const char *range,
                          char **out, size_t *out_len, long *status, char **content_type,
-                         char **content_range, char **effective_url, char *errbuf, size_t errbuf_len) {
+                         char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
+                         long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx) {
     if (content_type) *content_type = NULL;
     if (content_range) *content_range = NULL;
     if (effective_url) *effective_url = NULL;
@@ -390,6 +414,7 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
 
     CURLcode rc = CURLE_OK;
     int result = fetch_once(curl, url, proxy, headers, range, force11,
+                            timeout_ms, should_cancel, cancel_ctx,
                             out, out_len, status, content_type, content_range, effective_url,
                             &rc, errbuf, errbuf_len);
 
@@ -399,6 +424,7 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
         h2_deny(host);
         if (borrowed) curl_easy_reset(curl);
         result = fetch_once(curl, url, proxy, headers, range, true,
+                            timeout_ms, should_cancel, cancel_ctx,
                             out, out_len, status, content_type, content_range, effective_url,
                             &rc, errbuf, errbuf_len);
     }
@@ -626,7 +652,8 @@ static int fetch_external(const char *tool, const char *dl_params,
 int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
                  const char *downloader, const char *dl_params,
                  char **out, size_t *out_len, long *status, char **content_type,
-                 char **content_range, char **effective_url, char *errbuf, size_t errbuf_len) {
+                 char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
+                 long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx) {
     // NULL / "" / "internal" / "libcurl" → in-process libcurl. Otherwise run the
     // chosen external tool, falling back to libcurl if it isn't installed so a
     // missing binary never dead-ends a stream.
@@ -642,5 +669,7 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
 #else
     (void)dl_params;
 #endif
-    return fetch_libcurl(url, proxy, headers, range, out, out_len, status, content_type, content_range, effective_url, errbuf, errbuf_len);
+    return fetch_libcurl(url, proxy, headers, range, out, out_len, status, content_type,
+                         content_range, effective_url, errbuf, errbuf_len,
+                         timeout_ms, should_cancel, cancel_ctx);
 }

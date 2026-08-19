@@ -70,7 +70,8 @@ typedef int (*rs_live_fetch_fn)(const char *url, const char *proxy, const char *
                                 const char *range, const char *downloader, const char *dl_params,
                                 char **out, size_t *out_len, long *status,
                                 char **content_type, char **content_range,
-                                char **effective_url, char *errbuf, size_t errbuf_len);
+                                char **effective_url, char *errbuf, size_t errbuf_len,
+                                long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx);
 
 typedef char *(*rs_live_dash_fn)(const char *url, const char *proxy, const char *headers,
                                  const char *downloader, const char *dl_params,

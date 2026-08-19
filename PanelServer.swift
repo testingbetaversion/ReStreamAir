@@ -351,7 +351,7 @@ struct StreamConfig: Codable {
     var period: String
     var proxy: String
     var playlistSegments: Int
-    var parallelDownloads: Int = 50
+    var parallelDownloads: Int = 4
     var prioritizeOldest: Bool = false
     var reducedManifestPolling: Bool = true
     var keepSegments: Int
@@ -494,7 +494,7 @@ struct StreamConfig: Codable {
         playlistSegments = try container.decode(Int.self, forKey: .playlistSegments)
         keepSegments = try container.decode(Int.self, forKey: .keepSegments)
         downloadAhead = try container.decodeIfPresent(Int.self, forKey: .downloadAhead) ?? 20
-        parallelDownloads = try container.decodeIfPresent(Int.self, forKey: .parallelDownloads) ?? 50
+        parallelDownloads = try container.decodeIfPresent(Int.self, forKey: .parallelDownloads) ?? 4
         prioritizeOldest = try container.decodeIfPresent(Bool.self, forKey: .prioritizeOldest) ?? false
         reducedManifestPolling = try container.decodeIfPresent(Bool.self, forKey: .reducedManifestPolling) ?? true
         pollInterval = try container.decode(Double.self, forKey: .pollInterval)
@@ -4243,7 +4243,7 @@ final class PanelServer {
         stream.proxyScript = input["proxyScript"]?.bool ?? true
         stream.proxyManifest = input["proxyManifest"]?.bool ?? true
         stream.proxyMedia = input["proxyMedia"]?.bool ?? true
-        stream.parallelDownloads = max(1, input["parallelDownloads"]?.int ?? 50)
+        stream.parallelDownloads = max(1, input["parallelDownloads"]?.int ?? 4)
         stream.prioritizeOldest = input["prioritizeOldest"]?.bool ?? false
         stream.reducedManifestPolling = input["reducedManifestPolling"]?.bool ?? true
         return stream

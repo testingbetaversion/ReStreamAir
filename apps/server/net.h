@@ -26,10 +26,15 @@ extern "C" {
 // installed. `dl_params` is a free-form extra-arguments string (may be NULL).
 // `effective_url` (may be NULL) receives the final URL after redirects (libcurl
 // path only) — used to resolve a redirected DASH MPD's segment URLs.
+// `timeout_ms` is the whole-request timeout (<= 0 means 30 seconds). The
+// in-process client periodically calls `should_cancel(cancel_ctx)`, when set,
+// and aborts as soon as it returns non-zero. External tools use their own
+// timeout and cannot call back into the process.
 int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
                  const char *downloader, const char *dl_params,
                  char **out, size_t *out_len, long *status, char **content_type,
-                 char **content_range, char **effective_url, char *errbuf, size_t errbuf_len);
+                 char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
+                 long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx);
 
 #ifdef __cplusplus
 }
