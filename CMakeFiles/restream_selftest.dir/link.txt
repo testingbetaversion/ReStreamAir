@@ -1,1 +1,0 @@
-/usr/bin/cc  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/restream_selftest.dir/core/tests/selftest_main.c.o -o restream_selftest  librestream_base.a

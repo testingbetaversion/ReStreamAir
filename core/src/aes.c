@@ -4,7 +4,7 @@
 
 #include "aes_tables.h"
 
-// State is column-major throughout: index = col * 4 + row, matching AES.swift.
+// State is column-major throughout: index = col * 4 + row, as FIPS-197 lays it out.
 
 int rs_aes_init(rs_aes *ctx, const uint8_t *key, size_t key_len) {
     switch (key_len) {
@@ -155,7 +155,7 @@ int rs_aes_cbc_decrypt(const uint8_t *key, size_t key_len, const uint8_t *iv, si
     }
 
     // Strip PKCS7 padding — but see the header: an invalid pad byte yields the
-    // full plaintext rather than an error, matching AES.swift.
+    // full plaintext rather than an error (see the note in rs_aes.h).
     uint8_t pad = out[ct_len - 1];
     *out_len = (pad >= 1 && pad <= 16 && ct_len >= pad) ? ct_len - pad : ct_len;
     return 0;

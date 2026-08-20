@@ -9,16 +9,9 @@ on:
   pull_request:
   workflow_dispatch:
 
-env:
-  SWIFT_IMAGE: swift:6.0.3
-  STATIC_SDK_URL: https://download.swift.org/swift-6.0.3-release/static-sdk/swift-6.0.3-RELEASE/swift-6.0.3-RELEASE_static-linux-0.0.1.artifactbundle.tar.gz
-  STATIC_SDK_SHA: 67f765e0030e661a7450f7e4877cfe008db4f57f177d5a08a6e26fd661cdd0bd
-
 jobs:
-  # The C core, on every platform it claims to support. Until this job existed
-  # nothing in CI compiled core/ at all — the parity self-test that is supposed
-  # to prove the port matches Swift byte for byte was never run, so it could
-  # have rotted silently between releases.
+  # The one build there is: the C core, the self-test and the panel executable,
+  # on every platform the tree claims to support.
   core:
     name: C core (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -43,7 +36,7 @@ jobs:
         run: cmake -S . -B build ${{ runner.os == 'Windows' && '-DRS_BUILD_SERVER=OFF' || '' }}
       - name: Build
         run: cmake --build build --config Release
-      - name: Self-test (NIST vectors + Swift parity goldens)
+      - name: Self-test (NIST vectors + module goldens)
         run: ctest --test-dir build -C Release --output-on-failure
       # The HTTP layer the self-test cannot reach: the auth gate, the viewer
       # role, the login throttle, session persistence across a restart, cookie
@@ -51,10 +44,17 @@ jobs:
       - name: API end-to-end
         if: runner.os != 'Windows'
         run: python3 scripts/api-smoke.py --binary build/restreamair-server
+      - name: Smoke test the panel binary
+        if: runner.os != 'Windows'
+        run: |
+          ./build/restreamair-server --port 8799 --bind 127.0.0.1 --root public &
+          sleep 3
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/)" = "200"
+          curl -fsS http://127.0.0.1:8799/ping
 
   # ASan + UBSan over the same suites. The core parses attacker-supplied bytes
   # (MPD XML, MP4 boxes, playlists), which is exactly where a memory bug becomes
-  # a security bug, and a sanitizer build was already supported but never run.
+  # a security bug.
   core-sanitizers:
     name: C core (sanitizers)
     runs-on: ubuntu-latest
@@ -79,160 +79,3 @@ jobs:
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: python3 scripts/api-smoke.py --binary build-asan/restreamair-server
-
-  build:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Swift version
-        run: swift --version
-      # `swift build`, not a bare swiftc over *.swift: the Swift sources now
-      # `import restream_core`, and only SwiftPM compiles and links the C core
-      # alongside them. The old swiftc line could not build this tree at all.
-      - name: Build restreamair
-        run: swift build -c release --product restreamair
-      - name: Stage the binary
-        run: cp .build/release/restreamair restreamair
-      # The menu-bar companion is only HTTPClient + MenuBarApp, neither of which
-      # touches the C core, so it stays a direct swiftc invocation.
-      - name: Build restreamair-menubar
-        run: swiftc HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKit
-      - name: Smoke test
-        run: ./restreamair dash --help
-      - name: Crypto self-test
-        run: ./restreamair selftest
-      - uses: actions/upload-artifact@v4
-        with:
-          name: restreamair-macos
-          path: |
-            restreamair
-            restreamair-menubar
-          if-no-files-found: error
-
-  build-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # Fully static via the musl Static Linux SDK + embedded web UI → ONE file
-      # with zero external deps (no Swift runtime, libcurl, libxml2, or glibc).
-      - name: Build restreamair (Linux x86-64, fully static + embedded UI)
-        run: |
-          docker run --rm -e STATIC_SDK_URL -e STATIC_SDK_SHA -v "$PWD:/src" -w /src "$SWIFT_IMAGE" bash -c '
-            set -e
-            swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_SHA"
-            sh scripts/embed-assets.sh
-            swift build -c release --swift-sdk x86_64-swift-linux-musl --product restreamair
-            cp .build/x86_64-swift-linux-musl/release/restreamair restreamair-linux
-          '
-          file restreamair-linux
-      # Gold standard: run on a bare ubuntu:24.04 with NOTHING installed.
-      - name: Runs on bare Ubuntu with zero dependencies
-        run: |
-          docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 bash -c '
-            echo "--- ldd (expect: not a dynamic executable) ---"; ldd restreamair-linux || true
-            ./restreamair-linux selftest
-            ./restreamair-linux serve --port 8799 --bind 127.0.0.1 &
-            sleep 4
-            root=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8799/); echo "web UI: HTTP $root"; test "$root" = "200"
-            js=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8799/app.js); echo "app.js: HTTP $js"; test "$js" = "200"
-            echo "single-file binary serves the embedded UI on bare Ubuntu: OK"
-          '
-      - uses: actions/upload-artifact@v4
-        with:
-          name: restreamair-linux
-          path: restreamair-linux
-          if-no-files-found: error
-
-  # Dynamically-linked glibc build (static Swift runtime, system libcurl+libxml
-  # resolved at runtime). Unlike the fully-static musl single file, this uses
-  # the host's OpenSSL/libcurl, so it trusts the system CA store and can fetch
-  # HTTPS manifests. The musl single file bundles BoringSSL, which ships with no
-  # default trust store and no runtime CA override — it serves the embedded UI
-  # but cannot pull upstream streams — so this glibc build is the deployable
-  # Linux server binary until the musl TLS trust gap is closed.
-  build-linux-glibc:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build (glibc, static Swift runtime)
-        run: |
-          docker run --rm -v "$PWD:/src" -w /src swift:6.0 \
-            bash -c 'swift build -c release --product restreamair -Xswiftc -static-stdlib &&
-                     cp .build/release/restreamair restreamair-linux-glibc'
-          file restreamair-linux-glibc
-      - name: Self-contained-ish check + crypto self-test
-        run: |
-          if ldd restreamair-linux-glibc | grep -qi swift; then echo "ERROR: links Swift runtime"; exit 1; fi
-          ./restreamair-linux-glibc selftest
-      - name: Outbound HTTPS works (trusts system CAs)
-        run: |
-          ./restreamair-linux-glibc dash --info https://livesim2.dashif.org/livesim2/testpic_2s/Manifest.mpd | head -3
-      - uses: actions/upload-artifact@v4
-        with:
-          name: restreamair-linux-glibc
-          path: restreamair-linux-glibc
-          if-no-files-found: error
-
-#  build-linux-arm64:
-#    runs-on: ubuntu-latest
-#    steps:
-#      - uses: actions/checkout@v4
-#      - uses: docker/setup-qemu-action@v3
-#      # The static SDK cross-compiles arm64 from the x86 runner (fast — no
-#      # emulation to build); QEMU is only used to run the result for the test.
-#      - name: Build restreamair (Linux arm64, fully static + embedded UI)
-#        run: |
-#          docker run --rm -e STATIC_SDK_URL -e STATIC_SDK_SHA -v "$PWD:/src" -w /src "$SWIFT_IMAGE" bash -c '
-#            set -e
-#            swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_SHA"
-#            sh scripts/embed-assets.sh
-#            swift build -c release --swift-sdk aarch64-swift-linux-musl --product restreamair
-#            cp .build/aarch64-swift-linux-musl/release/restreamair restreamair-linux-arm64
-#          '
-#          file restreamair-linux-arm64
-#      - name: Runs on bare arm64 Ubuntu with zero dependencies
-#        run: |
-#          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w ubuntu:24.04 bash -c '
-#            ldd restreamair-linux-arm64 || true
-#            ./restreamair-linux-arm64 selftest
-#            echo "single-file arm64 binary runs on bare Ubuntu: OK"
-#          '
-#      - uses: actions/upload-artifact@v4
-#        with:
-#          name: restreamair-linux-arm64
-#          path: restreamair-linux-arm64
-#          if-no-files-found: error
-
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      # Swift 6.0 hit a "cyclic dependency in module 'ucrt'" against the MSVC
-      # that windows-latest now ships; 6.1.2 (what the Linux builds use) fixes it.
-      - uses: compnerd/gha-setup-swift@main
-        with:
-          swift-version: "swift-6.1.2-release"
-          swift-build: "6.1.2-RELEASE"
-      - name: Build restreamair (Windows x64)
-        shell: pwsh
-        run: |
-          $STAGE = "restreamair-windows"
-          # SwiftPM, not a bare swiftc: the sources import restream_core.
-          swift build -c release --product restreamair
-          Copy-Item .build\release\restreamair.exe -Destination restreamair.exe
-          New-Item -ItemType Directory -Path $STAGE -Force
-          Copy-Item restreamair.exe -Destination "$STAGE\restreamair.exe"
-          $swiftBin = Split-Path (Get-Command swiftc).Path
-          $swiftParent = Split-Path (Split-Path (Split-Path (Split-Path $swiftBin -Parent) -Parent) -Parent)
-          $searchPaths = @($swiftBin, $swiftParent, "$env:LOCALAPPDATA\Programs\Swift", "C:\Users\runneradmin\AppData\Local\Programs\Swift") | Where-Object { $_ -and (Test-Path $_) }
-          Get-ChildItem -Path $searchPaths -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
-              Copy-Item $_.FullName -Destination "$STAGE\" -Force
-          }
-          Compress-Archive -Path "$STAGE" -DestinationPath "restreamair-windows.zip"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: restreamair-windows
-          path: |
-            restreamair.exe
-            restreamair-windows.zip
-          if-no-files-found: error

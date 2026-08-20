@@ -7,7 +7,7 @@
 #include "rs_internal.h"
 #include "rs_url.h"
 
-// Line handling matches M3U8Rewriter.swift exactly, because the parity self-test
+// Line handling is pinned by the frozen goldens, because the self-test
 // diffs the two implementations byte for byte: split on "\n" keeping empty
 // pieces, classify using the trimmed line but emit the raw one, then join with
 // "\n" and append a single trailing newline.
@@ -79,7 +79,7 @@ static char *slice_dup(slice s) {
     return copy;
 }
 
-// Swift's Int(String) accepts an optional sign followed by digits and nothing
+// The accepted integer form is an optional sign followed by digits and nothing
 // else; anything looser (trailing text, empty) yields nil.
 static bool parse_int_strict(const char *s, size_t len, int64_t *out) {
     if (len == 0 || len > 20) return false;
@@ -110,7 +110,7 @@ int64_t rs_m3u8_media_sequence(const char *text) {
         int64_t value = 0;
         if (n > 0 && parse_int_strict(digits, n, &value)) return value;
         // A tag with no digits does not match the pattern; keep looking, as the
-        // regex search in the Swift version would.
+        // a regex search would.
         if (n == 0) {
             p = digits;
             continue;
@@ -297,7 +297,7 @@ char *rs_m3u8_rewrite_master(const char *text, const char *base_url,
 
 // Attribute list: a quote-aware comma split of everything after the first
 // colon, then key=value with surrounding quotes stripped from the value. A
-// repeated key keeps its last value, as assigning into a Swift dictionary does.
+// repeated key keeps its last value, as assigning into a dictionary does.
 
 typedef struct {
     char **keys;
@@ -382,7 +382,7 @@ static int64_t attr_int(const attrs *a, const char *key) {
     return -1;
 }
 
-// RESOLUTION is "WxH"; the Swift version takes the first component for width
+// RESOLUTION is "WxH"; this takes the first component for width
 // and the last for height, so a value with no "x" yields the same number twice.
 static void attr_resolution(const attrs *a, int64_t *width, int64_t *height) {
     *width = -1;

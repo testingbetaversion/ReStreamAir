@@ -49,7 +49,7 @@ void rs_strv_push_owned(rs_strv *v, char *s);        // takes ownership of s
 void rs_strv_pushf(rs_strv *v, const char *fmt, ...);
 void rs_strv_dispose(rs_strv *v);
 
-// True for the characters Swift's CharacterSet.whitespaces matches in ASCII.
+// True for the ASCII characters treated as whitespace when trimming.
 bool rs_is_space(char c);
 // Adds the line terminators, matching .whitespacesAndNewlines.
 bool rs_is_space_nl(char c);

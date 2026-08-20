@@ -1,10 +1,10 @@
 #ifndef RS_AUTH_H
 #define RS_AUTH_H
 
-// Admin password hashing and session tracking — the C port of AuthStore.swift.
-// Password hashes are persisted in state.json and must interoperate with the
-// Swift binary (same PBKDF2 parameters, same base64 encoding), so an account
-// created by either server logs in on the other.
+// Admin password hashing and session tracking. Password hashes are persisted in
+// state.json, and the PBKDF2 parameters and base64 framing are fixed by what is
+// already written there: an account created by an older build has to keep
+// logging in.
 //
 // Sessions persist too, through rs_auth_export_sessions/rs_auth_import_sessions
 // and the "sessions" array in state.json. What is stored is the SHA-256 of the

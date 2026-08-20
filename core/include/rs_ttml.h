@@ -11,8 +11,7 @@
 // every HLS player made in the last decade reads that.
 //
 // This module is deliberately libxml2-free: it lives in restream_base, which
-// the Swift build and the self-test both link, and neither may drag in the
-// server's XML dependency. TTML cue extraction needs a fraction of an XML
+// the self-test links without the server's XML dependency. TTML cue extraction needs a fraction of an XML
 // parser (elements, attributes, entities, character data) and none of the rest
 // (DTDs, namespaces as anything but a prefix to ignore, validation), so the
 // scanner below is that fraction and nothing more.

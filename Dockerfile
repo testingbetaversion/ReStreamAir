@@ -1,31 +1,32 @@
-# ReStreamAir — the Swift panel, which is the fully-featured binary on every
-# platform. Multi-stage: build with the Swift toolchain, ship on a slim runtime
-# that carries only the two shared libraries Foundation actually needs.
+# ReStreamAir — the panel. Multi-stage: build with cmake and the two dev
+# packages, ship on a slim runtime carrying only their shared libraries.
 #
 #   docker build -t restreamair .
 #   docker run -d --name restreamair -p 8787:8787 -v restreamair-data:/data restreamair
 #
-# Everything mutable (state.json, runtime/, logs/, logo-cache.json) is resolved
-# relative to the working directory, so /data is the only volume that matters.
-# Back that up and you have backed up the install.
+# Everything mutable (state.json, logs/, logo-cache.json) is resolved relative
+# to the working directory, so /data is the only volume that matters. Back that
+# up and you have backed up the install.
 
-FROM swift:6.0 AS build
+FROM ubuntu:24.04 AS build
 WORKDIR /src
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       cmake build-essential libcurl4-openssl-dev libxml2-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy the manifest and sources. `swift build` — not a bare swiftc — because the
-# Swift sources import the C core, which only SwiftPM compiles and links.
-COPY Package.swift ./
+COPY CMakeLists.txt ./
 COPY core ./core
-COPY *.swift ./
-RUN swift build -c release --product restreamair
+COPY apps ./apps
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$(nproc)"
 
-# Prove the crypto and the C-vs-Swift parity check pass in the same environment
-# that produced the binary, rather than trusting that they did somewhere else.
-RUN .build/release/restreamair selftest
+# Prove the known-answer vectors pass in the same environment that produced the
+# binary, rather than trusting that they did somewhere else.
+RUN ./build/restream_selftest
 
-FROM swift:6.0-slim
-# libcurl4 and libxml2 are what Foundation pulls in at runtime; ca-certificates
-# is what lets the panel fetch an https:// manifest at all.
+FROM ubuntu:24.04
+# libcurl4 fetches manifests and segments, libxml2 parses an MPD, and
+# ca-certificates is what lets either touch an https:// origin at all.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libcurl4 libxml2 \
     && rm -rf /var/lib/apt/lists/*
@@ -34,7 +35,7 @@ RUN apt-get update \
 # than a privileged port.
 RUN useradd --system --create-home --uid 10001 restreamair
 WORKDIR /data
-COPY --from=build /src/.build/release/restreamair /usr/local/bin/restreamair
+COPY --from=build /src/build/restreamair-server /usr/local/bin/restreamair
 COPY public /app/public
 # The panel serves ./public relative to the working directory; symlink rather
 # than copy into /data so a mounted volume doesn't shadow the UI.

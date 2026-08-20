@@ -17,7 +17,7 @@
 #include "net.h"
 
 // A live-DASH SegmentTemplate/SegmentTimeline expander — the C port of the
-// pieces of DashSegments.swift / LiveMPDToM3U8.swift needed to turn one MPD poll
+// pieces of DASH manifest handling needed to turn one MPD poll
 // into a per-representation download plan. Handles the common live cases:
 // SegmentTemplate with a SegmentTimeline ($Time$) or with @duration ($Number$),
 // template inheritance (AdaptationSet -> Representation), and BaseURL stacking.
@@ -659,7 +659,7 @@ static void pick_default_reps(xmlNode *root, rendition_set *out) {
 
 // --- segment URL query-string inheritance -----------------------------------
 //
-// The C port of appendingQueryParams (HTTPClient.swift): appends a raw
+// Appends a raw
 // query-string fragment (with or without a leading '?'/'&') to a URL, ahead of
 // any fragment. Caller frees the result; returns a copy of `url` unchanged
 // when `params` is empty. Some signed CDNs put an auth token in the query of

@@ -2,8 +2,8 @@
 #define RS_SYSSTATS_H
 
 // Live host stats for the panel's Server view — CPU, memory, disk, load,
-// uptime, OS. The C port of SystemStats.swift's snapshot, with per-platform
-// backends. CPU percent needs two samples to compute a delta, so a context
+// uptime, OS — one snapshot with per-platform backends behind it. CPU percent
+// needs two samples to compute a delta, so a context
 // carries the previous sample (and the running peaks) between polls.
 
 #include "rs_common.h"

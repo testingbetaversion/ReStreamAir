@@ -14,10 +14,10 @@
 #define RS_SESSION_REMEMBER_SECONDS (30 * 24 * 60 * 60)
 #define RS_COOKIE_NAME "restreamair_session"
 
-// Swift's JSONEncoder writes a Date as seconds since the 2001 reference epoch,
+// Timestamps in state.json are seconds since the 2001 reference epoch,
 // and state.json is shared between the two servers, so persisted timestamps use
 // that reference too — the same convention adminUsers.createdAt already
-// follows. Storing Unix seconds here would look ~31 years stale to the Swift
+// follows. Storing Unix seconds here would look ~31 years stale to any reader of the
 // binary, which would quietly drop every session the C server wrote.
 #define RS_APPLE_EPOCH_OFFSET 978307200.0
 
@@ -127,7 +127,7 @@ bool rs_auth_verify_password(const char *password, const char *hash_b64, const c
 // --- sessions --------------------------------------------------------------
 
 // A 32-byte random token as hex — unguessable, and (unlike the persisted
-// hashes) purely internal, so its shape needn't match the Swift token.
+// hashes) purely internal, so its shape needn't match any older token format.
 static char *make_token(void) {
     uint8_t bytes[32];
     if (rs_random_bytes(bytes, sizeof(bytes)) != 0) return NULL;

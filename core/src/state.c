@@ -56,7 +56,7 @@ int rs_state_load(rs_state *st, const char *path) {
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        // No file yet: start from an empty object, as the Swift binary does on
+        // No file yet: start from an empty object, as on
         // a fresh install. Not an error.
         st->root = rs_json_new_obj();
         return st->root ? 0 : -1;

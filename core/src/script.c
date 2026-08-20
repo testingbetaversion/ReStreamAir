@@ -206,7 +206,7 @@ int rs_script_run_sync(const char *script_path, const char **args, int argc, dou
     
     pid_t pid;
     const char *exe = spawn_args.items[0];
-    if (strcmp(exe, "python3") == 0) exe = "/usr/bin/env"; // /usr/bin/env python3 in Swift
+    if (strcmp(exe, "python3") == 0) exe = "/usr/bin/env"; // resolve python3 off PATH
 
     if (strcmp(spawn_args.items[0], "python3") == 0) {
         spawn_args.items[0] = "/usr/bin/env";

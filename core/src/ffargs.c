@@ -36,7 +36,7 @@ char *rs_ffargs_first_clear_key(const char *keys) {
     size_t len = strlen(keys);
     size_t i = 0;
     while (i < len) {
-        while (i < len && is_key_separator(keys[i])) i++;  // Swift's split omits empties
+        while (i < len && is_key_separator(keys[i])) i++;  // the split omits empties
         size_t start = i;
         while (i < len && !is_key_separator(keys[i])) i++;
 

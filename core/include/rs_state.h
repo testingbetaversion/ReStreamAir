@@ -18,7 +18,7 @@ typedef struct {
 } rs_state;
 
 // Loads the file at `path`. A missing file is not an error — it yields an empty
-// object, matching the Swift binary creating a fresh state on first run.
+// object — a fresh state, the same as a first run.
 // Returns 0 on success, -1 on a present-but-malformed file or allocation
 // failure.
 int rs_state_load(rs_state *st, const char *path);

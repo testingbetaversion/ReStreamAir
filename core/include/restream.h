@@ -51,7 +51,7 @@ void restream_server_set_verbose(bool verbose);
 // representations — or NULL on failure, with a message written to errbuf.
 //
 // The handler lives in the C++ server (which links libcurl/libxml2); the core
-// only holds the function pointer, so the Swift build never pulls in those
+// only holds the function pointer, so a build without the server never pulls in those
 // libraries. When no handler is registered, /api/probe returns 501.
 typedef char *(*restream_probe_fn)(const char *url, const char *proxy, const char *headers,
                                    char *errbuf, size_t errbuf_len);
@@ -87,7 +87,7 @@ void restream_server_set_fetch_handler(restream_fetch_fn handler);
 // rs_free) — default video/audio renditions plus, when `rep` is given, that
 // representation's init + newest-`want` segment URLs. NULL on failure with a
 // message in errbuf. Lives in the C++ server (libxml2); the core only holds the
-// pointer, so the Swift build never links libxml2. When unset, DASH playback
+// pointer, so a core-only build never links libxml2. When unset, DASH playback
 // returns 501. See rs_dash_describe.
 //
 // `segment_url_params` (may be NULL/"") is a raw query-string fragment
@@ -103,9 +103,8 @@ typedef char *(*restream_dash_fn)(const char *url, const char *proxy, const char
                                   char *errbuf, size_t errbuf_len);
 void restream_server_set_dash_handler(restream_dash_fn handler);
 
-// Start the server (non-blocking, or spawns a background thread in C,
-// or the Swift app just loops over a poll function).
-// For simplicity in C-Swift integration, we can have a poll function.
+// Start the server. Non-blocking: the caller drives it with
+// restream_server_poll() in a loop (see apps/server/main.cpp).
 bool restream_server_start(restream_server_t* server, uint16_t port, const char* bind_address);
 
 // Poll the server (should be called in a loop if running in the same thread, 

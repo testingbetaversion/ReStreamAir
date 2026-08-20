@@ -1,8 +1,6 @@
-// The Linux/Windows panel executable. It is deliberately thin: everything it
-// does lives in the C core, and this file only parses argv, runs the poll loop
-// and shuts down cleanly. The panel API isn't implemented in C yet (the core
-// answers /ping and serves public/ statically); the Swift binary is still the
-// one that runs the real panel.
+// The panel executable. It is deliberately thin: everything it does lives in
+// the core, and this file only parses argv, wires up the handlers that need
+// libcurl and libxml2, runs the poll loop and shuts down cleanly.
 
 #include <sys/stat.h>
 
@@ -43,8 +41,8 @@ void print_usage(const char *program) {
     std::fprintf(stderr,
                  "usage: %s [serve] [-p|--port N] [-b|--bind ADDRESS] [--root DIR] [--verbose]\n"
                  "\n"
-                 "  serve             optional; accepted so the argv matches the Swift binary\n"
-                 "  -p, --port N      port to listen on (default 8080)\n"
+                 "  serve             optional; the default action, accepted for symmetry\n"
+                 "  -p, --port N      port to listen on (default 8787, or the panel's stored value)\n"
                  "  -b, --bind ADDR   address to bind (default 0.0.0.0)\n"
                  "  --root DIR        serve the panel's static files from DIR (auto-detects public/)\n"
                  "  --verbose         full mongoose trace logging (default: errors only)\n"
@@ -160,7 +158,7 @@ static int service_action(const char *action, unsigned port, const char *bind,
 }
 
 int main(int argc, char **argv) {
-    unsigned short port = 8080;
+    unsigned short port = 8787;
     std::string bind_address = "0.0.0.0";
     std::string web_root;
     bool web_root_set = false;
@@ -175,7 +173,7 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
-        // Accept a leading `serve` so muscle memory from the Swift binary
+        // Accept a leading `serve` so the documented invocation
         // (`restreamair serve --port …`) works here too — it's a no-op, since
         // serving is all this binary does.
         if (i == 1 && std::strcmp(arg, "serve") == 0) {
@@ -253,9 +251,9 @@ int main(int argc, char **argv) {
         std::printf("  no web root — serving /ping only. Pass --root public/ to serve the panel's files.\n");
     } else {
         std::printf("  serving %s + the panel API: auth, provider/stream/user/key management,\n"
-                    "  live monitoring, source auto-detect, direct/HLS-proxy/DASH playback\n"
-                    "  (DASH ClearKey CENC decrypted in-server). ffmpeg input modes and\n"
-                    "  script providers aren't in the C server yet.\n",
+                    "  live monitoring, source auto-detect, script providers, and direct /\n"
+                    "  HLS-proxy / DASH playback (DASH ClearKey CENC decrypted in-server).\n"
+                    "  The ffmpeg and N_m3u8DL-RE input modes are not implemented.\n",
                     web_root.c_str());
     }
     std::fflush(stdout);

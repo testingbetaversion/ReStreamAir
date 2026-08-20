@@ -17,7 +17,7 @@ typedef struct {
 } rs_dash_segment;
 
 // A per-representation download plan expanded from one MPD poll. Mirrors the
-// Swift DashSegments.expandSegments output for a single representation: the
+// Expanded segment list for a single representation: the
 // initialization URL plus the media-segment window (newest `count`, in timeline
 // order), together with the stream-level fields the live worker needs to pace
 // itself (dynamic flag, poll interval, buffer depth).

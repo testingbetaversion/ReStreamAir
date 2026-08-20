@@ -1,15 +1,14 @@
 #ifndef RS_M3U8_H
 #define RS_M3U8_H
 
-// Parsing and rewriting for HLS playlist text — the C port of
-// M3U8Rewriter.swift, used by the panel's HLS proxy pipeline and by the probe
-// endpoint. Like the Swift original it knows nothing about the caller's routing
-// scheme: callers supply a transform that turns a resolved URI into whatever
-// path they want.
+// Parsing and rewriting for HLS playlist text, used by the panel's HLS proxy
+// pipeline and by the probe endpoint. It knows nothing about the caller's
+// routing scheme: callers supply a transform that turns a resolved URI into
+// whatever path they want.
 //
-// Swift's closures become function pointers plus a userdata pointer. A
-// transform returns a newly allocated string that this module takes ownership
-// of, or NULL to leave the URI as it was.
+// A transform is a function pointer plus a userdata pointer, and returns a
+// newly allocated string that this module takes ownership of, or NULL to leave
+// the URI as it was.
 
 #include "rs_common.h"
 
@@ -31,7 +30,7 @@ bool rs_m3u8_is_master(const char *text);
 // `seq` is the segment's media sequence number when the rewrite was asked to
 // drop keys (the caller needs it to derive a default AES-128 IV), and -1 for
 // key and map lines and whenever keys are not being dropped — the C spelling of
-// the Int? the Swift version passes.
+// an absent value.
 typedef char *(*rs_m3u8_transform_fn)(void *userdata, const char *absolute_uri,
                                       rs_m3u8_line_kind kind, int64_t seq);
 

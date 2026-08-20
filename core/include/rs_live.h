@@ -1,12 +1,12 @@
 #ifndef RS_LIVE_H
 #define RS_LIVE_H
 
-// The live DASH -> HLS engine: the C port of LiveMPDToM3U8.swift.
+// The live DASH -> HLS engine.
 //
-// The first C implementation translated the MPD inside the request handler —
+// The first implementation translated the MPD inside the request handler —
 // every playlist reload re-fetched the manifest, re-expanded the window, and
-// re-derived EXT-X-MEDIA-SEQUENCE from the segment's $Time$. That is not what
-// the Swift worker does, and it breaks playback in three separate ways:
+// re-derived EXT-X-MEDIA-SEQUENCE from the segment's $Time$. That breaks
+// playback in three separate ways:
 //
 //   * MEDIA-SEQUENCE jumped. RFC 8216 4.3.3.2 requires consecutive segments to
 //     differ by exactly 1; deriving it from $Time$/duration does not hold for a
@@ -23,7 +23,7 @@
 //     server's single-threaded event loop, which is what made the panel's
 //     Start/Stop buttons feel frozen.
 //
-// This module restores the Swift design. One engine per stream owns:
+// So the engine is a background pipeline instead. One engine per stream owns:
 //
 //   * a director thread that polls the MPD for the rendition list and renders
 //     the HLS master playlist, and
@@ -86,15 +86,15 @@ typedef void (*rs_live_log_fn)(void *ctx, const char *stream_id, const char *lev
                                long long bytes, const char *message);
 
 // A snapshot of one stream's playback settings. Strings are copied; NULL is
-// treated as "". Mirrors the argv PanelServer.swift builds for the Swift worker.
+// treated as "". One of these is built per stream from its stored settings.
 typedef struct {
     const char *mpd_url;
     // Fallback sources carrying the same content on other CDNs, tried in order
     // when the primary manifest stops answering. The panel has always collected
     // these ("if the primary manifest fails, the stream fails over to these in
-    // order") and the Swift worker rotated through them; the engine ignoring
-    // them meant a stream whose origin refused simply stalled with a perfectly
-    // good mirror configured and unused.
+    // order"), and an engine that ignored them meant a stream whose origin
+    // refused simply stalled with a perfectly good mirror configured and
+    // unused.
     const char *const *cdn_urls;
     size_t cdn_url_count;
     const char *representation;     // "" = auto-select video + audio renditions
@@ -269,7 +269,7 @@ uint8_t *rs_live_take_indexed(rs_live *live, const char *stream_id, int rep_inde
 // and expects bytes to keep arriving — so it needs the opposite shape: "what is
 // the next thing after the one I already sent?" That is what the two calls
 // below add, and they are the whole reason /direct can work off the in-memory
-// queue instead of the on-disk one the Swift build tailed.
+// queue rather than needing segments on disk to tail.
 
 // Description of one of a stream's renditions. `index` is the same slot
 // rs_live_take_indexed takes and the public URLs carry.

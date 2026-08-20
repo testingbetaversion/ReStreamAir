@@ -1,11 +1,12 @@
 #ifndef RS_URL_H
 #define RS_URL_H
 
-// Relative-reference resolution (RFC 3986 section 5). This has no Swift
-// counterpart in the repo: M3U8Rewriter.swift gets it from Foundation's
-// URL(string:relativeTo:), which C does not have, so the playlist rewriter
-// needs its own. Behaviour is matched to Foundation rather than to strict RFC
-// where the two differ — see rs_url_resolve.
+// Relative-reference resolution (RFC 3986 section 5), which the playlist
+// rewriter needs and C gives you nothing for. Where Foundation's
+// URL(string:relativeTo:) departs from the strict RFC, this follows Foundation:
+// the playlists in the wild were resolved that way for years, and matching the
+// spec more closely would change which URL a viewer is sent to — see
+// rs_url_resolve.
 
 #include "rs_common.h"
 

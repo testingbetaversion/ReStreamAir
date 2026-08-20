@@ -116,7 +116,7 @@
 // has aged out of our queue — but is still inside the manifest's much larger
 // timeShiftBufferDepth window — from being downloaded and appended a second
 // time, which would inflate the media sequence without the window advancing.
-// The Swift worker never prunes it; 8192 entries is over four hours at two
+// It is never pruned; 8192 entries is over four hours at two
 // second segments, so nothing the manifest can still advertise is ever
 // forgotten, and the memory stays bounded in a long-lived server.
 #define RS_LIVE_SEEN_MAX 8192
@@ -1523,7 +1523,7 @@ static void commit_one(live_rep *rep, const cfg_snap *cfg, pend_item *it,
                  "%s: CENC decrypt failed, serving as-is", rep->rep_id);
     }
 
-    // Lip-sync offset, audio track only — the same knob the Swift worker
+    // Lip-sync offset, audio track only — the same knob the panel's
     // applies to whichever worker owns the audio representation.
     if (cfg->audio_delay_ms != 0 && ts > 0 && strcmp(rep->kind, "audio") == 0) {
         int64_t delta = (int64_t)cfg->audio_delay_ms * (int64_t)ts / 1000;
@@ -2404,7 +2404,7 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     // hold-back, or the playlist would be rebuilt from segments that were
     // already pruned.
     //
-    // The upper clamp is the one place this deliberately departs from the Swift
+    // The upper clamp is the one place this deliberately departs from the original
     // worker. That one kept `keepSegments` (60 by default) on disk, where the
     // count costs nothing; here the segments are decrypted and held in RAM so
     // they can be served without touching the network, and 60 of them per

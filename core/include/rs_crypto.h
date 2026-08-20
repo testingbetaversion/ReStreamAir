@@ -2,9 +2,9 @@
 #define RS_CRYPTO_H
 
 // SHA-256 / HMAC-SHA256 / PBKDF2-HMAC-SHA256 with no platform crypto
-// dependency — the C port of PureCrypto in Crypto.swift. Output is
-// byte-identical to that implementation (and so to CommonCrypto), which is what
-// lets an admin password hashed by one build verify against another.
+// dependency. Output is byte-identical to CommonCrypto and OpenSSL for the same
+// parameters, which is what lets an admin password hashed by an older build
+// still verify today — see the vectors in the self-test.
 
 #include "rs_common.h"
 
@@ -22,7 +22,7 @@ typedef struct {
     uint64_t total_len;
 } rs_sha256_ctx;
 
-// Streaming interface. The Swift original is one-shot; this is incremental so
+// Streaming interface, incremental rather than one-shot so
 // later phases can hash a whole media segment without buffering it.
 void rs_sha256_init(rs_sha256_ctx *ctx);
 void rs_sha256_update(rs_sha256_ctx *ctx, const uint8_t *data, size_t len);

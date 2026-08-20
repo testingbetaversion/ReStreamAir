@@ -2,42 +2,32 @@
 
 A local DASH → HLS restreaming toolkit with a web control panel. Point it at a live DASH or HLS source and it serves that stream back out as HLS to any player on your network — decrypting CENC clearkey or HLS AES-128 along the way, without shelling out to ffmpeg.
 
-Written in Swift, with a C core (`core/`) that an increasing share of the app runs on and a C++ server that can now serve the panel on its own. See [The C core and C server](#the-c-core-and-c-server).
+Written in C. One binary — `restreamair` — serves the panel, runs the live engines and does its own decryption; there is no runtime, no interpreter and no worker subprocess behind it. The two libraries it needs, libcurl and libxml2, are on every distro. See [Architecture](#architecture).
 
-Two binaries ship:
-
-- **`restreamair`** — everything: the web panel (default), plus the `dash` / `live` CLI subcommands it spawns for itself.
-- **`restreamair-menubar`** — optional macOS-only menu bar companion that launches and monitors the panel.
-
-**Contents** — [Install](#install) · [Quick start](#quick-start) · [How it fits together](#how-it-fits-together) · [Web panel](#web-panel) · [Playback endpoints](#playback-endpoints) · [Script providers](#script-providers) · [Command line](#command-line) · [Building](#building-from-source) · [The C core and C server](#the-c-core-and-c-server) · [Deployment](#deployment) · [Data layout](#data-layout) · [Troubleshooting](#troubleshooting) · [License](#license)
+**Contents** — [Install](#install) · [Quick start](#quick-start) · [How it fits together](#how-it-fits-together) · [Web panel](#web-panel) · [Playback endpoints](#playback-endpoints) · [Script providers](#script-providers) · [Building](#building-from-source) · [Architecture](#architecture) · [Deployment](#deployment) · [Data layout](#data-layout) · [Troubleshooting](#troubleshooting) · [License](#license)
 
 ## Install
 
-Grab a prebuilt binary from the [latest release](https://github.com/testingbetaversion/ReStreamAir/releases/latest), or the [nightly](https://github.com/testingbetaversion/ReStreamAir/releases/tag/nightly) for the newest features. No toolchain needed — the Swift runtime is linked in.
+Grab a tarball from the [latest release](https://github.com/testingbetaversion/ReStreamAir/releases/latest), or the [nightly](https://github.com/testingbetaversion/ReStreamAir/releases/tag/nightly) for the newest features.
 
 | Platform | Asset |
 |---|---|
 | macOS (Apple Silicon / Intel) | `restreamair-<tag>-macos.tar.gz` |
-| Linux x86-64 (bundled, recommended) | `restreamair-<tag>-linux-x86_64.tar.gz` |
-| Linux x86-64 (single dynamic binary) | `restreamair-linux` |
-| Linux x86-64 (fully static, musl) | `restreamair-linux-static` |
-| Windows x64 | `restreamair-<tag>-windows-x64.zip` |
+| Linux x86-64 | `restreamair-<tag>-linux-x86_64.tar.gz` |
 
-On Linux, prefer the tarball and run the launcher inside it, **not** the raw binary:
+Each holds the `restreamair` binary and the `public/` directory it serves. Unpack and run it from inside the folder:
 
 ```bash
 tar -xzf restreamair-vX-linux-x86_64.tar.gz && cd restreamair-vX-linux-x86_64 && ./restreamair
 ```
 
-`restreamair` there is a wrapper that points `LD_LIBRARY_PATH` at the bundled `libs/`, so it works on distros shipping a different `libxml2` soname. To update, replace the whole folder.
-
-The bare dynamic binary needs two libraries Foundation uses. If you hit `error while loading shared libraries: libcurl.so.4`:
+Two shared libraries are resolved at runtime. If you hit `error while loading shared libraries: libcurl.so.4`:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y libcurl4 libxml2
 ```
 
-The fully static musl build has no such dependency, but its statically linked TLS stack **cannot make outbound HTTPS requests** — use the dynamic or bundled build on any machine that has to fetch from an origin.
+The Linux binary is built against the oldest glibc still supported, so it runs on newer distributions too — the other direction does not work. There is no Windows release: the panel needs libcurl and libxml2, which Windows CI has no supply of without vcpkg, so it compiles and self-tests the core there but ships nothing. [Build from source](#building-from-source) on any platform — it is two cmake commands.
 
 ## Quick start
 
@@ -48,24 +38,26 @@ chmod +x restreamair && ./restreamair
 Open `http://127.0.0.1:8787`. The first launch serves a **Create admin account** screen — nothing else works until that account exists. Everything you set up afterwards persists in `state.json` and is not reset between runs.
 
 ```bash
-./restreamair serve --port 9000
+./restreamair --port 9000
 ```
 
 ```bash
-./restreamair serve --bind 127.0.0.1
+./restreamair --bind 127.0.0.1
 ```
 
 ```bash
-./restreamair serve --admin-username admin --admin-password "new-password"
+./restreamair --root /srv/restreamair/public
 ```
 
-**Port** resolves in this order: `--port`, `$PORT`, the Settings panel's saved value, then `8787`. **Bind address** works the same way (`--bind`, `$BIND_ADDRESS`, Settings, then all interfaces). Both take effect on the next restart — a live listener can't rebind.
+**Port** resolves in this order: `--port`, the Settings panel's saved value, then `8787`. **Bind address** works the same way (`--bind`, Settings, then all interfaces). Both take effect on the next restart — a live listener can't rebind. A leading `serve` is accepted and ignored, so `./restreamair serve --port 9000` works too.
 
-The admin flags (or `RESTREAMAIR_ADMIN_USERNAME` / `RESTREAMAIR_ADMIN_PASSWORD`) **replace** every existing admin with exactly one. That's a deliberate reset for scripted deploys or a lost password, not a merge; existing sessions stop working immediately.
+The panel's static files are found automatically when `public/` sits next to the working directory or one level up; `--root` is for everything else. Without a web root it serves `/ping` and says so on startup rather than pretending.
 
-Starting a second instance on a taken port fails fast with the port number and a suggested `lsof -ti:<port> | xargs kill`, rather than hanging silently.
+Starting a second instance on a taken port fails immediately with the address it could not bind, rather than hanging silently.
 
-To run headless: `nohup ./restreamair > restreamair.log 2>&1 & disown`, or see [Launching without a terminal](#launching-without-a-terminal) for a proper macOS `.app`.
+**A lost admin password means editing `state.json`** — there is no reset flag. Stop the server, delete the account's object from the `users` array, restart, and the create-admin screen comes back.
+
+To run headless: `nohup ./restreamair > restreamair.log 2>&1 & disown`, or install the [systemd unit](#systemd).
 
 ## How it fits together
 
@@ -81,16 +73,18 @@ And an **input pipeline**, chosen per stream in **Input/output pipeline**:
 | Input | What runs |
 |---|---|
 | **Internal remuxer** (default) | The built-in engine. No ffmpeg anywhere; decrypts CENC clearkey and HLS AES-128 itself. |
-| **FFmpeg resident** / **TS HLS** / **MultiTS HLS** / **FMP4 HLS** | A resident ffmpeg reads the source directly and copy-remuxes to HLS, or pushes to an **Output target**. |
-| **N_m3u8DL-RE (live)** | Hands the source to N_m3u8DL-RE. |
+| **FFmpeg resident** / **TS HLS** / **MultiTS HLS** / **FMP4 HLS** | **Not implemented.** The panel still offers these and stores the choice, but starting such a stream answers `501`. |
+| **N_m3u8DL-RE (live)** | **Not implemented**, same as above. |
 
-Output is **HLS/Direct** by default; the ffmpeg inputs can also target **SRT Server**, **UDP/SRT**, or a **Custom** URL. The panel detects whether ffmpeg and N_m3u8DL-RE are present and offers to install them.
+Only the internal remuxer runs today, so **Output target** (SRT Server, UDP/SRT, Custom) has nothing behind it either — output is HLS. The ffmpeg-backed modes are the one part of the panel whose UI is ahead of the engine; see [Architecture](#architecture).
 
 Whatever the pipeline, players always use one URL: `/play/<id>/index.m3u8`.
 
 ## Web panel
 
 Seven views in one top bar: **Providers**, **All Streams**, **Server**, **Logs**, **API Keys**, **Settings**, **Help**. There's no refresh button — everything streams live.
+
+Every view has its own address — `/providers`, `/streams`, `/server`, `/logs`, `/keys`, `/settings`, `/help` — so back/forward, reload and bookmarks all work. The two views that carry context put it in the query string (`/streams?provider=<id>`, `/logs?stream=<id>`), so a deep link lands pre-filtered exactly the way the in-app shortcuts do. Both servers serve `index.html` for that fixed list of paths and nothing else: a mistyped asset or API path still gets a `404` rather than being quietly answered with the panel's HTML.
 
 ### Accounts and access
 
@@ -102,13 +96,13 @@ Every `/api/*` endpoint except `/api/auth/*` needs a signed-in session cookie or
 
 **Failed sign-ins are throttled** per username + client address: five free attempts, then a doubling delay (2s, 4s, 8s …) capped at 15 minutes, answered with `429` and a `Retry-After`. An hour of quiet clears the record. The counter is deliberately in memory only — persisting it would let anyone who can reach the login form lock an account out across restarts. Keying on the address as well as the username means one attacker can't lock a real operator out by guessing at their username from somewhere else.
 
-Passwords are hashed with PBKDF2-HMAC-SHA256 (100k iterations) from the C core, identically on every platform.
+Passwords are hashed with PBKDF2-HMAC-SHA256 (100k iterations), identically on every platform — no system crypto library is involved, so the same password hash verifies wherever you move `state.json`.
 
 **API keys** (generated in the **API Keys** view) are separate and gate *playback* only. Once at least one key exists, every playback path — `/play/`, `/restream/`, `/proxy/`, `/direct/`, `/download/`, `/source/` — requires `?key=<key>` or `Authorization: Bearer <key>`. With no keys, playback is open.
 
 ### Stream editor
 
-No Detect button and no type dropdown — paste a source URL and the panel probes it as soon as you pause typing. It sniffs DASH vs HLS (using the same parsers as the `dash` CLI, not a second implementation), lists every video quality and audio track, and fetches DASH init segments to report any CENC KID it finds — pre-filling **Decryption keys** with `KID:0000…` placeholders so you only paste the real key. Probing uses your configured proxy and **Manifest headers**, so a manifest that needs auth is probed with it.
+No Detect button and no type dropdown — paste a source URL and the panel probes it as soon as you pause typing. It sniffs DASH vs HLS (using the same parsers the live engine does, not a second implementation), lists every video quality and audio track, and fetches DASH init segments to report any CENC KID it finds — pre-filling **Decryption keys** with `KID:0000…` placeholders so you only paste the real key. Probing uses your configured proxy and **Manifest headers**, so a manifest that needs auth is probed with it.
 
 **DASH options**
 
@@ -118,11 +112,14 @@ No Detect button and no type dropdown — paste a source URL and the panel probe
 | **Playlist count** | Segments advertised in the rolling playlist. Floor of 3 — fewer starves player buffers and causes stalls. |
 | **Playback delay (s)** | Hold playback this many seconds behind the live edge. 0 = live. |
 | **Keep count** | Segments retained behind the playlist window. Raise it if players ask for segments that have already aged out. |
-| **Download ahead** | How far ahead of the playlist the engine fetches. |
+| **Download ahead** | How far ahead of the playlist the engine fetches. Also the working depth of the pending queue — see [the live engine](#the-live-engine) for why a bigger number is not automatically better. |
+| **Parallel downloads** | Segment requests in flight at once, **shared by every rendition of the stream** rather than allowed to each. Default 6, capped at 8. Changing it restarts the stream's download threads; every other field here is picked up on the next poll. |
+| **Prioritize oldest** | Vestigial. The download threads already take the oldest queued segment first, because that is the one the playlist is waiting on. |
 | **Poll seconds** | MPD poll period. Defaults to the MPD's `minimumUpdatePeriod`, else 2. |
 | **Audio delay (ms)** | Lip-sync offset, positive or negative. Applied by rewriting each audio segment's `tfdt` baseMediaDecodeTime through its `mdhd` timescale — a standards-correct timestamp shift, not a re-encode. |
 | **EPG channel id** | Exported as `tvg-id` in the M3U, which is how an external player binds guide data to this channel. Blank uses the stream id. |
 | **Allow offline/static MPD** | Static (`type="static"`) manifests are rejected unless this is ticked. |
+| **Reduce manifest polling** | On by default. A video+audio stream otherwise makes three concurrent manifest fetches (director plus two pollers); this backs the director off from a 15s to a 300s re-read once the renditions are known, taking steady-state concurrency to 2. Turn it off only if you want the director watching for rendition changes continuously; leave it on against origins that cap concurrent sessions or answer `429`/`403`. |
 
 **Multi-quality** — every track is selected by default. Select more than one and the stream serves an HLS master playlist, one worker per representation. Each variant gets a distinct `BANDWIDTH`, real when detected and a placeholder otherwise, since some clients collapse identical-bandwidth entries into one.
 
@@ -156,7 +153,9 @@ A provider sets a default **Proxy**, generic **Headers**, and a **Downloader** f
 | `native` (default) | In-process libcurl. No subprocess per fetch. |
 | `curl` / `wget` / `aria2c` | Spawns that external binary; **Downloader params** appends extra CLI args (`--retry 3`, `-x 8`). |
 
-The internal fetch pins **HTTP/1.1**. Some origins run a flaky HTTP/2 stack that drops mid-segment with a framing-layer error, and since every fetch opens its own connection with no connection cache, there is no multiplexing to lose.
+The internal fetch tries **HTTP/2 first and downgrades per host**. Some origins run a flaky HTTP/2 stack that drops mid-segment with a framing-layer error — reproducible with plain `curl`, so it is the origin, not the client. That host is remembered and used over HTTP/1.1 from then on, and the request that tripped it is retried immediately, so one broken origin costs one request once instead of giving up multiplexing for everything else.
+
+**Connections are reused per thread**: one long-lived handle each, reset between requests, which keeps its socket, TLS session and DNS cache. On a high-latency path the handshake rather than the bandwidth is what a live stream cannot afford — a TCP connect measured 0.34–0.94s, TLS adding ~0.15s, which a rendition publishing one 2s segment every 2s has nowhere to put, and which presents as "not enough bandwidth" when it is entirely latency. A handle is never touched by two threads (libcurl does not support sharing connections concurrently); the DNS and TLS session caches, which are documented as safe to share, are process-wide.
 
 For CDNs that carry an auth token in the query string and expect it on every segment, enable **Append each stream's own Source URL query params to its segments**. The params are taken from the URL that *actually answered* the manifest poll, not the URL you configured — some CDNs sign the token only onto the 302 target, and reading the configured URL would find nothing there. For a fixed query string that isn't part of any stream's URL, use the provider-wide **Segment URL params** instead.
 
@@ -178,6 +177,7 @@ Both run on every platform, with no ffmpeg involved.
 | `/play/<id>/index.mpd` | Live DASH manifest for the same `kind=mpd` stream, generated from the same segments. Uses `<SegmentList>` rather than `<SegmentTemplate>`, since filenames aren't a fixed-width formula; segment durations are nominal, not frame-exact. |
 | `/restream/<id>/<name>` | The segments the playlists point at. |
 | `/direct/<id>/<repId>` | Raw fMP4 tail. The connection stays open: init segment once, then each new segment appended to the same response. No playlist, no polling. `<repId>` is optional for single-representation streams. |
+| `/direct/<id>.ts` | The same never-ending tail, but with video and audio muxed together into one MPEG-TS stream, for players that won't assemble two separate fMP4 renditions themselves. A rendition that stalls is dropped from the mux and the mux is rebuilt when it comes back, which re-seats every viewer on the next keyframe. |
 | `/download/<id>/<repId>` | One-shot download of whatever is currently buffered (`.mp4` suffix optional). Every segment is a self-contained fragmented-MP4 chunk, so concatenating them *is* a playable file — no ffmpeg, no subprocess. |
 | `/source/<id>` | Redirect to the origin (or current CDN mirror). |
 | `/ping` | Liveness probe: `{"status":"ok",...}`. Deliberately unauthenticated so a supervisor, container healthcheck or uptime monitor can use it without holding a credential, and deliberately says nothing about the install. |
@@ -243,10 +243,15 @@ Events worth recognising:
 | `renditions` | The director thread settled on the video/audio/subtitle representations; the master playlist is ready. |
 | `discontinuity` | A timeline splice was detected from `tfdt` and marked in the playlist. |
 | `subtitleConvert` | A subtitle segment was neither TTML nor WebVTT, so it was skipped instead of being served as something the player can't parse. |
+| `pollQueued` / `pollDone` | One line per poll cycle per rendition: what was queued, how deep the pending queue is and how it splits (fetching / waiting / ready / failed), and how many of the stream's shared requests are busy. `pollDone` also carries **media published per second of wall clock** — `1.00x realtime` is keeping up, and sustained below that is the number that matters. |
+| `downloadSegment` | One segment: how much media it holds, how long the transfer took, and the achieved KB/s. The duration and the transfer time are deliberately both there — "is the link slow or is it dead" is the first question these logs get asked. |
+| `headOfLine` | The segment at the head of the queue was abandoned mid-fetch because it was holding up segments already downloaded behind it. Normal in ones and twos on a flaky path; continuous means the path can't carry the rendition. |
+| `lagWatch` / `fallingBehind` | A ~60s window published below 0.95x realtime. The first such window is `lagWatch` — burst-published sources routinely have one quiet minute then catch up — and it becomes `fallingBehind` when a second window agrees or new segments were actually lost. |
+| `liveEdgeSkip` | Segments were skipped to stay at the live edge, split into never queued / evicted from a full queue / dropped out of the source's window. A lower bitrate is the real fix; a smaller **Download ahead** keeps the delay down meanwhile. |
 | `pollSlow` | A poll cycle overran its own interval, so the engine went straight back to the origin instead of sleeping. Consistently slow means a longer **Poll seconds** or fewer segments per poll, not more polling. |
 | `error` | Includes the origin's own response body when it sent one — a `403` from a CDN that explains itself (`{"status":"FRUITION_EXCEED","message":"Limit of concurrent streams reached."}`) now shows that text instead of just the status code. |
 
-History is appended to `logs/<date>.jsonl`; each day is capped at 8MB, then rotated to `<date>.<epoch>.jsonl` keeping the newest 5.
+Logs are an in-memory ring of the most recent 20,000 entries. They survive a page reload, not a restart — if you need history kept, capture the process's own stdout.
 
 ## Interface
 
@@ -258,211 +263,133 @@ Dark floating-glass panels with a gradient accent by default, plus a light-theme
 
 ## Command line
 
-`restreamair` dispatches on its first argument; no argument means `serve`.
+The binary does one thing — serve the panel — so its argv is short:
 
-| Subcommand | Purpose |
+```
+restreamair [serve] [-p|--port N] [-b|--bind ADDRESS] [--root DIR] [--verbose]
+```
+
+| Flag | Purpose |
 |---|---|
-| `serve` | The web panel. The default. |
-| `dash` | DASH/MPD inspection. |
-| `live` | Live MPD → HLS worker — what the panel spawns per stream. |
-| `cdmprobe` | Print the DRM challenge (KIDs + PSSH) for a manifest, and run a CDM script against it. |
-| `selftest` | Known-answer crypto vectors plus the C-vs-Swift parity check. Used by CI. |
+| `serve` | Optional and a no-op. Accepted because that is how the panel is documented and deployed. |
+| `-p`, `--port` | Port to listen on. Defaults to the panel's stored value, else 8787. |
+| `-b`, `--bind` | Address to bind. Defaults to the stored value, else all interfaces. |
+| `--root` | Serve the panel's static files from this directory. Auto-detects `public/` next to the working directory or one level up. |
+| `--verbose` | Full HTTP trace logging; without it, errors only. |
 
-### `restreamair dash`
+An explicit flag always beats the stored setting — that is what a flag is for — and the Settings page's "takes effect after restart" means exactly that.
 
-```bash
-./restreamair dash --info <MPD_URL>
-```
+`build/restream_selftest` is the second executable: known-answer crypto vectors, frozen goldens for the ported modules, and the live engine's policy tables. It takes no arguments and is what CI runs.
 
-```bash
-./restreamair dash --list --count 5 <MPD_URL>
-```
+There are no `dash` / `live` / `cdmprobe` subcommands. Manifest inspection now happens through the panel's `/api/probe` (the stream editor's paste-to-detect), and live DASH runs in-process rather than as a worker the panel spawns for itself.
 
-```bash
-./restreamair dash --list --representation V300 --audio-only --period 0 --no-init <MPD_URL>
-```
-
-```bash
-./restreamair dash --list -H 'Authorization: Bearer T' --proxy http://127.0.0.1:8888 --timeout 10 <MPD_URL>
-```
-
-Add `--json` for machine-readable output, `--sleep-requests 2` to poll a live MPD, or no arguments at all for help.
-
-**Action mode** prints JSON — `{"ok":true,"action":"…","result":{}}`, or `{"ok":false,"error":"…"}`:
-
-```bash
-./restreamair dash action=<function> key=value key2=value2
-```
-
-Shared by MPD actions: `mpd` (required, absolute URL), `timeout` (default 30), `header` (`Name: value`, `|`-separated for several), `proxy`. Booleans accept `true`/`false`/`1`/`0`/`yes`/`no`.
-
-| Action | Does |
-|---|---|
-| `describeFunctions` | Lists the exported actions, arguments and output contract. |
-| `info` | Parses an MPD into periods / adaptation sets / representations. |
-| `readMPD` | Flexible read — parsed model, raw XML tree, selected `elements`/`attributes`, expanded segments, raw XML, in any combination. |
-| `listSegments` | Expands matching `SegmentTemplate` entries into segment URLs. |
-| `parseDuration` | ISO 8601 DASH duration (`PT1M30S`) → seconds. |
-| `fillTemplate` | Substitutes `$RepresentationID$`, `$Bandwidth$`, `$Number$`, `$Time$`, `$SubNumber$`. |
-
-Both live-DASH addressing forms are supported: a `<SegmentTimeline>`, and `SegmentTemplate@duration` with `$Number$` and no timeline — where there is no timeline to walk, so the live edge is derived from the wall clock against `MPD@availabilityStartTime` and `Period@start` (static MPDs use `Period@duration` / `mediaPresentationDuration` instead).
-
-`$SubNumber$` is DASH-IF low-latency chunked addressing: when a `SegmentTimeline` `<S>` carries a `k` attribute and the media template uses `$SubNumber$`, each position expands into `k` separately fetchable CMAF chunks.
-
-### `restreamair live`
-
-**`createLiveM3U8`** polls a live DASH MPD, downloads new segments into a temp folder, keeps a bounded queue, prunes old files, and writes a rolling HLS playlist. Static MPDs are rejected unless `forceOffline=true`.
-
-| Argument | Purpose |
-|---|---|
-| `mpd` | Live MPD URL. Required. |
-| `representation` / `period` | Which representation and period to convert. Representation recommended. |
-| `output` / `tempDir` | Playlist path and download directory. |
-| `playlistSegments` / `keepSegments` / `downloadAhead` | Windowing controls. |
-| `pollInterval` | Seconds between polls. Defaults to the MPD's `minimumUpdatePeriod`, else 2. |
-| `decryptionKeys` | `KID:KEY` hex pairs for CENC clearkey. |
-| `segmentUrlParams` | Query fragment appended to every segment/init URL. |
-| `manifestHeader` | Header used only for the MPD fetch (falls back to `header`). |
-| `forceOffline` / `maxPolls` | Testing and offline controls. |
-| `timeout` / `header` / `proxy` | As above. |
-
-```bash
-./restreamair live action=createLiveM3U8 mpd=<URL> representation=2 playlistSegments=8 keepSegments=12
-```
-
-Returns `playlist`, `tempDir`, `downloaded`, `kept`, `playlistSegments`, `live`, and prints one compact JSON line per fetch — which is exactly what the panel's Logs view collects.
-
-Two robustness details worth knowing. A single failed fetch doesn't kill the worker: it retries, then logs and skips, and the next poll resumes from the timeline. For chunked (`$SubNumber$`) sources, chunks are always requested in order, so a failure keeps the gapless prefix already downloaded and never serves anything past it — a hole in the middle of a GOP breaks decoding in a way a short segment doesn't. And `EXT-X-MEDIA-SEQUENCE` is its own counter, incrementing by exactly 1 per segment as RFC 8216 §4.3.3.2 requires, rather than echoing a chunked source's large, unevenly spaced numbering — which made strict clients read a normal advance as being thousands of segments behind and reload in a loop.
 
 ## Building from source
 
-**Prerequisites**: a Swift 5.9+ toolchain — Xcode Command Line Tools on macOS (`xcode-select --install`), or [swift.org/install](https://www.swift.org/install/) on Linux. There are no external packages to fetch.
-
-```bash
-swift build -c release && .build/release/restreamair
-```
-
-The same command builds on macOS and Linux; where macOS uses Apple frameworks, Linux compiles in portable equivalents automatically (a POSIX-socket HTTP server instead of `Network`). Behaviour is identical, including decryption — the internal remuxer never needs ffmpeg on either platform.
-
-> Use `swift build`, not `swift file.swift` or a bare `swiftc` invocation: the panel re-execs *itself* to spawn worker subprocesses, so it needs a real compiled executable, and the Swift sources link the C core.
-
-The menu bar companion is a separate macOS-only target:
-
-```bash
-swiftc HTTPClient.swift MenuBarApp.swift -o restreamair-menubar -framework AppKit
-```
-
-## The C core and C server
-
-`core/` holds a C library the app's logic is migrating into, so Linux and Windows can eventually run the panel from a C++ executable with no Swift toolchain at all. **The shipping binary on every platform is still the Swift one** — the C server is not yet the release artifact — but it is no longer a stub: it serves the panel, manages state, and plays live DASH and HLS on its own.
+**Prerequisites**: cmake, a C11/C++17 compiler, and the development headers for libcurl and libxml2. On Debian/Ubuntu:
 
 ```bash
 sudo apt-get install -y cmake build-essential libcurl4-openssl-dev libxml2-dev
 ```
 
+On macOS, Xcode Command Line Tools plus `brew install libxml2 pkg-config` (libcurl comes with the SDK). There is nothing to vendor and no package manager step — cJSON and mongoose are already in `core/deps/`.
+
 ```bash
 cmake -S . -B build && cmake --build build
 ```
 
+That produces `build/restreamair-server` (the panel) and `build/restream_selftest`. Run it from the repo root so it finds `public/`, or point it at the directory:
+
 ```bash
-./build/restream_selftest
+./build/restreamair-server --port 8787 --root public
+```
+
+The same commands build on macOS, Linux and Windows, under Clang, GCC and MSVC. `-DRS_BUILD_SERVER=OFF` builds the libraries and the self-test alone, without libcurl or libxml2 — which is how Windows CI verifies the core.
+
+Tests:
+
+```bash
+ctest --test-dir build --output-on-failure
 ```
 
 ```bash
 python3 scripts/api-smoke.py --binary build/restreamair-server
 ```
 
+For the parsers that chew on origin-supplied bytes there's a sanitizer build, which is the tool for a crash that only shows up after hours of real traffic — the process aborts at the instruction that corrupted memory instead of dying somewhere unrelated later:
+
 ```bash
-./build/restreamair-server --port 8080
+cmake -S . -B build-asan -DRS_SANITIZE=ON && cmake --build build-asan
 ```
 
-`restreamair-server` accepts an optional `serve` subcommand (so its argv matches the Swift binary), `-p`/`--port`, `-b`/`--bind`, and `--root`. It auto-detects `public/` and serves the panel's static files. `/ping` reports the build time, so a stale binary is one request away from being identified.
+## Architecture
 
-Working in C today:
+Everything is C, in two libraries and two executables:
 
-- **Auth** — create an account, sign in, sign out, with the same roles, session persistence and login throttling as the Swift panel. `state.json` is shared, so a session started on one server is honoured by the other.
-- **Full management** — create, edit and delete providers, streams, users and API keys, all through the real panel UI.
+- **`librestream_base`** — portable logic, no sockets and no third-party code: crypto, AES, URL resolution, the playlist rewriter and parser, state and auth, the panel's control-plane transforms, CENC and HLS decryption, TTML→WebVTT, MPEG-TS muxing, system stats.
+- **`librestream_core`** — that plus the live engine and the HTTP server, built on vendored [mongoose](https://github.com/cesanta/mongoose).
+- **`restreamair-server`** — the panel executable. Thin: it parses argv, registers the handlers that need libcurl (fetch) and libxml2 (MPD parsing) through function pointers, and runs the poll loop.
+- **`restream_selftest`** — links `librestream_base` alone, which is why the core has to stay free of the server's dependencies.
+
+That split is load-bearing rather than tidy: because the fetch, DASH and probe handlers are registered at runtime, the core and the self-test compile on a platform where libcurl and libxml2 are awkward to get — `-DRS_BUILD_SERVER=OFF` is how Windows CI verifies the core on every run.
+
+`/ping` reports the build time, so a stale binary is one request away from being identified.
+
+**What it does:**
+
+- **Auth** — create an account, sign in, sign out, with roles, session persistence across restarts and login throttling. What is stored is the SHA-256 of the session token, never the token itself: `state.json` is a file an operator copies around, and a bearer token in it would be a spare key to the panel.
+- **Full management** — create, edit and delete providers, streams, users and API keys.
 - **Live monitoring** — the Server view's `/api/events` SSE stream with real host stats, bandwidth and per-stream viewer counts.
 - **Source auto-detect** — `/api/probe` fetches a DASH/HLS source and lists its qualities, audio tracks and any DRM KIDs, so the stream editor's paste-to-detect works.
-- **Live DASH playback** — a background engine (below) with ClearKey CENC decryption, the multi-quality master playlist and the audio-delay `tfdt` shift, on the internal pipeline.
+- **Live DASH playback** — the background engine below, with ClearKey CENC decryption, the multi-quality master playlist and the audio-delay `tfdt` shift.
 - **HLS passthrough** — playlist rewriting, segment proxying, AES-128 decryption.
 - **Direct-source playback** — `/source/<id>` and a direct-source stream's `/play` link redirect to the origin, gated by the same API-key rule.
+- **Direct links and downloads** — `/direct/<id>` (fMP4 tail), `/direct/<id>.ts` (video and audio muxed into one MPEG-TS stream) and `/download/<id>`.
 - **Script providers** — every wired action, run off the request thread.
-- **Logs** — an in-memory ring (20,000 entries) behind `/api/logs`.
 - **Export and import** — `/api/playlist.m3u8`, per-provider M3U, provider export and import, and the stored EPG.
 
-Not in the C server: the **ffmpeg and N_m3u8DL-RE input modes**, **persisted** log files, and the `/direct/` and `/download/` routes — the last because the C live engine hands each cached segment out exactly once and has no API to replay the whole buffer, which is a change to the engine's ownership model rather than a route. Those return an honest `501`, and the Swift binary remains the fully working one for them. Password hashes and `state.json` are shared, so an account or provider created by either server is seen by the other, and the C server never drops fields it doesn't model.
+**What it does not do yet.** The **ffmpeg** and **N_m3u8DL-RE** input modes are not implemented — the process supervisor for them exists (`apps/server/ffrun.c`) but nothing is wired to it, so a stream configured for one of those input modes gets an honest `501` rather than a silent failure. **Logs are an in-memory ring** (20,000 entries) behind `/api/logs`: they survive a page reload, not a restart. `state.json` is never rewritten field-for-field — the whole file is held as a DOM and written back in full, so a field this build doesn't model is preserved rather than dropped.
+
 
 ### The live engine
 
-The C server's `kind=mpd` playback is a port of the Swift `live` worker's design, not a translation done inside the request handler. Per stream it runs a **director thread** (rendition discovery and the master playlist) and **one worker per representation** that polls the MPD, downloads segments with a bounded parallel fan-out, CENC-decrypts them, and holds them in a bounded in-memory queue (capped by both segment count and 64MB). Playlist requests are a string copy and segment requests a memcpy, so **no playback route touches the network**, and mongoose's single event loop is never blocked. Running streams resume by themselves after a restart.
+`kind=mpd` playback is a background pipeline, not a translation done inside the request handler. Per stream it runs a **director thread** (rendition discovery and the master playlist), and splits each representation's work three ways:
+
+- a **poller** that re-reads the MPD on a strict cadence and queues whatever is new,
+- a small pool of **persistent download threads** that fetch queued segments concurrently, and
+- a **writer** that CENC-decrypts and commits them strictly in queue order into a bounded in-memory queue (capped by both segment count and 64MB), and renders the media playlist.
+
+Those three used to be one thread doing poll → download → publish in a loop, and that coupling was the worst thing about the engine: a poll whose downloads took 135 seconds did not merely deliver late, it stopped the manifest being re-read for 135 seconds, so the next poll asked for a wider window, which took longer again. Splitting the roles is what both reference implementations do — streamlink's `HLSStreamWorker`/`HLSStreamWriter`, N_m3u8DL-RE's producer feeding a buffer block. Committing in queue order *without* waiting for each batch is the other half: segment N+3 can finish long before N and simply waits its turn, so a slow segment never leaves the network idle.
+
+Playlist requests are a string copy and segment requests a memcpy, so **no playback route touches the network**, and mongoose's single event loop is never blocked. Running streams resume by themselves after a restart.
 
 Some details that matter in practice:
 
 - **Media sequence** is the append counter, per RFC 8216 §4.3.3.2 — not derived from `$Time$`, which doesn't advance by 1 on a timeline with varying `@d`.
 - **Segment identity** is the manifest's own `$Time$` plus the segment filename, not the URL. Token-authenticated origins mint a fresh URL for the same segment on every poll (and rotate CDN hostname too); keying on the URL made the whole window look new every time and raced the media sequence ahead of the real timeline.
 - **The poll interval is a period, not a delay** — time already spent is subtracted from the sleep, and a poll that overruns goes straight back to the origin. Sleeping the full interval *after* the work meant a two-second `minimumUpdatePeriod` with a one-to-three-second poll advanced four seconds of media every four to five seconds of wall clock, which never builds a cushion.
+- **The queue bound is the catch-up policy**, and which end it drops from is the whole of it. When the pending queue is full, the *oldest* queued segments are evicted to make room for the newest the poll just found. Doing it the other way round — refusing the new ones because the queue is full of old ones — is worse than not dropping at all: it pins the engine a fixed distance behind the live edge forever, publishing forty-second-old media and discarding everything current even after the path recovers. Segments already being fetched are never dropped, since the work is paid for; what is dropped leaves a `tfdt` jump, which surfaces honestly as an `EXT-X-DISCONTINUITY`.
+- **A queued segment takes the fresh URL from every poll.** Signed CDN URLs expire in about a minute, and an expired one is often answered with silence rather than a refusal, so the fetch burns its entire timeout — and because the writer commits in order, one of those stalls everything already downloaded behind it. A queued item therefore keeps its identity and re-adopts the URL the current manifest advertises, and anything the source has stopped advertising is dropped rather than left to rot. That is the age bound, asked as "is this still on offer" rather than as a number of seconds.
+- **The head of the queue is abandoned** once it has been fetching for several times its own duration with finished work stuck behind it, or at a looser bound when nothing is finishing at all. Slots carry a generation stamp, so a late result from an abandoned fetch is discarded instead of landing on whatever occupies that slot next. Two attempts per segment, not three: against an origin that answers a dead URL with silence, a third attempt is another full timeout spent on a segment already too late to play.
+- **Timeouts are sized for bytes, not seconds.** A segment's whole-request timeout is 10× its media duration, floored at 20s and capped at 30s. Duration says nothing about how many bytes have to move: on one production proxy a 2s video segment is ~745 KB and needs about twelve and a half seconds at the ~60 KB/s a single connection gets there, so a duration-derived timeout killed every video segment fractionally short while the 25 KB audio segments beside it cleared the same bar trivially. There is deliberately **no low-speed abort** — libcurl's low-speed clock runs while waiting for the first byte, and time-to-first-byte on these paths is routinely several seconds, so it killed requests that were about to succeed, including the init segment that carries the timescale and the decryption key.
+- **Connections are one budget per stream, with a floor for each rendition.** `parallelDownloads` (default 6, capped at 8) is shared by video and audio rather than allowed to each. Per-connection rate on a proxied path is roughly fixed, so aggregate throughput is very nearly a function of how many connections are open — a 3 Mbps rendition wanting ~370 KB/s is six connections at that rate and simply unobtainable from two. Each rendition reserves a slot only for the *other* renditions that actually have work waiting, and may use everything else: audio can't be shut out by video's much deeper queue, and isn't held down to one connection when video is idle. Note that this is the engine's budget — the stream's own `parallelDownloads` still caps it.
 - **Blocking calls run on worker threads.** Probe, logo lookup, script actions and HLS passthrough fetches all hand off to a worker and return through `mg_wakeup()`; a cold or geo-blocked stream answers `503` + `Retry-After` immediately rather than making every other stream wait.
-- **`reducedManifestPolling`** (per stream, in the stream JSON — no panel checkbox yet) backs the director off from a 15s to a 300s re-read once renditions are known. Normally a single video+audio stream makes three concurrent manifest fetches — director plus two workers — and some tokens cap concurrent sessions low enough that this overlap alone trips the limit. With it on, steady-state concurrency is 2.
+- **Reduce manifest polling** (`reducedManifestPolling`, on by default) backs the director off from a 15s to a 300s re-read once renditions are known. Normally a single video+audio stream makes three concurrent manifest fetches — director plus two workers — and some tokens cap concurrent sessions low enough that this overlap alone trips the limit. With it on, steady-state concurrency is 2.
 
-### Parity and testing
+### Testing
 
-Ports are not merely tested, they are **proven equal** to the Swift code they replace: `restreamair selftest` runs both implementations over the same inputs and fails on any difference. That is what keeps a password hashed by an older build still verifying today, so `Crypto.swift` and `AES.swift` stay as the reference.
+Three kinds of check, all in `restream_selftest`:
 
-Ported so far: SHA-256/HMAC/PBKDF2, AES (block, CTR, CBC), RFC 3986 URL resolution, the HLS playlist rewriter, the ffmpeg argument builder, and IP/CIDR matching for trusted proxies. Four Swift call sites already run on it — admin password hashing, HLS AES-128 decryption, CENC subsample decryption, and reverse-proxy trust. The first three used to fork on `#if canImport(CommonCrypto)`; the app no longer links CommonCrypto at all. Trusted-proxy matching was written in C first precisely so both servers agree, byte for byte, on what `10.0.0.0/8` covers — getting that wrong is a security bug in either direction.
+- **Published vectors** — NIST/FIPS/RFC test vectors for SHA-256, PBKDF2 and AES, so a build proves it produces the right bytes on that platform rather than merely compiling. This is what keeps an admin password hashed by an older build still verifying today.
+- **Frozen goldens** — the expected output of the URL resolver, playlist rewriter and ffmpeg argument builder for the fixtures in `core/tests/fixtures.h`. These are a contract, not a snapshot: changing one changes what viewers and ffmpeg actually receive, so it takes a deliberate edit with a reason, never a paste of what the code now prints.
+- **Policy tables** — the live engine's decisions under load (the catch-up eviction plan, the falling-behind classifier) are written as pure functions precisely so they can be tested exhaustively, including their edge cases. What a stream does when the path degrades is exactly what cannot be exercised reliably against a live origin.
 
-The two test suites cover different things. `restream_selftest` proves the ported *functions* produce the same bytes as the Swift ones. `scripts/api-smoke.py` runs the real server in a scratch directory and exercises the layer around them over HTTP — the auth gate, the viewer role, the login throttle, cookie attributes, session persistence across a restart, the mode of `state.json`, the M3U export and the provider export/import round trip. CI runs both, on Linux and macOS, plus a third pass under AddressSanitizer and UBSan. `-DRS_BUILD_SERVER=OFF` builds the libraries and self-test alone, which is how the Windows CI job verifies the core without needing libcurl and libxml2.
+`scripts/api-smoke.py` covers the layer no unit test reaches: it runs the real server in a scratch directory and drives it over HTTP — the auth gate, the viewer role, the login throttle, cookie attributes, session persistence across a restart, the mode of `state.json`, the M3U export and the provider export/import round trip.
 
-For the parsers that chew on origin-supplied bytes, there's a sanitizer build:
+CI runs both suites on Linux and macOS, plus a third pass under AddressSanitizer and UBSan, and compiles the core on Windows. Fixtures are generated: rerun `scripts/gen-fixtures.py` after editing its tables.
 
-```bash
-cmake -S . -B build-asan -DRS_SANITIZE=ON && cmake --build build-asan
-```
+Trusted-proxy IP/CIDR matching lives in the core rather than in the request handler for the same reason the goldens are frozen — getting `10.0.0.0/8` wrong is a security bug in either direction, so it is one implementation with its own tests instead of a comparison written twice.
 
-That builds the server with AddressSanitizer + UBSan, so a bad pointer aborts at the faulting instruction with a stack instead of surfacing as an unexplained death hours later.
-
-The build produces `librestream_base.a` (portable logic, no sockets), `librestream_core.a` (that plus the [mongoose](https://github.com/cesanta/mongoose) HTTP server), and both executables, under GCC, Clang and MSVC. `Package.swift` compiles the same C sources into the Swift app, so the two build systems must be kept in step. Test fixtures and goldens are generated — rerun `scripts/gen-parity-fixtures.py`, and see the header comment in `scripts/gen-goldens.py`.
-
-## macOS menu bar
-
-`restreamair-menubar` shows a status item with a single Start/Stop toggle reflecting the current state, "Open Panel", and a live running-stream count from `/api/state`.
-
-```bash
-./restreamair-menubar
-```
-
-It looks for `restreamair` next to its own binary; override with `RESTREAMAIR_PATH`, and the port with `PORT`.
-
-### Launching without a terminal
-
-The menu bar binary is a bare Unix executable, so double-clicking it in Finder opens Terminal.app to run it. Wrapping it in a minimal `.app` bundle fixes that — LaunchServices runs a bundled executable directly. Point `RESTREAMAIR_PATH` at the real binary via `LSEnvironment` so the bundle can live in `/Applications` while `state.json`, `public/` and the rest stay in the project directory:
-
-```bash
-APP="ReStreamAir.app"
-mkdir -p "$APP/Contents/MacOS"
-cp restreamair-menubar "$APP/Contents/MacOS/"
-cat > "$APP/Contents/Info.plist" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key><string>restreamair-menubar</string>
-    <key>CFBundleIdentifier</key><string>com.restreamair.menubar</string>
-    <key>CFBundleName</key><string>ReStreamAir</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
-    <key>LSUIElement</key><true/>
-    <key>LSEnvironment</key>
-    <dict>
-        <key>RESTREAMAIR_PATH</key><string>$(pwd)/restreamair</string>
-    </dict>
-</dict>
-</plist>
-EOF
-open "$APP"
-```
-
-`LSUIElement` keeps it out of the Dock; the bundle is what removes the Terminal window. Re-run this if the project directory moves, since the path is baked into `Info.plist`.
 
 ## Deployment
 
@@ -475,7 +402,7 @@ docker build -t restreamair .
 docker run -d --name restreamair -p 8787:8787 -v restreamair-data:/data restreamair
 ```
 
-Everything mutable (`state.json`, `runtime/`, `logs/`, `logo-cache.json`) resolves relative to the working directory, so `/data` is the only volume that matters: back that up and you have backed up the install. The image runs as an unprivileged user and has a healthcheck on `/ping`.
+Everything mutable (`state.json`, `runtime/scripts/`, `logo-cache.json`) resolves relative to the working directory, so `/data` is the only volume that matters: back that up and you have backed up the install. The image builds from source in an `ubuntu:24.04` stage, runs the self-test before shipping, and runs as an unprivileged user with a healthcheck on `/ping`.
 
 ### Docker with HTTPS
 
@@ -489,7 +416,7 @@ The panel port is not published — only Caddy can reach it — so the plain-HTT
 
 ### systemd
 
-`deploy/restreamair.service` is a hardened unit for a bare-metal install; the header comment carries the install steps. It binds `127.0.0.1` by default, expecting a proxy in front.
+`deploy/restreamair.service` is a hardened unit for a bare-metal install; the header comment carries the install steps. It binds `127.0.0.1` by default, expecting a proxy in front. Copy `public/` alongside the binary — the unit sets `WorkingDirectory=/var/lib/restreamair`, and the panel looks for its static files there.
 
 ### Running behind a reverse proxy
 
@@ -514,10 +441,10 @@ A proxy also has to be told not to buffer: `/api/events` is an SSE stream open f
 Everything lives directly in the working directory:
 
 - `state.json` — providers, streams, admin accounts, API keys, settings, all-time bandwidth and peak totals. **Contains script account passwords** — treat it as a credentials file.
-- `runtime/<streamId>/` — downloaded segments and playlists for DASH restreams run by the Swift worker, one subfolder per representation. Only reachable through the key-checked `/restream/`, `/play/`, `/direct/` and `/download/` routes, never as static files. The C live engine keeps its queue in memory and writes nothing here.
-- `runtime/scripts/<providerId>/` — a script provider's durable session directory.
+- `runtime/scripts/<providerId>/` — a script provider's durable session directory. Created by the panel, never read by it, deleted with the provider.
 - `logo-cache.json` — name → logo URL cache (empty string records a confirmed miss).
-- `logs/<yyyy-MM-dd>.jsonl` — persisted log history, rotated daily.
+
+Segments are **not** on disk. The live engine holds each rendition's queue in memory, bounded by both a segment count and 64MB, and a playback request is a memcpy out of it — so there is nothing here to clean up, and nothing to leak through the static file handler.
 
 `state.json` is created `0600` and re-tightened on every save. It holds admin password hashes, session token hashes, API keys and — for script providers — account passwords in the clear, since the script has to be handed the real thing. Treat a provider export the same way: it embeds those passwords too.
 
@@ -531,7 +458,7 @@ Installs still using the old `data/` + `public/runtime/` layout are migrated aut
 
 **The origin returns 403 and it isn't obvious why.** The error line now carries the origin's own response body when it sent text back; concurrent-stream limits in particular usually say so explicitly.
 
-**A concurrent-stream limit trips with only one stream running.** A video+audio stream normally makes three concurrent manifest fetches. Set `reducedManifestPolling` on the stream (C server) to drop it to two.
+**A concurrent-stream limit trips with only one stream running.** A video+audio stream normally makes three concurrent manifest fetches. Tick **Reduce manifest polling** in the stream's DASH options — on by default — to drop it to two.
 
 **Video plays but audio drifts.** Set **Audio delay (ms)** — positive or negative — in the stream's DASH options.
 
@@ -545,4 +472,4 @@ Installs still using the old `data/` + `public/runtime/` layout are migrated aut
 
 MIT — see [LICENSE](LICENSE).
 
-Two vendored components keep their own terms. [cJSON](https://github.com/DaveGamble/cJSON) is MIT and [hls.js](https://github.com/video-dev/hls.js) is Apache-2.0, both compatible. [mongoose](https://github.com/cesanta/mongoose) is **GPLv2 or a commercial license from Cesanta**, and it is linked only into the C server (`librestream_core` / `restreamair-server`) — never into the Swift binary, which has its own HTTP server. That distinction matters if you distribute builds: the released `restreamair` binaries contain no mongoose, but a `restreamair-server` binary you distribute is a combined work under mongoose's terms.
+Three vendored components keep their own terms. [cJSON](https://github.com/DaveGamble/cJSON) is MIT and [hls.js](https://github.com/video-dev/hls.js) is Apache-2.0, both compatible. [mongoose](https://github.com/cesanta/mongoose) is **GPLv2 or a commercial license from Cesanta**, and it is the HTTP server every build now links — so a `restreamair` binary you distribute is a combined work under mongoose's terms. Running it yourself is unaffected; distributing it means either complying with GPLv2 or holding a licence from Cesanta.

@@ -23,3 +23,13 @@ restream_selftest
 restreamair-server
 restream_selftest
 restreamair-server
+
+# In-source cmake output. `cmake -S . -B build` is the documented way to build,
+# but a `cmake .` in the repo root drops these here — and they were committed
+# once already.
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+Makefile
+*.a

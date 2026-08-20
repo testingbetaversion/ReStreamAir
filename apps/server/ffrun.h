@@ -11,7 +11,7 @@
 // it cleanly.
 //
 // It lives in apps/server rather than core/ for the same reason the fetch and
-// DASH handlers do: the core must stay free of anything the SwiftPM build would
+// DASH handlers do: the core must stay free of anything a core-only build would
 // have to compile, and process spawning is platform-specific.
 //
 // Supervision runs off the server's existing one-second timer rather than a

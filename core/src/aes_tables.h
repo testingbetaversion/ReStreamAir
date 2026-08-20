@@ -2,7 +2,7 @@
 #define RS_AES_TABLES_H
 
 // Generated tables for aes.c: the AES S-box (FIPS-197), its inverse, and the
-// GF(2^8) multiplication tables MixColumns/InvMixColumns need. AES.swift builds
+// GF(2^8) multiplication tables MixColumns/InvMixColumns need. An implementation could build
 // the derived ones lazily at first use; C has no lazy statics, and baking them in
 // keeps rs_aes_init free of one-time initialisation that would need locking once
 // the core goes multithreaded.

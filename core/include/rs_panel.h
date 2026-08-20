@@ -2,10 +2,9 @@
 #define RS_PANEL_H
 
 // The panel's control-plane logic: the /api/state view transform and the
-// provider/stream/user/key mutations, all operating on the state DOM. Ports the
-// viewState/streamView/providerView shapes and the create/update/delete handlers
-// from PanelServer.swift. Kept out of server.c (which stays HTTP glue) and out
-// of the socket layer, so it can be unit-tested directly.
+// provider/stream/user/key mutations, all operating on the state DOM. Kept out
+// of server.c (which stays HTTP glue) and out of the socket layer, so it can be
+// unit-tested directly.
 
 #include "rs_auth.h"
 #include "rs_common.h"
@@ -48,7 +47,7 @@ int rs_panel_create_user(rs_state *st, const rs_json *body, const char **err);
 int rs_panel_delete_user(rs_state *st, const char *id, const char **err);
 
 // Builds the provider-export document (the C port of ProviderExport in
-// PanelServer.swift), or NULL if no such provider. Ids are deliberately left
+// the /api/state view), or NULL if no such provider. Ids are deliberately left
 // out — they mean nothing on the importing install — and the active script
 // account is carried by name. The caller adds the base64 script file, which
 // needs file IO. Free with rs_json_free.

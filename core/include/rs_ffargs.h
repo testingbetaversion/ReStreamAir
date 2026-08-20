@@ -1,11 +1,11 @@
 #ifndef RS_FFARGS_H
 #define RS_FFARGS_H
 
-// Builds the command line for a resident ffmpeg process — the C port of
-// FFmpegResident.swift. Pure string assembly: nothing here spawns anything.
+// Builds the command line for a resident ffmpeg process. Pure string assembly:
+// nothing here spawns anything.
 //
-// As in the Swift version the ffmpeg executable is NOT part of the argument
-// list; argv starts at "-hide_banner" and the caller prepends the binary path.
+// The ffmpeg executable is deliberately NOT part of the argument list; argv
+// starts at "-hide_banner" and the caller prepends the binary path.
 
 #include "rs_common.h"
 

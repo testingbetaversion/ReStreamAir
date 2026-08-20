@@ -1,9 +1,9 @@
 #ifndef RS_AES_H
 #define RS_AES_H
 
-// Pure-C AES — the port of AES.swift. Provides the block cipher plus the two
-// modes the decryptors use: streaming CTR (CENC) and CBC decrypt (HLS AES-128).
-// Byte-for-byte identical to the Swift implementation, and so to CommonCrypto.
+// Pure-C AES: the block cipher plus the two modes the decryptors use —
+// streaming CTR (CENC) and CBC decrypt (HLS AES-128). Byte-for-byte identical
+// to CommonCrypto and OpenSSL, which the self-test's NIST vectors pin down.
 
 #include "rs_common.h"
 
@@ -50,7 +50,7 @@ void rs_aes_ctr_process(rs_aes_ctr *ctx, uint8_t *buf, size_t len);
 // length to *out_len, or -1 if the key is not 16/24/32 bytes, the ciphertext is
 // empty or not a multiple of 16, or the IV is not 16 bytes.
 //
-// Note the deliberately lenient padding check inherited from AES.swift: when
+// Note the deliberately lenient padding check: when
 // the final byte is not in 1...16 the FULL plaintext is returned rather than an
 // error. Existing streams depend on that, so it is not a bug to fix here.
 int rs_aes_cbc_decrypt(const uint8_t *key, size_t key_len, const uint8_t *iv, size_t iv_len,

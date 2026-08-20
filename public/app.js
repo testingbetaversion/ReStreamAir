@@ -1098,10 +1098,11 @@ function newStream() {
 // window is one more window to manage and gets blocked/hidden by browsers
 // too easily, so this stays in the same window/tab.
 
-// Stream settings the C server persists but does not act on yet.
+// Stream settings the server persists but does not act on yet.
 //
-// The panel and the engine are separate ports: the panel stores every field the
-// Swift build ever had, while the C engine reads the subset it has implemented.
+// The panel and the engine move at different speeds: the panel stores every
+// field the editor has ever offered, while the engine reads the subset it has
+// implemented.
 // A control that silently does nothing is worse than a missing one — the
 // rendition picker looked like it worked for months while the engine ignored it
 // and auto-selected the top 1080p rendition, so "I selected 720p" and "it plays
@@ -1482,12 +1483,12 @@ function updateDecryptionKeysVisibility() {
 
 // MARK: - Input/output pipeline
 //
-// Input=internal runs the built-in Swift downloader/mixer. The ffmpeg input
-// modes (ffmpegResident / ffmpegTsHls / ffmpegMultiTsHls / ffmpegFmp4Hls)
-// spawn a resident ffmpeg that reads the source directly (decrypting CENC
-// clearkey itself) and remuxes with -c copy to the selected Output — HLS
-// served from the panel, or an SRT/UDP/TCP push (Output target). ffmpeg must
-// be installed for any non-internal input or non-hls output.
+// Input=internal runs the built-in engine, and is the only one implemented.
+// The ffmpeg input modes (ffmpegResident / ffmpegTsHls / ffmpegMultiTsHls /
+// ffmpegFmp4Hls) would spawn a resident ffmpeg that reads the source directly
+// (decrypting CENC clearkey itself) and remuxes with -c copy to the selected
+// Output — HLS served from the panel, or an SRT/UDP/TCP push (Output target).
+// The stored setting round-trips, but starting such a stream answers 501.
 
 let ffmpegStatus = null;
 let ffmpegStatusPromise = null;

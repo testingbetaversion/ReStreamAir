@@ -1,11 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(restreamair LANGUAGES C CXX)
 
-# This builds the C core and the Linux/Windows C++ server. The macOS Swift app
-# compiles the same C sources through Package.swift instead, so the two source
-# lists below and the ones in Package.swift describe the same files — a source
-# added to only one of them will fail to link somewhere. The sources are listed
-# explicitly (never globbed) so that stays visible.
+# This is the whole build: the C core, the self-test, and the panel executable,
+# on macOS, Linux and Windows alike. There is no second build system and no
+# other language in the tree. Sources are listed explicitly (never globbed), so
+# adding a file is a visible change rather than something a wildcard picks up.
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -91,7 +90,7 @@ if(WIN32)
     target_link_libraries(restream_core PUBLIC ws2_32)
 endif()
 
-# ---- restream_selftest: known-answer vectors for the ported modules ---------
+# ---- restream_selftest: known-answer vectors for the core modules ----------
 add_executable(restream_selftest core/tests/selftest_main.c)
 target_link_libraries(restream_selftest PRIVATE restream_base)
 target_compile_options(restream_selftest PRIVATE ${RS_WARNINGS})
@@ -101,9 +100,11 @@ add_test(NAME selftest COMMAND restream_selftest)
 
 # ---- restreamair-server: the Linux/Windows panel executable ----------------
 # Source auto-detect (/api/probe) needs outbound HTTPS (libcurl) and MPD parsing
-# (libxml2). These are linked into the server executable ONLY — the core and the
-# Swift build never see them, since the probe handler is registered at runtime
-# through a function pointer (see restream_server_set_probe_handler).
+# (libxml2). These are linked into the server executable ONLY — the core never
+# sees them, since the probe handler is registered at runtime through a function
+# pointer (see restream_server_set_probe_handler). That is what lets the core
+# and the self-test build on a platform where those two dev packages are
+# awkward to get.
 #
 # -DRS_BUILD_SERVER=OFF builds the libraries and the self-test without them, so
 # a platform where those two dev packages are awkward to get (Windows, without

@@ -1,12 +1,14 @@
-// Known-answer self-test for the C core. Two kinds of check live here:
+// Known-answer self-test for the C core. Three kinds of check live here:
 //
 //   * Published NIST/FIPS/RFC vectors for the crypto, so a build proves its
 //     SHA-256, PBKDF2 and AES produce the right bytes on that platform rather
-//     than merely compiling. These mirror CryptoSelfTest in AES.swift and add
-//     the multi-block and streaming cases the Swift version does not cover.
-//   * Goldens captured from the Swift implementations (goldens.h) for the URL
-//     resolver, playlist rewriter and ffmpeg argument builder, so the C port is
-//     measured against the behaviour the app ships today.
+//     than merely compiling, including the multi-block and streaming cases.
+//   * Frozen goldens (goldens.h) for the URL resolver, playlist rewriter and
+//     ffmpeg argument builder — the output those modules are contracted to
+//     produce for the fixtures in fixtures.h.
+//   * Policy tables for decisions the live engine makes under load (the
+//     catch-up plan, the falling-behind classifier), which are pure functions
+//     precisely so they can be tested without a live origin.
 //
 // No test framework: a failure prints what broke and exits non-zero, which is
 // all ctest and CI need.
@@ -87,8 +89,8 @@ static void check_hex(const char *name, const uint8_t *bytes, size_t len, const 
     check_str(name, actual, expected);
 }
 
-// Values captured from the Swift implementations. A missing key means the
-// goldens and this file have drifted apart, which is a broken test rather than
+// A missing key means the goldens and this file have drifted apart, which is a
+// broken test rather than
 // a failing one.
 static const char *golden(const char *key) {
     for (size_t i = 0; i < sizeof(rs_goldens) / sizeof(rs_goldens[0]); i++) {
@@ -118,7 +120,7 @@ static void test_sha256(void) {
               "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
 
     // The same input fed in awkward chunks must land on the same digest — the
-    // streaming path has no counterpart in the Swift one-shot implementation.
+    // streaming path has no counterpart in a one-shot implementation.
     rs_sha256_ctx ctx;
     rs_sha256_init(&ctx);
     size_t offsets[] = {1, 13, 64, 65};
@@ -220,8 +222,8 @@ static void test_aes_blocks(void) {
     rs_aes_decrypt_block(&aes, out, in);
     check_hex("aes128/decrypt", in, 16, "00112233445566778899aabbccddeeff");
 
-    // AES-192 has no vector in AES.swift's own self-test, so the expected
-    // values come from running that implementation (see goldens.h).
+    // AES-192 has no published vector in the set above, so the expected values
+    // are frozen goldens (see goldens.h).
     from_hex("000102030405060708090a0b0c0d0e0f1011121314151617", key, sizeof(key));
     check("aes192/init", rs_aes_init(&aes, key, 24) == 0);
     from_hex("00112233445566778899aabbccddeeff", in, sizeof(in));
@@ -246,7 +248,7 @@ static void test_aes_ctr(void) {
     from_hex("2b7e151628aed2a6abf7158809cf4f3c", key, sizeof(key));
     from_hex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff", iv, sizeof(iv));
 
-    // NIST SP 800-38A F.5.1 block 1 — the vector AES.swift's own self-test
+    // NIST SP 800-38A F.5.1 block 1 — the vector the crypto self-test
     // carries, so it is checked here as a literal too.
     rs_aes_ctr ctr;
     uint8_t block[16];
@@ -255,7 +257,7 @@ static void test_aes_ctr(void) {
     rs_aes_ctr_process(&ctr, block, 16);
     check_hex("ctr/f5.1-block-1", block, 16, "874d6191b620e3261bef6864990db6ce");
 
-    // Four blocks of keystream, from the Swift AESCTR.
+    // Four blocks of keystream (golden).
     for (size_t i = 0; i < sizeof(data); i++) data[i] = (uint8_t)i;
     rs_aes_ctr_init(&ctr, key, 16, iv, 16);
     rs_aes_ctr_process(&ctr, data, 64);
@@ -349,7 +351,7 @@ static const rs_ffargs_inputs *find_ffargs(const char *name) {
     return NULL;
 }
 
-// The transform scripts/dump-goldens.swift uses, so the two sides can be
+// The transform the goldens were captured through, so both sides can be
 // compared line for line.
 static char *media_transform(void *userdata, const char *uri, rs_m3u8_line_kind kind, int64_t seq) {
     (void)userdata;
@@ -393,7 +395,7 @@ static void append_int(char **buffer, size_t *cap, size_t *len, int64_t value) {
     append_field(buffer, cap, len, text);
 }
 
-// Serialises a probe result the way the Swift dumper does.
+// Serialises a probe result the way the goldens record it.
 static char *serialize_probe(const rs_m3u8_probe *probe) {
     char *buffer = NULL;
     size_t cap = 0, len = 0;
@@ -438,7 +440,7 @@ static char *serialize_command(const rs_ffargs_command *command) {
         append_field(&buffer, &cap, &len, command->argv[i]);
     }
     append_field(&buffer, &cap, &len, GROUP_SEP);
-    // The Swift dumper sorts environment keys; http_proxy precedes https_proxy
+    // The goldens sort environment keys; http_proxy precedes https_proxy
     // in that order, which is the order rs_ffargs_build emits them in anyway.
     for (size_t i = 0; i < command->env_count; i++) {
         if (i > 0) append_field(&buffer, &cap, &len, UNIT_SEP);
@@ -547,7 +549,7 @@ static void run_golden(const rs_golden *entry) {
     fail(key, "no handler for this golden key");
 }
 
-// --- helpers that have no Swift counterpart to compare against --------------
+// --- checks with no frozen golden behind them -------------------------------
 
 static void test_ffargs_helpers(void) {
     char *key = rs_ffargs_first_clear_key("\n  \nkid1:abc123\nkid2:def\n");
@@ -583,7 +585,7 @@ static void test_ffargs_helpers(void) {
     rs_free_strv(tokens, count);
 }
 
-// Subtitle mapping. This is not a golden: the Swift original never mapped
+// Subtitle mapping. This is not a golden: the original never mapped
 // subtitles at all, so there is nothing to be equal to — the rule being checked
 // is that the map appears exactly where a subtitle track can survive the remux
 // and nowhere else, because a bad `-map` fails ffmpeg at startup rather than
@@ -724,7 +726,7 @@ static void test_auth(void) {
 
     // Interop with the AuthStore encoding: verifying against a hash+salt pair
     // computed independently (Python's hashlib.pbkdf2_hmac) proves the base64
-    // framing and PBKDF2 parameters match what Swift persists. password
+    // framing and PBKDF2 parameters match what is already on disk. password
     // "hunter2", salt = base64("0123456789abcdef").
     check("auth/known-vector",
           rs_auth_verify_password("hunter2",
@@ -792,7 +794,8 @@ static void test_auth_sessions(void) {
     char *rendered = rs_json_serialize(exported, false);
     check("auth/export-hides-token", rendered && token && strstr(rendered, token) == NULL);
     check("auth/export-has-hash", rendered && strstr(rendered, "\"tokenHash\":\"") != NULL);
-    // Timestamps use the 2001 reference epoch, matching Swift's JSONEncoder, so
+    // Timestamps use the 2001 reference epoch, which is what existing state.json
+    // files already carry, so
     // a session written by either server is understood by the other. A Unix
     // timestamp would be a ten-digit number starting with 17…; this is nine.
     check("auth/export-uses-apple-epoch",
@@ -1646,8 +1649,8 @@ static void test_live_backoff(void) {
     check("live-backoff/unknown-does-not", !rs_live_status_is_throttle(0));
 }
 
-// TTML -> WebVTT. Unlike the modules above, this one has no Swift original to
-// capture goldens from, so the expectations are read off the TTML1 timing rules
+// TTML -> WebVTT. Unlike the modules above, this one has no frozen golden
+// behind it, so the expectations are read off the TTML1 timing rules
 // (section 10.3.1) and the WebVTT syntax directly.
 static void test_ttml(void) {
     // Namespace-prefixed elements, clock times, a hard break, entities, and the
