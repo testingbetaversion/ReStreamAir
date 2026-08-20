@@ -1491,6 +1491,22 @@ static void test_live_window(void) {
     check("live-window/zero-ahead", rs_live_window_size(0, 0, 2.0) >= 1);
 }
 
+static void test_live_lag_level(void) {
+    int slow = 0;
+    check("live-lag/not-started", rs_live_lag_level(0, 0.0, 0, &slow) == 0 && slow == 0);
+    check("live-lag/first-low-is-watch",
+          rs_live_lag_level(1, 0.80, 0, &slow) == 1 && slow == 1);
+    check("live-lag/second-low-is-error",
+          rs_live_lag_level(1, 0.90, 0, &slow) == 2 && slow == 2);
+    check("live-lag/recovery-resets",
+          rs_live_lag_level(1, 1.02, 0, &slow) == 0 && slow == 0);
+    check("live-lag/new-loss-is-immediate",
+          rs_live_lag_level(1, 0.94, 1, &slow) == 2 && slow == 1);
+    check("live-lag/healthy-with-old-loss",
+          rs_live_lag_level(1, 1.0, 5, &slow) == 0 && slow == 0);
+    check("live-lag/null-state-safe", rs_live_lag_level(1, 0.5, 1, NULL) == 0);
+}
+
 // The catch-up policy (live_window.c).
 //
 // rs_live_window_size deliberately asks for a WIDER window the later a poll is,
@@ -1764,6 +1780,7 @@ int main(void) {
     test_cenc_multifragment();
     test_mpegts();
     test_live_window();
+    test_live_lag_level();
     test_live_catch_up();
     test_live_backoff();
     test_ttml();

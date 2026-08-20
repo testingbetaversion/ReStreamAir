@@ -38,6 +38,18 @@ int rs_live_window_size(int download_ahead, double since_last, double seg_durati
     return want;
 }
 
+int rs_live_lag_level(int started, double realtime, long long newly_skipped,
+                      int *consecutive_slow_windows) {
+    if (!consecutive_slow_windows) return 0;
+    if (!started || realtime >= 0.95) {
+        *consecutive_slow_windows = 0;
+        return 0;
+    }
+    if (*consecutive_slow_windows < 1000) (*consecutive_slow_windows)++;
+    if (newly_skipped > 0 || *consecutive_slow_windows >= 2) return 2;
+    return 1;
+}
+
 void rs_live_catch_up_plan(int depth, int inflight, int waiting, int fresh,
                            int *evict_waiting, int *drop_fresh) {
     if (evict_waiting) *evict_waiting = 0;

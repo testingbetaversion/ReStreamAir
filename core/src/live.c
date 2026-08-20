@@ -68,7 +68,7 @@
 // as 0.0x realtime over any window short enough to sit inside the quiet part.
 // Judging that over five seconds turned fallingBehind — which is supposed to
 // mean "this stream is going to stall" — into noise.
-#define RS_LIVE_SUSTAIN_INTERVAL 30.0
+#define RS_LIVE_SUSTAIN_INTERVAL 60.0
 // How long the segment at the head of the queue may hold up everything behind
 // it before it is abandoned. The writer commits in queue order, which is what
 // keeps the timeline honest — but it also means one unanswerable request stops
@@ -659,6 +659,31 @@ static void rep_prune_locked(live_rep *rep, int keep);
 
 static pend_item *pend_at_locked(live_rep *rep, size_t i) {
     return &rep->pending[(rep->pend_head + i) % rep->pend_cap];
+}
+
+typedef struct {
+    size_t waiting;
+    size_t fetching;
+    size_t ready;
+    size_t failed;
+} pend_counts;
+
+// A queue depth is not a count of network requests: it also includes work that
+// has not started and completed results waiting for an older segment. Keeping
+// the split in one helper prevents diagnostics from calling all of it "in
+// flight", which made a six-item burst look like six concurrent connections.
+// Caller holds owner->mu.
+static pend_counts pend_counts_locked(live_rep *rep) {
+    pend_counts out = {0};
+    for (size_t i = 0; i < rep->pend_count; i++) {
+        switch (pend_at_locked(rep, i)->state) {
+        case PEND_WAITING:  out.waiting++; break;
+        case PEND_FETCHING: out.fetching++; break;
+        case PEND_READY:    out.ready++; break;
+        case PEND_FAILED:   out.failed++; break;
+        }
+    }
+    return out;
 }
 
 // Appends one segment. Caller has already checked there is room.
@@ -1417,6 +1442,9 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
         queued++;
     }
     size_t queue_depth = rep->pend_count;
+    pend_counts queue = pend_counts_locked(rep);
+    int stream_active = st->active_downloads;
+    int stream_budget = st->worker_parallel_downloads;
     if (queued || evicted || stale) pthread_cond_broadcast(&st->cv);
     pthread_mutex_unlock(&st->mu);
     free(found);
@@ -1432,16 +1460,19 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
             rep->rep_id, (unsigned long)(dropped + evicted + stale),
             (double)(dropped + evicted + stale) * seg_dur,
             (unsigned long)dropped, (unsigned long)evicted, (unsigned long)stale,
-            (unsigned long)rep->pend_count, (unsigned long)depth);
+            (unsigned long)queue_depth, (unsigned long)depth);
 
     if (queued == 0 && dropped == 0 && evicted == 0 && stale == 0) {
         lgf(st, "info", "pollIdle", NULL, 0, -1, "%s: no new segments this poll", rep->rep_id);
         return;
     }
     lgf(st, "info", "pollQueued", NULL, 0, -1,
-        "%s: queued %lu segments, refreshed %lu stale URLs (%lu in flight, depth %lu) in %.2fs",
+        "%s: queued %lu segments, refreshed %lu signed URLs; pending %lu/%lu "
+        "(%lu fetching, %lu waiting, %lu ready, %lu failed), stream requests %d/%d in %.2fs",
         rep->rep_id, queued, refreshed, (unsigned long)queue_depth, (unsigned long)depth,
-        now_seconds() - t0);
+        (unsigned long)queue.fetching, (unsigned long)queue.waiting,
+        (unsigned long)queue.ready, (unsigned long)queue.failed,
+        stream_active, stream_budget, now_seconds() - t0);
 }
 
 // --- the writer -------------------------------------------------------------
@@ -1603,7 +1634,8 @@ static void *writer_main(void *arg) {
     // genuinely falling behind. See RS_LIVE_SUSTAIN_INTERVAL.
     double sustain_anchor = report_anchor;
     double sustain_seconds = 0;
-    size_t sustain_added = 0;
+    int slow_sustain_windows = 0;
+    long long last_sustain_skipped = 0;
 
     for (;;) {
         pthread_mutex_lock(&st->mu);
@@ -1726,10 +1758,15 @@ static void *writer_main(void *arg) {
         double elapsed = now_seconds() - report_anchor;
         if (elapsed >= RS_LIVE_REPORT_INTERVAL) {
             pthread_mutex_lock(&st->mu);
-            size_t held = rep->nsegs, held_bytes = rep->bytes, inflight = rep->pend_count;
+            size_t held = rep->nsegs, held_bytes = rep->bytes;
+            pend_counts queue = pend_counts_locked(rep);
+            size_t pending = rep->pend_count;
             size_t pruned = rep->pruned_total;
             rep->pruned_total = 0;
             long long skipped = rep->skipped;
+            bool started = rep->ready;
+            int stream_active = st->active_downloads;
+            int stream_budget = st->worker_parallel_downloads;
             pthread_mutex_unlock(&st->mu);
 
             // Media published per second of wall clock. This is THE number for
@@ -1739,25 +1776,54 @@ static void *writer_main(void *arg) {
             // segments are.
             double realtime = elapsed > 0 ? added_seconds / elapsed : 0;
             lgf(st, "info", "pollDone", NULL, 0, added_bytes,
-                "%s: +%lu segments (%.1fs media) %.2fx realtime, %lu in flight, %lu failed, "
-                "%lu pruned, %lu held (%.1f MB) in %.2fs",
+                "%s: +%lu segments (%.1fs media) %.2fx realtime, %lu downloads failed; "
+                "pending %lu (%lu fetching, %lu waiting, %lu ready, %lu failed), "
+                "stream requests %d/%d, %lu pruned, %lu held (%.1f MB) in %.2fs",
                 rep->rep_id, (unsigned long)added, added_seconds, realtime,
-                (unsigned long)inflight, (unsigned long)failed, (unsigned long)pruned,
+                (unsigned long)failed, (unsigned long)pending,
+                (unsigned long)queue.fetching, (unsigned long)queue.waiting,
+                (unsigned long)queue.ready, (unsigned long)queue.failed,
+                stream_active, stream_budget, (unsigned long)pruned,
                 (unsigned long)held, (double)held_bytes / (1024.0 * 1024.0), elapsed);
 
             sustain_seconds += added_seconds;
-            sustain_added += added;
             double sustained = now_seconds() - sustain_anchor;
             if (sustained >= RS_LIVE_SUSTAIN_INTERVAL) {
                 double srt = sustained > 0 ? sustain_seconds / sustained : 0;
-                if (sustain_added > 0 && srt < 0.95)
-                    lgf(st, "error", "fallingBehind", NULL, 0, -1,
-                        "%s: publishing %.2fx realtime (%.1fs of media in %.1fs) — the advertised "
-                        "window will shrink and players will stall; %lld segments skipped so far",
-                        rep->rep_id, srt, sustain_seconds, sustained, skipped);
+                long long newly_skipped = skipped > last_sustain_skipped
+                                             ? skipped - last_sustain_skipped : 0;
+                int lag = rs_live_lag_level(started ? 1 : 0, srt, newly_skipped,
+                                            &slow_sustain_windows);
+
+                // Burst-published sources routinely have one quiet 30-60s
+                // interval followed by a >1x catch-up burst. Treat the first
+                // low window as a diagnostic unless it lost new media. It only
+                // becomes an error when loss is observed or two full windows
+                // agree that the deficit is persistent.
+                if (lag == 2) {
+                    if (newly_skipped > 0)
+                        lgf(st, "error", "fallingBehind", NULL, 0, -1,
+                            "%s: publishing %.2fx realtime (%.1fs of media in %.1fs) — the "
+                            "advertised window will shrink and players will stall; %lld segments "
+                            "skipped so far, %lld newly skipped in this window",
+                            rep->rep_id, srt, sustain_seconds, sustained, skipped, newly_skipped);
+                    else
+                        lgf(st, "error", "fallingBehind", NULL, 0, -1,
+                            "%s: publishing %.2fx realtime (%.1fs of media in %.1fs) for %d "
+                            "consecutive windows — the advertised window will shrink and players "
+                            "will stall; no new loss yet, %lld segments skipped previously",
+                            rep->rep_id, srt, sustain_seconds, sustained, slow_sustain_windows,
+                            skipped);
+                }
+                else if (lag == 1)
+                    lgf(st, "info", "lagWatch", NULL, 0, -1,
+                        "%s: one low-throughput window at %.2fx (%.1fs media in %.1fs), "
+                        "but no new segments were skipped — waiting for another window before "
+                        "calling it falling behind",
+                        rep->rep_id, srt, sustain_seconds, sustained);
+                last_sustain_skipped = skipped;
                 sustain_anchor = now_seconds();
                 sustain_seconds = 0;
-                sustain_added = 0;
             }
 
             report_anchor = now_seconds();

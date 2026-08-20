@@ -2562,7 +2562,7 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     cfg.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
     cfg.keep_segments = (int)rs_json_obj_int(stream, "keepSegments", 10);
     cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 20);
-    cfg.parallel_downloads = (int)rs_json_obj_int(stream, "parallelDownloads", 3);
+    cfg.parallel_downloads = (int)rs_json_obj_int(stream, "parallelDownloads", 6);
     cfg.prioritize_oldest = rs_json_obj_bool(stream, "prioritizeOldest", false) ? 1 : 0;
     cfg.playback_delay_seconds = (int)rs_json_obj_int(stream, "playbackDelaySeconds", 0);
     cfg.audio_delay_ms = (int)rs_json_obj_int(stream, "audioDelayMs", 0);
@@ -3073,6 +3073,12 @@ static bool ts_session_rebuild(restream_server_t *server, rs_ts_session *sess,
     sess->mux = replacement;
     sess->bound = false;
     sess->ntracks = 0;
+    // A rebuilt mux gets new track handles, so every piece of state associated
+    // with the old handles must be new as well. Leaving `ended` set made the
+    // very next pump "recover" the same track again, repeatedly clearing the
+    // TS ring and re-seating every viewer even though both renditions were
+    // healthy.
+    memset(sess->tracks, 0, sizeof(sess->tracks));
     sess->ring_base += sess->ring_len;
     sess->ring_len = 0;
     sess->njoins = 0;

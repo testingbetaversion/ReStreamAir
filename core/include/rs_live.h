@@ -117,7 +117,7 @@ typedef struct {
     int playlist_segments;          // advertised window (default 6)
     int keep_segments;              // segments held in memory (default 60)
     int download_ahead;             // segments requested per poll (default 16)
-    int parallel_downloads;         // max concurrent segment fetches per stream (default 3)
+    int parallel_downloads;         // max concurrent segment fetches per stream (default 6, cap 8)
     int prioritize_oldest;          // if non-zero, download the oldest segment sequentially first
     int playback_delay_seconds;     // extra live-edge hold-back, in seconds
     int audio_delay_ms;             // lip-sync shift, applied to audio only
@@ -142,6 +142,14 @@ typedef struct {
 // exists to prevent. Overshooting is harmless — the caller already skips
 // segments it holds.
 int rs_live_window_size(int download_ahead, double since_last, double seg_duration);
+
+// Classifies one long throughput window: 0 = healthy/not started, 1 = watch,
+// 2 = genuinely falling behind. During a low-throughput window, a newly
+// skipped segment is immediately an error; otherwise two consecutive windows
+// below 0.95x are required. The caller owns `consecutive_slow_windows`, which
+// this function updates.
+int rs_live_lag_level(int started, double realtime, long long newly_skipped,
+                      int *consecutive_slow_windows);
 
 // What to throw away so a representation's pending queue always holds the
 // NEWEST segments it knows about, never more than `depth` of them.
