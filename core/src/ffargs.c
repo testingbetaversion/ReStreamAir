@@ -135,7 +135,7 @@ int rs_ffargs_tokenize(const char *text, char ***tokens, size_t *count) {
         rs_buf_dispose(&current);
     }
 
-    if (out.err) {
+    if (quote != '\0' || out.err) {
         rs_strv_dispose(&out);
         return -1;
     }
@@ -220,7 +220,7 @@ static void append_hls_output(rs_strv *args, const rs_ffargs_inputs *in, bool mu
     rs_strv_push(args, use_ts ? "mpegts" : "fmp4");
     if (!use_ts) {
         rs_strv_push(args, "-hls_fmp4_init_filename");
-        rs_strv_push(args, "init.mp4");
+        rs_strv_push(args, multi && variants > 1 ? "%v/init.mp4" : "init.mp4");
         // MPEG-TS sources carry AAC as ADTS; muxing that into fMP4 with -c copy
         // fails unless the headers are stripped to ASC. A no-op when the source
         // audio is already fMP4/CMAF.
@@ -262,7 +262,8 @@ int rs_ffargs_build(const rs_ffargs_inputs *in, rs_ffargs_command *out) {
 
     // Input options, which must precede -i.
     const char *source = or_empty(in->source_url);
-    if (strncmp(source, "http", 4) == 0) {
+    bool pipe_input = str_equal(in->input_mode, "pipe");
+    if (!pipe_input && strncmp(source, "http", 4) == 0) {
         // Survive routine live-edge network blips instead of exiting.
         rs_strv_push(&args, "-reconnect");
         rs_strv_push(&args, "1");
@@ -276,27 +277,42 @@ int rs_ffargs_build(const rs_ffargs_inputs *in, rs_ffargs_command *out) {
         rs_strv_push(&args, "-rw_timeout");
         rs_strv_push(&args, "15000000");
     }
-    char *block = rs_ffargs_header_block(in->headers);
+    char *block = pipe_input ? NULL : rs_ffargs_header_block(in->headers);
     if (block) {
         rs_strv_push(&args, "-headers");
         rs_strv_push_owned(&args, block);
     }
     // Clearkey: ffmpeg decrypts CENC itself given the content key. DASH uses
     // -cenc_decryption_key; HLS SAMPLE-AES/clearkey uses -decryption_key.
-    char *key = rs_ffargs_first_clear_key(in->decryption_keys);
+    char *key = pipe_input ? NULL : rs_ffargs_first_clear_key(in->decryption_keys);
     if (key) {
         rs_strv_push(&args, str_equal(in->kind, "m3u8") ? "-decryption_key" : "-cenc_decryption_key");
         rs_strv_push_owned(&args, key);
     }
     rs_strv_push(&args, "-i");
-    rs_strv_push_owned(&args, with_params(source, in->segment_url_params));
+    rs_strv_push_owned(&args, pipe_input ? rs_strdup("pipe:0")
+                                        : with_params(source, in->segment_url_params));
 
     // Mapping and codec: copy only, no transcode.
     bool multi = str_equal(in->input_mode, "ffmpegMultiTsHls");
     size_t video_count = 0;
+    size_t audio_count = 0;
+    size_t first_video_index = 0;
+    size_t first_audio_index = 0;
+    bool have_video_index = false, have_audio_index = false;
     for (size_t i = 0; i < in->representation_id_count; i++) {
         const char *type = representation_type(in, in->representation_ids[i]);
-        if (!str_equal(type, "audio")) video_count++;
+        if (str_equal(type, "audio")) {
+            size_t source_index = in->representation_input_indices
+                ? in->representation_input_indices[i] : audio_count;
+            if (!have_audio_index) { first_audio_index = source_index; have_audio_index = true; }
+            audio_count++;
+        } else {
+            size_t source_index = in->representation_input_indices
+                ? in->representation_input_indices[i] : video_count;
+            if (!have_video_index) { first_video_index = source_index; have_video_index = true; }
+            video_count++;
+        }
     }
 
     if (multi && video_count > 1) {
@@ -304,17 +320,22 @@ int rs_ffargs_build(const rs_ffargs_inputs *in, rs_ffargs_command *out) {
         // video stream, all sharing the first audio. The trailing "?" keeps a
         // missing stream non-fatal, and the var_stream_map built in
         // append_hls_output lines up with this ordering.
-        for (size_t i = 0; i < video_count; i++) {
+        size_t legacy_video_index = 0;
+        for (size_t i = 0; i < in->representation_id_count; i++) {
+            if (str_equal(representation_type(in, in->representation_ids[i]), "audio")) continue;
+            size_t source_index = in->representation_input_indices
+                ? in->representation_input_indices[i] : legacy_video_index;
             rs_strv_push(&args, "-map");
-            rs_strv_pushf(&args, "0:v:%zu?", i);
+            rs_strv_pushf(&args, "0:v:%zu?", source_index);
+            legacy_video_index++;
         }
         rs_strv_push(&args, "-map");
-        rs_strv_push(&args, "0:a:0?");
+        rs_strv_pushf(&args, "0:a:%zu?", have_audio_index ? first_audio_index : 0);
     } else {
         rs_strv_push(&args, "-map");
-        rs_strv_push(&args, "0:v:0?");
+        rs_strv_pushf(&args, "0:v:%zu?", have_video_index ? first_video_index : 0);
         rs_strv_push(&args, "-map");
-        rs_strv_push(&args, "0:a:0?");
+        rs_strv_pushf(&args, "0:a:%zu?", have_audio_index ? first_audio_index : 0);
     }
     // Carry DVB subtitles and teletext through to a TS output. The "?" keeps a
     // source without any non-fatal, exactly as it does for the audio map above.

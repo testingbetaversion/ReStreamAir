@@ -45,6 +45,9 @@ typedef struct {
 
     char **argv;
     char **feeder_argv;
+    char **env_keys;
+    char **env_values;
+    size_t env_count;
 
     double started_at;
     int restarts;
@@ -107,6 +110,17 @@ static void argv_free(char **argv) {
     free(argv);
 }
 
+static char **strv_copy_n(const char *const *values, size_t count) {
+    if (!values || count == 0) return NULL;
+    char **out = (char **)calloc(count + 1, sizeof(char *));
+    if (!out) return NULL;
+    for (size_t i = 0; i < count; i++) {
+        out[i] = rs_strdup(values[i] ? values[i] : "");
+        if (!out[i]) { argv_free(out); return NULL; }
+    }
+    return out;
+}
+
 // Joins argv for a log line, with anything that looks like a key or a token
 // elided — these lines go to the panel's Logs tab, which is a place an operator
 // pastes into a bug report.
@@ -136,6 +150,35 @@ static char *argv_describe(char *const *argv) {
 
 #ifndef _WIN32
 
+static bool env_is_overridden(const ffrun_entry *e, const char *item) {
+    const char *eq = strchr(item, '=');
+    size_t name_len = eq ? (size_t)(eq - item) : strlen(item);
+    for (size_t i = 0; i < e->env_count; i++)
+        if (strlen(e->env_keys[i]) == name_len && strncmp(e->env_keys[i], item, name_len) == 0)
+            return true;
+    return false;
+}
+
+static char **pipeline_env(const ffrun_entry *e) {
+    size_t inherited = 0;
+    while (environ[inherited]) inherited++;
+    char **out = (char **)calloc(inherited + e->env_count + 1, sizeof(char *));
+    if (!out) return NULL;
+    size_t used = 0;
+    for (size_t i = 0; i < inherited; i++) {
+        if (env_is_overridden(e, environ[i])) continue;
+        out[used++] = rs_strdup(environ[i]);
+        if (!out[used - 1]) { argv_free(out); return NULL; }
+    }
+    for (size_t i = 0; i < e->env_count; i++) {
+        size_t need = strlen(e->env_keys[i]) + strlen(e->env_values[i]) + 2;
+        out[used] = (char *)malloc(need);
+        if (!out[used]) { argv_free(out); return NULL; }
+        snprintf(out[used++], need, "%s=%s", e->env_keys[i], e->env_values[i]);
+    }
+    return out;
+}
+
 // Spawns the pipeline. Returns 0 on success and fills pid/feeder_pid/stderr_fd.
 static int spawn_pipeline(rs_ffrun *r, ffrun_entry *e) {
     int err_pipe[2] = {-1, -1};
@@ -151,6 +194,14 @@ static int spawn_pipeline(rs_ffrun *r, ffrun_entry *e) {
         return -1;
     }
 
+    char **child_env = pipeline_env(e);
+    if (!child_env) {
+        close(err_pipe[0]); close(err_pipe[1]);
+        if (feed_pipe[0] >= 0) close(feed_pipe[0]);
+        if (feed_pipe[1] >= 0) close(feed_pipe[1]);
+        return -1;
+    }
+
     pid_t feeder = -1;
     if (e->feeder_argv) {
         // Producer: stdout -> the pipe ffmpeg reads, stderr -> the same log pipe
@@ -161,13 +212,14 @@ static int spawn_pipeline(rs_ffrun *r, ffrun_entry *e) {
         posix_spawn_file_actions_adddup2(&fa, err_pipe[1], STDERR_FILENO);
         posix_spawn_file_actions_addclose(&fa, feed_pipe[0]);
         posix_spawn_file_actions_addclose(&fa, err_pipe[0]);
-        int rc = posix_spawnp(&feeder, e->feeder_argv[0], &fa, NULL, e->feeder_argv, environ);
+        int rc = posix_spawnp(&feeder, e->feeder_argv[0], &fa, NULL, e->feeder_argv, child_env);
         posix_spawn_file_actions_destroy(&fa);
         if (rc != 0) {
             lgf(r, e->stream_id, "error", "ffmpegSpawn", "could not run \"%s\": %s",
                 e->feeder_argv[0], strerror(rc));
             close(err_pipe[0]); close(err_pipe[1]);
             close(feed_pipe[0]); close(feed_pipe[1]);
+            argv_free(child_env);
             return -1;
         }
     }
@@ -185,8 +237,9 @@ static int spawn_pipeline(rs_ffrun *r, ffrun_entry *e) {
         posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
     }
     pid_t pid = -1;
-    int rc = posix_spawnp(&pid, e->argv[0], &fa, NULL, e->argv, environ);
+    int rc = posix_spawnp(&pid, e->argv[0], &fa, NULL, e->argv, child_env);
     posix_spawn_file_actions_destroy(&fa);
+    argv_free(child_env);
 
     // The parent keeps only the read end of stderr and none of the feed pipe.
     close(err_pipe[1]);
@@ -212,10 +265,15 @@ static int spawn_pipeline(rs_ffrun *r, ffrun_entry *e) {
     lgf(r, e->stream_id, "info", "ffmpegStart", "pid %d: %s", (int)pid, desc ? desc : "");
     rs_free(desc);
     if (feeder > 0) {
-        char *fdesc = argv_describe(e->feeder_argv);
-        lgf(r, e->stream_id, "info", "ffmpegStart", "feeder pid %d: %s",
-            (int)feeder, fdesc ? fdesc : "");
-        rs_free(fdesc);
+        size_t feeder_argc = 0;
+        while (e->feeder_argv[feeder_argc]) feeder_argc++;
+        // A generic producer commonly carries account tokens or passwords in
+        // its argv. Log the executable and shape, never its argument values.
+        lgf(r, e->stream_id, "info", "ffmpegStart",
+            "feeder pid %d: %s (%lu argument%s redacted)",
+            (int)feeder, e->feeder_argv[0],
+            (unsigned long)(feeder_argc > 0 ? feeder_argc - 1 : 0),
+            feeder_argc == 2 ? "" : "s");
     }
     return 0;
 }
@@ -308,6 +366,8 @@ static void entry_release(ffrun_entry *e) {
     kill_pipeline(e);
     argv_free(e->argv);
     argv_free(e->feeder_argv);
+    argv_free(e->env_keys);
+    argv_free(e->env_values);
     free(e->stream_id);
     memset(e, 0, sizeof(*e));
     e->pid = -1;
@@ -336,7 +396,9 @@ void rs_ffrun_destroy(rs_ffrun *r) {
 }
 
 int rs_ffrun_start(rs_ffrun *r, const char *stream_id,
-                   const char *const *argv, const char *const *feeder_argv) {
+                   const char *const *argv, const char *const *feeder_argv,
+                   const char *const *env_keys, const char *const *env_values,
+                   size_t env_count) {
     if (!r || !stream_id || !argv || !argv[0]) return -1;
 
     // Replacing a running pipeline: the argument list is what a config edit
@@ -360,7 +422,13 @@ int rs_ffrun_start(rs_ffrun *r, const char *stream_id,
     e->stream_id = rs_strdup(stream_id);
     e->argv = argv_copy(argv);
     e->feeder_argv = feeder_argv && feeder_argv[0] ? argv_copy(feeder_argv) : NULL;
-    if (!e->stream_id || !e->argv) { entry_release(e); return -1; }
+    e->env_keys = strv_copy_n(env_keys, env_count);
+    e->env_values = strv_copy_n(env_values, env_count);
+    e->env_count = env_count;
+    if (!e->stream_id || !e->argv || (env_count && (!e->env_keys || !e->env_values))) {
+        entry_release(e);
+        return -1;
+    }
 
     if (spawn_pipeline(r, e) != 0) {
         // Keep the entry so the supervisor retries with backoff rather than

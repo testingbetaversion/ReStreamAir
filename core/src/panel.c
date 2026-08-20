@@ -125,10 +125,18 @@ static long long clamp_ll(long long v, long long lo) { return v < lo ? lo : v; }
 static rs_json *stream_from_body(const rs_json *body, const char *id, const char **err) {
     const char *name = rs_json_obj_str(body, "name", "");
     const char *url = rs_json_obj_str(body, "url", "");
+    const char *input_mode = rs_json_obj_str(body, "inputMode", "internal");
     // A trimmed-empty name is rejected.
     const char *trimmed = NULL;
     if (rs_trim(name, strlen(name), true, &trimmed) == 0) { *err = "Stream name is required."; return NULL; }
-    if (!is_http_url(url)) { *err = "Stream URL must be http or https."; return NULL; }
+    if (strcmp(input_mode, "pipe") != 0 && !is_http_url(url)) {
+        *err = "Stream URL must be http or https.";
+        return NULL;
+    }
+    if (strcmp(input_mode, "pipe") == 0 && !rs_json_obj_str(body, "pipeCommand", "")[0]) {
+        *err = "Program pipe command is required.";
+        return NULL;
+    }
 
     rs_json *s = rs_json_new_obj();
     rs_json_obj_set_str(s, "id", id);
@@ -166,6 +174,9 @@ static rs_json *stream_from_body(const rs_json *body, const char *id, const char
     const rs_json *meta = rs_json_obj_get(body, "representationMeta");
     rs_json_obj_set(s, "representationMeta",
                     meta && rs_json_type_of(meta) == RS_JSON_OBJ ? rs_json_clone(meta) : rs_json_new_obj());
+    const rs_json *order = rs_json_obj_get(body, "representationOrder");
+    rs_json_obj_set(s, "representationOrder",
+                    order && rs_json_type_of(order) == RS_JSON_ARR ? rs_json_clone(order) : rs_json_new_arr());
 
     rs_json_obj_set_str(s, "manifestHeaders", rs_json_obj_str(body, "manifestHeaders", ""));
     rs_json_obj_set_str(s, "mediaHeaders", rs_json_obj_str(body, "mediaHeaders", ""));
@@ -176,9 +187,9 @@ static rs_json *stream_from_body(const rs_json *body, const char *id, const char
     rs_json_obj_set_str(s, "tvgId", rs_json_obj_str(body, "tvgId", ""));
 
     // Enumerated fields fall back to their default when the value isn't valid.
-    const char *input_mode = rs_json_obj_str(body, "inputMode", "internal");
     static const char *valid_inputs[] = {"internal", "ffmpegResident", "ffmpegTsHls",
-                                         "ffmpegMultiTsHls", "ffmpegFmp4Hls", "nm3u8dlre"};
+                                         "ffmpegMultiTsHls", "ffmpegFmp4Hls", "pipe",
+                                         "nm3u8dlre"};
     bool input_ok = false;
     for (size_t i = 0; i < sizeof(valid_inputs) / sizeof(valid_inputs[0]); i++) {
         if (strcmp(input_mode, valid_inputs[i]) == 0) { input_ok = true; break; }
@@ -193,6 +204,7 @@ static rs_json *stream_from_body(const rs_json *body, const char *id, const char
     }
     rs_json_obj_set_str(s, "outputMode", output_ok ? output_mode : "hls");
     rs_json_obj_set_str(s, "outputTarget", rs_json_obj_str(body, "outputTarget", ""));
+    rs_json_obj_set_str(s, "pipeCommand", rs_json_obj_str(body, "pipeCommand", ""));
 
     // cdnUrls: an array of strings or a newline-separated string, keeping only
     // valid http(s) URLs, trimmed.
@@ -275,6 +287,9 @@ static rs_json *stream_view(const rs_state *st, const rs_json *stream, const cha
     const char *id = rs_json_obj_str(stream, "id", "");
     const char *kind = rs_json_obj_str(stream, "kind", "mpd");
     const char *name = rs_json_obj_str(stream, "name", "");
+    const char *input_mode = rs_json_obj_str(stream, "inputMode", "internal");
+    const char *output_mode = rs_json_obj_str(stream, "outputMode", "hls");
+    bool process_pipeline = strcmp(input_mode, "internal") != 0 || strcmp(output_mode, "hls") != 0;
 
     // Slug for the play URL: the name slug when unique, else the id.
     char *slug = rs_panel_slugify(name);
@@ -291,7 +306,8 @@ static rs_json *stream_view(const rs_state *st, const rs_json *stream, const cha
 
     char url[1024];
     snprintf(url, sizeof(url), "http://%s/play/%s/index.m3u8", host, play_id);
-    rs_json_obj_set_str(v, "playUrl", url);
+    rs_json_obj_set_str(v, "playUrl", strcmp(output_mode, "hls") == 0
+                                      ? url : rs_json_obj_str(stream, "outputTarget", ""));
     snprintf(url, sizeof(url), "http://%s/source/%s", host, id);
     rs_json_obj_set_str(v, "sourceUrl", url);
     if (strcmp(kind, "m3u8") == 0) {
@@ -303,7 +319,13 @@ static rs_json *stream_view(const rs_state *st, const rs_json *stream, const cha
 
     rs_json *direct = rs_json_new_obj();
     rs_json *download = rs_json_new_obj();
-    if (strcmp(kind, "m3u8") == 0) {
+    if (process_pipeline) {
+        if (strcmp(output_mode, "hls") == 0) {
+            snprintf(url, sizeof(url), "http://%s/play/%s/index.m3u8", host, play_id);
+            rs_json_obj_set_str(direct, "HLS", url);
+            rs_json_obj_set_str(v, "directUrl", url);
+        }
+    } else if (strcmp(kind, "m3u8") == 0) {
         snprintf(url, sizeof(url), "http://%s/direct/%s", host, id);
         rs_json_obj_set_str(direct, "source", url);
     } else {
@@ -342,7 +364,7 @@ static rs_json *stream_view(const rs_state *st, const rs_json *stream, const cha
     // single URL — hence one entry for the stream rather than one per
     // rendition. DASH only: an m3u8 source has no separate renditions here to
     // mux, and its /source link already is one stream.
-    if (strcmp(kind, "m3u8") != 0) {
+    if (!process_pipeline && strcmp(kind, "m3u8") != 0) {
         snprintf(url, sizeof(url), "http://%s/direct/%s.ts", host, id);
         rs_json_obj_set_str(direct, "muxed (mpeg-ts)", url);
     }

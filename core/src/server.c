@@ -29,8 +29,12 @@
 // and restream_core links Threads::Threads on every platform including Windows,
 // so this is available everywhere the live engine already relies on it being.
 #include <pthread.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <direct.h>
+#define RS_MKDIR(path) _mkdir(path)
+#else
 #include <sys/stat.h>   // mkdir for the script session dir
+#define RS_MKDIR(path) mkdir((path), 0755)
 #endif
 
 // In-memory log ring buffer. Each entry is a panel/stream event the Logs tab
@@ -121,12 +125,19 @@ static restream_fetch_fn g_fetch_handler = NULL;
 static restream_dash_fn g_dash_handler = NULL;
 static restream_service_status_fn g_service_status = NULL;
 static restream_service_action_fn g_service_action = NULL;
+static restream_pipeline_start_fn g_pipeline_start = NULL;
+static restream_pipeline_stop_fn g_pipeline_stop = NULL;
+static restream_pipeline_running_fn g_pipeline_running = NULL;
+static restream_pipeline_poll_fn g_pipeline_poll = NULL;
 
 // The live-engine control plane is defined with the playback handlers, further
 // down, but the /api/streams/*/start|stop|update|delete routes above them have
 // to be able to start and stop engines.
 static void live_sync_stream(restream_server_t *s, const char *stream_id);
 static void live_stop_stream(restream_server_t *s, const char *stream_id);
+static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
+                                char *errbuf, size_t errbuf_len);
+static void pipeline_stop_stream(const char *stream_id);
 static void live_sync_all(restream_server_t *s);
 static const char *stream_source_target(const rs_json *stream);
 
@@ -1581,15 +1592,18 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         char *id = capture(hm, "/api/streams/*/start");
         char *ip = client_ip(s, c, hm);
         const char *err = NULL;
-        const rs_json *before = rs_panel_find_stream(&s->state, id);
-        const char *input = before ? rs_json_obj_str(before, "inputMode", "internal") : "internal";
-        const char *output = before ? rs_json_obj_str(before, "outputMode", "hls") : "hls";
-        int rc;
-        if (before && (strcmp(input, "internal") != 0 || strcmp(output, "hls") != 0)) {
-            err = "This C server currently supports only Internal remuxer → HLS/Direct. Choose that pipeline before starting.";
-            rc = -400;
-        } else {
-            rc = rs_panel_set_stream_running(&s->state, id, true, &err);
+        int rc = rs_panel_set_stream_running(&s->state, id, true, &err);
+        char pipeline_err[256] = {0};
+        if (rc == 0) {
+            live_sync_stream(s, id);
+            if (pipeline_sync_stream(s, id, pipeline_err, sizeof(pipeline_err)) != 0) {
+                const char *ignored = NULL;
+                live_stop_stream(s, id);
+                pipeline_stop_stream(id);
+                rs_panel_set_stream_running(&s->state, id, false, &ignored);
+                err = pipeline_err;
+                rc = -400;
+            }
         }
         if (rc == 0) {
             const rs_json *stream = rs_panel_find_stream(&s->state, id);
@@ -1601,7 +1615,6 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
                         "START requested by %s — \"%s\" (%s, %s mode)", ip, name, kind, mode);
             log_recordf(s, "__panel__", "info", "streamStart", src, 0, -1,
                         "%s (\"%s\") started by %s", id, name, ip);
-            live_sync_stream(s, id);
         } else {
             log_recordf(s, "__panel__", "error", "streamStart", NULL, 0, -1,
                         "START of %s from %s failed: %s", id ? id : "?", ip,
@@ -1619,6 +1632,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         // Flag the engine before the status flip so the log reads in the order
         // things actually happened.
         live_stop_stream(s, id);
+        pipeline_stop_stream(id);
         int rc = rs_panel_set_stream_running(&s->state, id, false, &err);
         if (rc == 0) {
             const rs_json *stream = rs_panel_find_stream(&s->state, id);
@@ -1650,10 +1664,15 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
             // is required to replace its pthread pool; a stream switched off
             // simply winds down.
             const rs_json *stream = rs_panel_find_stream(&s->state, id);
-            if (stream && strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0)
+            if (stream && strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0) {
                 live_sync_stream(s, id);
-            else
+                char pipeline_err[256] = {0};
+                if (pipeline_sync_stream(s, id, pipeline_err, sizeof(pipeline_err)) != 0)
+                    log_record(s, id, "error", "ffmpegPipeline", NULL, 0, -1, pipeline_err);
+            } else {
                 live_stop_stream(s, id);
+                pipeline_stop_stream(id);
+            }
         }
         free(id);
         reply_after_mutation(s, c, hm, rc, err);
@@ -1665,6 +1684,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         // Stop the engine before the stream disappears from state: its config
         // is read from there.
         live_stop_stream(s, id);
+        pipeline_stop_stream(id);
         int rc = rs_panel_delete_stream(&s->state, id, &err);
         if (rc == 0 && id)
             log_recordf(s, "__panel__", "info", "streamDelete", NULL, 0, -1, "%s deleted", id);
@@ -2684,6 +2704,170 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     }
 }
 
+// --- resident ffmpeg pipeline control ---------------------------------------
+
+static bool stream_needs_pipeline(const rs_json *stream) {
+    if (!stream || rs_json_obj_bool(stream, "directSource", false)) return false;
+    const char *input = rs_json_obj_str(stream, "inputMode", "internal");
+    const char *output = rs_json_obj_str(stream, "outputMode", "hls");
+    return strcmp(input, "internal") != 0 || strcmp(output, "hls") != 0;
+}
+
+static void pipeline_stop_stream(const char *stream_id) {
+    if (g_pipeline_stop && stream_id && stream_id[0]) g_pipeline_stop(stream_id);
+}
+
+// Builds the command from stored stream/provider settings and hands it to the
+// app-owned supervisor. A pipe input is a producer argv (no implicit shell)
+// whose stdout the supervisor connects to ffmpeg's pipe:0 input.
+static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
+                                char *errbuf, size_t errbuf_len) {
+    if (!s || !stream_id || !stream_id[0]) return -1;
+    const rs_json *stream = rs_panel_find_stream(&s->state, stream_id);
+    if (!stream) return -1;
+    bool running = strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0;
+    if (!running || !stream_needs_pipeline(stream)) {
+        pipeline_stop_stream(stream_id);
+        return 0;
+    }
+
+    const char *input = rs_json_obj_str(stream, "inputMode", "internal");
+    const char *output = rs_json_obj_str(stream, "outputMode", "hls");
+    if (strcmp(input, "nm3u8dlre") == 0) {
+        snprintf(errbuf, errbuf_len, "N_m3u8DL-RE process supervision is not wired yet.");
+        return -1;
+    }
+    if (!g_pipeline_start) {
+        snprintf(errbuf, errbuf_len, "This build has no FFmpeg process supervisor.");
+        return -1;
+    }
+    if ((strcmp(output, "udpSrt") == 0 || strcmp(output, "custom") == 0) &&
+        !rs_json_obj_str(stream, "outputTarget", "")[0]) {
+        snprintf(errbuf, errbuf_len, "The selected output mode requires an output target.");
+        return -1;
+    }
+    if (strcmp(input, "pipe") == 0 && !rs_json_obj_str(stream, "pipeCommand", "")[0]) {
+        snprintf(errbuf, errbuf_len, "Program pipe command is required.");
+        return -1;
+    }
+
+    char *ffmpeg = rs_ffmpeg_resolve();
+    if (!ffmpeg) {
+        snprintf(errbuf, errbuf_len, "FFmpeg is not installed. Install the full development build in Settings.");
+        return -1;
+    }
+
+    RS_MKDIR("runtime");
+    RS_MKDIR("runtime/ffmpeg");
+    char out_dir[512], playlist[560];
+    snprintf(out_dir, sizeof(out_dir), "runtime/ffmpeg/%s", stream_id);
+    RS_MKDIR(out_dir);
+    snprintf(playlist, sizeof(playlist), "%s/live.m3u8", out_dir);
+
+    const rs_json *selected = rs_json_obj_get(stream, "representations");
+    const rs_json *meta = rs_json_obj_get(stream, "representationMeta");
+    const rs_json *rep_order = rs_json_obj_get(stream, "representationOrder");
+    size_t rep_count = rs_json_arr_len(selected);
+    const char **rep_ids = rep_count ? (const char **)calloc(rep_count, sizeof(*rep_ids)) : NULL;
+    const char **type_ids = rep_count ? (const char **)calloc(rep_count, sizeof(*type_ids)) : NULL;
+    const char **type_values = rep_count ? (const char **)calloc(rep_count, sizeof(*type_values)) : NULL;
+    size_t *input_indices = rep_count ? (size_t *)calloc(rep_count, sizeof(*input_indices)) : NULL;
+    size_t used = 0, videos = 0;
+    for (size_t i = 0; i < rep_count && rep_ids && type_ids && type_values && input_indices; i++) {
+        const char *id = rs_json_as_str(rs_json_arr_at(selected, i), "");
+        if (!id[0]) continue;
+        const rs_json *m = meta ? rs_json_obj_get(meta, id) : NULL;
+        const char *type = m ? rs_json_obj_str(m, "type", "video") : "video";
+        rep_ids[used] = type_ids[used] = id;
+        type_values[used] = type;
+        size_t ordinal = 0;
+        bool found_in_order = false;
+        for (size_t j = 0; j < rs_json_arr_len(rep_order); j++) {
+            const char *ordered_id = rs_json_as_str(rs_json_arr_at(rep_order, j), "");
+            const rs_json *ordered_meta = meta ? rs_json_obj_get(meta, ordered_id) : NULL;
+            const char *ordered_type = ordered_meta
+                ? rs_json_obj_str(ordered_meta, "type", "video") : "video";
+            if (strcmp(ordered_type, type) != 0) continue;
+            if (strcmp(ordered_id, id) == 0) { found_in_order = true; break; }
+            ordinal++;
+        }
+        if (!found_in_order) {
+            ordinal = 0;
+            for (size_t j = 0; j < used; j++)
+                if (strcmp(type_values[j], type) == 0) ordinal++;
+        }
+        input_indices[used] = ordinal;
+        if (strcmp(type, "audio") != 0) videos++;
+        used++;
+    }
+    if (strcmp(input, "ffmpegMultiTsHls") == 0 && videos > 1) {
+        for (size_t i = 0; i < videos; i++) {
+            char variant[560];
+            snprintf(variant, sizeof(variant), "%s/%lu", out_dir, (unsigned long)i);
+            RS_MKDIR(variant);
+        }
+    }
+
+    const rs_json *provider = provider_of(&s->state, stream);
+    char *proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    char *headers = effective_headers(provider, stream, "manifestHeaders");
+    rs_ffargs_inputs in;
+    memset(&in, 0, sizeof(in));
+    in.source_url = stream_source_target(stream);
+    in.kind = rs_json_obj_str(stream, "kind", "mpd");
+    in.input_mode = input;
+    in.output_mode = output;
+    in.output_target = rs_json_obj_str(stream, "outputTarget", "");
+    in.decryption_keys = rs_json_obj_str(stream, "decryptionKeys", "");
+    in.headers = headers;
+    in.proxy = proxy;
+    in.segment_url_params = provider ? rs_json_obj_str(provider, "segmentUrlParams", "") : "";
+    in.representation_ids = rep_ids;
+    in.representation_input_indices = input_indices;
+    in.representation_id_count = used;
+    in.rep_type_ids = type_ids;
+    in.rep_type_values = type_values;
+    in.rep_type_count = used;
+    in.temp_dir = out_dir;
+    in.output_playlist = playlist;
+    in.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
+    in.segment_seconds = 2;
+
+    rs_ffargs_command cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    char **producer = NULL;
+    size_t producer_count = 0;
+    int rc = rs_ffargs_build(&in, &cmd);
+    if (rc == 0 && strcmp(input, "pipe") == 0)
+        rc = rs_ffargs_tokenize(rs_json_obj_str(stream, "pipeCommand", ""),
+                                &producer, &producer_count);
+    if (rc == 0 && strcmp(input, "pipe") == 0 && producer_count == 0) rc = -1;
+
+    const char **argv = NULL;
+    if (rc == 0) {
+        argv = (const char **)calloc(cmd.argc + 2, sizeof(*argv));
+        if (!argv) rc = -1;
+    }
+    if (rc == 0) {
+        argv[0] = ffmpeg;
+        for (size_t i = 0; i < cmd.argc; i++) argv[i + 1] = cmd.argv[i];
+        rc = g_pipeline_start(stream_id, argv, (const char *const *)producer,
+                              (const char *const *)cmd.env_keys,
+                              (const char *const *)cmd.env_values, cmd.env_count);
+        // A failed initial spawn remains registered for supervised retry.
+        if (rc != 0 && g_pipeline_running && g_pipeline_running(stream_id)) rc = 0;
+    }
+    if (rc != 0) snprintf(errbuf, errbuf_len, "Could not build or start the FFmpeg pipeline. Check its command and Logs.");
+    else log_record(s, stream_id, "info", "ffmpegPipeline", in.source_url, 0, -1,
+                    strcmp(input, "pipe") == 0 ? "program pipe connected to FFmpeg" : "FFmpeg pipeline started");
+
+    free(argv);
+    rs_free_strv(producer, producer_count);
+    rs_ffargs_command_dispose(&cmd);
+    free(proxy); free(headers); free(rep_ids); free(type_ids); free(type_values); free(input_indices); free(ffmpeg);
+    return rc;
+}
+
 // --- the live DASH engine's control plane -----------------------------------
 //
 // Everything DASH is produced by a background engine (rs_live) rather than by
@@ -2834,7 +3018,7 @@ static void live_stop_stream(restream_server_t *s, const char *stream_id) {
 // server restart resumes the streams instead of waiting for someone to click
 // Start again.
 static void live_sync_all(restream_server_t *s) {
-    if (!s || !s->live) return;
+    if (!s) return;
     const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
     int started = 0;
     for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
@@ -2845,7 +3029,12 @@ static void live_sync_all(restream_server_t *s) {
             if (!id[0]) continue;
             if (strcmp(rs_json_obj_str(st, "status", "stopped"), "running") != 0) continue;
             live_sync_stream(s, id);
-            if (rs_live_is_running(s->live, id)) started++;
+            char pipeline_err[256] = {0};
+            int prc = pipeline_sync_stream(s, id, pipeline_err, sizeof(pipeline_err));
+            if (prc != 0)
+                log_record(s, id, "error", "ffmpegPipeline", NULL, 0, -1, pipeline_err);
+            if ((s->live && rs_live_is_running(s->live, id)) ||
+                (g_pipeline_running && g_pipeline_running(id))) started++;
         }
     }
     if (started > 0)
@@ -3669,8 +3858,73 @@ static void serve_download(restream_server_t *server, struct mg_connection *c,
     free(body);
 }
 
-// Playback routes. Direct-source streams redirect; HLS passthrough and DASH
-// (on-demand MPD->HLS translation) are proxied live. ffmpeg modes still 501.
+static bool safe_pipeline_relative_path(const char *path) {
+    if (!path || !path[0] || path[0] == '/' || strstr(path, "..") || strstr(path, "//")) return false;
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++)
+        if (!(isalnum(*p) || *p == '/' || *p == '.' || *p == '_' || *p == '-')) return false;
+    return true;
+}
+
+static bool serve_pipeline_hls(restream_server_t *server, struct mg_connection *c,
+                               struct mg_http_message *hm) {
+    char *tail = capture(hm, "/play/#");
+    if (!tail) return false;
+    char *slash = strchr(tail, '/');
+    if (!slash) { free(tail); return false; }
+    *slash++ = '\0';
+    const rs_json *stream = rs_panel_find_stream(&server->state, tail);
+    if (!stream || !stream_needs_pipeline(stream)) {
+        free(tail);
+        return false;
+    }
+    if (strcmp(rs_json_obj_str(stream, "outputMode", "hls"), "hls") != 0) {
+        free(tail);
+        reply_error(c, 409, "This FFmpeg pipeline pushes to an external output and has no HLS playback URL.");
+        return true;
+    }
+    if (strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") != 0) {
+        free(tail);
+        reply_error(c, 404, "Stream is stopped.");
+        return true;
+    }
+
+    const char *relative = slash;
+    char path[1024];
+    const char *id = rs_json_obj_str(stream, "id", tail);
+    if (strcmp(relative, "index.m3u8") == 0) {
+        const char *mode = rs_json_obj_str(stream, "inputMode", "ffmpegResident");
+        snprintf(path, sizeof(path), "runtime/ffmpeg/%s/%s", id,
+                 strcmp(mode, "ffmpegMultiTsHls") == 0 ? "master.m3u8" : "live.m3u8");
+        if (strcmp(mode, "ffmpegMultiTsHls") == 0) {
+            FILE *test = fopen(path, "rb");
+            if (!test) snprintf(path, sizeof(path), "runtime/ffmpeg/%s/live.m3u8", id);
+            else fclose(test);
+        }
+    } else {
+        if (!safe_pipeline_relative_path(relative)) {
+            free(tail);
+            reply_error(c, 400, "Bad HLS item path.");
+            return true;
+        }
+        snprintf(path, sizeof(path), "runtime/ffmpeg/%s/%s", id, relative);
+    }
+    free(tail);
+
+    FILE *test = fopen(path, "rb");
+    if (!test) {
+        mg_http_reply(c, 503, "Content-Type: application/json\r\nRetry-After: 1\r\n",
+                      "{\"error\":\"FFmpeg output is warming up.\"}");
+        return true;
+    }
+    fclose(test);
+    struct mg_http_serve_opts opts = {0};
+    opts.extra_headers = "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n";
+    mg_http_serve_file(c, hm, path, &opts);
+    return true;
+}
+
+// Playback routes. Direct-source streams redirect; internal HLS/DASH is
+// proxied live, while resident FFmpeg HLS is served from its scoped runtime dir.
 static bool handle_playback(restream_server_t *server, struct mg_connection *c,
                             struct mg_http_message *hm) {
     bool is_source = mg_match(hm->uri, mg_str("/source/*"), NULL);
@@ -3740,6 +3994,11 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
             reply_error(c, 404, "Stream is stopped — start it first.");
             return true;
         }
+        if (stream_needs_pipeline(stream)) {
+            free(tail);
+            reply_error(c, 400, "Direct/download links belong to the internal live engine. Use this FFmpeg stream's HLS play URL or configured output target.");
+            return true;
+        }
         if (strcmp(rs_json_obj_str(stream, "kind", "mpd"), "m3u8") == 0) {
             if (is_download) {
                 free(tail);
@@ -3769,6 +4028,8 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
         send_redirect(c, target);
         return true;
     }
+
+    if (is_play && serve_pipeline_hls(server, c, hm)) return true;
 
     // /play/<segment>/index.m3u8 or index.mpd
     bool is_m3u8 = mg_match(hm->uri, mg_str("/play/*/index.m3u8"), NULL);
@@ -3996,6 +4257,25 @@ void restream_server_set_service_handler(restream_service_status_fn status,
     g_service_action = action;
 }
 
+void restream_server_set_pipeline_handler(restream_pipeline_start_fn start,
+                                          restream_pipeline_stop_fn stop,
+                                          restream_pipeline_running_fn running,
+                                          restream_pipeline_poll_fn poll) {
+    g_pipeline_start = start;
+    g_pipeline_stop = stop;
+    g_pipeline_running = running;
+    g_pipeline_poll = poll;
+}
+
+void restream_server_log_external(restream_server_t *server, const char *stream_id,
+                                  const char *level, const char *event,
+                                  const char *message) {
+    if (!server) return;
+    log_record(server, stream_id && stream_id[0] ? stream_id : "__panel__",
+               level && level[0] ? level : "info",
+               event && event[0] ? event : "external", NULL, 0, -1, message);
+}
+
 void restream_server_set_web_root(restream_server_t* server, const char* path) {
     if (!server) return;
     free(server->web_root);
@@ -4065,6 +4345,7 @@ bool restream_server_start(restream_server_t* server, uint16_t port, const char*
 
 void restream_server_poll(restream_server_t* server, int timeout_ms) {
     if (server && server->is_running) {
+        if (g_pipeline_poll) g_pipeline_poll();
         mg_mgr_poll(&server->mgr, timeout_ms);
     }
 }

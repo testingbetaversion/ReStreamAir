@@ -46,7 +46,9 @@ void rs_ffrun_destroy(rs_ffrun *r);
 //
 // The arrays are copied, so the caller may free them on return.
 int rs_ffrun_start(rs_ffrun *r, const char *stream_id,
-                   const char *const *argv, const char *const *feeder_argv);
+                   const char *const *argv, const char *const *feeder_argv,
+                   const char *const *env_keys, const char *const *env_values,
+                   size_t env_count);
 
 // Signals the pipeline to stop (SIGTERM, then SIGKILL if it ignores that) and
 // forgets it. Safe to call for a stream that is not running.

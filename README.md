@@ -123,6 +123,12 @@ Paste a source URL and the panel probes it as soon as you pause typing. The smal
 
 **Multi-quality** — every track is selected by default. Select more than one and the stream serves an HLS master playlist, one worker per representation. Each variant gets a distinct `BANDWIDTH`, real when detected and a placeholder otherwise, since some clients collapse identical-bandwidth entries into one.
 
+### FFmpeg and program-pipe inputs
+
+The FFmpeg input modes are supervised by the C server: they start with the stream, restart with bounded backoff after an early failure, adopt saved changes through a controlled restart, resume after a server restart, and stop with the stream. HLS output is written under `runtime/ffmpeg/<stream-id>/` and served from the normal `/play/<id>/index.m3u8` URL; SRT, UDP/TCP and custom outputs use **Output target**.
+
+**Program pipe → FFmpeg** accepts an executable plus quoted arguments. The program's stdout becomes FFmpeg's `pipe:0` media input, so tools such as `streamlink --stdout URL best` can be used without an intermediate file. It is argv-based and does not invoke a shell automatically; if shell expansion, redirection or another pipe is required, invoke it explicitly (for example `/bin/sh -c 'producer | filter'`). Producer and FFmpeg stderr, exits and supervised restarts appear in the stream's Logs view. The configured proxy is passed to both processes as `http_proxy` and `https_proxy`.
+
 ### Subtitles and captions
 
 Picked up automatically — there is nothing to configure.

@@ -16,7 +16,7 @@ extern "C" {
 typedef struct {
     const char *source_url;
     const char *kind;           // "mpd" | "m3u8"
-    const char *input_mode;     // ffmpegResident | ffmpegTsHls | ffmpegMultiTsHls | ffmpegFmp4Hls
+    const char *input_mode;     // ffmpeg* modes, or "pipe" (producer -> ffmpeg stdin)
     const char *output_mode;    // hls | srtServer | udpSrt | custom
     const char *output_target;
 
@@ -32,6 +32,9 @@ typedef struct {
     // Selected representation ids and their audio/video typing, as parallel
     // arrays: rep_type_ids[i] is typed by rep_type_values[i] ("video"/"audio").
     const char *const *representation_ids;
+    // Input stream ordinal within its media type (video index or audio index),
+    // parallel to representation_ids. NULL preserves the legacy 0..N order.
+    const size_t *representation_input_indices;
     size_t representation_id_count;
     const char *const *rep_type_ids;
     const char *const *rep_type_values;

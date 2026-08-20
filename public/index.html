@@ -304,28 +304,30 @@
               <label>Downloader params<span class="field-hint">Extra CLI args passed to the tool, e.g. --retry 3 or aria2c -x 8</span><input name="downloaderParams" placeholder="optional"></label>
             </div>
             <div class="field-group">
-              <div class="field-group-title">Input/output pipeline<span class="field-hint">The C server currently supports Internal remuxer → HLS/Direct. Other saved pipeline values cannot be started until their process runner is connected.</span></div>
+              <div class="field-group-title">Input/output pipeline<span class="field-hint">Internal remuxing or a supervised FFmpeg process. Program pipe connects another program's stdout to FFmpeg stdin.</span></div>
               <div class="form-row">
                 <label>Input
                   <select name="inputMode">
                     <option value="internal">Internal remuxer (no ffmpeg)</option>
-                    <option value="ffmpegResident" data-needs-ffmpeg disabled>FFmpeg resident (not wired in C server)</option>
-                    <option value="ffmpegTsHls" data-needs-ffmpeg disabled>FFmpeg TS HLS/Direct (not wired in C server)</option>
-                    <option value="ffmpegMultiTsHls" data-needs-ffmpeg disabled>FFmpeg MultiTS HLS (not wired in C server)</option>
-                    <option value="ffmpegFmp4Hls" data-needs-ffmpeg disabled>FMP4 HLS (not wired in C server)</option>
+                    <option value="ffmpegResident" data-needs-ffmpeg disabled>FFmpeg resident</option>
+                    <option value="ffmpegTsHls" data-needs-ffmpeg disabled>FFmpeg TS HLS/Direct</option>
+                    <option value="ffmpegMultiTsHls" data-needs-ffmpeg disabled>FFmpeg MultiTS HLS</option>
+                    <option value="ffmpegFmp4Hls" data-needs-ffmpeg disabled>FMP4 HLS</option>
+                    <option value="pipe" data-needs-ffmpeg disabled>Program pipe → FFmpeg</option>
                     <option value="nm3u8dlre" data-needs-nm3u8dlre disabled>N_m3u8DL-RE (not wired in C server)</option>
                   </select>
                 </label>
                 <label>Output
                   <select name="outputMode">
                     <option value="hls">HLS/Direct</option>
-                    <option value="srtServer" data-needs-ffmpeg disabled>SRT Server (not wired in C server)</option>
-                    <option value="udpSrt" data-needs-ffmpeg disabled>UDP/SRT (not wired in C server)</option>
-                    <option value="custom" data-needs-ffmpeg disabled>Custom (not wired in C server)</option>
+                    <option value="srtServer" data-needs-ffmpeg disabled>SRT Server</option>
+                    <option value="udpSrt" data-needs-ffmpeg disabled>UDP/SRT</option>
+                    <option value="custom" data-needs-ffmpeg disabled>Custom FFmpeg output</option>
                   </select>
                 </label>
               </div>
               <label id="nm3u8dlreParamsField" class="hidden">N_m3u8DL-RE Params<span class="field-hint">Command-line arguments appended to the N_m3u8DL-RE execution</span><input name="nm3u8dlreParams"></label>
+              <label id="pipeCommandField" class="hidden">Program command<span class="field-hint">Executable plus quoted arguments. Its stdout is the media input. No shell is implied; use <code>/bin/sh -c '…'</code> explicitly for shell pipelines.</span><input name="pipeCommand" placeholder="streamlink --stdout https://example/live best"></label>
               <label id="outputTargetField" class="hidden">Output target<span class="field-hint" id="outputTargetHint"></span><input name="outputTarget"></label>
               <div id="ffmpegNotice" class="field-hint hidden"></div>
               <div id="ffmpegCapsNotice" class="field-hint warn hidden"></div>
@@ -591,7 +593,8 @@
                 <ul>
                   <li><b>Internal remuxer</b> (default) — no ffmpeg needed; downloads, decrypts and remuxes segments itself.</li>
                   <li><b>FFmpeg modes</b> — spawn a resident ffmpeg that reads the source and copy-remuxes to HLS, or pushes to SRT/UDP/TCP via the <b>Output target</b>.</li>
-                  <li><b>N_m3u8DL-RE</b> — hands the source to that downloader instead.</li>
+                  <li><b>Program pipe → FFmpeg</b> — runs any executable and feeds its stdout to FFmpeg. Enter executable + quoted arguments directly (for example <code>streamlink --stdout URL best</code>). It does not silently invoke a shell; use <code>/bin/sh -c '…'</code> explicitly when the command itself needs shell pipes or redirects.</li>
+                  <li><b>N_m3u8DL-RE</b> — reserved for that downloader; its resident process integration is not wired yet.</li>
                   <li><b>Direct source</b> — <code>/play</code> 302-redirects to the origin rather than restreaming. The API-key gate still applies to the redirect.</li>
                 </ul>
                 <p>Beside the player are two opt-in links: <code>/direct/&lt;id&gt;</code> streams a raw fMP4 tail down one never-closing connection (no playlist, no polling), and <code>/download/&lt;id&gt;</code> hands back whatever is currently buffered as a playable <code>.mp4</code>.</p>

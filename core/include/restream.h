@@ -32,6 +32,29 @@ typedef int (*restream_service_action_fn)(const char* action, unsigned port,
 void restream_server_set_service_handler(restream_service_status_fn status,
                                          restream_service_action_fn action);
 
+// Resident media-process supervision is platform/app-owned. The core builds
+// ffmpeg argv, while the app starts/stops it (and an optional producer whose
+// stdout becomes ffmpeg's stdin). argv is copied by the handler before return.
+typedef int (*restream_pipeline_start_fn)(const char *stream_id,
+                                          const char *const *argv,
+                                          const char *const *producer_argv,
+                                          const char *const *env_keys,
+                                          const char *const *env_values,
+                                          size_t env_count);
+typedef void (*restream_pipeline_stop_fn)(const char *stream_id);
+typedef bool (*restream_pipeline_running_fn)(const char *stream_id);
+typedef void (*restream_pipeline_poll_fn)(void);
+void restream_server_set_pipeline_handler(restream_pipeline_start_fn start,
+                                          restream_pipeline_stop_fn stop,
+                                          restream_pipeline_running_fn running,
+                                          restream_pipeline_poll_fn poll);
+
+// Lets the app-owned process supervisor put diagnostics in the same per-stream
+// log ring as the internal live engine.
+void restream_server_log_external(restream_server_t *server, const char *stream_id,
+                                  const char *level, const char *event,
+                                  const char *message);
+
 // The panel's stored Server Settings, read after create and before start so the
 // caller can honour them when no command-line override was given — the panel
 // tells the operator these "take effect after restart", which is only true if

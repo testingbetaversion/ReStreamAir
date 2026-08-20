@@ -26,6 +26,7 @@
 #include "net.h"
 #include "probe.h"
 #include "rs_dash.h"
+#include "ffrun.h"
 #include "service.h"
 #include "restream.h"
 
@@ -82,6 +83,34 @@ bool needs_value(const char *arg, int index, int argc, const char *flag) {
 }
 
 }  // namespace
+
+static rs_ffrun *g_ffrun = nullptr;
+
+static void pipeline_log(void *ctx, const char *stream_id, const char *level,
+                         const char *event, const char *message) {
+    restream_server_log_external(static_cast<restream_server_t *>(ctx), stream_id,
+                                 level, event, message);
+}
+
+static int pipeline_start(const char *stream_id, const char *const *argv,
+                          const char *const *producer_argv,
+                          const char *const *env_keys, const char *const *env_values,
+                          size_t env_count) {
+    return g_ffrun ? rs_ffrun_start(g_ffrun, stream_id, argv, producer_argv,
+                                    env_keys, env_values, env_count) : -1;
+}
+
+static void pipeline_stop(const char *stream_id) {
+    if (g_ffrun) rs_ffrun_stop(g_ffrun, stream_id);
+}
+
+static bool pipeline_running(const char *stream_id) {
+    return g_ffrun && rs_ffrun_is_running(g_ffrun, stream_id);
+}
+
+static void pipeline_poll(void) {
+    if (g_ffrun) rs_ffrun_poll(g_ffrun);
+}
 
 // --- service management bridge ----------------------------------------------
 //
@@ -227,6 +256,15 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "restreamair-server: out of memory\n");
         return 1;
     }
+    g_ffrun = rs_ffrun_create(pipeline_log, server);
+    if (!g_ffrun) {
+        std::fprintf(stderr, "restreamair-server: could not create FFmpeg supervisor\n");
+        restream_server_destroy(server);
+        curl_global_cleanup();
+        return 1;
+    }
+    restream_server_set_pipeline_handler(pipeline_start, pipeline_stop,
+                                         pipeline_running, pipeline_poll);
     if (!web_root.empty()) {
         restream_server_set_web_root(server, web_root.c_str());
     }
@@ -240,7 +278,10 @@ int main(int argc, char **argv) {
 
     if (!restream_server_start(server, port, bind_address.c_str())) {
         std::fprintf(stderr, "restreamair-server: cannot listen on %s:%u\n", bind_address.c_str(), port);
+        rs_ffrun_destroy(g_ffrun);
+        g_ffrun = nullptr;
         restream_server_destroy(server);
+        curl_global_cleanup();
         return 1;
     }
 
@@ -253,7 +294,7 @@ int main(int argc, char **argv) {
         std::printf("  serving %s + the panel API: auth, provider/stream/user/key management,\n"
                     "  live monitoring, source auto-detect, script providers, and direct /\n"
                     "  HLS-proxy / DASH playback (DASH ClearKey CENC decrypted in-server).\n"
-                    "  The ffmpeg and N_m3u8DL-RE input modes are not implemented.\n",
+                    "  FFmpeg URL and program-pipe inputs are supervised; N_m3u8DL-RE is not implemented.\n",
                     web_root.c_str());
     }
     std::fflush(stdout);
@@ -264,6 +305,10 @@ int main(int argc, char **argv) {
 
     std::printf("\nrestreamair-server stopping\n");
     restream_server_stop(server);
+    rs_ffrun_destroy(g_ffrun);
+    g_ffrun = nullptr;
+    restream_server_set_pipeline_handler(nullptr, nullptr, nullptr, nullptr);
     restream_server_destroy(server);
+    curl_global_cleanup();
     return 0;
 }

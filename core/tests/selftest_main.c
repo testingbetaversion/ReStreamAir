@@ -607,6 +607,37 @@ static void test_ffargs_helpers(void) {
         check_str("ffargs/tokenize-4", tokens[4], "e");
     }
     rs_free_strv(tokens, count);
+
+    tokens = NULL; count = 0;
+    check("ffargs/tokenize-unclosed-quote",
+          rs_ffargs_tokenize("program --name 'unfinished", &tokens, &count) != 0);
+    rs_free_strv(tokens, count);
+
+    rs_ffargs_inputs in;
+    memset(&in, 0, sizeof(in));
+    in.source_url = "https://must.not/appear.mpd";
+    in.kind = "mpd";
+    in.input_mode = "pipe";
+    in.output_mode = "hls";
+    in.headers = "Authorization: secret";
+    in.decryption_keys = "001122";
+    in.temp_dir = "/tmp/restreamair-pipe";
+    in.output_playlist = "/tmp/restreamair-pipe/live.m3u8";
+    in.playlist_segments = 6;
+    in.segment_seconds = 2;
+    rs_ffargs_command command;
+    memset(&command, 0, sizeof(command));
+    check("ffargs/pipe-build", rs_ffargs_build(&in, &command) == 0);
+    bool found_pipe = false, leaked_url_options = false;
+    for (size_t i = 0; i < command.argc; i++) {
+        if (strcmp(command.argv[i], "pipe:0") == 0) found_pipe = true;
+        if (strcmp(command.argv[i], "-headers") == 0 ||
+            strcmp(command.argv[i], "-cenc_decryption_key") == 0 ||
+            strstr(command.argv[i], "must.not")) leaked_url_options = true;
+    }
+    check("ffargs/pipe-stdin", found_pipe);
+    check("ffargs/pipe-ignores-url-options", !leaked_url_options);
+    rs_ffargs_command_dispose(&command);
 }
 
 // Subtitle mapping. This is not a golden: the original never mapped

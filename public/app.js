@@ -866,6 +866,7 @@ function renderEditor() {
   form.elements.inputMode.value = stream.inputMode || "internal";
   form.elements.outputMode.value = stream.outputMode || "hls";
   form.elements.outputTarget.value = stream.outputTarget || "";
+  form.elements.pipeCommand.value = stream.pipeCommand || "";
   if (form.elements.nm3u8dlreParams) {
     form.elements.nm3u8dlreParams.value = stream.nm3u8dlreParams || "";
   }
@@ -894,9 +895,13 @@ function renderEditor() {
   updatePipelineFieldVisibility();
 
   selectedRepIds = new Set(stream.representations || []);
+  const savedMeta = stream.representationMeta || {};
+  const savedOrder = Array.isArray(stream.representationOrder) && stream.representationOrder.length
+    ? stream.representationOrder
+    : Object.keys(savedMeta);
   probeResult = {
     kind: stream.kind,
-    representations: Object.entries(stream.representationMeta || {}).map(([id, meta]) => ({ id, ...meta })),
+    representations: savedOrder.filter((id) => savedMeta[id]).map((id) => ({ id, ...savedMeta[id] })),
     protection: {},
   };
   renderRepresentationPicker();
@@ -965,6 +970,7 @@ function streamPayload() {
     cdnUrls: collectCdnMirrors(),
     representation: form.elements.representation.value,
     representations: Array.from(selectedRepIds),
+    representationOrder: (probeResult?.representations || []).map((rep) => rep.id),
     representationMeta,
     period: form.elements.period.value,
     proxy: form.elements.proxy.value,
@@ -991,6 +997,7 @@ function streamPayload() {
     inputMode: form.elements.inputMode.value,
     outputMode: form.elements.outputMode.value,
     outputTarget: form.elements.outputTarget.value,
+    pipeCommand: form.elements.pipeCommand.value,
     nm3u8dlreParams: form.elements.nm3u8dlreParams?.value || "",
     useCdm: form.elements.useCdm.checked,
     sessionManifest: form.elements.sessionManifest.checked,
@@ -1114,8 +1121,6 @@ function newStream() {
 // 1080p" were both true. Marking them is the cheap half of the fix; the values
 // are still stored and start working the moment the engine reads them.
 const INACTIVE_FIELDS = {
-  outputMode: "only HLS/Direct output is implemented in this build",
-  outputTarget: "used by the SRT/UDP output modes, which aren't in this build",
   period: "the engine reads every DASH period; selection isn't implemented",
   forceOffline: "not implemented in this build",
   onDemand: "not implemented in this build",
@@ -1491,12 +1496,10 @@ function updateDecryptionKeysVisibility() {
 
 // MARK: - Input/output pipeline
 //
-// Input=internal runs the built-in engine, and is the only one implemented.
-// The ffmpeg input modes (ffmpegResident / ffmpegTsHls / ffmpegMultiTsHls /
-// ffmpegFmp4Hls) would spawn a resident ffmpeg that reads the source directly
-// (decrypting CENC clearkey itself) and remuxes with -c copy to the selected
-// Output — HLS served from the panel, or an SRT/UDP/TCP push (Output target).
-// The stored setting round-trips, but starting such a stream answers 501.
+// Input=internal runs the built-in engine. The ffmpeg modes spawn a supervised
+// resident process that reads the URL directly; pipe instead spawns the entered
+// producer argv and connects its stdout to ffmpeg's stdin. Both copy-remux to
+// HLS or the selected SRT/UDP/custom output without transcoding.
 
 let ffmpegStatus = null;
 let ffmpegStatusPromise = null;
@@ -1548,6 +1551,10 @@ function updatePipelineFieldVisibility() {
 
   const nmParamsField = $("#nm3u8dlreParamsField");
   if (nmParamsField) nmParamsField.classList.toggle("hidden", inputMode !== "nm3u8dlre");
+  const pipeCommandField = $("#pipeCommandField");
+  if (pipeCommandField) pipeCommandField.classList.toggle("hidden", inputMode !== "pipe");
+  if (form.elements.pipeCommand) form.elements.pipeCommand.required = inputMode === "pipe";
+  if (form.elements.url) form.elements.url.required = inputMode !== "pipe";
 
   const needsFfmpeg = (inputMode !== "internal" && inputMode !== "nm3u8dlre") || outputMode !== "hls";
   const notice = $("#ffmpegNotice");
