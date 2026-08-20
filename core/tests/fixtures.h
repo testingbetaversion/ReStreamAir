@@ -87,7 +87,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "",
         "", "",
-        NULL, 0, NULL, NULL, 0,
+        NULL, NULL, 0, NULL, NULL, 0,
         "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4,
     },
     {
@@ -101,7 +101,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
     "  Referer: https://example.com  \n"
     "",
         "http://127.0.0.1:8888", " ?token=abc&region=eu ",
-        NULL, 0, NULL, NULL, 0,
+        NULL, NULL, 0, NULL, NULL, 0,
         "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4,
     },
     {
@@ -110,7 +110,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "00112233445566778899aabbccddeeff",
         "",
         "", "",
-        rs_ff2_ids, 3, rs_ff2_ids, rs_ff2_types, 3,
+        rs_ff2_ids, NULL, 3, rs_ff2_ids, rs_ff2_types, 3,
         "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4,
     },
     {
@@ -119,7 +119,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "",
         "", "",
-        rs_ff3_ids, 2, rs_ff3_ids, rs_ff3_types, 2,
+        rs_ff3_ids, NULL, 2, rs_ff3_ids, rs_ff3_types, 2,
         "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4,
     },
     {
@@ -128,7 +128,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "",
         "", "",
-        NULL, 0, NULL, NULL, 0,
+        NULL, NULL, 0, NULL, NULL, 0,
         "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4,
     },
     {
@@ -137,7 +137,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "",
         "", "",
-        NULL, 0, NULL, NULL, 0,
+        NULL, NULL, 0, NULL, NULL, 0,
         "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4,
     },
     {
@@ -146,7 +146,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "",
         "", "ignored=1",
-        NULL, 0, NULL, NULL, 0,
+        NULL, NULL, 0, NULL, NULL, 0,
         "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4,
     },
     {
@@ -155,7 +155,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         ":deadbeefdeadbeefdeadbeefdeadbeef",
         "",
         "", "&more=2",
-        NULL, 0, NULL, NULL, 0,
+        NULL, NULL, 0, NULL, NULL, 0,
         "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4,
     },
 };
