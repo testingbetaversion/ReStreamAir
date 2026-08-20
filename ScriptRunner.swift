@@ -241,7 +241,7 @@ enum ScriptRunner {
     /// to `onLine` as they arrive rather than batching until exit — needed
     /// for login/pair, where a script may print a pairing code and then
     /// block for a while waiting on the user to act on it elsewhere (see
-    /// disneyplus.py's commented-out pair() for exactly that shape). `onExit`
+    /// the commented-out pair() in a provider script for that shape). `onExit`
     /// fires once the process terminates (nil error on a clean exit).
     @discardableResult
     static func runStreaming(scriptPath rawScriptPath: String, args: [String], onLine: @escaping (String) -> Void, onExit: @escaping (Error?) -> Void) -> Process? {

@@ -88,9 +88,9 @@ struct RepresentationMetaEntry: Codable {
 }
 
 // A named credential/session profile for a script provider — e.g. two
-// different Disney+ logins run through the same script. `username`/
-// `password` are sent as user=/password= (matching the param names
-// o11-based scripts like disneyplus.py already read via
+// different logins for one provider run through the same script.
+// `username`/`password` are sent as user=/password= (matching the param
+// names o11-based provider scripts already read via
 // o11.parse_params(sys.argv, 'user'/'password')) when set — either can be
 // left blank if a script doesn't need it (a token-only login, or pairing,
 // which is typically credential-less/code-based). `params` is an
