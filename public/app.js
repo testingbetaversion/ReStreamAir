@@ -50,7 +50,7 @@ let selectedProviderId = null;
 let selectedStreamId = null;
 let hls = null;
 let pipHls = null;
-let currentView = "monitor";
+let currentView = "server";
 let eventSource = null;
 let authenticated = false;
 let probeResult = null;
@@ -142,9 +142,12 @@ function renderUpdateBanner() {
 }
 
 function renderViewHeader() {
-  if (currentView === "monitor") {
+  if (currentView === "server") {
     $("#viewTitle").textContent = "Server information";
-    $("#viewMeta").textContent = "Live bandwidth, active clients, and server usage.";
+    $("#viewMeta").textContent = "Host health, capacity, and build information.";
+  } else if (currentView === "monitor") {
+    $("#viewTitle").textContent = "Monitoring";
+    $("#viewMeta").textContent = "Live bandwidth by stream and by connected client.";
   } else if (currentView === "grid") {
     const filtered = streamsGridProviderId && state.providers.find((p) => p.id === streamsGridProviderId);
     $("#viewTitle").textContent = filtered ? filtered.name : "All streams";
@@ -187,14 +190,15 @@ let logsPollTimer = null;
 const VIEW_ROUTES = {
   providers: "/providers",
   grid: "/streams",
-  monitor: "/server",
+  server: "/server",
+  monitor: "/monitoring",
   logs: "/logs",
   keys: "/keys",
   settings: "/settings",
   help: "/help",
 };
 const ROUTE_VIEWS = Object.fromEntries(Object.entries(VIEW_ROUTES).map(([view, path]) => [path, view]));
-const DEFAULT_VIEW = "monitor";
+const DEFAULT_VIEW = "server";
 
 // The address that represents the app's current state, including the filter
 // context of whichever view is showing.
@@ -263,6 +267,7 @@ function switchView(view, { history: historyMode = "push" } = {}) {
     document.querySelectorAll(".nav-btn").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
     $("#providersView").classList.toggle("hidden", view !== "providers");
     $("#streamsGridView").classList.toggle("hidden", view !== "grid");
+    $("#serverView").classList.toggle("hidden", view !== "server");
     $("#monitorView").classList.toggle("hidden", view !== "monitor");
     $("#logsView").classList.toggle("hidden", view !== "logs");
     $("#keysView").classList.toggle("hidden", view !== "keys");
@@ -270,7 +275,7 @@ function switchView(view, { history: historyMode = "push" } = {}) {
     $("#helpView").classList.toggle("hidden", view !== "help");
     renderViewHeader();
     if (view === "grid") renderStreamsGrid();
-    if (view === "monitor") repaintMonitorIfActive();
+    if (view === "server" || view === "monitor") repaintMonitorIfActive();
     if (view === "settings") loadSettingsView();
     // Logs auto-refresh only while the tab is actually open, same reasoning
     // as the existing "no overhead when closed" comment on loadLogs itself.
@@ -782,7 +787,7 @@ function renderEditor() {
       form.elements.parallelDownloads.value = 6;
       form.elements.prioritizeOldest.checked = false;
       form.elements.pollInterval.value = 0;
-      form.elements.reducedManifestPolling.checked = true;
+      form.elements.reducedManifestPolling.checked = false;
       $("#playLink").value = "";
       setLinkField($("#directLink"), {});
       $("#statusBox").textContent = "Select or create a stream.";
@@ -1080,7 +1085,7 @@ function newStream() {
   $("#streamForm").elements.parallelDownloads.value = 6;
   $("#streamForm").elements.prioritizeOldest.checked = false;
   $("#streamForm").elements.pollInterval.value = 0;
-  $("#streamForm").elements.reducedManifestPolling.checked = true;
+  $("#streamForm").elements.reducedManifestPolling.checked = false;
   $("#playLink").value = "";
   setLinkField($("#directLink"), {});
   renderCdnMirrors([]);
@@ -1334,6 +1339,9 @@ function loadPlayer() {
     hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
       video.play().catch(() => {});
       renderTrackControls(hls);
+    });
+    hls.on(window.Hls.Events.LEVEL_SWITCHED, (_event, data) => {
+      if (hls && hls.manualLevel !== -1) $("#qualitySelect").value = String(data.level);
     });
     attachHlsErrorRecovery(hls, (data) => {
       console.error("hls.js gave up on", stream.name, data);
@@ -1604,8 +1612,7 @@ function stopFfmpegInstallPoll() {
   ffmpegInstallPollTimer = null;
 }
 
-async function pollFfmpegInstallOutput() {
-  const box = $("#ffmpegInstallOutput");
+async function pollFfmpegInstallOutput(box = $("#ffmpegInstallOutput")) {
   try {
     const result = await request(`/api/logs?streamId=${encodeURIComponent("ffmpeg-install")}&limit=500`);
     const lines = (result.entries || []).slice().reverse().map((entry) => entry.message || entry.event).join("\n");
@@ -1619,24 +1626,28 @@ async function pollFfmpegInstallOutput() {
       stopFfmpegInstallPoll();
       ffmpegStatusPromise = null;
       await fetchFfmpegStatus();
+      if (currentView === "settings") await refreshSettingsFfmpegStatus();
     }
   } catch (error) {
     box.textContent = `Couldn't load install output: ${error.message || error}`;
   }
 }
 
-$("#ffmpegInstallBtn").addEventListener("click", async () => {
-  $("#ffmpegInstallOutput").classList.remove("hidden");
-  $("#ffmpegInstallOutput").textContent = "Starting…";
+async function startFfmpegInstall(output) {
+  output.classList.remove("hidden");
+  output.textContent = "Starting installer…";
   try {
     await request("/api/ffmpeg-install", { method: "POST", body: "{}" });
+    stopFfmpegInstallPoll();
+    pollFfmpegInstallOutput(output);
+    ffmpegInstallPollTimer = setInterval(() => pollFfmpegInstallOutput(output), 1000);
   } catch (error) {
-    $("#ffmpegInstallOutput").textContent = `Couldn't start install: ${error.message || error}`;
-    return;
+    output.textContent = `Couldn't start install: ${error.message || error}`;
   }
-  stopFfmpegInstallPoll();
-  pollFfmpegInstallOutput();
-  ffmpegInstallPollTimer = setInterval(pollFfmpegInstallOutput, 1000);
+}
+
+$("#ffmpegInstallBtn").addEventListener("click", () => {
+  startFfmpegInstall($("#ffmpegInstallOutput"));
 });
 
 let nm3u8dlreInstallPollTimer = null;
@@ -1823,6 +1834,7 @@ async function detectSource() {
   if (!url) { $("#detectStatus").textContent = "Enter a source URL first."; return; }
   lastAutoDetectedUrl = url;
   detecting = true;
+  $("#forceProbeBtn").disabled = true;
   $("#detectStatus").textContent = "Detecting…";
   try {
     const proxy = form.elements.proxy.value || selectedProvider()?.proxy || "";
@@ -1851,8 +1863,15 @@ async function detectSource() {
     $("#detectStatus").textContent = `${error.message || error} — you can still add a representation manually below.`;
   } finally {
     detecting = false;
+    $("#forceProbeBtn").disabled = false;
   }
 }
+
+$("#forceProbeBtn").addEventListener("click", () => {
+  clearTimeout(autoDetectTimer);
+  lastAutoDetectedUrl = "";
+  detectSource();
+});
 
 // MARK: - Script actions
 //
@@ -2539,8 +2558,27 @@ async function loadSettingsView() {
     $("#portForm").elements.trustedProxies.value = settings.trustedProxies || "";
   } catch (error) { /* ignore */ }
   await refreshServiceStatus();
+  await refreshSettingsFfmpegStatus();
   await refreshUserList();
 }
+
+async function refreshSettingsFfmpegStatus() {
+  const status = $("#settingsFfmpegStatus");
+  const button = $("#settingsFfmpegInstallBtn");
+  if (!status || !button) return;
+  const result = await fetchFfmpegStatus();
+  if (result.available) {
+    status.textContent = `Installed${result.version ? ` — ${result.version}` : ""}${result.hasDash === false ? " · this build has no DASH demuxer" : ""}`;
+    button.classList.add("hidden");
+  } else {
+    status.textContent = "FFmpeg is not installed. The internal remuxer still works without it.";
+    button.classList.toggle("hidden", !result.installCommand);
+  }
+}
+
+$("#settingsFfmpegInstallBtn")?.addEventListener("click", () => {
+  startFfmpegInstall($("#settingsFfmpegInstallOutput"));
+});
 
 // Service panel. The port setting says "takes effect after restart", so the
 // restart has to be reachable from the same page; and a fresh install often has
@@ -2721,21 +2759,13 @@ function applyMetrics(payload) {
   // frame and skip the repaint unless the monitor view is actually visible;
   // switchView repaints from this cache the instant the user comes back.
   lastMetricsPayload = payload;
-  if (currentView !== "monitor") return;
+  if (currentView !== "monitor" && currentView !== "server") return;
   const global = payload.global || {};
-  const globalInput = payload.globalInput || {};
   const system = payload.system || {};
   const cpuPercent = Number(system.cpuPercent || 0);
   const loadAverage = Number(system.loadAverage || 0);
   const memUsed = Number(system.memoryUsedBytes || 0);
   const memTotal = Number(system.totalMemoryBytes || 1);
-
-  $("#headlineTiles").innerHTML = [
-    statTile("Input Bandwidth", formatBytesPerSecond(globalInput.bytesPerSecond)),
-    statTile("Output Bandwidth", formatBytesPerSecond(global.bytesPerSecond)),
-    statTile("CPU Load", `${loadAverage.toFixed(2)} / ${system.coreCount || "?"}`),
-    statTile("Memory Usage", formatBytes(memUsed)),
-  ].join("");
 
   $("#serverTiles").innerHTML = [
     statTile("CPU", `${cpuPercent.toFixed(1)}%`, `${system.cpuModel || ""} · ${system.coreCount || "?"} cores · peak ${Number(system.peakCPUPercent || 0).toFixed(1)}%`),
@@ -2744,7 +2774,15 @@ function applyMetrics(payload) {
     statTile("Uptime", formatUptime(system.uptimeSeconds), system.osVersion || ""),
     statTile("Build", appVersionLabel(), appVersionSubtitle()),
     statTile("All-time served", formatBytes(global.allTimeBytes)),
-    statTile("All-time downloaded", formatBytes(globalInput.allTimeBytes)),
+  ].join("");
+
+  if (currentView === "server") return;
+
+  $("#headlineTiles").innerHTML = [
+    statTile("Live bandwidth", formatBytesPerSecond(global.bytesPerSecond)),
+    statTile("Active clients", String(global.activeClients || 0)),
+    statTile("All-time served", formatBytes(global.allTimeBytes)),
+    statTile("Connected IPs", String(new Set((payload.connections || []).map((c) => c.clientIP).filter(Boolean)).size)),
   ].join("");
 
   const streams = payload.streams || {};
@@ -2762,9 +2800,8 @@ function applyMetrics(payload) {
     container.innerHTML = streamIds.map((id) => {
       const info = streams[id];
       const name = findStreamName(id) || id;
-      const bw = info.bandwidth || {};
-      const inBw = info.inputBandwidth || {};
-      return statTile(name, `${info.activeClients || 0} active`, `↓ ${formatBytesPerSecond(inBw.bytesPerSecond)} · ↑ ${formatBytesPerSecond(bw.bytesPerSecond)}`);
+      const bw = info.bandwidth || info;
+      return statTile(name, `${info.activeClients || 0} active`, formatBytesPerSecond(bw.bytesPerSecond));
     }).join("");
   }
 
@@ -2773,7 +2810,7 @@ function applyMetrics(payload) {
 }
 
 function repaintMonitorIfActive() {
-  if (currentView === "monitor" && lastMetricsPayload) applyMetrics(lastMetricsPayload);
+  if ((currentView === "server" || currentView === "monitor") && lastMetricsPayload) applyMetrics(lastMetricsPayload);
 }
 
 function renderConnectionsTable() {
@@ -3066,7 +3103,11 @@ $("#copyDirectBtn").addEventListener("click", async (event) => {
   else window.prompt("Copy the URL:", link);
 });
 $("#qualitySelect").addEventListener("change", (event) => {
-  if (hls) hls.currentLevel = Number(event.currentTarget.value);
+  if (hls) {
+    const level = Number(event.currentTarget.value);
+    hls.currentLevel = level;
+    if (level >= 0) hls.nextLevel = level;
+  }
 });
 $("#audioTrackSelect").addEventListener("change", (event) => {
   if (hls) hls.audioTrack = Number(event.currentTarget.value);

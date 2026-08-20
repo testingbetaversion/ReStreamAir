@@ -871,6 +871,10 @@ label {
   min-width: 160px;
 }
 
+.input-with-button { position: relative; display: block; }
+.input-with-button input { width: 100%; padding-right: 44px; }
+.input-with-button .icon-btn { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); width: 34px; height: 34px; padding: 7px; }
+
 /* Direct link / Download link are real clickable <a> elements, one per
    representation, instead of a read-only text field you have to select and
    copy out of — a stream with more than one quality/track gets one link per

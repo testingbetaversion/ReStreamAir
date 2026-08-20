@@ -472,9 +472,9 @@ char *rs_ffmpeg_resolve(void) {
 
 char *rs_ffmpeg_install_plan(void) {
 #if defined(__APPLE__)
-    return strdup("brew install ffmpeg");
+    return strdup("brew install ffmpeg-full");
 #elif defined(__linux__)
-    return strdup("apt-get install -y ffmpeg");
+    return strdup("apt-get update && apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev libavutil-dev libswresample-dev libswscale-dev");
 #else
     return NULL;
 #endif

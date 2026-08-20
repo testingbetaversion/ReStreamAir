@@ -31,6 +31,13 @@ double rs_metrics_bytes_per_sec(const rs_metrics *m, const char *stream_id);
 // Get total bytes served for a stream since metrics creation
 int64_t rs_metrics_total_bytes(const rs_metrics *m, const char *stream_id);
 
+typedef void (*rs_metrics_connection_fn)(void *ctx, const char *stream_id,
+                                         const char *identity, const char *client_ip,
+                                         const char *user_agent, long long uptime_seconds,
+                                         int errors, double bytes_per_second,
+                                         int64_t total_bytes);
+void rs_metrics_each_connection(const rs_metrics *m, rs_metrics_connection_fn fn, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

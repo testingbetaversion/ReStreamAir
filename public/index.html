@@ -41,7 +41,8 @@
         <nav class="view-nav">
           <button type="button" class="nav-btn" data-view="providers"><span data-icon="providers"></span>Providers</button>
           <button type="button" class="nav-btn" data-view="grid"><span data-icon="grid"></span>All Streams</button>
-          <button type="button" class="nav-btn active" data-view="monitor"><span data-icon="monitor"></span>Server</button>
+          <button type="button" class="nav-btn active" data-view="server"><span data-icon="settings"></span>Server</button>
+          <button type="button" class="nav-btn" data-view="monitor"><span data-icon="monitor"></span>Monitoring</button>
           <button type="button" class="nav-btn" data-view="logs"><span data-icon="logs"></span>Logs</button>
           <button type="button" class="nav-btn" data-view="keys"><span data-icon="keys"></span>API Keys</button>
           <button type="button" class="nav-btn" data-view="settings"><span data-icon="settings"></span>Settings</button>
@@ -192,7 +193,7 @@
             <input type="hidden" name="id">
             <input type="hidden" name="kind" value="mpd">
             <label>Name<input name="name" placeholder="Sports HD" required></label>
-            <label>Source URL<input name="url" placeholder="https://example.com/index.mpd — type auto-detects" required></label>
+            <label>Source URL<span class="input-with-button"><input name="url" placeholder="https://example.com/index.mpd — type auto-detects" required><button type="button" id="forceProbeBtn" class="icon-btn ghost" title="Probe now and list all representations" aria-label="Probe now and list all representations"><span data-icon="refresh"></span></button></span></label>
             <div id="detectStatus" class="field-hint"></div>
             <div class="cdn-mirrors-field">
               <div class="field-label-row">CDN mirrors<span class="field-hint">Optional fallback sources — same content on other CDNs. If the primary manifest fails, the stream fails over to these in order.</span></div>
@@ -226,7 +227,7 @@
                 <label>EPG channel id<span class="field-hint">Exported as <code>tvg-id</code> in the M3U, which is how external players match guide data to this channel. Blank uses the stream id.</span><input name="tvgId" placeholder="bbc-one.uk"></label>
               </div>
               <label class="check"><input name="forceOffline" type="checkbox"> Allow offline/static MPD</label>
-              <label class="check"><input name="reducedManifestPolling" type="checkbox" checked> Reduce manifest polling<span class="field-hint">A video+audio stream normally makes three concurrent manifest fetches (a director plus two workers). This backs the director off once it has found the renditions, cutting that to two — use it when the origin caps concurrent sessions, or rate-limits and returns HTTP 429/403.</span></label>
+              <label class="check"><input name="reducedManifestPolling" type="checkbox"> Reduce manifest polling<span class="field-hint">Optional compatibility mode for origins that cap concurrent sessions or rate-limit with HTTP 429/403.</span></label>
               <button type="button" id="showDecryptionKeysBtn" class="ghost hidden">Add decryption keys</button>
               <div id="decryptionKeysGroup" class="key-field-group hidden">
                 <label>CENC decryption keys<span class="field-hint">One KID:KEY hex pair per line. When protection is auto-detected, KIDs are pre-filled with zeroed placeholder keys — replace the zeros with the real key. Works on any CENC "cenc" (AES-CTR) stream — including ones labeled Widevine/PlayReady — as long as you already know the raw key; this doesn't acquire keys from a license server. macOS only.</span><textarea name="decryptionKeys" placeholder="1234567890abcdef1234567890abcdef:abcdef1234567890abcdef1234567890"></textarea></label>
@@ -397,7 +398,16 @@
           </div>
         </section>
 
-        <section id="monitorView">
+        <section id="serverView">
+          <div class="monitor-panel full-width">
+            <div class="panel-head"><h3>Server</h3></div>
+            <div class="monitor-body">
+              <div id="serverTiles" class="tile-grid"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="monitorView" class="hidden">
           <div class="monitor-panel full-width">
             <div class="panel-head">
               <h3>Live monitoring</h3>
@@ -405,8 +415,6 @@
             </div>
             <div class="monitor-body">
               <div id="headlineTiles" class="tile-grid"></div>
-              <h3>Server</h3>
-              <div id="serverTiles" class="tile-grid"></div>
               <h3>Per-stream</h3>
               <div id="streamTiles" class="tile-grid empty-state">No streams yet.</div>
               <div class="connections-head">
@@ -485,6 +493,12 @@
                 </div>
                 <div id="serviceNote" class="field-hint"></div>
               </div>
+              <div id="settingsFfmpegPanel">
+                <h3>FFmpeg</h3>
+                <div id="settingsFfmpegStatus" class="field-hint">Checking…</div>
+                <div class="actions"><button type="button" id="settingsFfmpegInstallBtn" class="ghost hidden"><span data-icon="download"></span>Install full FFmpeg + development libraries</button></div>
+                <pre id="settingsFfmpegInstallOutput" class="script-output hidden"></pre>
+              </div>
               <h3>Accounts</h3>
               <form id="userForm" class="form-row">
                 <label>Username<input name="username" required></label>
@@ -525,7 +539,7 @@
                 <p>ReStreamAir re-streams DASH/HLS sources as clean HLS you can play in any player. Create a <b>Provider</b> (a group of streams that share settings and credentials), add <b>Streams</b> under it, then hit play or copy the output URL.</p>
                 <ol>
                   <li>Go to <b>Providers → New provider</b>.</li>
-                  <li>Open the provider, add a stream with its source URL (an <code>.mpd</code> or <code>.m3u8</code>). Paste the URL and pause — the panel probes it and fills in qualities, audio tracks and any DRM KIDs by itself. There is no Detect button and no type dropdown.</li>
+                  <li>Open the provider, add a stream with its source URL (an <code>.mpd</code> or <code>.m3u8</code>). Paste the URL and pause — the panel probes it and fills in qualities, audio tracks and any DRM KIDs by itself. Use the refresh button inside the URL field to force a fresh probe.</li>
                   <li>Press <b>Start</b>, then <b>Copy output URL</b> and open it in VLC / a browser / an IPTV player.</li>
                 </ol>
                 <p class="help-note">A <code>.mpd</code> stream must be <b>started</b> before its URL answers — the engine has to fetch and decrypt a few segments first. Until it's ready, <code>/play</code> returns <code>503</code> with a Retry-After and players retry on their own.</p>

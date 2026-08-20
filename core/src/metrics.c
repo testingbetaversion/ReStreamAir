@@ -20,21 +20,26 @@ static int64_t current_time_ms(void) {
 #endif
 }
 
+typedef struct rs_byte_sample rs_byte_sample;
+
 typedef struct rs_conn_info {
     char *stream_id;
     char *identity;
     char *client_ip;
     char *user_agent;
     int64_t last_seen_ms;
+    int64_t first_seen_ms;
+    int64_t total_bytes;
+    rs_byte_sample *recent_bytes;
     int error_count;
     struct rs_conn_info *next;
 } rs_conn_info;
 
-typedef struct rs_byte_sample {
+struct rs_byte_sample {
     int64_t ts_ms;
     int bytes;
     struct rs_byte_sample *next;
-} rs_byte_sample;
+};
 
 typedef struct rs_stream_stats {
     char *stream_id;
@@ -70,6 +75,7 @@ void rs_metrics_destroy(rs_metrics *m) {
         rs_free(c->identity);
         rs_free(c->client_ip);
         rs_free(c->user_agent);
+        free_samples(c->recent_bytes);
         free(c);
         c = next;
     }
@@ -97,24 +103,26 @@ static rs_stream_stats* get_or_create_stream(rs_metrics *m, const char *stream_i
     return s;
 }
 
-// Keyed by (stream_id, identity), not identity alone: an identity defaults to
+// Keyed by (stream_id, identity, client IP), not identity alone: an identity defaults to
 // the client IP when no playback key is configured, so the same viewer
 // switching between two streams (or two tabs watching two streams at once)
-// must not collapse into one connection record — that left rs_metrics_
-// active_clients() reporting the viewer against whichever stream they were
-// first seen on, and the monitor never showing them against a stream they
-// switched to.
-static rs_conn_info* get_or_create_conn(rs_metrics *m, const char *stream_id, const char *identity) {
+// must not collapse into one connection record. The IP is also part of the key
+// because one API key can legitimately be shared by several TVs/players.
+// Collapsing those would hide connections and make per-client bandwidth wrong.
+static rs_conn_info* get_or_create_conn(rs_metrics *m, const char *stream_id, const char *identity,
+                                        const char *client_ip) {
     rs_conn_info *c = m->conns;
     while (c) {
-        if (strcmp(c->stream_id, stream_id) == 0 && strcmp(c->identity, identity) == 0) return c;
+        if (strcmp(c->stream_id, stream_id) == 0 && strcmp(c->identity, identity) == 0 &&
+            strcmp(c->client_ip, client_ip ? client_ip : "") == 0) return c;
         c = c->next;
     }
     c = calloc(1, sizeof(rs_conn_info));
     c->stream_id = rs_strdup(stream_id);
     c->identity = rs_strdup(identity);
-    c->client_ip = rs_strdup("");
+    c->client_ip = rs_strdup(client_ip ? client_ip : "");
     c->user_agent = rs_strdup("");
+    c->first_seen_ms = current_time_ms();
     c->next = m->conns;
     m->conns = c;
     return c;
@@ -134,8 +142,16 @@ void rs_metrics_record(rs_metrics *m, const char *stream_id, const char *identit
     sample->next = s->recent_bytes;
     s->recent_bytes = sample;
 
-    rs_conn_info *c = get_or_create_conn(m, stream_id, identity);
+    rs_conn_info *c = get_or_create_conn(m, stream_id, identity, client_ip);
     c->last_seen_ms = now;
+    c->total_bytes += bytes;
+    rs_byte_sample *client_sample = calloc(1, sizeof(rs_byte_sample));
+    if (client_sample) {
+        client_sample->ts_ms = now;
+        client_sample->bytes = bytes;
+        client_sample->next = c->recent_bytes;
+        c->recent_bytes = client_sample;
+    }
     if (client_ip && client_ip[0]) {
         rs_free(c->client_ip);
         c->client_ip = rs_strdup(client_ip);
@@ -175,8 +191,15 @@ void rs_metrics_prune(rs_metrics *m) {
             rs_free(c->identity);
             rs_free(c->client_ip);
             rs_free(c->user_agent);
+            free_samples(c->recent_bytes);
             free(c);
         } else {
+            rs_byte_sample **sp = &c->recent_bytes;
+            while (*sp) {
+                rs_byte_sample *sample = *sp;
+                if (sample->ts_ms < rate_cutoff) { *sp = sample->next; free(sample); }
+                else sp = &sample->next;
+            }
             cp = &c->next;
         }
     }
@@ -244,4 +267,20 @@ int64_t rs_metrics_total_bytes(const rs_metrics *m, const char *stream_id) {
         s = s->next;
     }
     return 0;
+}
+
+void rs_metrics_each_connection(const rs_metrics *m, rs_metrics_connection_fn fn, void *ctx) {
+    if (!m || !fn) return;
+    int64_t now = current_time_ms();
+    int64_t activity_cutoff = now - 45000;
+    int64_t rate_cutoff = now - 10000;
+    for (const rs_conn_info *c = m->conns; c; c = c->next) {
+        if (c->last_seen_ms < activity_cutoff) continue;
+        long long recent = 0;
+        for (const rs_byte_sample *sample = c->recent_bytes; sample; sample = sample->next)
+            if (sample->ts_ms >= rate_cutoff) recent += sample->bytes;
+        fn(ctx, c->stream_id, c->identity, c->client_ip, c->user_agent,
+           (now - c->first_seen_ms) / 1000, c->error_count,
+           (double)recent / 10.0, c->total_bytes);
+    }
 }

@@ -84,7 +84,7 @@ Whatever the pipeline, players always use one URL: `/play/<id>/index.m3u8`.
 
 Seven views in one top bar: **Providers**, **All Streams**, **Server**, **Logs**, **API Keys**, **Settings**, **Help**. There's no refresh button — everything streams live.
 
-Every view has its own address — `/providers`, `/streams`, `/server`, `/logs`, `/keys`, `/settings`, `/help` — so back/forward, reload and bookmarks all work. The two views that carry context put it in the query string (`/streams?provider=<id>`, `/logs?stream=<id>`), so a deep link lands pre-filtered exactly the way the in-app shortcuts do. Both servers serve `index.html` for that fixed list of paths and nothing else: a mistyped asset or API path still gets a `404` rather than being quietly answered with the panel's HTML.
+Every view has its own address — `/providers`, `/streams`, `/server`, `/monitoring`, `/logs`, `/keys`, `/settings`, `/help` — so back/forward, reload and bookmarks all work. The two views that carry context put it in the query string (`/streams?provider=<id>`, `/logs?stream=<id>`), so a deep link lands pre-filtered exactly the way the in-app shortcuts do. Both servers serve `index.html` for that fixed list of paths and nothing else: a mistyped asset or API path still gets a `404` rather than being quietly answered with the panel's HTML.
 
 ### Accounts and access
 
@@ -102,7 +102,7 @@ Passwords are hashed with PBKDF2-HMAC-SHA256 (100k iterations), identically on e
 
 ### Stream editor
 
-No Detect button and no type dropdown — paste a source URL and the panel probes it as soon as you pause typing. It sniffs DASH vs HLS (using the same parsers the live engine does, not a second implementation), lists every video quality and audio track, and fetches DASH init segments to report any CENC KID it finds — pre-filling **Decryption keys** with `KID:0000…` placeholders so you only paste the real key. Probing uses your configured proxy and **Manifest headers**, so a manifest that needs auth is probed with it.
+Paste a source URL and the panel probes it as soon as you pause typing. The small refresh button at the right edge forces a new probe whenever an expiring URL or changing manifest needs to be enumerated again. It sniffs DASH vs HLS (using the same parsers the live engine does, not a second implementation), lists every video quality and audio track, and fetches DASH init segments to report any CENC KID it finds — pre-filling **Decryption keys** with `KID:0000…` placeholders so you only paste the real key. Probing uses your configured proxy and **Manifest headers**, so a manifest that needs auth is probed with it.
 
 **DASH options**
 
@@ -119,7 +119,7 @@ No Detect button and no type dropdown — paste a source URL and the panel probe
 | **Audio delay (ms)** | Lip-sync offset, positive or negative. Applied by rewriting each audio segment's `tfdt` baseMediaDecodeTime through its `mdhd` timescale — a standards-correct timestamp shift, not a re-encode. |
 | **EPG channel id** | Exported as `tvg-id` in the M3U, which is how an external player binds guide data to this channel. Blank uses the stream id. |
 | **Allow offline/static MPD** | Static (`type="static"`) manifests are rejected unless this is ticked. |
-| **Reduce manifest polling** | On by default. A video+audio stream otherwise makes three concurrent manifest fetches (director plus two pollers); this backs the director off from a 15s to a 300s re-read once the renditions are known, taking steady-state concurrency to 2. Turn it off only if you want the director watching for rendition changes continuously; leave it on against origins that cap concurrent sessions or answer `429`/`403`. |
+| **Reduce manifest polling** | Off by default. Enable it for an origin that caps concurrent sessions or answers `429`/`403`; it backs the director off from a 15s to a 300s re-read once renditions are known. |
 
 **Multi-quality** — every track is selected by default. Select more than one and the stream serves an HLS master playlist, one worker per representation. Each variant gets a distinct `BANDWIDTH`, real when detected and a placeholder otherwise, since some clients collapse identical-bandwidth entries into one.
 
@@ -231,7 +231,7 @@ The **Server** view is the landing page, pushed over Server-Sent Events at `/api
 - **Input / output bandwidth** — bytes pulled from sources vs served to viewers, global and per stream, current and all-time, persisted across restarts.
 - **Active clients per stream** — distinct clients (by API key, else IP) in the last ~30–60s, counted per stream, so one viewer moving between two streams is counted against the one they're actually watching.
 - **Server specs** — CPU model and cores, load average, live CPU/memory/disk/uptime, and all-time peaks.
-- **Active connections** — one row per playback connection: stream, provider, type, user, IP, user agent, uptime, errors and live bandwidth. Searchable.
+- **Monitoring tab / active connections** — one row per playback connection: stream, provider, client identity, IP, user agent, uptime, errors and live per-client bandwidth. Searchable. Host CPU, memory, disk, uptime and build information live separately on the **Server** tab.
 
 The **Logs** view shows structured events from each running worker, newest first. It polls `/api/logs` every 2s **only while open**. Toggle Normal/Verbose for the raw JSON, filter by stream, level, or run date, and jump straight to a stream's logs from the icon on its card. Per-stream **Clear** hides everything logged for that stream up to now while leaving new activity visible.
 
@@ -339,7 +339,7 @@ That split is load-bearing rather than tidy: because the fetch, DASH and probe h
 
 - **Auth** — create an account, sign in, sign out, with roles, session persistence across restarts and login throttling. What is stored is the SHA-256 of the session token, never the token itself: `state.json` is a file an operator copies around, and a bearer token in it would be a spare key to the panel.
 - **Full management** — create, edit and delete providers, streams, users and API keys.
-- **Live monitoring** — the Server view's `/api/events` SSE stream with real host stats, bandwidth and per-stream viewer counts.
+- **Live monitoring** — the Monitoring view's `/api/events` SSE stream with bandwidth, per-stream viewer counts, and per-client/IP rates; host stats have their own Server view.
 - **Source auto-detect** — `/api/probe` fetches a DASH/HLS source and lists its qualities, audio tracks and any DRM KIDs, so the stream editor's paste-to-detect works.
 - **Live DASH playback** — the background engine below, with ClearKey CENC decryption, the multi-quality master playlist and the audio-delay `tfdt` shift.
 - **HLS passthrough** — playlist rewriting, segment proxying, AES-128 decryption.
@@ -374,7 +374,7 @@ Some details that matter in practice:
 - **Timeouts are sized for bytes, not seconds.** A segment's whole-request timeout is 10× its media duration, floored at 20s and capped at 30s. Duration says nothing about how many bytes have to move: on one production proxy a 2s video segment is ~745 KB and needs about twelve and a half seconds at the ~60 KB/s a single connection gets there, so a duration-derived timeout killed every video segment fractionally short while the 25 KB audio segments beside it cleared the same bar trivially. There is deliberately **no low-speed abort** — libcurl's low-speed clock runs while waiting for the first byte, and time-to-first-byte on these paths is routinely several seconds, so it killed requests that were about to succeed, including the init segment that carries the timescale and the decryption key.
 - **Connections are one budget per stream, with a floor for each rendition.** `parallelDownloads` (default 6, capped at 8) is shared by video and audio rather than allowed to each. Per-connection rate on a proxied path is roughly fixed, so aggregate throughput is very nearly a function of how many connections are open — a 3 Mbps rendition wanting ~370 KB/s is six connections at that rate and simply unobtainable from two. Each rendition reserves a slot only for the *other* renditions that actually have work waiting, and may use everything else: audio can't be shut out by video's much deeper queue, and isn't held down to one connection when video is idle. Note that this is the engine's budget — the stream's own `parallelDownloads` still caps it.
 - **Blocking calls run on worker threads.** Probe, logo lookup, script actions and HLS passthrough fetches all hand off to a worker and return through `mg_wakeup()`; a cold or geo-blocked stream answers `503` + `Retry-After` immediately rather than making every other stream wait.
-- **Reduce manifest polling** (`reducedManifestPolling`, on by default) backs the director off from a 15s to a 300s re-read once renditions are known. Normally a single video+audio stream makes three concurrent manifest fetches — director plus two workers — and some tokens cap concurrent sessions low enough that this overlap alone trips the limit. With it on, steady-state concurrency is 2.
+- **Reduce manifest polling** (`reducedManifestPolling`, off by default) backs the director off from a 15s to a 300s re-read once renditions are known. Enable it when a token caps concurrent sessions low enough that the director plus rendition workers trip the limit.
 
 ### Testing
 
@@ -458,7 +458,7 @@ Installs still using the old `data/` + `public/runtime/` layout are migrated aut
 
 **The origin returns 403 and it isn't obvious why.** The error line now carries the origin's own response body when it sent text back; concurrent-stream limits in particular usually say so explicitly.
 
-**A concurrent-stream limit trips with only one stream running.** A video+audio stream normally makes three concurrent manifest fetches. Tick **Reduce manifest polling** in the stream's DASH options — on by default — to drop it to two.
+**A concurrent-stream limit trips with only one stream running.** A video+audio stream normally makes three concurrent manifest fetches. Tick **Reduce manifest polling** in the stream's DASH options to drop it to two.
 
 **Video plays but audio drifts.** Set **Audio delay (ms)** — positive or negative — in the stream's DASH options.
 

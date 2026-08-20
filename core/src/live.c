@@ -493,6 +493,8 @@ typedef struct live_stream {
 
     // Config, replaced wholesale by rs_live_start. Guarded by `mu`.
     char *mpd_url, *representation;
+    rs_live_representation *representations;
+    size_t representation_count;
     // [primary] + cdnUrls. `source` is the one currently in use; it advances
     // when a manifest poll exhausts its retries, and stays there — a mirror
     // that answers is as good as the primary, and flapping back to a source
@@ -545,6 +547,8 @@ typedef struct {
     char *manifest_headers, *media_headers;
     char *downloader, *dl_params, *keys;
     char *segment_url_params;
+    rs_live_representation *representations;
+    size_t representation_count;
     int inherit_url_params;
     int reduced_manifest_polling;
     int playlist_segments, keep_segments, download_ahead;
@@ -559,6 +563,11 @@ static void cfg_snap_dispose(cfg_snap *c) {
     free(c->manifest_headers); free(c->media_headers);
     free(c->downloader); free(c->dl_params); free(c->keys);
     free(c->segment_url_params);
+    for (size_t i = 0; i < c->representation_count; i++) {
+        free((char *)c->representations[i].id); free((char *)c->representations[i].type);
+        free((char *)c->representations[i].codecs); free((char *)c->representations[i].language);
+    }
+    free(c->representations);
     for (size_t i = 0; i < c->nsources; i++) free(c->sources[i]);
     free(c->sources);
     memset(c, 0, sizeof(*c));
@@ -586,6 +595,17 @@ static void cfg_snapshot_locked(const live_stream *st, cfg_snap *out) {
     out->dl_params = rs_strdup(st->dl_params ? st->dl_params : "");
     out->keys = rs_strdup(st->keys ? st->keys : "");
     out->segment_url_params = rs_strdup(st->segment_url_params ? st->segment_url_params : "");
+    out->representations = (rs_live_representation *)calloc(st->representation_count, sizeof(*out->representations));
+    if (out->representations) {
+        out->representation_count = st->representation_count;
+        for (size_t i = 0; i < st->representation_count; i++) {
+            out->representations[i] = st->representations[i];
+            out->representations[i].id = rs_strdup(st->representations[i].id);
+            out->representations[i].type = rs_strdup(st->representations[i].type);
+            out->representations[i].codecs = rs_strdup(st->representations[i].codecs);
+            out->representations[i].language = rs_strdup(st->representations[i].language);
+        }
+    }
     out->inherit_url_params = st->inherit_url_params;
     out->reduced_manifest_polling = st->reduced_manifest_polling;
     out->playlist_segments = st->playlist_segments;
@@ -2189,6 +2209,18 @@ static void *director_main(void *arg) {
         const char *aid = have_audio ? rs_json_obj_str(audio, "id", "") : "";
         const char *acodecs = have_audio ? rs_json_obj_str(audio, "codecs", "") : "";
         const char *alang = have_audio ? rs_json_obj_str(audio, "lang", "") : "";
+        const rs_live_representation *video_choices[RS_LIVE_MAX_REPS];
+        size_t video_choice_count = 0;
+        for (size_t i = 0; i < cfg.representation_count; i++) {
+            const rs_live_representation *choice = &cfg.representations[i];
+            if (!choice->id || !choice->id[0]) continue;
+            if (choice->type && strcmp(choice->type, "audio") == 0) {
+                if (have_audio) { aid = choice->id; acodecs = choice->codecs; alang = choice->language; }
+            } else if (!choice->type || strcmp(choice->type, "video") == 0) {
+                if (video_choice_count < RS_LIVE_MAX_REPS) video_choices[video_choice_count++] = choice;
+            }
+        }
+        if (video_choice_count > 0) vid = video_choices[0]->id;
         if (aid[0] && vid[0] && strcmp(aid, vid) == 0) { aid = ""; acodecs = ""; have_audio = false; }
         const char *tid = have_text ? rs_json_obj_str(text, "id", "") : "";
         const char *tlang = have_text ? rs_json_obj_str(text, "lang", "") : "";
@@ -2245,24 +2277,32 @@ static void *director_main(void *arg) {
             sb_addf(&b, ",AUTOSELECT=YES,INSTREAM-ID=\"%s\"\n", iid);
         }
 
-        sb_addf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%lld", vbw > 0 ? vbw : 3000000);
-        if (vcodecs[0] && acodecs[0]) sb_addf(&b, ",CODECS=\"%s,%s\"", vcodecs, acodecs);
-        else if (vcodecs[0]) sb_addf(&b, ",CODECS=\"%s\"", vcodecs);
-        if (have_audio && aid[0]) sb_add(&b, ",AUDIO=\"aud\"");
-        if (have_text && tid[0]) sb_add(&b, ",SUBTITLES=\"subs\"");
-        // RFC 8216 4.3.4.2: the attribute must be NONE when there are no
-        // in-band captions, or a player is entitled to go looking for them
-        // anyway — which some do, on every segment, for nothing.
-        sb_add(&b, ncc > 0 ? ",CLOSED-CAPTIONS=\"cc\"" : ",CLOSED-CAPTIONS=NONE");
-        char *venc = qenc(vid);
-        sb_addf(&b, "\n/play/%s/index.m3u8?rep=%s&mtype=video\n", st->id, venc ? venc : "");
-        free(venc);
+        size_t variants = video_choice_count ? video_choice_count : 1;
+        for (size_t i = 0; i < variants; i++) {
+            const rs_live_representation *choice = video_choice_count ? video_choices[i] : NULL;
+            const char *variant_id = choice ? choice->id : vid;
+            const char *variant_codecs = choice && choice->codecs ? choice->codecs : vcodecs;
+            long long variant_bw = choice && choice->bandwidth > 0 ? choice->bandwidth : vbw;
+            sb_addf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%lld", variant_bw > 0 ? variant_bw : 3000000 + (long long)i);
+            if (choice && choice->width > 0 && choice->height > 0)
+                sb_addf(&b, ",RESOLUTION=%dx%d", choice->width, choice->height);
+            if (variant_codecs[0] && acodecs[0]) sb_addf(&b, ",CODECS=\"%s,%s\"", variant_codecs, acodecs);
+            else if (variant_codecs[0]) sb_addf(&b, ",CODECS=\"%s\"", variant_codecs);
+            if (have_audio && aid[0]) sb_add(&b, ",AUDIO=\"aud\"");
+            if (have_text && tid[0]) sb_add(&b, ",SUBTITLES=\"subs\"");
+            sb_add(&b, ncc > 0 ? ",CLOSED-CAPTIONS=\"cc\"" : ",CLOSED-CAPTIONS=NONE");
+            char *venc = qenc(variant_id);
+            sb_addf(&b, "\n/play/%s/index.m3u8?rep=%s&mtype=video\n", st->id, venc ? venc : "");
+            free(venc);
+        }
 
         pthread_mutex_lock(&st->mu);
         bool first = st->master == NULL;
         free(st->master);
         st->master = b.p;  // ownership moves to the stream
-        rep_ensure_locked(st, vid, "video");
+        if (video_choice_count) {
+            for (size_t i = 0; i < video_choice_count; i++) rep_ensure_locked(st, video_choices[i]->id, "video");
+        } else rep_ensure_locked(st, vid, "video");
         if (have_audio && aid[0]) rep_ensure_locked(st, aid, "audio");
         if (have_text && tid[0]) rep_ensure_locked(st, tid, "text");
         pthread_cond_broadcast(&st->cv);
@@ -2270,8 +2310,9 @@ static void *director_main(void *arg) {
 
         if (first)
             lgf(st, "info", "renditions", cfg.mpd_url, 0, -1,
-                "%s MPD — video \"%s\"%s%s%s%s%s%s%s, master playlist ready",
-                dynamic ? "dynamic" : "static", vid,
+                "%s MPD — %lu video %s (first \"%s\")%s%s%s%s%s%s%s, master playlist ready",
+                dynamic ? "dynamic" : "static",
+                (unsigned long)variants, variants == 1 ? "quality" : "qualities", vid,
                 (have_audio && aid[0]) ? ", audio \"" : "",
                 (have_audio && aid[0]) ? aid : "",
                 (have_audio && aid[0]) ? "\"" : "",
@@ -2323,6 +2364,11 @@ static void rep_dispose(live_rep *rep) {
 static void stream_dispose(live_stream *st) {
     for (size_t i = 0; i < st->nreps; i++) rep_dispose(st->reps[i]);
     free(st->id);
+    for (size_t i = 0; i < st->representation_count; i++) {
+        free((char *)st->representations[i].id); free((char *)st->representations[i].type);
+        free((char *)st->representations[i].codecs); free((char *)st->representations[i].language);
+    }
+    free(st->representations);
     free(st->mpd_url); free(st->representation);
     free(st->manifest_proxy); free(st->media_proxy);
     free(st->manifest_headers); free(st->media_headers);
@@ -2370,6 +2416,21 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     SET(keys, cfg->decryption_keys);
     SET(segment_url_params, cfg->segment_url_params);
 #undef SET
+
+    for (size_t i = 0; i < st->representation_count; i++) {
+        free((char *)st->representations[i].id); free((char *)st->representations[i].type);
+        free((char *)st->representations[i].codecs); free((char *)st->representations[i].language);
+    }
+    free(st->representations);
+    st->representations = (rs_live_representation *)calloc(cfg->representation_count, sizeof(*st->representations));
+    st->representation_count = st->representations ? cfg->representation_count : 0;
+    for (size_t i = 0; i < st->representation_count; i++) {
+        st->representations[i] = cfg->representations[i];
+        st->representations[i].id = rs_strdup(cfg->representations[i].id ? cfg->representations[i].id : "");
+        st->representations[i].type = rs_strdup(cfg->representations[i].type ? cfg->representations[i].type : "video");
+        st->representations[i].codecs = rs_strdup(cfg->representations[i].codecs ? cfg->representations[i].codecs : "");
+        st->representations[i].language = rs_strdup(cfg->representations[i].language ? cfg->representations[i].language : "");
+    }
 
     // Rebuild the source list: primary first, then the mirrors. A config edit
     // resets the cursor to the primary, since the operator changing the sources

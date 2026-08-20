@@ -26,6 +26,7 @@
 #include "rs_live.h"
 #include "rs_m3u8.h"
 #include "rs_mpegts.h"
+#include "rs_metrics.h"
 #include "rs_netmatch.h"
 #include "rs_panel.h"
 #include "rs_state.h"
@@ -37,6 +38,17 @@
 
 static int checks_run = 0;
 static int failures = 0;
+
+typedef struct { int count; long long total; bool saw_ip1; bool saw_ip2; } metrics_capture;
+static void capture_connection(void *opaque, const char *stream_id, const char *identity,
+                               const char *client_ip, const char *user_agent,
+                               long long uptime, int errors, double bps, int64_t total) {
+    (void)stream_id; (void)identity; (void)user_agent; (void)uptime; (void)errors; (void)bps;
+    metrics_capture *c = (metrics_capture *)opaque;
+    c->count++; c->total += total;
+    if (strcmp(client_ip, "10.0.0.1") == 0) c->saw_ip1 = true;
+    if (strcmp(client_ip, "10.0.0.2") == 0) c->saw_ip2 = true;
+}
 
 static void fail(const char *name, const char *detail) {
     failures++;
@@ -56,6 +68,18 @@ static void check_str(const char *name, const char *actual, const char *expected
         fprintf(stderr, "FAIL %s\n     expected: %s\n     actual:   %s\n",
                 name, expected, actual ? actual : "(null)");
     }
+}
+
+static void test_metrics_connections(void) {
+    rs_metrics *m = rs_metrics_create();
+    rs_metrics_record(m, "stream-a", "shared-key", "10.0.0.1", "Player A", 1000);
+    rs_metrics_record(m, "stream-a", "shared-key", "10.0.0.2", "Player B", 2000);
+    metrics_capture capture = {0};
+    rs_metrics_each_connection(m, capture_connection, &capture);
+    check("metrics/shared-key-keeps-distinct-ips", capture.count == 2 && capture.saw_ip1 && capture.saw_ip2);
+    check("metrics/per-client-totals", capture.total == 3000);
+    check("metrics/stream-client-count", rs_metrics_active_clients(m, "stream-a") == 2);
+    rs_metrics_destroy(m);
 }
 
 // --- hex helpers ------------------------------------------------------------
@@ -1782,6 +1806,7 @@ int main(void) {
     test_panel();
     test_cenc_multifragment();
     test_mpegts();
+    test_metrics_connections();
     test_live_window();
     test_live_lag_level();
     test_live_catch_up();

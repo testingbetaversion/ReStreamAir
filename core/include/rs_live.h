@@ -63,6 +63,16 @@ extern "C" {
 
 typedef struct rs_live rs_live;
 
+typedef struct {
+    const char *id;
+    const char *type;
+    const char *codecs;
+    const char *language;
+    long long bandwidth;
+    int width;
+    int height;
+} rs_live_representation;
+
 // Same signature as restream_fetch_fn / restream_dash_fn (see restream.h). The
 // engine holds the pointers rather than the implementations so the core never
 // links libcurl or libxml2.
@@ -98,6 +108,8 @@ typedef struct {
     const char *const *cdn_urls;
     size_t cdn_url_count;
     const char *representation;     // "" = auto-select video + audio renditions
+    const rs_live_representation *representations;
+    size_t representation_count;
     const char *manifest_proxy;
     const char *media_proxy;
     const char *manifest_headers;   // newline-separated "Name: value"

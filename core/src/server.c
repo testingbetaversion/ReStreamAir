@@ -86,6 +86,7 @@ struct restream_server {
     rs_pending_job *pending_head; // in-flight async jobs (playback fetches, probe, logo lookup, script actions)
     pthread_mutex_t pending_mu;     // guards pending_head and each entry's `cancelled` flag
     pthread_cond_t pending_cv;      // signalled whenever a job unlinks itself; wakes restream_server_destroy's drain
+    bool ffmpeg_install_running;    // guarded by pending_mu; installer thread holds the server alive
     pthread_mutex_t logo_mu;        // serialises RS_PENDING_LOGO workers' access to logo_cache (not itself thread-safe)
     uint16_t listen_port;   // the port actually bound, which is what /api/state must report
     // A restart requested from Settings. Restarting replaces this process, so it
@@ -275,6 +276,71 @@ static void live_log_sink(void *ctx, const char *stream_id, const char *level,
                           long long bytes, const char *message) {
     log_record((restream_server_t *)ctx, stream_id, level, event, url, status, bytes, message);
 }
+
+typedef struct { restream_server_t *server; char *command; } ffmpeg_install_job;
+
+#ifndef _WIN32
+static void *ffmpeg_install_worker(void *opaque) {
+    ffmpeg_install_job *job = (ffmpeg_install_job *)opaque;
+    log_record(job->server, "ffmpeg-install", "info", "installStart", NULL, 0, -1,
+               "Installing the full FFmpeg package and development libraries…");
+    FILE *pipe = popen(job->command, "r");
+    int status = -1;
+    if (!pipe) {
+        log_record(job->server, "ffmpeg-install", "error", "installOutput", NULL, 0, -1,
+                   "Could not start the package manager.");
+    } else {
+        char line[768];
+        while (fgets(line, sizeof(line), pipe)) {
+            size_t len = strlen(line);
+            while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+            if (len) log_record(job->server, "ffmpeg-install", "info", "installOutput", NULL, 0, -1, line);
+        }
+        status = pclose(pipe);
+    }
+    char message[160];
+    if (status == 0) snprintf(message, sizeof(message), "FFmpeg installation completed successfully.");
+    else snprintf(message, sizeof(message), "FFmpeg installation exited with status %d.", status);
+    log_record(job->server, "ffmpeg-install", status == 0 ? "info" : "error",
+               "installExit", NULL, status, -1, message);
+    pthread_mutex_lock(&job->server->pending_mu);
+    job->server->ffmpeg_install_running = false;
+    pthread_cond_broadcast(&job->server->pending_cv);
+    pthread_mutex_unlock(&job->server->pending_mu);
+    free(job->command);
+    free(job);
+    return NULL;
+}
+
+static int start_ffmpeg_install(restream_server_t *server, char *command) {
+    ffmpeg_install_job *job = (ffmpeg_install_job *)calloc(1, sizeof(*job));
+    if (!job) { free(command); return -1; }
+    job->server = server;
+    size_t command_len = strlen(command);
+    job->command = (char *)malloc(command_len + 6);
+    if (!job->command) { free(command); free(job); return -1; }
+    snprintf(job->command, command_len + 6, "%s 2>&1", command);
+    free(command);
+    pthread_mutex_lock(&server->pending_mu);
+    if (server->ffmpeg_install_running) {
+        pthread_mutex_unlock(&server->pending_mu);
+        free(job->command); free(job);
+        return 1;
+    }
+    server->ffmpeg_install_running = true;
+    pthread_mutex_unlock(&server->pending_mu);
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, ffmpeg_install_worker, job) != 0) {
+        pthread_mutex_lock(&server->pending_mu);
+        server->ffmpeg_install_running = false;
+        pthread_mutex_unlock(&server->pending_mu);
+        free(job->command); free(job);
+        return -1;
+    }
+    pthread_detach(tid);
+    return 0;
+}
+#endif
 
 // Per-sid "cleared before" cutoff: log_clear(sid) can't compact the ring (its
 // slots are shared by every sid, addressed only by position), so a per-stream
@@ -855,9 +921,56 @@ static void handle_settings_update(restream_server_t *s, struct mg_connection *c
     reply_json(c, 200, out, NULL);
 }
 
-// Builds the metrics payload the SSE stream and the Server view consume. The
-// system stats are real; bandwidth, per-stream metrics and connections are
-// empty until the playback plane (slice 4) produces traffic.
+typedef struct { restream_server_t *server; rs_json *array; } metrics_conn_ctx;
+
+static void append_metrics_connection(void *opaque, const char *stream_id,
+                                      const char *identity, const char *client_ip,
+                                      const char *user_agent, long long uptime_seconds,
+                                      int errors, double bytes_per_second,
+                                      int64_t total_bytes) {
+    metrics_conn_ctx *ctx = (metrics_conn_ctx *)opaque;
+    const char *stream_name = stream_id, *provider_name = "";
+    const char *user = "Anonymous", *uid = "";
+    const rs_json *providers = rs_json_obj_get(ctx->server->state.root, "providers");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *provider = rs_json_arr_at(providers, i);
+        const rs_json *streams = rs_json_obj_get(provider, "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+            const rs_json *stream = rs_json_arr_at(streams, j);
+            if (strcmp(rs_json_obj_str(stream, "id", ""), stream_id) == 0) {
+                stream_name = rs_json_obj_str(stream, "name", stream_id);
+                provider_name = rs_json_obj_str(provider, "name", "");
+                i = rs_json_arr_len(providers);
+                break;
+            }
+        }
+    }
+    const rs_json *keys = rs_json_obj_get(ctx->server->state.root, "apiKeys");
+    for (size_t i = 0; i < rs_json_arr_len(keys); i++) {
+        const rs_json *key = rs_json_arr_at(keys, i);
+        if (strcmp(rs_json_obj_str(key, "key", ""), identity) == 0) {
+            user = rs_json_obj_str(key, "label", "API key");
+            uid = rs_json_obj_str(key, "id", "");
+            break;
+        }
+    }
+    rs_json *o = rs_json_new_obj();
+    rs_json_obj_set_str(o, "streamId", stream_id);
+    rs_json_obj_set_str(o, "streamName", stream_name);
+    rs_json_obj_set_str(o, "providerName", provider_name);
+    rs_json_obj_set_str(o, "kind", "playback");
+    rs_json_obj_set_str(o, "user", user);
+    rs_json_obj_set_str(o, "uid", uid);
+    rs_json_obj_set_str(o, "clientIP", client_ip);
+    rs_json_obj_set_str(o, "userAgent", user_agent);
+    rs_json_obj_set_int(o, "uptimeSeconds", uptime_seconds);
+    rs_json_obj_set_int(o, "errors", errors);
+    rs_json_obj_set_int(o, "bytesPerSecond", (long long)bytes_per_second);
+    rs_json_obj_set_int(o, "allTimeBytes", total_bytes);
+    rs_json_arr_push(ctx->array, o);
+}
+
+// Builds the metrics payload the SSE stream and the Monitoring view consume.
 static rs_json *build_metrics(restream_server_t *s) {
     rs_json *out = rs_json_new_obj();
     rs_json *streams = rs_json_new_obj();
@@ -895,7 +1008,10 @@ static rs_json *build_metrics(restream_server_t *s) {
     rs_json_obj_set(out, "globalInput", ginput);
     rs_json_obj_set(out, "system", rs_sysstats_snapshot(s->sysstats));
     rs_json_obj_set(out, "streams", streams);
-    rs_json_obj_set(out, "connections", rs_json_new_arr());
+    rs_json *connections = rs_json_new_arr();
+    metrics_conn_ctx conn_ctx = {s, connections};
+    rs_metrics_each_connection(s->metrics, append_metrics_connection, &conn_ctx);
+    rs_json_obj_set(out, "connections", connections);
     return out;
 }
 
@@ -1622,8 +1738,15 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     }
     if (mg_match(hm->uri, mg_str("/api/ffmpeg-status"), NULL) && method_is(hm, "GET")) {
         char *path = rs_ffmpeg_resolve();
+        char *install = rs_ffmpeg_install_plan();
         rs_json *o = rs_json_new_obj();
         rs_json_obj_set_str(o, "status", path ? "available" : "missing");
+        rs_json_obj_set_bool(o, "available", path != NULL);
+        // The install runs asynchronously and streams package-manager output
+        // into the Logs API; privilege failures are therefore visible rather
+        // than leaving the Settings button spinning without an explanation.
+        rs_json_obj_set_bool(o, "canAutoInstall", install != NULL);
+        rs_json_obj_set_str(o, "installCommand", install ? install : "");
         if (path) rs_json_obj_set_str(o, "path", path);
         // Presence is not capability. A build without libxml2 has no DASH
         // demuxer, so an .mpd source cannot be opened at all — a failure that
@@ -1641,6 +1764,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
             }
         }
         free(path);
+        free(install);
         reply_json(c, 200, o, NULL);
         return true;
     }
@@ -1656,6 +1780,15 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     if (mg_match(hm->uri, mg_str("/api/ffmpeg-install"), NULL) && (method_is(hm, "GET") || method_is(hm, "POST"))) {
         char *cmd_plan = rs_ffmpeg_install_plan();
         if (cmd_plan) {
+#ifndef _WIN32
+            if (method_is(hm, "POST")) {
+                int started = start_ffmpeg_install(s, cmd_plan);
+                if (started == 1) reply_error(c, 409, "An FFmpeg install is already running.");
+                else if (started != 0) reply_error(c, 500, "Could not start the FFmpeg installer.");
+                else { rs_json *o = rs_json_new_obj(); rs_json_obj_set_bool(o, "started", true); reply_json(c, 202, o, NULL); }
+                return true;
+            }
+#endif
             rs_json *o = rs_json_new_obj();
             rs_json_obj_set_str(o, "command", cmd_plan);
             reply_json(c, 200, o, NULL);
@@ -2186,7 +2319,8 @@ static void pending_job_cancel(restream_server_t *s, unsigned long conn_id) {
 // when it finishes.
 static void pending_job_wait_idle(restream_server_t *s) {
     pthread_mutex_lock(&s->pending_mu);
-    while (s->pending_head != NULL) pthread_cond_wait(&s->pending_cv, &s->pending_mu);
+    while (s->pending_head != NULL || s->ffmpeg_install_running)
+        pthread_cond_wait(&s->pending_cv, &s->pending_mu);
     pthread_mutex_unlock(&s->pending_mu);
 }
 
@@ -2612,6 +2746,27 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     cfg.cdn_urls = mirror_urls;
     cfg.cdn_url_count = mirror_used;
     cfg.representation = selected_video_rep(stream);
+    const rs_json *selected_reps = rs_json_obj_get(stream, "representations");
+    const rs_json *rep_meta = rs_json_obj_get(stream, "representationMeta");
+    size_t selected_count = rs_json_arr_len(selected_reps);
+    rs_live_representation *live_reps = selected_count
+        ? (rs_live_representation *)calloc(selected_count, sizeof(*live_reps)) : NULL;
+    size_t live_rep_count = 0;
+    for (size_t i = 0; live_reps && i < selected_count; i++) {
+        const char *id = rs_json_as_str(rs_json_arr_at(selected_reps, i), "");
+        const rs_json *meta = rs_json_obj_get(rep_meta, id);
+        if (!id[0] || !meta) continue;
+        rs_live_representation *dst = &live_reps[live_rep_count++];
+        dst->id = id;
+        dst->type = rs_json_obj_str(meta, "type", "video");
+        dst->codecs = rs_json_obj_str(meta, "codecs", "");
+        dst->language = rs_json_obj_str(meta, "language", "");
+        dst->bandwidth = rs_json_obj_int(meta, "bandwidth", 0);
+        dst->width = (int)rs_json_obj_int(meta, "width", 0);
+        dst->height = (int)rs_json_obj_int(meta, "height", 0);
+    }
+    cfg.representations = live_reps;
+    cfg.representation_count = live_rep_count;
     cfg.manifest_proxy = mproxy;
     cfg.media_proxy = dproxy;
     cfg.manifest_headers = mheaders;
@@ -2629,7 +2784,7 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     // Per-stream, off by default: some CDNs cap concurrent sessions per signed
     // token low enough that the director's own periodic re-poll (a 3rd fetch
     // alongside the video and audio workers) trips it by itself. See rs_live.h.
-    cfg.reduced_manifest_polling = rs_json_obj_bool(stream, "reducedManifestPolling", true);
+    cfg.reduced_manifest_polling = rs_json_obj_bool(stream, "reducedManifestPolling", false);
     cfg.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
     cfg.keep_segments = (int)rs_json_obj_int(stream, "keepSegments", 10);
     cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 20);
@@ -2641,6 +2796,7 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
 
     bool already = rs_live_is_running(s->live, stream_id);
     int rc = rs_live_start(s->live, stream_id, &cfg);
+    free(live_reps);
     if (rc != 0) {
         log_record(s, stream_id, "error", "liveStart", src, 0, -1,
                    "could not start the live DASH engine");
@@ -3669,7 +3825,7 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
 // step with VIEW_ROUTES in public/app.js.
 static bool is_panel_view_path(struct mg_str uri) {
     static const char *const views[] = {
-        "/providers", "/streams", "/server", "/logs", "/keys", "/settings", "/help",
+        "/providers", "/streams", "/server", "/monitoring", "/logs", "/keys", "/settings", "/help",
     };
     for (size_t i = 0; i < sizeof(views) / sizeof(views[0]); i++)
         if (mg_strcmp(uri, mg_str(views[i])) == 0) return true;
