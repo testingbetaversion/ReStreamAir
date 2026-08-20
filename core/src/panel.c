@@ -7,7 +7,7 @@
 
 #include "rs_internal.h"
 
-// The 2001 reference epoch Swift's JSONEncoder writes Date values against.
+// The 2001 reference epoch that dates in state.json are recorded against.
 #define RS_APPLE_EPOCH_OFFSET 978307200.0
 
 static double apple_epoch_now(void) {
@@ -304,7 +304,7 @@ static rs_json *stream_view(const rs_state *st, const rs_json *stream, const cha
     rs_json *direct = rs_json_new_obj();
     rs_json *download = rs_json_new_obj();
     if (strcmp(kind, "m3u8") == 0) {
-        snprintf(url, sizeof(url), "http://%s/source/%s", host, id);
+        snprintf(url, sizeof(url), "http://%s/direct/%s", host, id);
         rs_json_obj_set_str(direct, "source", url);
     } else {
         // effectiveRepresentationIds: representations if any, else the single
@@ -579,7 +579,7 @@ int rs_panel_update_stream(rs_state *st, const char *stream_id, const rs_json *b
     if (!updated) return -400;
 
     // Channel/event-import fields have no editor inputs, so carry them over from
-    // the existing stream rather than resetting them (see the Swift PUT merge).
+    // the existing stream rather than resetting them (a PUT merges, not replaces).
     static const char *carried[] = {"sourceType", "mode", "scriptVideoSelector", "scriptAudioSelector",
                                     "onDemand", "speedUp", "autostart", "scriptStart", "scriptEnd",
                                     "recordEvent"};
@@ -704,7 +704,7 @@ rs_json *rs_panel_export_provider(const rs_state *st, const char *provider_id) {
     }
     if (!found) return NULL;
 
-    // Mirrors ProviderExport/ExportedProvider in PanelServer.swift field for
+    // Mirrors the provider export envelope field for
     // field, so a file written by either server imports into the other. Ids are
     // deliberately omitted: they mean nothing on the importing install, which
     // regenerates them. The active account is carried by *name* for the same

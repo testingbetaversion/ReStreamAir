@@ -112,7 +112,7 @@ struct restream_server {
 #define RS_SSE_MARKER 'S'
 
 // The probe/fetch handlers are registered by the C++ app; the core only calls
-// through them, so libcurl/libxml2 never reach the Swift build. Declared here so
+// through them, so libcurl/libxml2 never reach a core-only build. Declared here so
 // everything below (including the logo fetcher and the live engine) can
 // reference them before their setters are defined.
 static restream_probe_fn g_probe_handler = NULL;
@@ -533,7 +533,7 @@ static void handle_auth_status(restream_server_t *s, struct mg_connection *c,
     reply_json(c, 200, out, NULL);
 }
 
-// A unix-seconds timestamp expressed the way Swift's JSONEncoder writes a Date:
+// A unix-seconds timestamp expressed the way state.json records a date:
 // seconds since the 2001 reference epoch. Keeps createdAt byte-compatible.
 static double apple_epoch_now(void) {
     return (double)time(NULL) - 978307200.0;
@@ -576,7 +576,7 @@ static void handle_auth_setup(restream_server_t *s, struct mg_connection *c,
     bool remember = body && strcmp(rs_json_as_str(rs_json_obj_get(body, "remember"), ""), "true") == 0;
     rs_json_free(body);
 
-    // Trim the username the same way the Swift handler does.
+    // Trim the username before storing or comparing it.
     if (username) {
         char *start = username;
         while (*start == ' ' || *start == '\t') start++;
@@ -1227,7 +1227,7 @@ static void serve_provider_epg(struct mg_connection *c, const char *provider_id)
         reply_error(c, 404, "No EPG stored for this provider yet — run the epg action first.");
         return;
     }
-    // The script may return XMLTV or JSON; sniff it the same way the Swift
+    // The script may return XMLTV or JSON; sniff it the same way the panel
     // handler does rather than forcing one content type on both.
     const char *type = (len > 0 && data[0] == '<') ? "application/xml; charset=utf-8"
                                                    : "application/json; charset=utf-8";
@@ -1251,7 +1251,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         handle_auth_logout(s, c, hm); return true;
     }
 
-    // Everything past here needs a signed-in account, same as the Swift panel.
+    // Everything past here needs a signed-in account.
     char *user = current_user(s, hm);
     if (!user) { reply_error(c, 401, "Not signed in."); return true; }
 
@@ -1345,8 +1345,8 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
 
     if (mg_match(hm->uri, mg_str("/api/probe"), NULL) && method_is(hm, "POST")) {
         if (!g_probe_handler) {
-            reply_error(c, 501, "Source auto-detect isn't in the C server build. "
-                                "Add a representation manually, or use the Swift binary.");
+            reply_error(c, 501, "Source auto-detect isn't available in this build "
+                                "(it needs libcurl and libxml2). Add a representation manually.");
             return true;
         }
         rs_json *body = parse_body(hm);
@@ -1465,7 +1465,16 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         char *id = capture(hm, "/api/streams/*/start");
         char *ip = client_ip(s, c, hm);
         const char *err = NULL;
-        int rc = rs_panel_set_stream_running(&s->state, id, true, &err);
+        const rs_json *before = rs_panel_find_stream(&s->state, id);
+        const char *input = before ? rs_json_obj_str(before, "inputMode", "internal") : "internal";
+        const char *output = before ? rs_json_obj_str(before, "outputMode", "hls") : "hls";
+        int rc;
+        if (before && (strcmp(input, "internal") != 0 || strcmp(output, "hls") != 0)) {
+            err = "This C server currently supports only Internal remuxer → HLS/Direct. Choose that pipeline before starting.";
+            rc = -400;
+        } else {
+            rc = rs_panel_set_stream_running(&s->state, id, true, &err);
+        }
         if (rc == 0) {
             const rs_json *stream = rs_panel_find_stream(&s->state, id);
             const char *name = stream ? rs_json_obj_str(stream, "name", "") : "";
@@ -1861,30 +1870,73 @@ static void proxy_filename(const char *abs_uri, rs_m3u8_line_kind kind, char *ou
     snprintf(out, outlen, "seg.ts");
 }
 
+typedef struct {
+    const char *stream_id;
+    const char *playback_key;
+} playlist_route_ctx;
+
 static char *media_transform(void *ud, const char *abs_uri, rs_m3u8_line_kind kind, int64_t seq) {
-    (void)seq;
-    const char *stream_id = (const char *)ud;
+    const playlist_route_ctx *ctx = (const playlist_route_ctx *)ud;
+    const char *stream_id = ctx->stream_id;
     const char *kindstr = kind == RS_M3U8_LINE_KEY ? "key" : (kind == RS_M3U8_LINE_MAP ? "map" : "segment");
     char fname[16];
     proxy_filename(abs_uri, kind, fname, sizeof(fname));
     char *enc = query_encode(abs_uri);
-    if (!enc) return NULL;
-    size_t need = strlen(stream_id) + strlen(enc) + strlen(fname) + 64;
+    char *key = (ctx->playback_key && ctx->playback_key[0]) ? query_encode(ctx->playback_key) : NULL;
+    if (!enc) { free(key); return NULL; }
+    size_t need = strlen(stream_id) + strlen(enc) + strlen(fname) + (key ? strlen(key) : 0) + 96;
     char *out = (char *)malloc(need);
-    if (out) snprintf(out, need, "/restream/%s/%s?u=%s&kind=%s", stream_id, fname, enc, kindstr);
+    if (out) {
+        snprintf(out, need, "/restream/%s/%s?u=%s&kind=%s", stream_id, fname, enc, kindstr);
+        if (seq >= 0) snprintf(out + strlen(out), need - strlen(out), "&seq=%lld", (long long)seq);
+        if (key) snprintf(out + strlen(out), need - strlen(out), "&key=%s", key);
+    }
     free(enc);
+    free(key);
     return out;
 }
 
 static char *master_transform(void *ud, const char *abs_uri) {
-    const char *stream_id = (const char *)ud;
+    const playlist_route_ctx *ctx = (const playlist_route_ctx *)ud;
+    const char *stream_id = ctx->stream_id;
     char *enc = query_encode(abs_uri);
-    if (!enc) return NULL;
-    size_t need = strlen(stream_id) + strlen(enc) + 48;
+    char *key = (ctx->playback_key && ctx->playback_key[0]) ? query_encode(ctx->playback_key) : NULL;
+    if (!enc) { free(key); return NULL; }
+    size_t need = strlen(stream_id) + strlen(enc) + (key ? strlen(key) : 0) + 64;
     char *out = (char *)malloc(need);
-    if (out) snprintf(out, need, "/play/%s/index.m3u8?variant=%s", stream_id, enc);
+    if (out) snprintf(out, need, "/play/%s/index.m3u8?variant=%s%s%s", stream_id, enc,
+                      key ? "&key=" : "", key ? key : "");
     free(enc);
+    free(key);
     return out;
+}
+
+// The DASH engine renders request-independent playlists in the background.
+// Playback authentication is request-specific, so add the accepted credential
+// to every protected child URL as the playlist leaves the server.
+static char *playlist_with_playback_key(const char *playlist, const char *playback_key_value) {
+    if (!playlist) return NULL;
+    if (!playback_key_value || !playback_key_value[0]) return rs_strdup(playlist);
+    char *key = query_encode(playback_key_value);
+    if (!key) return NULL;
+
+    rs_buf out = RS_BUF_INIT;
+    const char *p = playlist;
+    while (*p) {
+        bool local = strncmp(p, "/play/", 6) == 0 || strncmp(p, "/restream/", 10) == 0;
+        if (!local) {
+            rs_buf_append_char(&out, *p++);
+            continue;
+        }
+        const char *end = p;
+        while (*end && *end != '"' && *end != '\r' && *end != '\n') end++;
+        rs_buf_append(&out, p, (size_t)(end - p));
+        rs_buf_append_str(&out, memchr(p, '?', (size_t)(end - p)) ? "&key=" : "?key=");
+        rs_buf_append_str(&out, key);
+        p = end;
+    }
+    free(key);
+    return rs_buf_take(&out);
 }
 
 static void send_redirect(struct mg_connection *c, const char *location) {
@@ -2143,14 +2195,17 @@ static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job 
         reply_error(c, 502, pf->err[0] ? pf->err : "Could not fetch the playlist.");
         return;
     }
+    playlist_route_ctx ctx = {pf->stream_id, pf->playback_key_str};
+    bool server_decrypts_hls = pf->hls_key && pf->hls_key[0] != '\0';
     char *rewritten;
     if (rs_m3u8_is_master(pf->body)) {
-        rewritten = rs_m3u8_rewrite_master(pf->body, pf->url, master_transform, (void *)pf->stream_id);
+        rewritten = rs_m3u8_rewrite_master(pf->body, pf->url, master_transform, &ctx);
     } else {
-        // The player fetches (and, if encrypted, decrypts with) the key itself,
-        // so keys are proxied through rather than dropped — server-side HLS
-        // decryption is a later increment.
-        rewritten = rs_m3u8_rewrite(pf->body, pf->url, false, media_transform, (void *)pf->stream_id);
+        // With a configured clear key the server decrypts each segment. Strip
+        // EXT-X-KEY so the player does not decrypt the clear bytes a second
+        // time; drop_key also passes the media sequence used as the implicit IV.
+        rewritten = rs_m3u8_rewrite(pf->body, pf->url, server_decrypts_hls,
+                                    media_transform, &ctx);
     }
     if (!rewritten) { reply_error(c, 500, "Out of memory rewriting the playlist."); return; }
     mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
@@ -2187,6 +2242,13 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
             status = 0; free(pf->content_range); pf->content_range = NULL;
         } else {
             log_record(server, pf->stream_id, "error", "decryptSegment", pf->url, 0, -1, "HLS decryption failed");
+            // The rewritten playlist no longer carries EXT-X-KEY, so returning
+            // the still-encrypted body as 200 would feed guaranteed garbage to
+            // the player. Fail this request explicitly instead.
+            free(body);
+            pf->body = NULL;
+            reply_error(c, 502, "HLS segment decryption failed.");
+            return;
         }
     }
 
@@ -2306,6 +2368,8 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     pf->headers = effective_headers(provider, stream, "manifestHeaders");
     pf->downloader = rs_strdup(effective_downloader(provider, stream));
     pf->downloader_params = rs_strdup(effective_downloader_params(provider, stream));
+    pf->hls_key = rs_strdup(rs_json_obj_str(stream, "hlsKey", ""));
+    pf->playback_key_str = playback_key(hm);
     free(variant);
 
     if (!pending_job_dispatch(server, c, pf)) {
@@ -2467,7 +2531,7 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     // whole segment, so a ranged fetch would corrupt it.
     pf->range = decrypt ? NULL : header_dup(hm, "Range");
     pf->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
-    pf->headers = effective_headers(provider, stream, "mediaHeaders");
+    pf->headers = effective_headers(provider, stream, is_key ? "hlsKeyHeaders" : "mediaHeaders");
     pf->downloader = rs_strdup(effective_downloader(provider, stream));
     pf->downloader_params = rs_strdup(effective_downloader_params(provider, stream));
     pf->decryption_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
@@ -2503,10 +2567,17 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     if (!s || !s->live || !stream_id || !stream_id[0]) return;
     const rs_json *stream = rs_panel_find_stream(&s->state, stream_id);
     if (!stream) return;
-    if (rs_json_obj_bool(stream, "directSource", false)) return;
-    if (strcmp(rs_json_obj_str(stream, "kind", "mpd"), "mpd") != 0) return;
-    if (strcmp(rs_json_obj_str(stream, "inputMode", "internal"), "internal") != 0) return;
-    if (strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") != 0) return;
+    bool eligible = !rs_json_obj_bool(stream, "directSource", false)
+        && strcmp(rs_json_obj_str(stream, "kind", "mpd"), "mpd") == 0
+        && strcmp(rs_json_obj_str(stream, "inputMode", "internal"), "internal") == 0
+        && strcmp(rs_json_obj_str(stream, "outputMode", "hls"), "hls") == 0
+        && strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0;
+    if (!eligible) {
+        // Editing a running stream to another pipeline must not leave the old
+        // MPD engine downloading invisibly under the previous configuration.
+        if (rs_live_is_running(s->live, stream_id)) rs_live_stop(s->live, stream_id);
+        return;
+    }
 
     const char *src = stream_source_target(stream);
     if (!src[0]) {
@@ -2552,7 +2623,7 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     // redirect target, so a segmentUrlParams typed ahead of time from the
     // configured source URL would always be empty for them (see
     // rs_dash_describe). Provider-level only — no per-stream override, same as
-    // the Swift panel's effectiveSegmentUrlParams.
+    // the panel's effective segment URL params.
     cfg.inherit_url_params = provider ? rs_json_obj_bool(provider, "inheritUrlParams", false) : false;
     cfg.segment_url_params = (!cfg.inherit_url_params && provider) ? rs_json_obj_str(provider, "segmentUrlParams", "") : "";
     // Per-stream, off by default: some CDNs cap concurrent sessions per signed
@@ -2632,11 +2703,10 @@ static void live_sync_all(restream_server_t *s) {
 // a player never gets a master whose variant playlists 404.
 static void serve_dash_master(restream_server_t *server, struct mg_connection *c,
                               struct mg_http_message *hm, const rs_json *stream) {
-    (void)hm;
     const char *stream_id = rs_json_obj_str(stream, "id", "");
     if (!server->live) {
         reply_error(c, 501, "DASH playback needs the threaded live engine, which this build "
-                            "does not have. Use the Swift binary, or an HLS (.m3u8) source.");
+                            "does not have. Use an HLS (.m3u8) source.");
         return;
     }
 
@@ -2674,12 +2744,17 @@ static void serve_dash_master(restream_server_t *server, struct mg_connection *c
         return;
     }
 
+    char *key = playback_key(hm);
+    char *routed = playlist_with_playback_key(master, key);
+    free(key);
+    rs_free(master);
+    if (!routed) { reply_error(c, 500, "Out of memory rewriting the master playlist."); return; }
     log_record(server, stream_id, "info", "master", NULL, 200,
-               (long long)strlen(master), "master playlist served");
+               (long long)strlen(routed), "master playlist served");
     mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
                           "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
-                  "%s", master);
-    rs_free(master);
+                  "%s", routed);
+    rs_free(routed);
 }
 
 // Serves one representation's media playlist. This is the hot path — a live
@@ -2687,11 +2762,10 @@ static void serve_dash_master(restream_server_t *server, struct mg_connection *c
 // the string the representation's worker already rendered.
 static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
                              struct mg_http_message *hm, const rs_json *stream, const char *rep) {
-    (void)hm;
     const char *stream_id = rs_json_obj_str(stream, "id", "");
     if (!server->live) {
         reply_error(c, 501, "DASH playback needs the threaded live engine, which this build "
-                            "does not have. Use the Swift binary, or an HLS (.m3u8) source.");
+                            "does not have. Use an HLS (.m3u8) source.");
         return;
     }
 
@@ -2707,12 +2781,17 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
         return;
     }
 
-    log_recordf(server, stream_id, "info", "playlist", NULL, 200, (long long)strlen(playlist),
+    char *key = playback_key(hm);
+    char *routed = playlist_with_playback_key(playlist, key);
+    free(key);
+    rs_free(playlist);
+    if (!routed) { reply_error(c, 500, "Out of memory rewriting the media playlist."); return; }
+    log_recordf(server, stream_id, "info", "playlist", NULL, 200, (long long)strlen(routed),
                 "%s: media playlist served", rep);
     mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
                           "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
-                  "%s", playlist);
-    rs_free(playlist);
+                  "%s", routed);
+    rs_free(routed);
 }
 
 // --- direct links -----------------------------------------------------------
@@ -3320,7 +3399,7 @@ static void serve_direct(restream_server_t *server, struct mg_connection *c,
     if (key && !key[0]) free(key);
 
     // Framed by the connection closing, not by a length — the same contract the
-    // Swift build served and the one every player that takes a raw URL expects.
+    // shape every player that takes a raw URL expects.
     mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n"
                  "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n"
                  "Connection: close\r\n\r\n");
@@ -3505,6 +3584,18 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
             reply_error(c, 404, "Stream is stopped — start it first.");
             return true;
         }
+        if (strcmp(rs_json_obj_str(stream, "kind", "mpd"), "m3u8") == 0) {
+            if (is_download) {
+                free(tail);
+                reply_error(c, 400, "Buffered MP4 download is available only for live MPD streams.");
+                return true;
+            }
+            const char *target = stream_source_target(stream);
+            if (!target[0]) { free(tail); reply_error(c, 400, "Stream has no source URL."); return true; }
+            send_redirect(c, target);
+            free(tail);
+            return true;
+        }
         if (is_download) serve_download(server, c, hm, sid, rep);
         else if (want_ts) serve_direct_ts(server, c, hm, sid);
         else serve_direct(server, c, hm, sid, rep);
@@ -3575,7 +3666,7 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
 
 // Mongoose event handler
 // The front-end router's view addresses (VIEW_ROUTES in public/app.js). Kept in
-// step with PanelServer.panelViewPaths on the Swift side.
+// step with VIEW_ROUTES in public/app.js.
 static bool is_panel_view_path(struct mg_str uri) {
     static const char *const views[] = {
         "/providers", "/streams", "/server", "/logs", "/keys", "/settings", "/help",
@@ -3654,8 +3745,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         // A recognised prefix but not a route we serve yet: honest 501, so a
         // browser gets a clean error rather than an HTML page as JSON.
         reply_error(c, 501,
-                    "This endpoint isn't implemented in the C server yet. "
-                    "Run the Swift 'restreamair' binary for full functionality.");
+                    "This endpoint isn't implemented yet.");
         return;
     }
 
@@ -3711,11 +3801,11 @@ restream_server_t* restream_server_create(void) {
 #ifndef _WIN32
     pthread_mutex_init(&server->log_mu, NULL);
 #endif
-    // The engine needs both hooks; without them (the Swift build registers
+    // The engine needs both hooks; without them (a core-only build registers
     // neither) it stays NULL and the DASH routes report that honestly instead
     // of half-working. The C++ app registers them before calling this.
     server->live = rs_live_create(g_fetch_handler, g_dash_handler, live_log_sink, server);
-    // state.json lives in the working directory, matching the Swift binary.
+    // state.json lives in the working directory.
     if (rs_state_load(&server->state, "state.json") != 0 || !server->auth || !server->sysstats || !server->metrics) {
         // A malformed state.json is fatal — better to refuse than to risk
         // overwriting it with a fresh one and losing the user's data.
@@ -3735,7 +3825,7 @@ restream_server_t* restream_server_create(void) {
         return NULL;
     }
     // Resume the sessions the previous run persisted, so a restart (or a switch
-    // between the C and Swift servers, which share state.json) leaves signed-in
+    // across a restart, since state.json carries them) leaves signed-in
     // browsers signed in.
     rs_auth_import_sessions(server->auth, rs_json_obj_get(server->state.root, "sessions"));
     log_recordf(server, "__panel__", "info", "serverStart", NULL, 0, -1,

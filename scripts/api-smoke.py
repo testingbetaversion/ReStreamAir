@@ -19,6 +19,7 @@ Standard library only, so CI needs nothing installed.
 
 import argparse
 import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import shutil
@@ -26,6 +27,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 ADMIN_USER = "admin"
@@ -130,6 +132,51 @@ class Server:
 
     def __exit__(self, *_):
         self.stop()
+
+
+class HLSOrigin:
+    """Tiny deterministic live-HLS origin for playback-route integration tests."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/master.m3u8"):
+                body = ("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\n"
+                        "media.m3u8\n").encode()
+                content_type = "application/vnd.apple.mpegurl"
+            elif self.path.startswith("/media.m3u8"):
+                body = ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:42\n"
+                        "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n"
+                        "#EXTINF:2.0,\nseg.ts\n").encode()
+                content_type = "application/vnd.apple.mpegurl"
+            elif self.path.startswith("/key.bin"):
+                body, content_type = bytes(16), "application/octet-stream"
+            elif self.path.startswith("/seg.ts"):
+                body, content_type = bytes(16), "video/mp2t"
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    def __init__(self):
+        self.port = free_port()
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self.Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
 
 
 def test_health_and_gate(client):
@@ -373,6 +420,68 @@ def test_provider_routes(client):
     return provider
 
 
+def test_hls_playback_routes(client, origin):
+    print("live HLS playback routing")
+    status, body, _ = client.json("POST", "/api/providers", body={"name": "Playback Test"})
+    provider = next((p for p in body.get("providers", []) if p["name"] == "Playback Test"), None)
+    check("playback-test provider is created", status == 200 and provider is not None, f"{status} {body}")
+    if not provider:
+        return
+
+    source = f"http://127.0.0.1:{origin.port}/master.m3u8"
+    status, body, _ = client.json(
+        "POST", f"/api/providers/{provider['id']}/streams",
+        body={"name": "Encrypted HLS", "kind": "m3u8", "url": source,
+              "hlsKey": "00000000000000000000000000000000"},
+    )
+    stream = next((s for p in body.get("providers", []) if p["id"] == provider["id"]
+                   for s in p.get("streams", []) if s["name"] == "Encrypted HLS"), None)
+    check("encrypted HLS stream is created", status == 200 and stream is not None, f"{status} {body}")
+    if not stream:
+        return
+    status, _, _ = client.request("POST", f"/api/streams/{stream['id']}/start", body={})
+    check("internal HLS stream starts", status == 200, f"got {status}")
+
+    status, body, _ = client.json("POST", "/api/keys", body={"label": "playback-test"})
+    key_rows = body.get("apiKeys", body.get("keys", []))
+    key = next((k.get("key") for k in key_rows if k.get("label") == "playback-test"), None)
+    check("playback API key is created", status == 200 and bool(key), f"{status} {body}")
+    if not key:
+        return
+
+    status, payload, _ = client.request("GET", f"/play/{stream['id']}/index.m3u8?key={key}")
+    master = payload.decode(errors="replace")
+    child = next((line for line in master.splitlines() if line and not line.startswith("#")), "")
+    check("authenticated HLS master is served", status == 200 and child.startswith("/play/"), f"{status} {master}")
+    check("playback key propagates to the child playlist", f"&key={key}" in child, child)
+
+    status, payload, _ = client.request("GET", child)
+    media = payload.decode(errors="replace")
+    segment = next((line for line in media.splitlines() if line and not line.startswith("#")), "")
+    check("authenticated HLS media playlist is served", status == 200, f"{status} {media}")
+    check("server-side HLS decryption strips EXT-X-KEY", "#EXT-X-KEY" not in media, media)
+    check("implicit-IV media sequence reaches the segment route", "seq=42" in segment, segment)
+    check("playback key propagates to the segment route", f"key={key}" in segment, segment)
+    check("child request without a playback key is rejected",
+          client.request("GET", child.split("&key=", 1)[0])[0] == 401)
+
+    status, _, headers = client.request("GET", f"/direct/{stream['id']}?key={key}")
+    check("HLS direct route redirects to the origin",
+          status == 302 and headers.get("Location") == source, f"{status} {headers}")
+    status, _, _ = client.request("GET", f"/download/{stream['id']}.mp4?key={key}")
+    check("HLS buffered MP4 download fails explicitly", status == 400, f"got {status}")
+
+    status, body, _ = client.json(
+        "POST", f"/api/providers/{provider['id']}/streams",
+        body={"name": "Unsupported Pipeline", "kind": "m3u8", "url": source,
+              "inputMode": "ffmpegResident", "outputMode": "hls"},
+    )
+    unsupported = next((s for p in body.get("providers", []) if p["id"] == provider["id"]
+                        for s in p.get("streams", []) if s["name"] == "Unsupported Pipeline"), None)
+    status = client.request("POST", f"/api/streams/{unsupported['id']}/start", body={})[0] if unsupported else 0
+    check("unwired external pipeline is rejected at Start", status == 400, f"got {status}")
+
+
 def test_sessions_are_hashed_at_rest(workdir, admin):
     print("session storage")
     with open(os.path.join(workdir, "state.json"), encoding="utf-8") as handle:
@@ -407,19 +516,21 @@ def main():
     port = free_port()
     print(f"running {args.binary} in {workdir} on port {port}\n")
     try:
-        with Server(args.binary, workdir, port) as server:
-            admin = Client(port)
-            test_health_and_gate(admin)
-            test_setup_and_cookie(admin)
-            test_state_permissions(workdir)
-            test_legacy_account_upgrade(workdir, admin)
-            test_login_throttle(port)
-            test_proxy_headers(admin)
-            viewer = test_viewer_role(admin, port)
-            test_provider_routes(admin)
-            test_sessions_are_hashed_at_rest(workdir, admin)
-            test_session_persistence(server, admin, viewer)
-            test_logout(admin)
+        with HLSOrigin() as origin:
+            with Server(args.binary, workdir, port) as server:
+                admin = Client(port)
+                test_health_and_gate(admin)
+                test_setup_and_cookie(admin)
+                test_state_permissions(workdir)
+                test_legacy_account_upgrade(workdir, admin)
+                test_login_throttle(port)
+                test_proxy_headers(admin)
+                viewer = test_viewer_role(admin, port)
+                test_provider_routes(admin)
+                test_hls_playback_routes(admin, origin)
+                test_sessions_are_hashed_at_rest(workdir, admin)
+                test_session_persistence(server, admin, viewer)
+                test_logout(admin)
     finally:
         if args.keep:
             print(f"\nscratch directory kept at {workdir}")

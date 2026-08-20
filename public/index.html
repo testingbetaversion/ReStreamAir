@@ -303,24 +303,24 @@
               <label>Downloader params<span class="field-hint">Extra CLI args passed to the tool, e.g. --retry 3 or aria2c -x 8</span><input name="downloaderParams" placeholder="optional"></label>
             </div>
             <div class="field-group">
-              <div class="field-group-title">Input/output pipeline<span class="field-hint">Internal remuxer needs no ffmpeg. FFmpeg modes spawn a resident ffmpeg that reads the source directly (decrypting CENC clearkey itself) and copy-remuxes to HLS, or pushes to SRT/UDP/TCP via the Output target.</span></div>
+              <div class="field-group-title">Input/output pipeline<span class="field-hint">The C server currently supports Internal remuxer → HLS/Direct. Other saved pipeline values cannot be started until their process runner is connected.</span></div>
               <div class="form-row">
                 <label>Input
                   <select name="inputMode">
                     <option value="internal">Internal remuxer (no ffmpeg)</option>
-                    <option value="ffmpegResident" data-needs-ffmpeg>FFmpeg resident</option>
-                    <option value="ffmpegTsHls" data-needs-ffmpeg>FFmpeg TS HLS/Direct</option>
-                    <option value="ffmpegMultiTsHls" data-needs-ffmpeg>FFmpeg MultiTS HLS</option>
-                    <option value="ffmpegFmp4Hls" data-needs-ffmpeg>FMP4 HLS</option>
-                    <option value="nm3u8dlre" data-needs-nm3u8dlre>N_m3u8DL-RE (live)</option>
+                    <option value="ffmpegResident" data-needs-ffmpeg disabled>FFmpeg resident (not wired in C server)</option>
+                    <option value="ffmpegTsHls" data-needs-ffmpeg disabled>FFmpeg TS HLS/Direct (not wired in C server)</option>
+                    <option value="ffmpegMultiTsHls" data-needs-ffmpeg disabled>FFmpeg MultiTS HLS (not wired in C server)</option>
+                    <option value="ffmpegFmp4Hls" data-needs-ffmpeg disabled>FMP4 HLS (not wired in C server)</option>
+                    <option value="nm3u8dlre" data-needs-nm3u8dlre disabled>N_m3u8DL-RE (not wired in C server)</option>
                   </select>
                 </label>
                 <label>Output
                   <select name="outputMode">
                     <option value="hls">HLS/Direct</option>
-                    <option value="srtServer" data-needs-ffmpeg>SRT Server</option>
-                    <option value="udpSrt" data-needs-ffmpeg>UDP/SRT</option>
-                    <option value="custom" data-needs-ffmpeg>Custom</option>
+                    <option value="srtServer" data-needs-ffmpeg disabled>SRT Server (not wired in C server)</option>
+                    <option value="udpSrt" data-needs-ffmpeg disabled>UDP/SRT (not wired in C server)</option>
+                    <option value="custom" data-needs-ffmpeg disabled>Custom (not wired in C server)</option>
                   </select>
                 </label>
               </div>
@@ -748,7 +748,7 @@ cd restreamair-vX-linux-x86_64
                   <li><b>Panel logins</b> are separate — an API key never gets you into <code>/api/*</code>, and an admin account is not a playback key.</li>
                   <li><b>Export playlist</b> — one M3U of every stream, for VLC/Kodi/an IPTV app.</li>
                   <li><b>CLI:</b> <code>restreamair cdmprobe mpd=&lt;url&gt; [script=&lt;path&gt;]</code> prints the DRM challenge (KIDs/PSSH) and, with a script, the clear keys it returned — the quickest way to test a CDM script.</li>
-                  <li><b>CLI:</b> <code>restreamair dash --info &lt;url&gt;</code> inspects a manifest without touching the panel; <code>restreamair selftest</code> runs the crypto known-answer vectors.</li>
+                  <li><b>CLI:</b> <code>restreamair [serve] [--port N] [--bind ADDR] [--root DIR]</code> — serving the panel is all the binary does. Manifest inspection lives in the stream editor's paste-to-detect; the known-answer vectors are a separate <code>restream_selftest</code> executable.</li>
                 </ul>
               </article>
             </div>
