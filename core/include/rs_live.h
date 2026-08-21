@@ -296,6 +296,7 @@ typedef struct {
     // is a minute or more of latency to hand someone who just connected.
     long long oldest_seq, newest_seq;
     size_t held;         // segments in the queue; 0 means the range is meaningless
+    double segment_duration; // newest measured duration; 2s fallback when unknown
 } rs_live_rep_desc;
 
 // Enumerates a running stream's renditions, newest config first. Returns the

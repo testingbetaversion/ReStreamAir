@@ -352,6 +352,7 @@ typedef struct {
     bool have_start;
     bool disc;             // needs an EXT-X-DISCONTINUITY before it
     double disc_gap;       // seconds the timeline jumped, for the log line
+    double release_at;     // wall clock when a configured playout buffer may expose it
 } live_seg;
 
 struct live_stream;
@@ -1019,7 +1020,8 @@ static void rep_prune_locked(live_rep *rep, int keep) {
 }
 
 // Caller holds st->mu. Takes ownership of `data`.
-static void rep_append_locked(live_rep *rep, const char *url, uint8_t *data, size_t len,
+static void rep_append_locked(live_rep *rep, const cfg_snap *cfg,
+                              const char *url, uint8_t *data, size_t len,
                               double duration, uint64_t start, bool have_start) {
     if (rep->nsegs == rep->cap) {
         size_t ncap = rep->cap ? rep->cap * 2 : 32;
@@ -1040,6 +1042,22 @@ static void rep_append_locked(live_rep *rep, const char *url, uint8_t *data, siz
     s->disc_gap = timeline_gap(rep, prev, start, have_start);
     s->disc = s->disc_gap > RS_LIVE_SPLICE_THRESHOLD || s->disc_gap < -RS_LIVE_SPLICE_THRESHOLD;
     s->seq = rep->total_queued++;
+    // A real playout buffer needs a clocked release point. Merely retaining
+    // history does not help an outage: without this timestamp the playlist is
+    // only regenerated when another upstream segment arrives. Make the first
+    // advertised window available together after the configured warm-up, then
+    // pace every later segment by media duration. During a short origin outage
+    // those already-downloaded future segments therefore continue to become
+    // visible at realtime speed.
+    double release = now_seconds() + (double)(cfg->playback_delay_seconds > 0
+                                                  ? cfg->playback_delay_seconds : 0);
+    if (prev) {
+        double paced = prev->release_at;
+        if (rep->nsegs > (size_t)(cfg->playlist_segments > 0 ? cfg->playlist_segments : 6))
+            paced += prev->duration > 0 ? prev->duration : duration;
+        if (paced > release) release = paced;
+    }
+    s->release_at = release;
     rep->bytes += len;
     // Segment durations drive the window sizing in rep_poll. Track the newest
     // rather than assuming 2s, since sources vary (and vary per rendition).
@@ -1594,7 +1612,7 @@ static void commit_one(live_rep *rep, const cfg_snap *cfg, pend_item *it,
     pthread_mutex_lock(&st->mu);
     bool was_disc = false;
     double gap = 0;
-    rep_append_locked(rep, it->url, data, len,
+    rep_append_locked(rep, cfg, it->url, data, len,
                       it->duration > 0 ? it->duration : 2.0, start, have_start);
     if (rep->nsegs > 0) {
         was_disc = rep->segs[rep->nsegs - 1].disc;
@@ -1773,6 +1791,25 @@ static void *writer_main(void *arg) {
             if (first)
                 lgf(st, "info", "playlistReady", NULL, 0, -1,
                     "%s: first media playlist is ready", rep->rep_id);
+        } else if (cfg.playback_delay_seconds > 0) {
+            // The timed wait above wakes once a second even when the origin is
+            // quiet. Advance the delayed playlist from the already-downloaded
+            // queue so a short manifest/proxy outage consumes the configured
+            // cushion instead of freezing the playlist immediately.
+            pthread_mutex_lock(&st->mu);
+            char *rendered = rep_render_locked(rep, &cfg);
+            bool first = false;
+            if (rendered) {
+                free(rep->playlist);
+                rep->playlist = rendered;
+                first = !rep->ready;
+                rep->ready = true;
+                pthread_cond_broadcast(&st->cv);
+            }
+            pthread_mutex_unlock(&st->mu);
+            if (first)
+                lgf(st, "info", "playlistReady", NULL, 0, -1,
+                    "%s: buffered media playlist is ready", rep->rep_id);
         }
 
         double elapsed = now_seconds() - report_anchor;
@@ -1866,29 +1903,37 @@ static void *writer_main(void *arg) {
 static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
     if (rep->nsegs == 0) return NULL;
 
-    // Average duration, for turning the configured delay in seconds into a
-    // number of segments.
-    double sum = 0;
-    for (size_t i = 0; i < rep->nsegs; i++) sum += rep->segs[i].duration;
-    double avg = sum / (double)rep->nsegs;
+    // A configured playout buffer releases committed segments by wall clock.
+    // This is deliberately separate from the ordinary live-edge hold-back:
+    // the latter keeps players away from the edge, while the former is future
+    // media that can continue to be exposed during a short upstream outage.
+    long long released = (long long)rep->nsegs;
+    if (cfg->playback_delay_seconds > 0) {
+        double now = now_seconds();
+        released = 0;
+        while (released < (long long)rep->nsegs && rep->segs[released].release_at <= now)
+            released++;
+        if (released < cfg->playlist_segments) return NULL;
+    }
 
     // Live-edge hold-back: end the advertised window this many segments before
     // the newest one we hold, so the player always has that many segments
     // already downloaded and queued ahead of the playlist end and cannot drain
     // to the true edge and stall.
-    int base_hold = cfg->download_ahead - cfg->playlist_segments;
+    // downloadAhead's historical hold-back is the legacy minimum-latency
+    // behaviour. A clocked buffer already defines the live-edge distance, so
+    // stacking both would turn a requested 30 seconds into roughly 60.
+    int base_hold = cfg->playback_delay_seconds > 0
+                        ? 0 : cfg->download_ahead - cfg->playlist_segments;
     if (base_hold < 0) base_hold = 0;
-    int delay_hold = (cfg->playback_delay_seconds > 0 && avg > 0.01)
-                         ? (int)((double)cfg->playback_delay_seconds / avg + 0.5)
-                         : 0;
-    long long hold = base_hold + delay_hold;
+    long long hold = base_hold;
     // Never hold back so far that a full window is not available yet (startup).
-    long long slack = (long long)rep->nsegs - cfg->playlist_segments;
+    long long slack = released - cfg->playlist_segments;
     if (hold > slack) hold = slack;
     if (hold < 0) hold = 0;
 
-    long long window_end = (long long)rep->nsegs - hold;
-    if (window_end < 1) window_end = (long long)rep->nsegs;
+    long long window_end = released - hold;
+    if (window_end < 1) window_end = released;
     long long window_start = window_end - cfg->playlist_segments;
     if (window_start < 0) window_start = 0;
 
@@ -2457,6 +2502,7 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     st->download_ahead = cfg->download_ahead > 0 ? cfg->download_ahead : 16;
     st->parallel_downloads = cfg->parallel_downloads;
     st->prioritize_oldest = cfg->prioritize_oldest;
+    int previous_buffer_seconds = st->playback_delay_seconds;
     st->playback_delay_seconds = cfg->playback_delay_seconds > 0 ? cfg->playback_delay_seconds : 0;
     st->audio_delay_ms = cfg->audio_delay_ms;
     st->poll_interval = cfg->poll_interval;
@@ -2474,10 +2520,36 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     // badly behind, which the hold-back already exists to prevent.
     int hold = st->download_ahead - st->playlist_segments;
     if (hold < 0) hold = 0;
-    int need = st->playlist_segments + hold + 8;
+    // Retain the delayed future as well as the visible window and normal edge
+    // hold-back. Segment duration is not known until media arrives; two seconds
+    // is the common DASH duration and the 64MB per-rendition ceiling remains
+    // the final memory guard for unusually large/short segments.
+    int buffer_segments = (st->playback_delay_seconds + 1) / 2;
+    int need = st->playlist_segments + hold + buffer_segments + 8;
     st->keep_segments = cfg->keep_segments > 0 ? cfg->keep_segments : 60;
     if (st->keep_segments < need) st->keep_segments = need;
-    if (st->keep_segments > need + 12) st->keep_segments = need + 12;
+    if (st->keep_segments > 240) st->keep_segments = 240;
+
+    // Buffer edits apply without restarting the download pool. Rebase held
+    // segments so increasing/decreasing the value takes effect predictably
+    // instead of leaving the old release schedule in place indefinitely.
+    if (previous_buffer_seconds != st->playback_delay_seconds) {
+        double newest_release = now_seconds() + (double)st->playback_delay_seconds;
+        for (size_t i = 0; i < st->nreps; i++) {
+            live_rep *rep = st->reps[i];
+            double release = newest_release;
+            // Work backwards from the newest held segment. Anchoring the
+            // oldest at now+buffer would accidentally add all retained history
+            // to the requested delay when the option is edited on a live stream.
+            for (size_t j = rep->nsegs; j > 0; j--) {
+                rep->segs[j - 1].release_at = release;
+                if (j > 1)
+                    release -= rep->segs[j - 2].duration > 0
+                                   ? rep->segs[j - 2].duration : 2.0;
+            }
+        }
+        pthread_cond_broadcast(&st->cv);
+    }
 }
 
 rs_live *rs_live_create(rs_live_fetch_fn fetch, rs_live_dash_fn dash,
@@ -2746,6 +2818,8 @@ size_t rs_live_reps(rs_live *live, const char *stream_id, rs_live_rep_desc **out
                     descs[i].index = st->reps[i]->index;
                     descs[i].timescale = st->reps[i]->timescale;
                     descs[i].held = st->reps[i]->nsegs;
+                    descs[i].segment_duration = st->reps[i]->seg_duration > 0
+                                                    ? st->reps[i]->seg_duration : 2.0;
                     if (st->reps[i]->nsegs) {
                         descs[i].oldest_seq = st->reps[i]->segs[0].seq;
                         descs[i].newest_seq = st->reps[i]->segs[st->reps[i]->nsegs - 1].seq;

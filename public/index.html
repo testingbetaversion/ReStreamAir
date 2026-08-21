@@ -215,8 +215,8 @@
               </div>
               <div class="form-row">
                 <label>Playlist count<span class="field-hint">At least 3 — fewer makes the live edge unstable for most players</span><input name="playlistSegments" type="number" min="3" value="6"></label>
-                <label>Playback delay (s)<span class="field-hint">Hold playback this many seconds behind the live edge — 0 = live</span><input name="playbackDelaySeconds" type="number" min="0" value="0"></label>
-                <label>Keep segments<input name="keepSegments" type="number" min="1" value="10"></label>
+                <label>Playout buffer (s)<span class="field-hint">Clocked buffer for HLS and direct MPEG-TS. It adds latency but keeps releasing downloaded media during short origin outages. Recommended: 15–30s; 0 = minimum latency.</span><input name="playbackDelaySeconds" type="number" min="0" max="120" value="0"></label>
+                <label>Keep segments<span class="field-hint">Retained history; raised automatically when the playout buffer needs more room.</span><input name="keepSegments" type="number" min="1" max="240" value="10"></label>
                 <label>Download ahead<input name="downloadAhead" type="number" min="1" value="20"></label>
                 <label>Parallel downloads<span class="field-hint">Active segment requests shared by video and audio. Default 6, capped at 8; idle connections are not used when the queue is caught up.</span><input name="parallelDownloads" type="number" min="1" max="8" value="6"></label>
                 <label><input name="prioritizeOldest" type="checkbox"> Prioritize oldest (sequential first)<span class="field-hint">No longer needed — download threads always take the oldest queued segment first, because that is the one the playlist is waiting on.</span></label>
@@ -552,7 +552,7 @@
                 <p><b>Provider settings</b> hold defaults shared by every stream under them: proxy, generic headers, downloader, and a provider <b>script</b> + accounts. A stream inherits these unless it overrides them.</p>
                 <ul>
                   <li><b>Proxy</b> — set once on the provider; a stream's own Proxy field wins if filled, and <b>Use proxy for</b> scopes it to Script / Manifest / Media independently.</li>
-                  <li><b>Stream tuning</b> (Playlist count, Keep count, Download ahead, Poll seconds, Playback delay) is per-stream, in the stream editor's DASH options — see below.</li>
+                  <li><b>Stream tuning</b> (Playlist count, Keep count, Download ahead, Poll seconds, Playout buffer) is per-stream, in the stream editor's DASH options — see below.</li>
                   <li><b>All Streams</b> view: bulk start/stop/delete, filter by provider and by Channels / Events / Manually added, and import channels or events from a provider script.</li>
                   <li><b>Export / Import</b> — the download icon on a provider card writes one JSON file with every setting, stream, account and the script's own source. It contains <b>passwords in clear</b>; treat it like a credentials file.</li>
                 </ul>
@@ -567,7 +567,7 @@
                   <tr><td><b>Keep count</b></td><td>Segments kept behind the window before pruning.</td><td>The logs show <code>404</code>s for segments a player asked for — it fell behind and they'd already aged out.</td></tr>
                   <tr><td><b>Download ahead</b></td><td>How far ahead of the playlist the engine fetches.</td><td>The origin is slow and the engine can't stay ahead.</td></tr>
                   <tr><td><b>Poll seconds</b></td><td>How often the MPD is re-read. Defaults to the manifest's own <code>minimumUpdatePeriod</code>, else 2.</td><td>The logs show <code>pollSlow</code> — a poll cycle is overrunning its own interval.</td></tr>
-                  <tr><td><b>Playback delay (s)</b></td><td>Holds playback that many seconds behind the live edge. 0 = live.</td><td>You want a cushion against origin hiccups more than you want latency.</td></tr>
+                  <tr><td><b>Playout buffer (s)</b></td><td>Preloads media and releases it on a clock, so playback can continue through a short origin hiccup. 0 disables it.</td><td>Use 15 s for healthy sources, 20 s for uneven sources, and 30 s for unstable sources.</td></tr>
                   <tr><td><b>Audio delay (ms)</b></td><td>Lip-sync offset, positive or negative. Rewrites each audio segment's timestamps — not a re-encode.</td><td>Audio drifts against video.</td></tr>
                   <tr><td><b>EPG channel id</b></td><td>Exported as <code>tvg-id</code> in the M3U — how an external player binds guide data to this channel. Blank uses the stream id.</td><td>You're pointing TiviMate, Kodi or Jellyfin at both the playlist and a script's EPG.</td></tr>
                   <tr><td><b>Allow offline/static MPD</b></td><td>Accepts a <code>type="static"</code> (VOD) manifest.</td><td>The source is a recording, not a live feed — otherwise it's rejected.</td></tr>

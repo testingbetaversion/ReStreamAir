@@ -3162,7 +3162,7 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
 
 // How often the pump moves new segments to viewers. Segments arrive every few
 // seconds, so this only bounds the added latency, not the throughput.
-#define RS_DIRECT_PUMP_MS 250
+#define RS_DIRECT_PUMP_MS 500
 
 // Per-viewer socket buffer ceiling. A viewer whose link is slower than the
 // stream's bitrate would otherwise grow mongoose's send buffer until the
@@ -3175,21 +3175,24 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
 // Segments handed to one viewer (or one mux) per tick. A viewer that just
 // connected catches up over a few ticks instead of memcpying the whole window
 // into the send buffer at once.
-#define RS_DIRECT_BURST 8
+#define RS_DIRECT_BURST 2
 
 // How far back from the live edge a new viewer starts. The engine holds
 // keepSegments (typically 10-60) of history, and starting at the oldest of them
 // would hand someone who just connected a minute of stale media to play through
-// before reaching live — the exact latency a direct link exists to avoid. Two
-// segments back is enough to open on a keyframe and to have something to send
-// immediately, without the backlog.
+// before reaching live. With no configured buffer, two segments are enough to
+// open on a keyframe; with one, its requested duration becomes the preroll.
 #define RS_DIRECT_PREROLL 2
 
-// The sequence a viewer should start after, to begin RS_DIRECT_PREROLL segments
-// behind the live edge. -1 ("everything held") when the queue is still empty.
-static long long direct_start_seq(const rs_live_rep_desc *rep) {
+// The sequence a viewer should start after. -1 ("everything held") when the
+// queue is still empty.
+static long long direct_start_seq(const rs_live_rep_desc *rep, int buffer_seconds) {
     if (!rep->held) return -1;
-    long long start = rep->newest_seq - RS_DIRECT_PREROLL;
+    double duration = rep->segment_duration > 0.01 ? rep->segment_duration : 2.0;
+    long long buffered = buffer_seconds > 0
+                             ? (long long)((double)buffer_seconds / duration + 0.999) : 0;
+    if (buffered < RS_DIRECT_PREROLL) buffered = RS_DIRECT_PREROLL;
+    long long start = rep->newest_seq - buffered;
     if (start < rep->oldest_seq) start = rep->oldest_seq;
     return start - 1;  // take_after is exclusive
 }
@@ -3202,6 +3205,7 @@ typedef struct rs_direct_client {
     int rep_index;
     bool sent_init;
     long long last_seq;
+    double next_due;
     char *identity, *ip, *ua;
 } rs_direct_client;
 
@@ -3214,7 +3218,7 @@ typedef struct rs_direct_client {
 // Pumps a rendition may produce nothing for before the mux stops waiting on it.
 // Comfortably longer than a segment duration plus a slow poll, so an ordinary
 // hiccup never trips it.
-#define RS_TS_STALL_TICKS 60   // 15 s at RS_DIRECT_PUMP_MS
+#define RS_TS_STALL_TICKS 30   // 15 s at RS_DIRECT_PUMP_MS
 
 // How long a mux outlives its last viewer. Tearing it down the instant someone
 // disconnects means the next viewer — a player reconnecting after a hiccup, or
@@ -3222,7 +3226,7 @@ typedef struct rs_direct_client {
 // track alignment before a single byte arrives, which can take longer than a
 // client's own timeout. Lingering keeps a warm ring for the reconnect, at the
 // cost of muxing a few more seconds of a stream nobody is watching.
-#define RS_TS_LINGER_TICKS 40  // 10 s at RS_DIRECT_PUMP_MS
+#define RS_TS_LINGER_TICKS 20  // 10 s at RS_DIRECT_PUMP_MS
 
 typedef struct rs_ts_session {
     struct rs_ts_session *next;
@@ -3236,6 +3240,7 @@ typedef struct rs_ts_session {
         long long last_seq;
         int idle_ticks;     // pumps in a row that produced nothing
         bool ended;         // given up on; no longer gates the other track
+        double next_due;    // clocked playout; prevents instantly draining the buffer
     } tracks[RS_TS_MAX_TRACKS];
 
     // Recent output, as a byte window with absolute positions so a viewer's
@@ -3398,6 +3403,9 @@ static void ts_session_bind(restream_server_t *server, rs_ts_session *sess) {
         if (!inits[i] || !lens[i]) complete = false;
     }
     if (complete) {
+        const rs_json *stream = rs_panel_find_stream(&server->state, sess->stream_id);
+        int buffer_seconds = stream
+                                 ? (int)rs_json_obj_int(stream, "playbackDelaySeconds", 0) : 0;
         bool have_video = false, have_audio = false;
         for (size_t i = 0; i < n; i++) {
             // One video and one audio. A stream configured with several video
@@ -3419,7 +3427,7 @@ static void ts_session_bind(restream_server_t *server, rs_ts_session *sess) {
             if (is_audio) have_audio = true; else have_video = true;
             sess->tracks[sess->ntracks].rep_index = reps[i].index;
             sess->tracks[sess->ntracks].track = track;
-            sess->tracks[sess->ntracks].last_seq = direct_start_seq(&reps[i]);
+            sess->tracks[sess->ntracks].last_seq = direct_start_seq(&reps[i], buffer_seconds);
             sess->ntracks++;
         }
         sess->bound = sess->ntracks > 0;
@@ -3542,18 +3550,25 @@ static void ts_session_pump(restream_server_t *server, rs_ts_session *sess) {
         break;
     }
 
+    double pump_now = (double)mg_millis() / 1000.0;
     for (size_t i = 0; i < sess->ntracks; i++) {
         int taken = 0;
         for (int n = 0; n < RS_DIRECT_BURST; n++) {
+            if (sess->tracks[i].next_due > pump_now) break;
             size_t len = 0;
             long long seq = 0;
+            double duration = 0;
             uint8_t *seg = rs_live_take_after(server->live, sess->stream_id,
                                               sess->tracks[i].rep_index,
-                                              sess->tracks[i].last_seq, &seq, NULL, &len);
+                                              sess->tracks[i].last_seq, &seq, &duration, &len);
             if (!seg) break;
             rs_ts_mux_push(sess->mux, sess->tracks[i].track, seg, len);
             sess->tracks[i].last_seq = seq;
             rs_free(seg);
+            if (duration <= 0.01) duration = 2.0;
+            sess->tracks[i].next_due = sess->tracks[i].next_due > 0
+                                            ? sess->tracks[i].next_due + duration
+                                            : pump_now + duration;
             taken++;
         }
         // Interleaving holds a sample back until every other rendition has
@@ -3603,16 +3618,21 @@ static bool direct_client_pump(restream_server_t *server, rs_direct_client *d,
         rs_free(init);
         d->sent_init = true;
     }
+    double pump_now = (double)mg_millis() / 1000.0;
     for (int n = 0; n < RS_DIRECT_BURST; n++) {
+        if (d->next_due > pump_now) break;
         size_t len = 0;
         long long seq = 0;
+        double duration = 0;
         uint8_t *seg = rs_live_take_after(server->live, d->stream_id, d->rep_index,
-                                          d->last_seq, &seq, NULL, &len);
+                                          d->last_seq, &seq, &duration, &len);
         if (!seg) break;
         mg_send(c, seg, len);
         sent += len;
         d->last_seq = seq;
         rs_free(seg);
+        if (duration <= 0.01) duration = 2.0;
+        d->next_due = d->next_due > 0 ? d->next_due + duration : pump_now + duration;
     }
     if (sent)
         rs_metrics_record(server->metrics, d->stream_id, d->identity, d->ip, d->ua, (int)sent);
@@ -3714,7 +3734,10 @@ static int direct_rep_index(restream_server_t *server, const char *stream_id,
             if (index < 0 && n == 1) index = reps[0].index;
         }
     }
-    if (out_start) *out_start = (index >= 0) ? direct_start_seq(&reps[found]) : -1;
+    const rs_json *stream = rs_panel_find_stream(&server->state, stream_id);
+    int buffer_seconds = stream ? (int)rs_json_obj_int(stream, "playbackDelaySeconds", 0) : 0;
+    if (out_start) *out_start = (index >= 0)
+                                   ? direct_start_seq(&reps[found], buffer_seconds) : -1;
     rs_live_reps_free(reps, n);
     return index;
 }

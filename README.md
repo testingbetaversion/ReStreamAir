@@ -110,7 +110,7 @@ Paste a source URL and the panel probes it as soon as you pause typing. The smal
 |---|---|
 | **Representation** / **Period** | Used when no qualities are ticked above. |
 | **Playlist count** | Segments advertised in the rolling playlist. Floor of 3 — fewer starves player buffers and causes stalls. |
-| **Playback delay (s)** | Hold playback this many seconds behind the live edge. 0 = live. |
+| **Playout buffer (s)** | Clocked delay for HLS and direct MPEG-TS. Already-downloaded future segments continue to be released during a short origin outage. Adds equal latency; 0 = minimum latency, 15–30s is a practical starting point. |
 | **Keep count** | Segments retained behind the playlist window. Raise it if players ask for segments that have already aged out. |
 | **Download ahead** | How far ahead of the playlist the engine fetches. Also the working depth of the pending queue — see [the live engine](#the-live-engine) for why a bigger number is not automatically better. |
 | **Parallel downloads** | Segment requests in flight at once, **shared by every rendition of the stream** rather than allowed to each. Default 6, capped at 8. Changing it restarts the stream's download threads; every other field here is picked up on the next poll. |

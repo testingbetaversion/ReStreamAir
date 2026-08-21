@@ -1040,14 +1040,20 @@ static void test_panel(void) {
     check("panel/provider-count", rs_json_arr_len(providers) == 1);
     const char *pid = rs_json_obj_str(rs_json_arr_at(providers, 0), "id", "");
 
-    // A stream with a sub-floor playlistSegments must clamp to 3.
+    // Window floors and memory-protection ceilings are enforced server-side;
+    // the browser's numeric input is only a convenience and can be bypassed.
     rs_json *sbody = parse_json(
-        "{\"name\":\"S1\",\"kind\":\"mpd\",\"url\":\"https://e.com/a.mpd\",\"playlistSegments\":1}");
+        "{\"name\":\"S1\",\"kind\":\"mpd\",\"url\":\"https://e.com/a.mpd\","
+        "\"playlistSegments\":1,\"playbackDelaySeconds\":999,\"keepSegments\":999}");
     check("panel/create-stream", rs_panel_create_stream(&st, pid, sbody, &err) == 0);
     rs_json_free(sbody);
     const rs_json *streams = rs_json_obj_get(rs_json_arr_at(providers, 0), "streams");
     check("panel/stream-count", rs_json_arr_len(streams) == 1);
     check("panel/clamp", rs_json_obj_int(rs_json_arr_at(streams, 0), "playlistSegments", 0) == 3);
+    check("panel/buffer-ceiling",
+          rs_json_obj_int(rs_json_arr_at(streams, 0), "playbackDelaySeconds", 0) == 120);
+    check("panel/keep-ceiling",
+          rs_json_obj_int(rs_json_arr_at(streams, 0), "keepSegments", 0) == 240);
 
     // A bad URL is rejected with a 400.
     rs_json *bad = parse_json("{\"name\":\"S2\",\"url\":\"ftp://nope\"}");

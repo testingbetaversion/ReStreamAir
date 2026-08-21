@@ -80,7 +80,9 @@ async function request(path, options = {}) {
   return payload;
 }
 
-async function refresh() {
+let refreshPromise = null;
+
+async function refreshOnce() {
   state = await request("/api/state");
   if (!selectedProviderId && state.providers[0]) selectedProviderId = state.providers[0].id;
   const provider = selectedProvider();
@@ -91,6 +93,16 @@ async function refresh() {
   // representations just picked) gets replaced by that stream's saved data.
   if (!editingNewStream && !selectedStream() && provider?.streams[0]) selectedStreamId = provider.streams[0].id;
   render();
+}
+
+function refresh() {
+  // setInterval does not wait for the previous tick. Under load, overlapping
+  // state requests and full DOM renders made the panel look frozen precisely
+  // when several channels were starting. Coalesce every caller onto one refresh.
+  if (!refreshPromise) {
+    refreshPromise = refreshOnce().finally(() => { refreshPromise = null; });
+  }
+  return refreshPromise;
 }
 
 function selectedProvider() {
@@ -477,37 +489,25 @@ async function bulkStreamAction(kind) {
     if (!confirm(`Delete ${rows.length} stream${rows.length === 1 ? "" : "s"}? This stops them and removes their configuration. This cannot be undone.`)) return;
   }
   let count = 0;
-  const promises = [];
-  
+  // Starting many DASH engines simultaneously creates every director, poller,
+  // writer and download pool in one spike. Serialize bulk operations; the UI
+  // already promised this behavior and it keeps the panel event loop responsive.
   for (const { stream } of rows) {
-    if (kind === "start" && !stream.running) {
-      promises.push(request(`/api/streams/${stream.id}/start`, { method: "POST", body: "{}" })
-        .then(res => { count++; return res; })
-        .catch(error => {
-          $("#streamsGridImportStatus").classList.remove("hidden");
-          $("#streamsGridImportStatus").textContent = `${kind} failed on "${stream.name}": ${error.message || error}`;
-        }));
-    } else if (kind === "stop" && stream.running) {
-      promises.push(request(`/api/streams/${stream.id}/stop`, { method: "POST", body: "{}" })
-        .then(res => { count++; return res; })
-        .catch(error => {
-          $("#streamsGridImportStatus").classList.remove("hidden");
-          $("#streamsGridImportStatus").textContent = `${kind} failed on "${stream.name}": ${error.message || error}`;
-        }));
-    } else if (kind === "delete") {
-      promises.push(request(`/api/streams/${stream.id}`, { method: "DELETE" })
-        .then(res => { count++; return res; })
-        .catch(error => {
-          $("#streamsGridImportStatus").classList.remove("hidden");
-          $("#streamsGridImportStatus").textContent = `${kind} failed on "${stream.name}": ${error.message || error}`;
-        }));
+    let path = null;
+    let method = "POST";
+    if (kind === "start" && !stream.running) path = `/api/streams/${stream.id}/start`;
+    else if (kind === "stop" && stream.running) path = `/api/streams/${stream.id}/stop`;
+    else if (kind === "delete") { path = `/api/streams/${stream.id}`; method = "DELETE"; }
+    if (!path) continue;
+    try {
+      await request(path, { method, body: method === "POST" ? "{}" : undefined });
+      count++;
+    } catch (error) {
+      $("#streamsGridImportStatus").classList.remove("hidden");
+      $("#streamsGridImportStatus").textContent = `${kind} failed on "${stream.name}": ${error.message || error}`;
     }
   }
-
-  if (promises.length > 0) {
-    await Promise.all(promises);
-    state = await request("/api/state");
-  }
+  if (count > 0) state = await request("/api/state");
   
   if (kind === "delete") { selectedStreamId = null; lastEditorStreamId = null; }
   render();
