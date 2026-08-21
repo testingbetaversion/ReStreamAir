@@ -123,13 +123,17 @@ typedef struct {
     // the MPD independently — normally 3 simultaneous manifest fetches for one
     // video+audio stream. Some CDNs cap concurrent sessions per signed token
     // (e.g. a "cnt":3 claim) low enough that this 3-way overlap alone trips it.
-    // Non-zero backs the director off to a slow keep-alive cadence once the
-    // renditions are known, cutting steady-state concurrency to 2.
+    // Non-zero floors the poll period at the observed segment duration, so the
+    // manifest is never read more often than the source produces media. There
+    // is one manifest reader per stream, so this is about request rate, not
+    // concurrency.
     int reduced_manifest_polling;
     int playlist_segments;          // advertised window (default 6)
+    int hls_segment_seconds;        // output fragment group duration (default 10)
     int keep_segments;              // segments held in memory (default 60)
     int download_ahead;             // segments requested per poll (default 16)
-    int parallel_downloads;         // max concurrent segment fetches per stream (default 6, cap 8)
+    int parallel_downloads;         // persistent media connections per stream, shared by every
+                                    // rendition, and the in-flight request cap (default 6, cap 8)
     int prioritize_oldest;          // if non-zero, download the oldest segment sequentially first
     int playback_delay_seconds;     // extra live-edge hold-back, in seconds
     int audio_delay_ms;             // lip-sync shift, applied to audio only
@@ -316,6 +320,22 @@ void rs_live_reps_free(rs_live_rep_desc *reps, size_t count);
 uint8_t *rs_live_take_after(rs_live *live, const char *stream_id, int rep_index,
                             long long after_seq, long long *out_seq,
                             double *out_duration, size_t *out_len);
+
+// How many bytes this engine has pulled from the origin since the last call,
+// zeroing the counter as it reads. Segment and init downloads, retries
+// included; manifest polls are not counted, because the MPD is parsed by the
+// host's fetcher and never comes back here as bytes.
+//
+// A drain rather than a running total so the caller needs no state of its own:
+// the server folds each tick's figure into the same per-stream monitor that
+// tracks bytes served, which is what makes the panel's ↓ figure survive the
+// engine being stopped and started. Returns 0 for a stream with no engine.
+//
+// This is the whole reason the inbound number exists separately: the engine
+// polls, downloads and decrypts continuously whether or not anyone is
+// watching, so with zero viewers the outbound rate is legitimately 0 B/s while
+// the inbound rate is the full bitrate of the stream.
+long long rs_live_drain_ingest(rs_live *live, const char *stream_id);
 
 // A one-line health summary for the logs/diagnostics ("video 12 segs, seq 431,
 // 3 disc; audio 12 segs …"). Caller frees with rs_free, or NULL if unknown.

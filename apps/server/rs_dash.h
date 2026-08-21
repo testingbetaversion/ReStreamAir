@@ -56,9 +56,14 @@ void rs_dash_plan_dispose(rs_dash_plan *plan);
 //     "audio": {"id","codecs","lang"} | null,        // default audio rendition
 //     "text":  {"id","codecs","lang","mime"} | null, // default subtitle rendition
 //     "cc":    [ {"instreamId","lang"} ... ],        // in-band CEA-608/708 services
-//     "plan":  {                                       // only when `rep` matched
+//     "plan":  { ... },                                // the first match, if any
+//     "plans": [ {                                     // one per matched id
 //        "repId","type","timescale","initUrl",
-//        "segments":[ {"url","time","duration"} ... ] } }
+//        "segments":[ {"url","time","duration"} ... ] } ... ] }
+//
+// `rep` is a comma-separated list of representation ids, so one MPD read can
+// serve every rendition of a stream. Ids that are not in the manifest are
+// simply absent from "plans".
 //
 // "text" is a sidecar subtitle AdaptationSet (TTML/stpp or WebVTT), which the
 // caller fetches as its own rendition. "cc" is captions embedded in the video

@@ -149,6 +149,9 @@ static rs_json *stream_from_body(const rs_json *body, const char *id, const char
     rs_json_obj_set_str(s, "downloader", normalize_downloader(rs_json_obj_str(body, "downloader", "")));
     rs_json_obj_set_str(s, "downloaderParams", rs_json_obj_str(body, "downloaderParams", ""));
     rs_json_obj_set_int(s, "playlistSegments", clamp_ll(rs_json_obj_int(body, "playlistSegments", 6), 3));
+    long long hls_segment_seconds = clamp_ll(rs_json_obj_int(body, "hlsSegmentSeconds", 10), 1);
+    if (hls_segment_seconds > 30) hls_segment_seconds = 30;
+    rs_json_obj_set_int(s, "hlsSegmentSeconds", hls_segment_seconds);
     long long buffer_seconds = clamp_ll(rs_json_obj_int(body, "playbackDelaySeconds", 0), 0);
     if (buffer_seconds > 120) buffer_seconds = 120;
     rs_json_obj_set_int(s, "playbackDelaySeconds", buffer_seconds);

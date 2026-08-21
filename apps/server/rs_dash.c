@@ -885,12 +885,32 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
     rs_json_obj_set(obj, "cc", ccs);
     xmlFreeDoc(doc);
 
-    // Expand the requested representation's segment window.
+    // Expand the requested representations' segment windows. `rep` is a
+    // comma-separated list so one MPD read serves every rendition of a stream:
+    // the live engine polls once and hands each rendition its own plan, instead
+    // of one thread — and one held-open connection — per rendition all fetching
+    // the same document. A single id is just a list of one, and still lands in
+    // "plan" for the request-time DASH path that asks for exactly one.
     if (rep && rep[0]) {
-        rs_dash_plan plan; char perr[256] = {0};
-        if (rs_dash_plan_build(xml, len, base, rep, want, &plan, perr, sizeof(perr)) == 0) {
+        rs_json *plans = rs_json_new_arr();
+        const char *cursor = rep;
+        while (*cursor) {
+            const char *comma = strchr(cursor, ',');
+            size_t idlen = comma ? (size_t)(comma - cursor) : strlen(cursor);
+            char one[512];
+            if (idlen == 0 || idlen >= sizeof(one)) {
+                if (!comma) break;
+                cursor = comma + 1;
+                continue;
+            }
+            memcpy(one, cursor, idlen);
+            one[idlen] = '\0';
+            cursor = comma ? comma + 1 : cursor + idlen;
+
+            rs_dash_plan plan; char perr[256] = {0};
+            if (rs_dash_plan_build(xml, len, base, one, want, &plan, perr, sizeof(perr)) != 0) continue;
             rs_json *p = rs_json_new_obj();
-            rs_json_obj_set_str(p, "repId", plan.representation_id ? plan.representation_id : rep);
+            rs_json_obj_set_str(p, "repId", plan.representation_id ? plan.representation_id : one);
             rs_json_obj_set_str(p, "type", plan.adaptation_type ? plan.adaptation_type : "video");
             rs_json_obj_set_int(p, "timescale", (long long)plan.timescale);
             if (plan.init_url) {
@@ -909,9 +929,13 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
                 rs_json_arr_push(segs, s);
             }
             rs_json_obj_set(p, "segments", segs);
-            rs_json_obj_set(obj, "plan", p);
+            // "plan" is the first match, kept so single-representation callers
+            // need no change; "plans" carries every match in the order asked.
+            if (rs_json_arr_len(plans) == 0) rs_json_obj_set(obj, "plan", rs_json_clone(p));
+            rs_json_arr_push(plans, p);
             rs_dash_plan_dispose(&plan);
         }
+        rs_json_obj_set(obj, "plans", plans);
     }
 
     rendition_set_dispose(&reps);

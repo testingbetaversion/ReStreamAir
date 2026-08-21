@@ -47,8 +47,9 @@
 // are set to.
 #define RS_LIVE_FETCH_PAR 6
 
-// Ceiling on a representation's persistent download threads, whatever
-// parallelDownloads is set to. Each thread keeps its own HTTP connection alive
+// Ceiling on the stream's persistent download threads, whatever
+// parallelDownloads is set to. One pool serves every rendition, so this is the
+// most media connections a channel can hold open. Each thread keeps its own HTTP connection alive
 // for the life of the stream (see the per-thread handle in the server's net.c),
 // so the useful figure is "how many requests should be in flight at once", not
 // "how many segments are outstanding" — and past a handful that stops buying
@@ -125,18 +126,9 @@
 // backstop for the segment-count limit, for sources whose segments are far
 // larger than the couple of megabytes this is sized around.
 #define RS_LIVE_MAX_BYTES (64u * 1024u * 1024u)
-// How often the director re-reads the rendition list. Representation ids
-// effectively never change mid-stream, so this is deliberately much slower than
-// the segment poll.
-#define RS_LIVE_DIRECTOR_INTERVAL 15.0
-// With reduced_manifest_polling on, the interval the director backs off to
-// once it has already found the renditions — just often enough to notice a
-// genuine rendition-list change, rarely enough to stop being a 3rd concurrent
-// manifest fetch alongside the two representation workers.
-#define RS_LIVE_DIRECTOR_IDLE_INTERVAL 300.0
-// Base delay before the director re-reads a rendition list that failed. Doubles
-// per consecutive failure (see live_backoff.c) rather than retrying flat, which
-// is what let a rate-limited origin keep refusing indefinitely.
+// Base delay before the director re-reads a manifest that failed. Doubles per
+// consecutive failure (see live_backoff.c) rather than retrying flat, which is
+// what let a rate-limited origin keep refusing indefinitely.
 #define RS_LIVE_DIRECTOR_RETRY 3.0
 
 // --- 1. helpers -------------------------------------------------------------
@@ -353,6 +345,8 @@ typedef struct {
     bool disc;             // needs an EXT-X-DISCONTINUITY before it
     double disc_gap;       // seconds the timeline jumped, for the log line
     double release_at;     // wall clock when a configured playout buffer may expose it
+    double opened_at;      // first source fragment arrival; bounds partial-group latency
+    bool complete;         // false only for the newest HLS group still being assembled
 } live_seg;
 
 struct live_stream;
@@ -398,9 +392,8 @@ typedef struct {
     char *kind;            // "video" | "audio" | "text"
     int index;             // slot in owner->reps, used as the public URL token
 
-    pthread_t thread;
-    bool thread_started;
-    bool finished;
+    // No poller thread: manifest reads are the director's, once per stream.
+    bool broken;           // its writer never started; skip it everywhere
 
     // --- the pending queue --------------------------------------------------
     //
@@ -437,8 +430,6 @@ typedef struct {
     size_t pend_count;     // items live in the ring
     size_t pend_cap;
     uint64_t pend_gen;     // monotonic stamp source for pend_item.gen
-    pthread_t *dl_threads;
-    size_t ndl;
     int active_downloads;  // requests currently owned by this rendition
     pthread_t wr_thread;
     bool wr_started;
@@ -475,12 +466,6 @@ typedef struct {
     double seg_duration;       // last observed segment duration, for sizing
     long long skipped;         // segments the window moved past, never fetched
 
-    // Consecutive failed manifest polls, and whether the last one was an
-    // explicit rate refusal. Drives the backoff in rep_main; reset to 0 by the
-    // first poll that retrieves a window. Only touched by this rep's own
-    // worker thread.
-    int manifest_failures;
-    bool manifest_throttled;
     long long highest_time_val;
 } live_rep;
 
@@ -509,16 +494,34 @@ typedef struct live_stream {
     char *segment_url_params;
     int inherit_url_params;
     int reduced_manifest_polling;
-    int playlist_segments, keep_segments, download_ahead;
+    int playlist_segments, hls_segment_seconds, keep_segments, download_ahead;
     int parallel_downloads;
     // Effective stream-wide request budget captured when this engine instance
-    // was created. Each rendition has enough waiting workers to use the budget,
-    // but active_downloads below prevents the pools multiplying it.
+    // was created. It is both the number of threads in the shared download pool
+    // below and the number of requests allowed in flight, so it is exactly the
+    // count of media connections this channel holds open at the origin.
     int worker_parallel_downloads;
     int active_downloads;  // active media requests across every rendition
+    // The download pool, shared by every rendition. One thread is one
+    // persistent HTTP connection (see the per-thread easy handle in the
+    // server's net.c), so a per-rendition pool made the channel's connection
+    // count parallelDownloads x renditions while the budget above still let
+    // only parallelDownloads of them work at a time — video+audio at the
+    // default held twelve connections to do the work of six. Threads live for
+    // the stream and take work from whichever rendition has some.
+    pthread_t *dl_threads;
+    size_t ndl;
+    size_t dl_cursor;      // round-robin start point, so no rendition starves
     int prioritize_oldest;
     int playback_delay_seconds, audio_delay_ms;
     double poll_interval;
+
+    // Bytes pulled from the origin since the last drain (rs_live_drain_ingest).
+    // Counted where the fetch returns rather than where the segment is
+    // committed, so a segment that is downloaded and then dropped by the
+    // catch-up policy still shows up as bandwidth spent — it was. Guarded by
+    // `mu`; the download threads add to it as they finish.
+    long long ingest_bytes;
 
     pthread_t dir_thread;
     bool dir_started, dir_finished;
@@ -552,7 +555,7 @@ typedef struct {
     size_t representation_count;
     int inherit_url_params;
     int reduced_manifest_polling;
-    int playlist_segments, keep_segments, download_ahead;
+    int playlist_segments, hls_segment_seconds, keep_segments, download_ahead;
     int parallel_downloads;
     int prioritize_oldest;
     int playback_delay_seconds, audio_delay_ms;
@@ -610,6 +613,7 @@ static void cfg_snapshot_locked(const live_stream *st, cfg_snap *out) {
     out->inherit_url_params = st->inherit_url_params;
     out->reduced_manifest_polling = st->reduced_manifest_polling;
     out->playlist_segments = st->playlist_segments;
+    out->hls_segment_seconds = st->hls_segment_seconds;
     out->keep_segments = st->keep_segments;
     out->download_ahead = st->download_ahead;
     out->parallel_downloads = st->parallel_downloads;
@@ -859,22 +863,31 @@ static bool pend_has_waiting_locked(live_rep *rep) {
     return false;
 }
 
+// One thread of the stream's shared download pool. It belongs to no rendition:
+// each pass it looks for a rendition with a segment waiting and takes the
+// oldest one, starting the scan where the last claim left off so video's much
+// deeper queue cannot monopolise the pool. rep_active_limit_locked still keeps
+// a slot free for every other rendition that has work.
 static void *download_main(void *arg) {
-    live_rep *rep = (live_rep *)arg;
-    live_stream *st = rep->owner;
+    live_stream *st = (live_stream *)arg;
 
     for (;;) {
         pthread_mutex_lock(&st->mu);
+        live_rep *rep = NULL;
         long idx = -1;
         while (!st->stop) {
-            if (st->active_downloads < st->worker_parallel_downloads &&
-                rep->active_downloads < rep_active_limit_locked(rep))
-                idx = pend_claim_locked(rep);
-            if (idx >= 0) break;
-            if (rep->poller_done && !pend_has_waiting_locked(rep)) {
-                pthread_mutex_unlock(&st->mu);
-                return NULL;
+            if (st->active_downloads < st->worker_parallel_downloads) {
+                for (size_t k = 0; k < st->nreps && idx < 0; k++) {
+                    live_rep *cand = st->reps[(st->dl_cursor + k) % st->nreps];
+                    if (cand->active_downloads >= rep_active_limit_locked(cand)) continue;
+                    long got = pend_claim_locked(cand);
+                    if (got < 0) continue;
+                    rep = cand;
+                    idx = got;
+                    st->dl_cursor = (st->dl_cursor + k + 1) % st->nreps;
+                }
             }
+            if (idx >= 0) break;
             pthread_cond_wait(&st->cv, &st->mu);
         }
         if (st->stop) { pthread_mutex_unlock(&st->mu); return NULL; }
@@ -894,6 +907,7 @@ static void *download_main(void *arg) {
         size_t len = 0;
         int attempts = 0;
         double fetch_seconds = 0;
+        long long ingest_bytes = 0;
         char err[192] = {0};
         bool ok = false;
 
@@ -936,6 +950,9 @@ static void *download_main(void *arg) {
                                     media_timeout_ms(duration), download_should_cancel, &cancel);
             free(url);
             attempts = attempt + 1;
+            // Every attempt that put bytes on the wire counts, including the
+            // failed ones — a retried segment really was paid for twice.
+            ingest_bytes += (long long)blen;
             if (rc == 0 && body) {
                 data = (uint8_t *)body;
                 len = blen;
@@ -949,6 +966,7 @@ static void *download_main(void *arg) {
         cfg_snap_dispose(&cfg);
 
         pthread_mutex_lock(&st->mu);
+        st->ingest_bytes += ingest_bytes;
         if (st->active_downloads > 0) st->active_downloads--;
         if (rep->active_downloads > 0) rep->active_downloads--;
         // The slot may no longer be ours: a stop can have cleared the queue,
@@ -1019,10 +1037,58 @@ static void rep_prune_locked(live_rep *rep, int keep) {
     }
 }
 
-// Caller holds st->mu. Takes ownership of `data`.
+// Marks the newest group advertisable and assigns its clocked release point.
+// Caller holds st->mu.
+static void rep_finish_last_locked(live_rep *rep, const cfg_snap *cfg) {
+    if (rep->nsegs == 0) return;
+    live_seg *s = &rep->segs[rep->nsegs - 1];
+    if (s->complete) return;
+    s->complete = true;
+
+    double release = now_seconds() + (double)(cfg->playback_delay_seconds > 0
+                                                  ? cfg->playback_delay_seconds : 0);
+    const live_seg *prev = rep->nsegs > 1 ? &rep->segs[rep->nsegs - 2] : NULL;
+    if (prev) {
+        double paced = prev->release_at + (prev->duration > 0 ? prev->duration : 10.0);
+        if (paced > release) release = paced;
+    }
+    s->release_at = release;
+}
+
+// Caller holds st->mu. Takes ownership of `data`. Short CMAF fragments are
+// concatenated into one fMP4 HLS media segment; a CMAF segment may legally
+// contain multiple moof/mdat fragment pairs, so this is a remux-free grouping
+// operation rather than a timestamp rewrite or fake EXTINF value.
 static void rep_append_locked(live_rep *rep, const cfg_snap *cfg,
                               const char *url, uint8_t *data, size_t len,
                               double duration, uint64_t start, bool have_start) {
+    double source_duration = duration > 0 ? duration : 2.0;
+    int target = cfg->hls_segment_seconds > 0 ? cfg->hls_segment_seconds : 10;
+    bool groupable = strcmp(rep->kind, "text") != 0 && source_duration < (double)target;
+
+    live_seg *open = rep->nsegs > 0 ? &rep->segs[rep->nsegs - 1] : NULL;
+    if (open && !open->complete && groupable) {
+        double gap = timeline_gap(rep, open, start, have_start);
+        bool disc = gap > RS_LIVE_SPLICE_THRESHOLD || gap < -RS_LIVE_SPLICE_THRESHOLD;
+        if (!disc) {
+            uint8_t *joined = (uint8_t *)realloc(open->data, open->len + len);
+            if (!joined) { free(data); return; }
+            memcpy(joined + open->len, data, len);
+            free(data);
+            open->data = joined;
+            open->len += len;
+            open->duration += source_duration;
+            rep->bytes += len;
+            if (open->duration + 0.001 >= (double)target) rep_finish_last_locked(rep, cfg);
+            if (source_duration > 0) rep->seg_duration = source_duration;
+            return;
+        }
+        // Never bridge an actual timeline splice inside one advertised URI.
+        // Publish the short group before starting the discontinuous one.
+        rep_finish_last_locked(rep, cfg);
+    }
+    if (open && !open->complete) rep_finish_last_locked(rep, cfg);
+
     if (rep->nsegs == rep->cap) {
         size_t ncap = rep->cap ? rep->cap * 2 : 32;
         live_seg *ns = (live_seg *)realloc(rep->segs, ncap * sizeof(live_seg));
@@ -1036,32 +1102,27 @@ static void rep_append_locked(live_rep *rep, const cfg_snap *cfg,
     s->url = rs_strdup(url);
     s->data = data;
     s->len = len;
-    s->duration = duration;
+    s->duration = source_duration;
     s->start_time = start;
     s->have_start = have_start;
     s->disc_gap = timeline_gap(rep, prev, start, have_start);
     s->disc = s->disc_gap > RS_LIVE_SPLICE_THRESHOLD || s->disc_gap < -RS_LIVE_SPLICE_THRESHOLD;
     s->seq = rep->total_queued++;
-    // A real playout buffer needs a clocked release point. Merely retaining
-    // history does not help an outage: without this timestamp the playlist is
-    // only regenerated when another upstream segment arrives. Make the first
-    // advertised window available together after the configured warm-up, then
-    // pace every later segment by media duration. During a short origin outage
-    // those already-downloaded future segments therefore continue to become
-    // visible at realtime speed.
-    double release = now_seconds() + (double)(cfg->playback_delay_seconds > 0
-                                                  ? cfg->playback_delay_seconds : 0);
-    if (prev) {
-        double paced = prev->release_at;
-        if (rep->nsegs > (size_t)(cfg->playlist_segments > 0 ? cfg->playlist_segments : 6))
-            paced += prev->duration > 0 ? prev->duration : duration;
-        if (paced > release) release = paced;
-    }
-    s->release_at = release;
+    s->opened_at = now_seconds();
     rep->bytes += len;
     // Segment durations drive the window sizing in rep_poll. Track the newest
     // rather than assuming 2s, since sources vary (and vary per rendition).
-    if (duration > 0) rep->seg_duration = duration;
+    if (source_duration > 0) rep->seg_duration = source_duration;
+    if (!groupable || s->duration + 0.001 >= (double)target) rep_finish_last_locked(rep, cfg);
+}
+
+// Adds to the stream's inbound byte count from a thread that is not already
+// holding the lock. See rs_live_drain_ingest.
+static void ingest_record(live_stream *st, size_t bytes) {
+    if (bytes == 0) return;
+    pthread_mutex_lock(&st->mu);
+    st->ingest_bytes += (long long)bytes;
+    pthread_mutex_unlock(&st->mu);
 }
 
 // Fetches and installs the initialization segment: patch it to a clear codec,
@@ -1079,6 +1140,7 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
                             cfg->downloader, cfg->dl_params,
                             &body, &len, &status, NULL, NULL, NULL, err, sizeof(err),
                             30000, NULL, NULL);
+    ingest_record(st, len);
     if (rc != 0 || !body) {
         free(body);
         lgf(st, "error", "initFetch", init_url, status, -1, "%s: %s", rep->rep_id,
@@ -1222,51 +1284,39 @@ static char *manifest_fetch(live_stream *st, const cfg_snap *cfg, const char *re
     return NULL;
 }
 
-// Records the outcome of a manifest poll for the backoff in rep_main.
-static void rep_note_manifest(live_rep *rep, bool ok, const char *err) {
-    if (ok) {
-        rep->manifest_failures = 0;
-        rep->manifest_throttled = false;
-        return;
-    }
-    if (rep->manifest_failures < 1000) rep->manifest_failures++;
-    rep->manifest_throttled = rs_live_status_is_throttle(status_from_error(err)) != 0;
-}
-
-static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interval) {
+// How wide a manifest window this representation needs on the next read.
+//
+// The manifest request is anchored at the live edge: it returns the NEWEST
+// `want` segments. So `want` has to cover everything the source produced since
+// the previous request, and a fixed download_ahead only ever covers
+// download_ahead * segment_duration seconds. Whenever a cycle took longer than
+// that — a slow origin, large segments, a proxy in the path — every segment
+// older than the window was never requested, and the next one to arrive landed
+// a few seconds further down the media timeline. That is what put a permanent
+// EXT-X-DISCONTINUITY every few segments into the output and left the engine
+// publishing well under 1x realtime, so any player drained its buffer and
+// stalled no matter how good the bytes were.
+//
+// Widening the ask is free: `seen` skips anything already held, so the only
+// cost of overshooting is a slightly larger manifest response.
+//
+// NB: the anchor only advances once a window has actually been retrieved (in
+// rep_apply_plan). Advancing it here would mean a failed manifest fetch
+// silently reset the clock, so the next poll would ask for a window sized to
+// that short interval and lose the backlog the failure created — the very hole
+// this sizing exists to prevent.
+static int rep_window_want(live_rep *rep, const cfg_snap *cfg, double t0) {
     live_stream *st = rep->owner;
-    char err[256] = {0};
-    double t0 = now_seconds();
-
-    // The manifest request is anchored at the live edge: it returns the NEWEST
-    // `want` segments. So `want` has to cover everything the source produced
-    // since the previous request, and a fixed download_ahead only ever covers
-    // download_ahead * segment_duration seconds. Whenever a cycle took longer
-    // than that — a slow origin, large segments, a proxy in the path — every
-    // segment older than the window was never requested, and the next one to
-    // arrive landed a few seconds further down the media timeline. That is what
-    // put a permanent EXT-X-DISCONTINUITY every few segments into the output
-    // and left the engine publishing well under 1x realtime, so any player
-    // drained its buffer and stalled no matter how good the bytes were.
-    //
-    // Widening the ask is free: `seen` skips anything already held, so the only
-    // cost of overshooting is a slightly larger manifest response.
-    int want = cfg->download_ahead;
     pthread_mutex_lock(&st->mu);
     double anchor = rep->window_anchor;
     double seg_dur = rep->seg_duration > 0 ? rep->seg_duration : 2.0;
     pthread_mutex_unlock(&st->mu);
-    // NB: the anchor only advances once a window has actually been retrieved
-    // (below, after the plan is in hand). Advancing it here would mean a failed
-    // manifest fetch silently reset the clock, so the next poll would ask for a
-    // window sized to that short interval and lose the backlog the failure
-    // created — the very hole this sizing exists to prevent.
 
     // Wall time since the previous request == media the source produced in the
     // meantime. Zero on the first poll, which deliberately starts at the live
     // edge with just download_ahead rather than pulling the whole DVR window.
     double since_last = anchor > 0 ? t0 - anchor : 0;
-    want = rs_live_window_size(cfg->download_ahead, since_last, seg_dur);
+    int want = rs_live_window_size(cfg->download_ahead, since_last, seg_dur);
 
     // First poll: take a short run-up at the live edge rather than the whole
     // downloadAhead window. Asking for twenty segments before a single byte has
@@ -1281,42 +1331,27 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
         if (start < 4) start = 4;
         if (want > start) want = start;
     }
+    return want;
+}
 
-    lgf(st, "info", "pollStart", cfg->mpd_url, 0, -1,
-        "%s: requesting %d segments (%.1fs since last poll, %.3fs each)",
-        rep->rep_id, want, since_last, seg_dur);
-    char *json = manifest_fetch(st, cfg, rep->rep_id, want, err, sizeof(err));
-    if (!json) {
-        rep_note_manifest(rep, false, err);
-        lgf(st, "error", "manifest", cfg->mpd_url, 0, -1, "%s: %s", rep->rep_id,
-            err[0] ? err : "could not read the MPD");
-        return;
-    }
-    rs_json *root = rs_json_parse(json, strlen(json));
-    free(json);
-    if (!root) {
-        rep_note_manifest(rep, false, NULL);
-        lgf(st, "error", "manifest", cfg->mpd_url, 0, -1, "%s: malformed DASH description", rep->rep_id);
-        return;
-    }
-
-    double mup = rs_json_as_num(rs_json_obj_get(root, "mup"), 0);
-    if (mup > 0 && cfg->poll_interval <= 0) *out_next_interval = mup;
-
-    const rs_json *plan = rs_json_obj_get(root, "plan");
-    if (!plan || rs_json_type_of(plan) != RS_JSON_OBJ) {
-        rep_note_manifest(rep, false, NULL);
-        lgf(st, "error", "manifest", cfg->mpd_url, 0, -1,
-            "%s: representation not present in the MPD", rep->rep_id);
-        rs_json_free(root);
-        return;
-    }
-    rep_note_manifest(rep, true, NULL);
+// Queues whatever is new in one representation's slice of a manifest read.
+//
+// The read itself belongs to the director: one MPD fetch per cycle serves every
+// rendition, so the plan is already in hand and the only network traffic here
+// is an init segment that genuinely rotated. `want` is this representation's
+// own window from rep_window_want — the request was sized for the widest one,
+// so the plan may be wider than this rendition asked for.
+static void rep_apply_plan(live_rep *rep, const cfg_snap *cfg, const rs_json *plan,
+                           double t0, int want) {
+    live_stream *st = rep->owner;
 
     // A window is genuinely in hand now, so this poll becomes the reference
     // point the next one measures its backlog against.
     pthread_mutex_lock(&st->mu);
     rep->window_anchor = t0;
+    rep->polls++;
+    rep->last_poll = t0;
+    double seg_dur = rep->seg_duration > 0 ? rep->seg_duration : 2.0;
     pthread_mutex_unlock(&st->mu);
 
     unsigned long plan_ts = (unsigned long)rs_json_as_num(rs_json_obj_get(plan, "timescale"), 1);
@@ -1324,9 +1359,16 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     const rs_json *segs = rs_json_obj_get(plan, "segments");
     size_t total = rs_json_arr_len(segs);
 
+    // Narrow the shared window back to this rendition's own ask. Without it a
+    // rendition on its first poll would inherit whatever the widest one needed
+    // and open with exactly the backlog the clamp in rep_window_want exists to
+    // avoid. Indices stay absolute: the stale sweep below still has to see the
+    // trimmed-off entries, which are every bit as advertised as the rest.
+    size_t skip = (want > 0 && total > (size_t)want) ? total - (size_t)want : 0;
+
     lgf(st, "info", "manifest", cfg->mpd_url, 0, -1,
-        "%s: %lu segments in the manifest window (%.2fs)", rep->rep_id,
-        (unsigned long)total, now_seconds() - t0);
+        "%s: %lu segments in the manifest window, %lu of them mine (%.2fs)", rep->rep_id,
+        (unsigned long)total, (unsigned long)(total - skip), now_seconds() - t0);
 
     // The init segment is fetched once, and again only if the source genuinely
     // rotates it — compared by stable identity, so a re-tokenized URL for the
@@ -1338,20 +1380,20 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     need_init = init_url[0] && (!rep->init_key || strcmp(rep->init_key, init_key) != 0);
     pthread_mutex_unlock(&st->mu);
     if (need_init) rep_load_init(rep, init_url, cfg, plan_ts);
-    if (live_stopping(st)) { rs_json_free(root); return; }
+    if (live_stopping(st)) return;
 
     // Collect the segments this poll has not already served, in timeline order.
     typedef struct { const char *url; long long tv; double dur; char idkey[288]; } cand;
     cand *found = (cand *)calloc(total ? total : 1, sizeof(cand));
-    if (!found) { rs_json_free(root); return; }
+    if (!found) return;
     size_t n = 0;
     unsigned long refreshed = 0;
     // Which manifest entries correspond to something already queued, so the
     // sweep below can tell "still offered by the origin" from "gone".
     bool *still_advertised = (bool *)calloc(total ? total : 1, sizeof(bool));
-    if (!still_advertised) { free(found); rs_json_free(root); return; }
+    if (!still_advertised) { free(found); return; }
     pthread_mutex_lock(&st->mu);
-    for (size_t i = 0; i < total; i++) {
+    for (size_t i = skip; i < total; i++) {
         const rs_json *sg = rs_json_arr_at(segs, i);
         const char *u = rs_json_obj_str(sg, "url", "");
         if (!u[0]) continue;
@@ -1487,7 +1529,6 @@ static void rep_poll(live_rep *rep, const cfg_snap *cfg, double *out_next_interv
     pthread_mutex_unlock(&st->mu);
     free(found);
     free(still_advertised);
-    rs_json_free(root);
 
     if (dropped || evicted || stale)
         lgf(st, "error", "liveEdgeSkip", NULL, 0, -1,
@@ -1791,13 +1832,23 @@ static void *writer_main(void *arg) {
             if (first)
                 lgf(st, "info", "playlistReady", NULL, 0, -1,
                     "%s: first media playlist is ready", rep->rep_id);
-        } else if (cfg.playback_delay_seconds > 0) {
+        } else {
             // The timed wait above wakes once a second even when the origin is
-            // quiet. Advance the delayed playlist from the already-downloaded
-            // queue so a short manifest/proxy outage consumes the configured
-            // cushion instead of freezing the playlist immediately.
+            // quiet. Finish a partial 10-second group when its wall-clock
+            // budget expires, and advance a delayed playlist from the already-
+            // downloaded queue during a short manifest/proxy outage.
             pthread_mutex_lock(&st->mu);
-            char *rendered = rep_render_locked(rep, &cfg);
+            bool finished_partial = false;
+            if (rep->nsegs > 0) {
+                live_seg *tail = &rep->segs[rep->nsegs - 1];
+                int target = cfg.hls_segment_seconds > 0 ? cfg.hls_segment_seconds : 10;
+                if (!tail->complete && now_seconds() - tail->opened_at >= (double)target) {
+                    rep_finish_last_locked(rep, &cfg);
+                    finished_partial = true;
+                }
+            }
+            char *rendered = (finished_partial || cfg.playback_delay_seconds > 0)
+                                 ? rep_render_locked(rep, &cfg) : NULL;
             bool first = false;
             if (rendered) {
                 free(rep->playlist);
@@ -1907,14 +1958,24 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
     // This is deliberately separate from the ordinary live-edge hold-back:
     // the latter keeps players away from the edge, while the former is future
     // media that can continue to be exposed during a short upstream outage.
-    long long released = (long long)rep->nsegs;
+    // The newest entry may still be accumulating short source fragments. Its
+    // bytes and EXTINF are mutable until the target duration is reached, so it
+    // must never be advertised or handed to a player early.
+    long long complete = 0;
+    while (complete < (long long)rep->nsegs && rep->segs[complete].complete) complete++;
+    long long released = complete;
     if (cfg->playback_delay_seconds > 0) {
         double now = now_seconds();
         released = 0;
-        while (released < (long long)rep->nsegs && rep->segs[released].release_at <= now)
+        while (released < complete && rep->segs[released].release_at <= now)
             released++;
-        if (released < cfg->playlist_segments) return NULL;
     }
+    // With a clocked cushion, the first finished segment is already safely
+    // behind live and can be advertised immediately; waiting for three full
+    // ten-second groups on top of the cushion made Start look like a failure.
+    int startup_segments = cfg->playback_delay_seconds > 0
+                               ? 1 : (cfg->playlist_segments < 3 ? cfg->playlist_segments : 3);
+    if (released < startup_segments) return NULL;
 
     // Live-edge hold-back: end the advertised window this many segments before
     // the newest one we hold, so the player always has that many segments
@@ -1923,18 +1984,19 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
     // downloadAhead's historical hold-back is the legacy minimum-latency
     // behaviour. A clocked buffer already defines the live-edge distance, so
     // stacking both would turn a requested 30 seconds into roughly 60.
-    int base_hold = cfg->playback_delay_seconds > 0
+    int base_hold = (cfg->playback_delay_seconds > 0 || cfg->hls_segment_seconds > 1)
                         ? 0 : cfg->download_ahead - cfg->playlist_segments;
     if (base_hold < 0) base_hold = 0;
     long long hold = base_hold;
     // Never hold back so far that a full window is not available yet (startup).
-    long long slack = released - cfg->playlist_segments;
+    int window_count = released < cfg->playlist_segments ? (int)released : cfg->playlist_segments;
+    long long slack = released - window_count;
     if (hold > slack) hold = slack;
     if (hold < 0) hold = 0;
 
     long long window_end = released - hold;
     if (window_end < 1) window_end = released;
-    long long window_start = window_end - cfg->playlist_segments;
+    long long window_start = window_end - window_count;
     if (window_start < 0) window_start = 0;
 
     double maxdur = 0;
@@ -2003,33 +2065,19 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
 
 // --- the representation thread ---------------------------------------------
 
-// Starts this representation's download pool and writer. Both live for as long
-// as the rep does: the whole point of persistent download threads is that each
-// one keeps its HTTP connection open across segments, so the TLS handshake is
-// paid once per thread rather than once per segment.
-static bool rep_start_workers(live_rep *rep, const cfg_snap *cfg) {
+// Starts this representation's queue and writer. The download threads are not
+// here: they belong to the stream (see stream_start_pool) and are shared with
+// every other rendition, because one thread is one held-open connection.
+static bool rep_start_workers(live_rep *rep) {
     live_stream *st = rep->owner;
 
     rep->pend_cap = RS_LIVE_PENDING_MAX;
     rep->pending = (pend_item *)calloc(rep->pend_cap, sizeof(pend_item));
     if (!rep->pending) return false;
 
-    size_t want = (size_t)effective_parallel_downloads(cfg->parallel_downloads);
-
-    rep->dl_threads = (pthread_t *)calloc(want, sizeof(pthread_t));
-    if (!rep->dl_threads) return false;
-    for (size_t i = 0; i < want; i++)
-        if (pthread_create(&rep->dl_threads[rep->ndl], NULL, download_main, rep) == 0) rep->ndl++;
-    if (rep->ndl == 0) return false;
-
     if (pthread_create(&rep->wr_thread, NULL, writer_main, rep) == 0) rep->wr_started = true;
     else return false;
-
-    if ((size_t)cfg->parallel_downloads > RS_LIVE_MAX_DL_THREADS)
-        lgf(st, "info", "repStart", NULL, 0, -1,
-            "%s: parallelDownloads is %d, using %lu persistent connections — each one is kept "
-            "open across segments, so more than this buys congestion, not throughput",
-            rep->rep_id, cfg->parallel_downloads, (unsigned long)rep->ndl);
+    (void)st;
     return true;
 }
 
@@ -2038,114 +2086,24 @@ static void rep_stop_workers(live_rep *rep) {
     pthread_mutex_lock(&st->mu);
     rep->poller_done = true;
     pthread_cond_broadcast(&st->cv);
+    // Pool threads are shared and are joined once, by the director. Any of them
+    // may still be inside a fetch that writes into this rendition's ring, so
+    // wait for the rendition's own count to fall to zero before freeing it.
+    // They stop retrying as soon as st->stop is set, which is the only way this
+    // function is reached.
+    while (rep->active_downloads > 0) pthread_cond_wait(&st->cv, &st->mu);
     pthread_mutex_unlock(&st->mu);
 
-    for (size_t i = 0; i < rep->ndl; i++) pthread_join(rep->dl_threads[i], NULL);
     if (rep->wr_started) pthread_join(rep->wr_thread, NULL);
 
     pthread_mutex_lock(&st->mu);
     pend_clear_locked(rep);
-    pthread_mutex_unlock(&st->mu);
-    free(rep->dl_threads);
-    rep->dl_threads = NULL;
-    rep->ndl = 0;
-    rep->wr_started = false;
-    free(rep->pending);
+    pend_item *ring = rep->pending;
     rep->pending = NULL;
     rep->pend_cap = 0;
-}
-
-// The poller. Re-reads the manifest on a strict cadence and queues whatever is
-// new; it never downloads, decrypts or publishes, so nothing the network does
-// can stop it keeping its place in the live window.
-static void *rep_main(void *arg) {
-    live_rep *rep = (live_rep *)arg;
-    live_stream *st = rep->owner;
-    double interval = 2.0;
-
-    cfg_snap boot;
-    pthread_mutex_lock(&st->mu);
-    cfg_snapshot_locked(st, &boot);
     pthread_mutex_unlock(&st->mu);
-    bool ok = rep_start_workers(rep, &boot);
-    lgf(st, ok ? "info" : "error", "repStart", NULL, 0, -1,
-        ok ? "%s (%s): worker started, %lu download threads"
-           : "%s (%s): worker could not start its download threads",
-        rep->rep_id, rep->kind, (unsigned long)rep->ndl);
-    cfg_snap_dispose(&boot);
-
-    while (ok) {
-        if (live_stopping(st)) break;
-        double cycle_start = now_seconds();
-
-        cfg_snap cfg;
-        pthread_mutex_lock(&st->mu);
-        cfg_snapshot_locked(st, &cfg);
-        rep->polls++;
-        rep->last_poll = now_seconds();
-        pthread_mutex_unlock(&st->mu);
-
-        rep_poll(rep, &cfg, &interval);
-
-        // The poll interval is a PERIOD, not a delay: sleeping the full
-        // interval after the work made the real cycle interval + work, which at
-        // a two second minimumUpdatePeriod was exactly break-even and never
-        // built a cushion.
-        double period = cfg.poll_interval > 0 ? cfg.poll_interval : interval;
-        if (period > 10.0) period = 10.0;
-
-        // Never poll so slowly that segments can age out of the manifest window
-        // between reads. N_m3u8DL-RE takes the same guarantee from the other
-        // direction, setting its refresh to half the window's duration minus a
-        // two second margin; here the period is already short, so this only
-        // caps a source that advertises an absurd minimumUpdatePeriod.
-        double window_seconds = (double)(cfg.download_ahead > 0 ? cfg.download_ahead : 8)
-                              * (rep->seg_duration > 0 ? rep->seg_duration : 2.0);
-        double safety = window_seconds / 2.0 - 2.0;
-        if (safety < 1.0) safety = 1.0;
-        if (period > safety) period = safety;
-
-        double spent = now_seconds() - cycle_start;
-        double sleep_for = period - spent;
-        if (sleep_for < 0.1) sleep_for = 0.1;
-        // A manifest read that on its own overruns the safety margin is the one
-        // case where segments can still be missed, because the window moves on
-        // while the read is in flight. Downloads no longer share this thread,
-        // so this now means the manifest path itself is too slow — a different
-        // and much more specific problem than the old pollSlow, which fired
-        // whenever a batch of segments took a while.
-        if (spent > safety)
-            lgf(st, "error", "pollSlow", NULL, 0, -1,
-                "%s: the manifest read alone took %.2fs, over the %.2fs safety margin for a "
-                "%.0fs window — segments can age out between reads",
-                rep->rep_id, spent, safety, window_seconds);
-
-        // A failed poll overrides all of that. The rule above reasons about a
-        // poll that did work, and a failure that returns in 40ms looks to it
-        // like the fastest possible success — so it retried hardest exactly
-        // when it should have retried least, and against an origin that limits
-        // by IP the retries alone kept the block in place. See live_backoff.c.
-        double backoff = rs_live_backoff_delay(rep->manifest_failures, rep->manifest_throttled, period);
-        if (backoff > sleep_for) {
-            sleep_for = backoff;
-            lgf(st, "info", "pollBackoff", NULL, 0, -1,
-                "%s: %d failed poll%s in a row%s — waiting %.1fs before the next one",
-                rep->rep_id, rep->manifest_failures, rep->manifest_failures == 1 ? "" : "s",
-                rep->manifest_throttled ? " (origin is refusing for rate reasons)" : "",
-                sleep_for);
-        }
-        cfg_snap_dispose(&cfg);
-        if (!live_wait(st, sleep_for)) break;
-    }
-
-    rep_stop_workers(rep);
-    lgf(st, "info", "repStop", NULL, 0, -1, "%s: worker stopped after %lld polls",
-        rep->rep_id, rep->polls);
-
-    pthread_mutex_lock(&st->mu);
-    rep->finished = true;
-    pthread_mutex_unlock(&st->mu);
-    return NULL;
+    rep->wr_started = false;
+    free(ring);
 }
 
 // --- 4. the director --------------------------------------------------------
@@ -2173,8 +2131,13 @@ static void rep_ensure_locked(live_stream *st, const char *rep_id, const char *k
     rep->highest_time_val = -1;
     rep->index = (int)st->nreps;
     st->reps[st->nreps++] = rep;
-    if (pthread_create(&rep->thread, NULL, rep_main, rep) == 0) rep->thread_started = true;
-    else rep->finished = true;
+    // No poller thread: the director reads the manifest once for the whole
+    // stream and hands this rendition its plan. What the rendition still owns
+    // is its writer, which commits downloaded segments in queue order.
+    // Deliberately not logged from here — the caller holds st->mu, and the log
+    // sink is the server's, so announcing the rendition is left to the director
+    // once it has let the lock go.
+    if (!rep_start_workers(rep)) rep->broken = true;
 }
 
 // The director's retry-after-failure delay, on the same rule as the
@@ -2187,15 +2150,57 @@ static double director_retry_delay(int failures, bool throttled) {
     return d > 0 ? d : RS_LIVE_DIRECTOR_RETRY;
 }
 
+// The stream's download pool. Sized once, from parallelDownloads, and shared
+// by every rendition for the life of the stream — a thread that comes and goes
+// throws away the keep-alive connection that is the whole reason it is
+// persistent. Threads block until a rendition exists and has work, so the pool
+// can be up before the director has even read the rendition list.
+static size_t stream_start_pool(live_stream *st) {
+    size_t want = (size_t)st->worker_parallel_downloads;
+    st->dl_threads = (pthread_t *)calloc(want ? want : 1, sizeof(pthread_t));
+    if (!st->dl_threads) return 0;
+    for (size_t i = 0; i < want; i++)
+        if (pthread_create(&st->dl_threads[st->ndl], NULL, download_main, st) == 0) st->ndl++;
+    return st->ndl;
+}
+
+static void stream_stop_pool(live_stream *st) {
+    pthread_mutex_lock(&st->mu);
+    st->stop = true;
+    pthread_cond_broadcast(&st->cv);
+    pthread_mutex_unlock(&st->mu);
+    for (size_t i = 0; i < st->ndl; i++) pthread_join(st->dl_threads[i], NULL);
+    free(st->dl_threads);
+    st->dl_threads = NULL;
+    st->ndl = 0;
+}
+
 static void *director_main(void *arg) {
     live_stream *st = (live_stream *)arg;
     lg(st, "info", "liveStart", NULL, 0, -1, "live DASH engine started");
 
-    int fails = 0;              // consecutive failed rendition polls
+    size_t pool = stream_start_pool(st);
+    if (pool == 0) {
+        lg(st, "error", "liveStart", NULL, 0, -1,
+           "could not start the download pool");
+        pthread_mutex_lock(&st->mu);
+        st->stop = true;
+        st->dir_finished = true;
+        pthread_cond_broadcast(&st->cv);
+        pthread_mutex_unlock(&st->mu);
+        return NULL;
+    }
+    lgf(st, "info", "liveStart", NULL, 0, -1,
+        "%lu download connection%s for this channel, shared by every rendition",
+        (unsigned long)pool, pool == 1 ? "" : "s");
+
+    int fails = 0;              // consecutive failed manifest polls
     bool throttled = false;     // ...and whether the last was a rate refusal
+    double interval = 2.0;      // the source's minimumUpdatePeriod, once known
 
     for (;;) {
         if (live_stopping(st)) break;
+        double cycle_start = now_seconds();
 
         cfg_snap cfg;
         char *pinned = NULL;
@@ -2204,13 +2209,50 @@ static void *director_main(void *arg) {
         pinned = rs_strdup(st->representation ? st->representation : "");
         pthread_mutex_unlock(&st->mu);
 
+        // One manifest read serves the whole stream. Every rendition that
+        // already exists is named in the same request, so the origin sees one
+        // fetch per cycle and the engine holds ONE manifest connection instead
+        // of one per rendition — which is what made a channel's connection
+        // count "parallelDownloads plus a poller each" rather than just
+        // parallelDownloads. (Representation ids are template substitutions in
+        // segment URLs, so a comma in one is not a case that occurs.)
+        //
+        // The window is sized for the widest asker; each rendition narrows it
+        // back to its own in rep_apply_plan.
+        live_rep *polled[RS_LIVE_MAX_REPS];
+        int wants[RS_LIVE_MAX_REPS];
+        size_t npolled = 0;
+        pthread_mutex_lock(&st->mu);
+        for (size_t r = 0; r < st->nreps; r++)
+            if (!st->reps[r]->broken) polled[npolled++] = st->reps[r];
+        size_t reps_before = st->nreps;
+        pthread_mutex_unlock(&st->mu);
+
+        int want = 0;
+        char ids[1024];
+        size_t idlen = 0;
+        ids[0] = '\0';
+        for (size_t r = 0; r < npolled; r++) {
+            wants[r] = rep_window_want(polled[r], &cfg, cycle_start);
+            if (wants[r] > want) want = wants[r];
+            int n = snprintf(ids + idlen, sizeof(ids) - idlen, "%s%s",
+                             idlen ? "," : "", polled[r]->rep_id);
+            if (n > 0 && (size_t)n < sizeof(ids) - idlen) idlen += (size_t)n;
+            else ids[idlen] = '\0';
+        }
+
+        if (npolled)
+            lgf(st, "info", "pollStart", cfg.mpd_url, 0, -1,
+                "requesting %d segments for %lu rendition%s in one manifest read",
+                want, (unsigned long)npolled, npolled == 1 ? "" : "s");
+
         char err[256] = {0};
-        char *json = manifest_fetch(st, &cfg, "", 0, err, sizeof(err));
+        char *json = manifest_fetch(st, &cfg, ids, want, err, sizeof(err));
         if (!json) {
             fails++;
             throttled = rs_live_status_is_throttle(status_from_error(err)) != 0;
             double wait = director_retry_delay(fails, throttled);
-            lgf(st, "error", "renditions", cfg.mpd_url, 0, -1, "%s — retrying in %.1fs",
+            lgf(st, "error", "manifest", cfg.mpd_url, 0, -1, "%s — retrying in %.1fs",
                 err[0] ? err : "could not read the MPD", wait);
             free(pinned);
             cfg_snap_dispose(&cfg);
@@ -2224,7 +2266,7 @@ static void *director_main(void *arg) {
             fails++;
             throttled = false;
             double wait = director_retry_delay(fails, throttled);
-            lgf(st, "error", "renditions", cfg.mpd_url, 0, -1,
+            lgf(st, "error", "manifest", cfg.mpd_url, 0, -1,
                 "malformed DASH description — retrying in %.1fs", wait);
             free(pinned);
             cfg_snap_dispose(&cfg);
@@ -2366,12 +2408,108 @@ static void *director_main(void *arg) {
                 (have_text && tid[0]) ? "\"" : "",
                 ncc > 0 ? ", in-band closed captions" : "");
 
+        // Announce anything the rendition list just added, now that st->mu is
+        // free again (rep_ensure_locked cannot log from under it).
+        for (size_t r = reps_before; r < st->nreps; r++) {
+            live_rep *fresh = st->reps[r];
+            if (fresh->broken)
+                lgf(st, "error", "repStart", NULL, 0, -1,
+                    "%s (%s): rendition could not start its writer", fresh->rep_id, fresh->kind);
+            else
+                lgf(st, "info", "repStart", NULL, 0, -1,
+                    "%s (%s): rendition ready, sharing the stream's %d download connection%s",
+                    fresh->rep_id, fresh->kind, st->worker_parallel_downloads,
+                    st->worker_parallel_downloads == 1 ? "" : "s");
+        }
+
+        // Hand every rendition its slice of this read. Renditions created just
+        // above were not in the request, so they have no plan yet; the poll
+        // below runs again immediately for them rather than making a brand new
+        // rendition wait out a full cycle before its first segment.
+        const rs_json *plans = rs_json_obj_get(root, "plans");
+        size_t nplans = (plans && rs_json_type_of(plans) == RS_JSON_ARR) ? rs_json_arr_len(plans) : 0;
+        for (size_t r = 0; r < npolled; r++) {
+            const rs_json *mine = NULL;
+            for (size_t i = 0; i < nplans && !mine; i++) {
+                const rs_json *pj = rs_json_arr_at(plans, i);
+                if (strcmp(rs_json_obj_str(pj, "repId", ""), polled[r]->rep_id) == 0) mine = pj;
+            }
+            if (!mine) {
+                lgf(st, "error", "manifest", cfg.mpd_url, 0, -1,
+                    "%s: representation not present in the MPD", polled[r]->rep_id);
+                continue;
+            }
+            rep_apply_plan(polled[r], &cfg, mine, cycle_start, wants[r]);
+            if (live_stopping(st)) break;
+        }
+
+        double mup = rs_json_as_num(rs_json_obj_get(root, "mup"), 0);
+        if (mup > 0 && cfg.poll_interval <= 0) interval = mup;
+
+        pthread_mutex_lock(&st->mu);
+        bool discovered = st->nreps > reps_before;
+        double seg_dur = 2.0;
+        for (size_t r = 0; r < st->nreps; r++)
+            if (st->reps[r]->seg_duration > seg_dur) seg_dur = st->reps[r]->seg_duration;
+        pthread_mutex_unlock(&st->mu);
+
         bool reduced = cfg.reduced_manifest_polling != 0;
         rs_json_free(root);
         free(pinned);
+
+        // The poll interval is a PERIOD, not a delay: sleeping the full
+        // interval after the work made the real cycle interval + work, which at
+        // a two second minimumUpdatePeriod was exactly break-even and never
+        // built a cushion.
+        double period = cfg.poll_interval > 0 ? cfg.poll_interval : interval;
+        if (period > 10.0) period = 10.0;
+
+        // Never poll so slowly that segments can age out of the manifest window
+        // between reads. N_m3u8DL-RE takes the same guarantee from the other
+        // direction, setting its refresh to half the window's duration minus a
+        // two second margin; here the period is already short, so this only
+        // caps a source that advertises an absurd minimumUpdatePeriod.
+        double window_seconds = (double)(cfg.download_ahead > 0 ? cfg.download_ahead : 8) * seg_dur;
+        double safety = window_seconds / 2.0 - 2.0;
+        if (safety < 1.0) safety = 1.0;
+        if (period > safety) period = safety;
+
+        // reducedManifestPolling used to mean "back the rendition-list poll off
+        // so it stops being a third concurrent manifest fetch". There is only
+        // one fetch now, so it means the thing its name always said: never read
+        // the manifest more than once per segment the source produces. Still
+        // opt-in, because it trades live-edge responsiveness for request rate.
+        if (reduced && period < seg_dur) period = seg_dur;
+
+        double spent = now_seconds() - cycle_start;
+        double sleep_for = period - spent;
+        if (sleep_for < 0.1) sleep_for = 0.1;
+        // A manifest read that on its own overruns the safety margin is the one
+        // case where segments can still be missed, because the window moves on
+        // while the read is in flight. Downloads do not share this thread, so
+        // this means the manifest path itself is too slow.
+        if (spent > safety)
+            lgf(st, "error", "pollSlow", NULL, 0, -1,
+                "the manifest read alone took %.2fs, over the %.2fs safety margin for a "
+                "%.0fs window — segments can age out between reads",
+                spent, safety, window_seconds);
+        if (discovered) sleep_for = 0.1;
+
         cfg_snap_dispose(&cfg);
-        if (!live_wait(st, reduced ? RS_LIVE_DIRECTOR_IDLE_INTERVAL : RS_LIVE_DIRECTOR_INTERVAL)) break;
+        if (!live_wait(st, sleep_for)) break;
     }
+
+    // Renditions have no thread of their own any more, so their teardown is
+    // the director's. Each one waits for the shared pool's in-flight fetches
+    // into its ring to land before freeing it, which is why the pool is stopped
+    // only afterwards.
+    for (size_t r = 0; r < st->nreps; r++) {
+        if (st->reps[r]->broken) continue;
+        rep_stop_workers(st->reps[r]);
+        lgf(st, "info", "repStop", NULL, 0, -1, "%s: rendition stopped after %lld polls",
+            st->reps[r]->rep_id, st->reps[r]->polls);
+    }
+    stream_stop_pool(st);
 
     lg(st, "info", "liveStop", NULL, 0, -1, "live DASH engine stopped");
     pthread_mutex_lock(&st->mu);
@@ -2395,7 +2533,6 @@ static void rep_dispose(live_rep *rep) {
             pend_item_dispose(&rep->pending[(rep->pend_head + i) % rep->pend_cap]);
         free(rep->pending);
     }
-    free(rep->dl_threads);
     free(rep->init_url);
     free(rep->init_key);
     free(rep->init_data);
@@ -2408,6 +2545,9 @@ static void rep_dispose(live_rep *rep) {
 
 static void stream_dispose(live_stream *st) {
     for (size_t i = 0; i < st->nreps; i++) rep_dispose(st->reps[i]);
+    // Normally released by stream_stop_pool; a pool that never got a thread
+    // started (the director bails out immediately) still owns the array.
+    free(st->dl_threads);
     free(st->id);
     for (size_t i = 0; i < st->representation_count; i++) {
         free((char *)st->representations[i].id); free((char *)st->representations[i].type);
@@ -2499,6 +2639,8 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     st->reduced_manifest_polling = cfg->reduced_manifest_polling;
     st->playlist_segments = cfg->playlist_segments > 0 ? cfg->playlist_segments : 6;
     if (st->playlist_segments < 3) st->playlist_segments = 3;
+    st->hls_segment_seconds = cfg->hls_segment_seconds > 0 ? cfg->hls_segment_seconds : 10;
+    if (st->hls_segment_seconds > 30) st->hls_segment_seconds = 30;
     st->download_ahead = cfg->download_ahead > 0 ? cfg->download_ahead : 16;
     st->parallel_downloads = cfg->parallel_downloads;
     st->prioritize_oldest = cfg->prioritize_oldest;
@@ -2518,13 +2660,15 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     // rendition would be well over a hundred megabytes per stream. Everything
     // past the window plus a lag allowance only serves players that have fallen
     // badly behind, which the hold-back already exists to prevent.
-    int hold = st->download_ahead - st->playlist_segments;
+    int hold = st->hls_segment_seconds > 1
+                   ? 0 : st->download_ahead - st->playlist_segments;
     if (hold < 0) hold = 0;
     // Retain the delayed future as well as the visible window and normal edge
     // hold-back. Segment duration is not known until media arrives; two seconds
     // is the common DASH duration and the 64MB per-rendition ceiling remains
     // the final memory guard for unusually large/short segments.
-    int buffer_segments = (st->playback_delay_seconds + 1) / 2;
+    int buffer_segments = (st->playback_delay_seconds + st->hls_segment_seconds - 1)
+                            / st->hls_segment_seconds;
     int need = st->playlist_segments + hold + buffer_segments + 8;
     st->keep_segments = cfg->keep_segments > 0 ? cfg->keep_segments : 60;
     if (st->keep_segments < need) st->keep_segments = need;
@@ -2542,6 +2686,7 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
             // oldest at now+buffer would accidentally add all retained history
             // to the requested delay when the option is edited on a live stream.
             for (size_t j = rep->nsegs; j > 0; j--) {
+                if (!rep->segs[j - 1].complete) continue;
                 rep->segs[j - 1].release_at = release;
                 if (j > 1)
                     release -= rep->segs[j - 2].duration > 0
@@ -2661,15 +2806,13 @@ void rs_live_reap(rs_live *live) {
     for (size_t i = 0; i < live->nstreams;) {
         live_stream *st = live->streams[i];
         pthread_mutex_lock(&st->mu);
+        // The director owns every other thread in the stream — the shared
+        // download pool and each rendition's writer — and finishes last.
         bool done = st->stop && (!st->dir_started || st->dir_finished);
-        for (size_t r = 0; done && r < st->nreps; r++)
-            if (st->reps[r]->thread_started && !st->reps[r]->finished) done = false;
         pthread_mutex_unlock(&st->mu);
         if (!done) { i++; continue; }
 
         if (st->dir_started) pthread_join(st->dir_thread, NULL);
-        for (size_t r = 0; r < st->nreps; r++)
-            if (st->reps[r]->thread_started) pthread_join(st->reps[r]->thread, NULL);
         live->streams[i] = live->streams[live->nstreams - 1];
         live->nstreams--;
         pthread_mutex_unlock(&live->mu);
@@ -2698,8 +2841,6 @@ void rs_live_destroy(rs_live *live) {
     for (size_t i = 0; i < n; i++) {
         live_stream *st = all[i];
         if (st->dir_started) pthread_join(st->dir_thread, NULL);
-        for (size_t r = 0; r < st->nreps; r++)
-            if (st->reps[r]->thread_started) pthread_join(st->reps[r]->thread, NULL);
         stream_dispose(st);
     }
     pthread_mutex_destroy(&live->mu);
@@ -2787,7 +2928,7 @@ uint8_t *rs_live_take_indexed(rs_live *live, const char *stream_id, int rep_inde
                 // The queue is small (a couple of dozen entries) and ordered, so
                 // a scan costs nothing next to the memcpy that follows.
                 for (size_t j = 0; j < r->nsegs; j++) {
-                    if (r->segs[j].seq != seq) continue;
+                    if (r->segs[j].seq != seq || !r->segs[j].complete) continue;
                     size_t len = r->segs[j].len;
                     copy = (uint8_t *)malloc(len ? len : 1);
                     if (copy) { memcpy(copy, r->segs[j].data, len); *out_len = len; }
@@ -2817,12 +2958,14 @@ size_t rs_live_reps(rs_live *live, const char *stream_id, rs_live_rep_desc **out
                     descs[i].kind = rs_strdup(st->reps[i]->kind ? st->reps[i]->kind : "");
                     descs[i].index = st->reps[i]->index;
                     descs[i].timescale = st->reps[i]->timescale;
-                    descs[i].held = st->reps[i]->nsegs;
-                    descs[i].segment_duration = st->reps[i]->seg_duration > 0
-                                                    ? st->reps[i]->seg_duration : 2.0;
-                    if (st->reps[i]->nsegs) {
+                    size_t complete = st->reps[i]->nsegs;
+                    if (complete > 0 && !st->reps[i]->segs[complete - 1].complete) complete--;
+                    descs[i].held = complete;
+                    descs[i].segment_duration = complete > 0
+                                                    ? st->reps[i]->segs[complete - 1].duration : 10.0;
+                    if (complete) {
                         descs[i].oldest_seq = st->reps[i]->segs[0].seq;
-                        descs[i].newest_seq = st->reps[i]->segs[st->reps[i]->nsegs - 1].seq;
+                        descs[i].newest_seq = st->reps[i]->segs[complete - 1].seq;
                     }
                 }
                 *out = descs;
@@ -2861,7 +3004,7 @@ uint8_t *rs_live_take_after(rs_live *live, const char *stream_id, int rep_index,
             // lands on the oldest one still held instead — the gap is real and
             // already lost, and stalling forever would be worse.
             for (size_t j = 0; j < r->nsegs; j++) {
-                if (r->segs[j].seq <= after_seq) continue;
+                if (r->segs[j].seq <= after_seq || !r->segs[j].complete) continue;
                 size_t len = r->segs[j].len;
                 copy = (uint8_t *)malloc(len ? len : 1);
                 if (copy) {
@@ -2904,6 +3047,21 @@ char *rs_live_status_line(rs_live *live, const char *stream_id) {
     return out;
 }
 
+long long rs_live_drain_ingest(rs_live *live, const char *stream_id) {
+    if (!live || !stream_id) return 0;
+    long long bytes = 0;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        bytes = st->ingest_bytes;
+        st->ingest_bytes = 0;
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    return bytes;
+}
+
 #else  // _WIN32 — no pthreads here yet; DASH playback falls back to the
        // request-time path in server.c.
 
@@ -2943,5 +3101,8 @@ uint8_t *rs_live_take_after(rs_live *live, const char *stream_id, int rep_index,
     return NULL;
 }
 char *rs_live_status_line(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return NULL; }
+long long rs_live_drain_ingest(rs_live *live, const char *stream_id) {
+    (void)live; (void)stream_id; return 0;
+}
 
 #endif  // _WIN32

@@ -81,9 +81,16 @@ async function request(path, options = {}) {
 }
 
 let refreshPromise = null;
+let stateMutationEpoch = 0;
 
 async function refreshOnce() {
-  state = await request("/api/state");
+  const epoch = stateMutationEpoch;
+  const fresh = await request("/api/state");
+  // A GET issued just before Start can arrive after the POST response and used
+  // to paint the old `stopped` snapshot over the new running state. That made
+  // a successful broadcast visibly "drop" until another refresh.
+  if (epoch !== stateMutationEpoch) return;
+  state = fresh;
   if (!selectedProviderId && state.providers[0]) selectedProviderId = state.providers[0].id;
   const provider = selectedProvider();
   if (!provider) selectedProviderId = null;
@@ -489,6 +496,7 @@ async function bulkStreamAction(kind) {
     if (!confirm(`Delete ${rows.length} stream${rows.length === 1 ? "" : "s"}? This stops them and removes their configuration. This cannot be undone.`)) return;
   }
   let count = 0;
+  stateMutationEpoch++;
   // Starting many DASH engines simultaneously creates every director, poller,
   // writer and download pool in one spike. Serialize bulk operations; the UI
   // already promised this behavior and it keeps the panel event loop responsive.
@@ -508,6 +516,7 @@ async function bulkStreamAction(kind) {
     }
   }
   if (count > 0) state = await request("/api/state");
+  stateMutationEpoch++;
   
   if (kind === "delete") { selectedStreamId = null; lastEditorStreamId = null; }
   render();
@@ -589,8 +598,8 @@ function renderStreamsGrid() {
       ${eventWindow ? `<div class="stream-url">${escapeHtml(eventWindow)}${stream.autostart ? " · autostart" : ""}</div>` : ""}
       <div class="stream-stats">
         <span>${stream.activeClients ?? 0} active</span>
-        <span>↓ ${formatBytesPerSecond(inputBandwidth.bytesPerSecond)}</span>
-        <span>↑ ${formatBytesPerSecond(bandwidth.bytesPerSecond)}</span>
+        <span title="Downloaded from the origin">↓ ${formatBytesPerSecond(inputBandwidth.bytesPerSecond)}</span>
+        <span title="Served to viewers">↑ ${formatBytesPerSecond(bandwidth.bytesPerSecond)}</span>
       </div>
       <div class="actions">
         <button type="button" class="ghost mini-icon-btn" data-action="copyurl" title="Copy the HLS (m3u8) output URL"><span data-icon="copy"></span></button>
@@ -781,6 +790,7 @@ function renderEditor() {
     if (!editingNewStream) {
       form.reset();
       form.elements.playlistSegments.value = 6;
+      form.elements.hlsSegmentSeconds.value = 10;
       form.elements.playbackDelaySeconds.value = 0;
       form.elements.keepSegments.value = 60;
       form.elements.downloadAhead.value = 20;
@@ -846,6 +856,7 @@ function renderEditor() {
   form.elements.downloader.value = stream.downloader || "";
   form.elements.downloaderParams.value = stream.downloaderParams || "";
   form.elements.playlistSegments.value = stream.playlistSegments || 6;
+  form.elements.hlsSegmentSeconds.value = stream.hlsSegmentSeconds || 10;
   form.elements.playbackDelaySeconds.value = stream.playbackDelaySeconds || 0;
   form.elements.keepSegments.value = stream.keepSegments || 60;
   form.elements.downloadAhead.value = stream.downloadAhead ?? 20;
@@ -977,6 +988,7 @@ function streamPayload() {
     downloader: form.elements.downloader.value,
     downloaderParams: form.elements.downloaderParams.value,
     playlistSegments: Number(form.elements.playlistSegments.value),
+    hlsSegmentSeconds: Number(form.elements.hlsSegmentSeconds.value) || 10,
     playbackDelaySeconds: Number(form.elements.playbackDelaySeconds.value),
     keepSegments: Number(form.elements.keepSegments.value),
     downloadAhead: Number(form.elements.downloadAhead.value),
@@ -1043,7 +1055,9 @@ async function saveStream(event) {
 
 async function toggleStreamRun(id, running) {
   try {
+    stateMutationEpoch++;
     state = await request(`/api/streams/${id}/${running ? "stop" : "start"}`, { method: "POST", body: "{}" });
+    stateMutationEpoch++;
     render();
   } catch (error) {
     alert(`Failed to ${running ? "stop" : "start"} stream: ${error.message || error}`);
@@ -1086,6 +1100,7 @@ function newStream() {
   $("#streamForm").elements.id.value = "";
   $("#streamForm").elements.kind.value = "mpd";
   $("#streamForm").elements.playlistSegments.value = 6;
+  $("#streamForm").elements.hlsSegmentSeconds.value = 10;
   $("#streamForm").elements.playbackDelaySeconds.value = 0;
   $("#streamForm").elements.keepSegments.value = 10;
   $("#streamForm").elements.downloadAhead.value = 20;
@@ -1254,8 +1269,10 @@ function stopPlayer() {
 // moment later. Retrying persistently with backoff lets playback start on its
 // own as soon as the first segments land, and also rides out a transient blip
 // mid-stream rather than tearing the player down.
-// liveSyncDurationCount=2 (hls.js's default) means "start ~4s behind the live
-// edge" — fine when the origin publishes on a steady 2s cadence, but the
+// Use seconds rather than segment counts: output segment duration is
+// configurable, and ten-second segments must not turn an 8-segment target
+// into 80 seconds of extra latency. Twenty seconds gives the player two full
+// default segments while the
 // sources this app restreams get fetched through slow/rate-limited proxies,
 // so the server's own poll cycle can take 10-20s+ per batch and the live edge
 // jumps forward in bursts rather than one segment at a time. hls.js kept
@@ -1266,8 +1283,8 @@ function stopPlayer() {
 // ~16s more live latency for a target that survives one burst gives it
 // something to actually catch up to.
 const HLS_CONFIG = {
-  liveSyncDurationCount: 8,
-  liveMaxLatencyDurationCount: 14,
+  liveSyncDuration: 20,
+  liveMaxLatencyDuration: 60,
   maxLiveSyncPlaybackRate: 1,
   debug: true,
   playlistLoadPolicy: {
@@ -2768,6 +2785,7 @@ function applyMetrics(payload) {
   lastMetricsPayload = payload;
   if (currentView !== "monitor" && currentView !== "server") return;
   const global = payload.global || {};
+  const globalInput = payload.globalInput || {};
   const system = payload.system || {};
   const cpuPercent = Number(system.cpuPercent || 0);
   const loadAverage = Number(system.loadAverage || 0);
@@ -2780,15 +2798,17 @@ function applyMetrics(payload) {
     statTile("Disk", formatBytes((system.diskTotalBytes || 0) - (system.diskAvailableBytes || 0)), `of ${formatBytes(system.diskTotalBytes)} used`),
     statTile("Uptime", formatUptime(system.uptimeSeconds), system.osVersion || ""),
     statTile("Build", appVersionLabel(), appVersionSubtitle()),
-    statTile("All-time served", formatBytes(global.allTimeBytes)),
+    statTile("All-time served", formatBytes(global.allTimeBytes), `${formatBytes(globalInput.allTimeBytes)} pulled from origins`),
   ].join("");
 
   if (currentView === "server") return;
 
+  // Out (↑) is what viewers are taking; in (↓) is what the engines are pulling
+  // from the origins, which keeps running with nobody connected.
   $("#headlineTiles").innerHTML = [
-    statTile("Live bandwidth", formatBytesPerSecond(global.bytesPerSecond)),
+    statTile("Live bandwidth", `↑ ${formatBytesPerSecond(global.bytesPerSecond)}`, `↓ ${formatBytesPerSecond(globalInput.bytesPerSecond)} from origins`),
     statTile("Active clients", String(global.activeClients || 0)),
-    statTile("All-time served", formatBytes(global.allTimeBytes)),
+    statTile("All-time served", formatBytes(global.allTimeBytes), `${formatBytes(globalInput.allTimeBytes)} pulled`),
     statTile("Connected IPs", String(new Set((payload.connections || []).map((c) => c.clientIP).filter(Boolean)).size)),
   ].join("");
 
@@ -2808,7 +2828,9 @@ function applyMetrics(payload) {
       const info = streams[id];
       const name = findStreamName(id) || id;
       const bw = info.bandwidth || info;
-      return statTile(name, `${info.activeClients || 0} active`, formatBytesPerSecond(bw.bytesPerSecond));
+      const inBps = info.inputBytesPerSecond ?? (info.inputBandwidth || {}).bytesPerSecond;
+      return statTile(name, `${info.activeClients || 0} active`,
+                      `↓ ${formatBytesPerSecond(inBps)} · ↑ ${formatBytesPerSecond(bw.bytesPerSecond)}`);
     }).join("");
   }
 

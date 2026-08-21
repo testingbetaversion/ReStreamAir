@@ -1044,12 +1044,15 @@ static void test_panel(void) {
     // the browser's numeric input is only a convenience and can be bypassed.
     rs_json *sbody = parse_json(
         "{\"name\":\"S1\",\"kind\":\"mpd\",\"url\":\"https://e.com/a.mpd\","
-        "\"playlistSegments\":1,\"playbackDelaySeconds\":999,\"keepSegments\":999}");
+        "\"playlistSegments\":1,\"hlsSegmentSeconds\":999,"
+        "\"playbackDelaySeconds\":999,\"keepSegments\":999}");
     check("panel/create-stream", rs_panel_create_stream(&st, pid, sbody, &err) == 0);
     rs_json_free(sbody);
     const rs_json *streams = rs_json_obj_get(rs_json_arr_at(providers, 0), "streams");
     check("panel/stream-count", rs_json_arr_len(streams) == 1);
     check("panel/clamp", rs_json_obj_int(rs_json_arr_at(streams, 0), "playlistSegments", 0) == 3);
+    check("panel/hls-segment-ceiling",
+          rs_json_obj_int(rs_json_arr_at(streams, 0), "hlsSegmentSeconds", 0) == 30);
     check("panel/buffer-ceiling",
           rs_json_obj_int(rs_json_arr_at(streams, 0), "playbackDelaySeconds", 0) == 120);
     check("panel/keep-ceiling",

@@ -133,7 +133,7 @@ static restream_pipeline_poll_fn g_pipeline_poll = NULL;
 // The live-engine control plane is defined with the playback handlers, further
 // down, but the /api/streams/*/start|stop|update|delete routes above them have
 // to be able to start and stop engines.
-static void live_sync_stream(restream_server_t *s, const char *stream_id);
+static int live_sync_stream(restream_server_t *s, const char *stream_id);
 static void live_stop_stream(restream_server_t *s, const char *stream_id);
 static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
                                 char *errbuf, size_t errbuf_len);
@@ -801,16 +801,20 @@ static void inject_stream_metrics(restream_server_t *s, rs_json *view) {
             rs_json *st = (rs_json *)rs_json_arr_at(streams, j);
             const char *id = rs_json_obj_str(st, "id", "");
             if (!id[0]) continue;
-            long long bps = (long long)rs_metrics_bytes_per_sec(s->metrics, id);
-            long long total = rs_metrics_total_bytes(s->metrics, id);
             rs_json_obj_set_int(st, "activeClients", rs_metrics_active_clients(s->metrics, id));
             rs_json *out = rs_json_new_obj();
-            rs_json_obj_set_int(out, "bytesPerSecond", bps);
-            rs_json_obj_set_int(out, "allTimeBytes", total);
+            rs_json_obj_set_int(out, "bytesPerSecond",
+                                (long long)rs_metrics_bytes_per_sec(s->metrics, id));
+            rs_json_obj_set_int(out, "allTimeBytes", rs_metrics_total_bytes(s->metrics, id));
             rs_json_obj_set(st, "bandwidth", out);
-            rs_json *in = rs_json_new_obj();  // proxy: input rate ≈ output rate
-            rs_json_obj_set_int(in, "bytesPerSecond", bps);
-            rs_json_obj_set_int(in, "allTimeBytes", total);
+            // Measured, not assumed. This used to report the served rate as the
+            // input rate too, which read as 0 B/s for every running stream
+            // nobody was watching — exactly the case where knowing what the
+            // engine costs upstream matters most.
+            rs_json *in = rs_json_new_obj();
+            rs_json_obj_set_int(in, "bytesPerSecond",
+                                (long long)rs_metrics_input_bytes_per_sec(s->metrics, id));
+            rs_json_obj_set_int(in, "allTimeBytes", rs_metrics_input_total_bytes(s->metrics, id));
             rs_json_obj_set(st, "inputBandwidth", in);
         }
     }
@@ -986,10 +990,12 @@ static rs_json *build_metrics(restream_server_t *s) {
     rs_json *out = rs_json_new_obj();
     rs_json *streams = rs_json_new_obj();
     double global_bps = 0; long long global_total = 0; int global_clients = 0;
+    double global_in_bps = 0; long long global_in_total = 0;
 
-    // One entry per stream, plus running totals for the global monitor. The C
-    // server is a proxy, so bytes fetched ≈ bytes served — report the served
-    // rate as both the input (↓) and output (↑) figure.
+    // One entry per stream, plus running totals for the global monitor. In (↓)
+    // and out (↑) are measured separately: a running engine pulls segments
+    // continuously with nobody connected, so the two figures are only ever
+    // close when every stream has a viewer.
     const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
     for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
         const rs_json *streams_arr = rs_json_obj_get(rs_json_arr_at(providers, i), "streams");
@@ -998,13 +1004,18 @@ static rs_json *build_metrics(restream_server_t *s) {
             if (!id[0]) continue;
             double bps = rs_metrics_bytes_per_sec(s->metrics, id);
             long long total = rs_metrics_total_bytes(s->metrics, id);
+            double in_bps = rs_metrics_input_bytes_per_sec(s->metrics, id);
+            long long in_total = rs_metrics_input_total_bytes(s->metrics, id);
             int clients = rs_metrics_active_clients(s->metrics, id);
             rs_json *sm = rs_json_new_obj();
             rs_json_obj_set_int(sm, "bytesPerSecond", (long long)bps);
             rs_json_obj_set_int(sm, "allTimeBytes", total);
+            rs_json_obj_set_int(sm, "inputBytesPerSecond", (long long)in_bps);
+            rs_json_obj_set_int(sm, "inputAllTimeBytes", in_total);
             rs_json_obj_set_int(sm, "activeClients", clients);
             rs_json_obj_set(streams, id, sm);
             global_bps += bps; global_total += total; global_clients += clients;
+            global_in_bps += in_bps; global_in_total += in_total;
         }
     }
 
@@ -1014,8 +1025,8 @@ static rs_json *build_metrics(restream_server_t *s) {
     rs_json_obj_set_int(global, "activeClients", global_clients);
     rs_json_obj_set(out, "global", global);
     rs_json *ginput = rs_json_new_obj();
-    rs_json_obj_set_int(ginput, "bytesPerSecond", (long long)global_bps);
-    rs_json_obj_set_int(ginput, "allTimeBytes", global_total);
+    rs_json_obj_set_int(ginput, "bytesPerSecond", (long long)global_in_bps);
+    rs_json_obj_set_int(ginput, "allTimeBytes", global_in_total);
     rs_json_obj_set(out, "globalInput", ginput);
     rs_json_obj_set(out, "system", rs_sysstats_snapshot(s->sysstats));
     rs_json_obj_set(out, "streams", streams);
@@ -1043,6 +1054,25 @@ static void handle_events(restream_server_t *s, struct mg_connection *c) {
     }
 }
 
+// Folds what each live engine has pulled from the origin since the last tick
+// into the network monitor, so the panel's inbound figure reflects the engine's
+// own downloads and not just what viewers happened to take. Must run on every
+// tick, including the ones where nobody is subscribed to the SSE stream: the
+// engine's counter is a drain, and skipping ticks would bank a minute of bytes
+// and then report them all as one second's worth.
+static void collect_ingest(restream_server_t *s) {
+    const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *streams = rs_json_obj_get(rs_json_arr_at(providers, i), "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+            const char *id = rs_json_obj_str(rs_json_arr_at(streams, j), "id", "");
+            if (!id[0]) continue;
+            long long bytes = rs_live_drain_ingest(s->live, id);
+            if (bytes > 0) rs_metrics_record_input(s->metrics, id, bytes);
+        }
+    }
+}
+
 // The 1s timer: push a fresh metrics frame to every SSE subscriber.
 static void broadcast_metrics(void *arg) {
     restream_server_t *s = (restream_server_t *)arg;
@@ -1056,6 +1086,7 @@ static void broadcast_metrics(void *arg) {
                        err[0] ? err : "the restart could not be handed to systemd");
     }
     rs_metrics_prune(s->metrics);  // expire stale clients/rate windows every tick
+    collect_ingest(s);
     // Join and free any engine that finished winding down since the last tick.
     // Doing it here rather than in the stop handler is what makes Stop return
     // instantly instead of waiting for an in-flight segment download.
@@ -1595,14 +1626,15 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         int rc = rs_panel_set_stream_running(&s->state, id, true, &err);
         char pipeline_err[256] = {0};
         if (rc == 0) {
-            live_sync_stream(s, id);
-            if (pipeline_sync_stream(s, id, pipeline_err, sizeof(pipeline_err)) != 0) {
+            int live_rc = live_sync_stream(s, id);
+            if (live_rc != 0 ||
+                pipeline_sync_stream(s, id, pipeline_err, sizeof(pipeline_err)) != 0) {
                 const char *ignored = NULL;
                 live_stop_stream(s, id);
                 pipeline_stop_stream(id);
                 rs_panel_set_stream_running(&s->state, id, false, &ignored);
-                err = pipeline_err;
-                rc = -400;
+                err = live_rc != 0 ? "The live engine could not start." : pipeline_err;
+                rc = live_rc != 0 ? -500 : -400;
             }
         }
         if (rc == 0) {
@@ -2378,6 +2410,10 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
     uint8_t *body = (uint8_t *)pf->body;
     size_t body_len = pf->body_len;
     long status = pf->status;
+    // What came off the wire, before decryption changes the length. This is the
+    // proxy path's contribution to the inbound figure; the live engine reports
+    // its own downloads through rs_live_drain_ingest.
+    rs_metrics_record_input(server->metrics, pf->stream_id, (long long)pf->body_len);
 
     if (pf->decrypt) {
         size_t new_len = 0;
@@ -2831,7 +2867,7 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
     in.temp_dir = out_dir;
     in.output_playlist = playlist;
     in.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
-    in.segment_seconds = 2;
+    in.segment_seconds = (int)rs_json_obj_int(stream, "hlsSegmentSeconds", 10);
 
     rs_ffargs_command cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -2881,10 +2917,10 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
 // it alone. Safe (and cheap) to call repeatedly — ordinary settings are picked
 // up on the next poll. A changed connection-pool size performs a controlled
 // engine restart because an existing pthread pool cannot resize in place.
-static void live_sync_stream(restream_server_t *s, const char *stream_id) {
-    if (!s || !s->live || !stream_id || !stream_id[0]) return;
+static int live_sync_stream(restream_server_t *s, const char *stream_id) {
+    if (!s || !s->live || !stream_id || !stream_id[0]) return -1;
     const rs_json *stream = rs_panel_find_stream(&s->state, stream_id);
-    if (!stream) return;
+    if (!stream) return -1;
     bool eligible = !rs_json_obj_bool(stream, "directSource", false)
         && strcmp(rs_json_obj_str(stream, "kind", "mpd"), "mpd") == 0
         && strcmp(rs_json_obj_str(stream, "inputMode", "internal"), "internal") == 0
@@ -2894,14 +2930,14 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
         // Editing a running stream to another pipeline must not leave the old
         // MPD engine downloading invisibly under the previous configuration.
         if (rs_live_is_running(s->live, stream_id)) rs_live_stop(s->live, stream_id);
-        return;
+        return 0;
     }
 
     const char *src = stream_source_target(stream);
     if (!src[0]) {
         log_record(s, stream_id, "error", "liveStart", NULL, 0, -1,
                    "stream has no source URL — nothing to poll");
-        return;
+        return -1;
     }
 
     const rs_json *provider = provider_of(&s->state, stream);
@@ -2970,6 +3006,7 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
     // alongside the video and audio workers) trips it by itself. See rs_live.h.
     cfg.reduced_manifest_polling = rs_json_obj_bool(stream, "reducedManifestPolling", false);
     cfg.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
+    cfg.hls_segment_seconds = (int)rs_json_obj_int(stream, "hlsSegmentSeconds", 10);
     cfg.keep_segments = (int)rs_json_obj_int(stream, "keepSegments", 10);
     cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 20);
     cfg.parallel_downloads = (int)rs_json_obj_int(stream, "parallelDownloads", 6);
@@ -2986,9 +3023,10 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
                    "could not start the live DASH engine");
     } else if (!already) {
         log_recordf(s, stream_id, "info", "liveStart", src, 0, -1,
-                    "engine starting: window %d, ahead %d, keep %d, delay %ds, "
+                    "engine starting: window %d, HLS segment %ds, ahead %d, keep %d, delay %ds, "
                     "audio offset %dms, keys %s, rep %s, %lu CDN mirror%s",
-                    cfg.playlist_segments, cfg.download_ahead, cfg.keep_segments,
+                    cfg.playlist_segments, cfg.hls_segment_seconds,
+                    cfg.download_ahead, cfg.keep_segments,
                     cfg.playback_delay_seconds, cfg.audio_delay_ms,
                     cfg.decryption_keys[0] ? "set" : "none",
                     cfg.representation[0] ? cfg.representation : "auto",
@@ -3002,6 +3040,7 @@ static void live_sync_stream(restream_server_t *s, const char *stream_id) {
 
     free(mproxy); free(dproxy); free(mheaders); free(dheaders);
     free((void *)mirror_urls);  // the strings belong to the state DOM
+    return rc;
 }
 
 static void live_stop_stream(restream_server_t *s, const char *stream_id) {
