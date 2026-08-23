@@ -6,6 +6,7 @@
 #include <fcntl.h>
 
 #include "rs_internal.h"
+#include "rs_proc.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -496,6 +497,12 @@ char *rs_ffmpeg_install_plan(void) {
     return strdup("brew install ffmpeg-full");
 #elif defined(__linux__)
     return strdup("apt-get update && apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev libavutil-dev libswresample-dev libswscale-dev");
+#elif defined(_WIN32)
+    // The command to run, not a command the panel runs: unattended package
+    // installs on Windows commonly need an elevated prompt and an interactive
+    // agreement, so the server only offers the line and the operator runs it.
+    // The POST that installs in place stays POSIX-only for that reason.
+    return strdup("winget install --id Gyan.FFmpeg -e");
 #else
     return NULL;
 #endif
@@ -507,52 +514,30 @@ char *rs_ffmpeg_install_plan(void) {
 // present but built without libxml2 has no DASH demuxer, and the resulting
 // failure looks like a broken stream rather than a missing feature.
 
-#ifndef _WIN32
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
-extern char **environ;
-
-// Runs `path arg...` and returns its stdout. NULL if it could not be run.
-// Bounded: these outputs are a few kilobytes and anything longer is truncated.
+// Runs `path arg...` and returns its stdout, or NULL if it could not be run at
+// all. rs_proc_run drains stdout while the child runs, so an ffmpeg that writes
+// more than a pipe buffer's worth of demuxers cannot deadlock the probe.
 static char *ff_capture(const char *path, const char *const *args) {
-    int fds[2];
-    if (pipe(fds) != 0) return NULL;
-
     size_t argc = 0;
     while (args[argc]) argc++;
     const char **argv = (const char **)calloc(argc + 2, sizeof(char *));
-    if (!argv) { close(fds[0]); close(fds[1]); return NULL; }
+    if (!argv) return NULL;
     argv[0] = path;
     for (size_t i = 0; i < argc; i++) argv[i + 1] = args[i];
 
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addclose(&fa, fds[0]);
-    pid_t pid = -1;
-    int rc = posix_spawn(&pid, path, &fa, NULL, (char *const *)argv, environ);
-    posix_spawn_file_actions_destroy(&fa);
+    // stderr is discarded: -version and -demuxers answer on stdout, and the
+    // banner noise on stderr is not what we are parsing. 20s is generous for a
+    // program that prints a list and exits, and stops a wedged binary from
+    // holding the request thread that is probing it.
+    rs_run_result res;
+    int rc = rs_proc_run(argv, NULL, 20.0, true, false, NULL, &res, NULL, 0);
     free((void *)argv);
-    close(fds[1]);
-    if (rc != 0) { close(fds[0]); return NULL; }
+    if (rc != 0) { rs_run_result_dispose(&res); return NULL; }
 
-    size_t cap = 65536, used = 0;
-    char *buf = (char *)malloc(cap);
-    if (buf) {
-        for (;;) {
-            if (used + 1 >= cap) break;   // truncate rather than grow unbounded
-            ssize_t n = read(fds[0], buf + used, cap - used - 1);
-            if (n <= 0) break;
-            used += (size_t)n;
-        }
-        buf[used] = '\0';
-    }
-    close(fds[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
-    return buf;
+    char *out = res.out;
+    res.out = NULL;           // handed to the caller
+    rs_run_result_dispose(&res);
+    return out;
 }
 
 int rs_ffmpeg_probe_caps(const char *path, rs_ffmpeg_caps *out) {
@@ -613,16 +598,6 @@ int rs_ffmpeg_probe_caps(const char *path, rs_ffmpeg_caps *out) {
     free(owned);
     return 0;
 }
-
-#else  // _WIN32
-
-int rs_ffmpeg_probe_caps(const char *path, rs_ffmpeg_caps *out) {
-    (void)path;
-    if (out) memset(out, 0, sizeof(*out));
-    return -1;
-}
-
-#endif
 
 void rs_ffmpeg_caps_dispose(rs_ffmpeg_caps *caps) {
     if (!caps) return;

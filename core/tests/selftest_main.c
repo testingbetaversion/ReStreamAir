@@ -13,6 +13,7 @@
 // No test framework: a failure prints what broke and exits non-zero, which is
 // all ctest and CI need.
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +30,9 @@
 #include "rs_metrics.h"
 #include "rs_netmatch.h"
 #include "rs_panel.h"
+#include "rs_proc.h"
 #include "rs_state.h"
+#include "rs_thread.h"
 #include "rs_ttml.h"
 #include "rs_url.h"
 
@@ -1829,7 +1832,258 @@ static void test_ttml(void) {
     rs_free(vtt);
 }
 
-int main(void) {
+
+// --- the portability layer ---------------------------------------------------
+//
+// rs_thread.h and proc.c are the two places where POSIX and Windows are made to
+// look the same, and they are the two places where "it compiled" says least
+// about whether it works. A deadlock, a condition variable that never wakes, or
+// a Windows command line that re-splits an argument in the wrong place are all
+// runtime faults. These run on every platform, so the contract is checked
+// identically everywhere rather than assumed to hold on the one nobody tests.
+
+#define RS_TEST_THREADS 4
+#define RS_TEST_INCREMENTS 20000
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    long long counter;
+    int  once_calls;
+    int  tls_destructor_calls;
+    bool signalled;
+} thread_fixture;
+
+static thread_fixture g_tf;
+static pthread_key_t  g_tls_key;
+static pthread_once_t g_once = PTHREAD_ONCE_INIT;
+
+static void once_body(void) { g_tf.once_calls++; }
+
+static void tls_destructor(void *value) {
+    free(value);
+    pthread_mutex_lock(&g_tf.mu);
+    g_tf.tls_destructor_calls++;
+    pthread_mutex_unlock(&g_tf.mu);
+}
+
+static void *counter_worker(void *arg) {
+    (void)arg;
+    pthread_once(&g_once, once_body);
+
+    // Thread-local storage with a destructor: the pattern net.c uses to give
+    // each download thread its own reusable CURL handle.
+    int *mine = (int *)malloc(sizeof(int));
+    *mine = 1;
+    pthread_setspecific(g_tls_key, mine);
+    if (pthread_getspecific(g_tls_key) != mine) {
+        pthread_mutex_lock(&g_tf.mu);
+        g_tf.counter = -1;   // poisons the total, so the check below fails loudly
+        pthread_mutex_unlock(&g_tf.mu);
+        return NULL;
+    }
+
+    for (int i = 0; i < RS_TEST_INCREMENTS; i++) {
+        pthread_mutex_lock(&g_tf.mu);
+        g_tf.counter++;
+        pthread_mutex_unlock(&g_tf.mu);
+    }
+    return NULL;
+}
+
+static void *waiter_worker(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_tf.mu);
+    while (!g_tf.signalled) pthread_cond_wait(&g_tf.cv, &g_tf.mu);
+    pthread_mutex_unlock(&g_tf.mu);
+    return NULL;
+}
+
+static void test_threads(void) {
+    pthread_t workers[RS_TEST_THREADS];
+    pthread_t waiter;
+    int started = 0;
+
+    memset(&g_tf, 0, sizeof(g_tf));
+    pthread_mutex_init(&g_tf.mu, NULL);
+    pthread_cond_init(&g_tf.cv, NULL);
+    check("threads: TLS key can be created", pthread_key_create(&g_tls_key, tls_destructor) == 0);
+
+    for (int i = 0; i < RS_TEST_THREADS; i++)
+        if (pthread_create(&workers[i], NULL, counter_worker, NULL) == 0) started++;
+    check("threads: every worker started", started == RS_TEST_THREADS);
+    for (int i = 0; i < started; i++) pthread_join(workers[i], NULL);
+
+    // If the mutex were not actually excluding, this total would come up short.
+    check("threads: the mutex serialised every increment",
+          g_tf.counter == (long long)started * RS_TEST_INCREMENTS);
+    check("threads: pthread_once ran exactly once", g_tf.once_calls == 1);
+    // Each worker's TLS value must have been freed by the destructor when that
+    // thread exited — the leak that would otherwise strand a socket per thread.
+    check("threads: a TLS destructor ran for each thread",
+          g_tf.tls_destructor_calls == started);
+
+    // A condition variable that never wakes its waiter is a hang, not a failure,
+    // so this would show up as a CI timeout rather than a wrong answer.
+    if (pthread_create(&waiter, NULL, waiter_worker, NULL) == 0) {
+        rs_proc_sleep_ms(20);
+        pthread_mutex_lock(&g_tf.mu);
+        g_tf.signalled = true;
+        pthread_cond_broadcast(&g_tf.cv);
+        pthread_mutex_unlock(&g_tf.mu);
+        pthread_join(waiter, NULL);
+        check("threads: a broadcast woke the waiter", true);
+    } else {
+        check("threads: a broadcast woke the waiter", false);
+    }
+
+    // A deadline already in the past must return ETIMEDOUT at once rather than
+    // blocking forever — the case live_wait() hits whenever it is running late.
+    {
+        struct timespec past;
+        clock_gettime(CLOCK_REALTIME, &past);
+        past.tv_sec -= 1;
+        pthread_mutex_lock(&g_tf.mu);
+        int rc = pthread_cond_timedwait(&g_tf.cv, &g_tf.mu, &past);
+        pthread_mutex_unlock(&g_tf.mu);
+        check("threads: an elapsed deadline times out immediately", rc == ETIMEDOUT);
+    }
+
+    // And a real deadline must actually elapse rather than return at once.
+    {
+        struct timespec soon;
+        double before, after;
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        clock_gettime(CLOCK_REALTIME, &soon);
+        soon.tv_nsec += 120 * 1000 * 1000;
+        if (soon.tv_nsec >= 1000000000L) { soon.tv_sec++; soon.tv_nsec -= 1000000000L; }
+        pthread_mutex_lock(&g_tf.mu);
+        g_tf.signalled = false;
+        int rc = pthread_cond_timedwait(&g_tf.cv, &g_tf.mu, &soon);
+        pthread_mutex_unlock(&g_tf.mu);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        before = (double)t0.tv_sec + (double)t0.tv_nsec / 1e9;
+        after  = (double)t1.tv_sec + (double)t1.tv_nsec / 1e9;
+        check("threads: a future deadline waits for it", rc == ETIMEDOUT && after - before >= 0.05);
+    }
+
+    pthread_key_delete(g_tls_key);
+    pthread_cond_destroy(&g_tf.cv);
+    pthread_mutex_destroy(&g_tf.mu);
+}
+
+// The child half of the process tests. The self-test spawns itself rather than
+// some system program, because there is no single command that exists on
+// Windows, macOS and Linux alike — and because it means the argument the parent
+// sends is compared against the exact bytes the child received.
+#define RS_CHILD_ECHO  "--rs-selftest-child-echo"
+#define RS_CHILD_SLEEP "--rs-selftest-child-sleep"
+
+// Deliberately awkward: a space, an embedded quote, a trailing backslash and a
+// non-ASCII byte. On Windows argv is one string that the child's runtime splits
+// again, and each of these is a case the naive quoting gets wrong.
+#define RS_TRICKY_ARG "a b\"c\\"
+
+static int run_child_mode(int argc, char **argv) {
+    if (argc >= 3 && strcmp(argv[1], RS_CHILD_ECHO) == 0) {
+        printf("OUT[%s]", argv[2]);
+        fflush(stdout);
+        fprintf(stderr, "ERR[%s]", argv[2]);
+        fflush(stderr);
+        return 7;
+    }
+    if (argc >= 2 && strcmp(argv[1], RS_CHILD_SLEEP) == 0) {
+        rs_proc_sleep_ms(30000);
+        return 0;
+    }
+    return -1;   // not a child invocation
+}
+
+static void test_proc(const char *self) {
+    char expect_out[512], expect_err[512];
+    snprintf(expect_out, sizeof(expect_out), "OUT[%s]", RS_TRICKY_ARG);
+    snprintf(expect_err, sizeof(expect_err), "ERR[%s]", RS_TRICKY_ARG);
+
+    // 1. argv round-trip, both streams captured, exit code propagated.
+    {
+        const char *argv[] = { self, RS_CHILD_ECHO, RS_TRICKY_ARG, NULL };
+        rs_run_result res;
+        int rc = rs_proc_run(argv, NULL, 30.0, true, true, NULL, &res, NULL, 0);
+        check("proc: the child ran", rc == 0 && res.spawned);
+        // The real point of this one: on Windows argv became a single command
+        // line and was split again by the child. If the quoting is wrong, this
+        // is where it shows up.
+        check_str("proc: argv survived the round trip", res.out, expect_out);
+        check_str("proc: stderr was captured separately", res.err, expect_err);
+        check("proc: the exit code came back", res.exit_code == 7);
+        check("proc: it was not recorded as a timeout", !res.timed_out);
+        rs_run_result_dispose(&res);
+    }
+
+    // 2. A child that outlives its deadline is killed, and says so.
+    {
+        const char *argv[] = { self, RS_CHILD_SLEEP, NULL };
+        rs_run_result res;
+        int rc = rs_proc_run(argv, NULL, 0.4, true, true, NULL, &res, NULL, 0);
+        check("proc: a slow child is reaped at the deadline", rc == 0 && res.timed_out);
+        rs_run_result_dispose(&res);
+    }
+
+    // 3. A missing program is reported as absent, not as a generic failure —
+    //    net.c relies on telling those apart to fall back to libcurl.
+    {
+        const char *argv[] = { "rs-no-such-program-exists-anywhere", NULL };
+        rs_run_result res;
+        char errbuf[256] = {0};
+        int rc = rs_proc_run(argv, NULL, 5.0, true, true, NULL, &res, errbuf, sizeof(errbuf));
+        check("proc: a missing program fails to spawn", rc != 0 && !res.spawned);
+        check("proc: and is reported as ENOENT", res.spawn_error == ENOENT);
+        check("proc: with a reason the caller can log", errbuf[0] != '\0');
+        rs_run_result_dispose(&res);
+    }
+
+    // 4. Environment overrides reach the child, and the parent's own
+    //    environment survives beside them.
+    {
+        const char *keys[]   = { "RS_SELFTEST_VAR" };
+        const char *values[] = { "present" };
+        char **env = rs_env_build(keys, values, 1);
+        bool found = false, kept_path = false;
+        check("proc: an environment could be built", env != NULL);
+        for (size_t i = 0; env && env[i]; i++) {
+            if (strcmp(env[i], "RS_SELFTEST_VAR=present") == 0) found = true;
+            if (strncmp(env[i], "PATH=", 5) == 0 || strncmp(env[i], "Path=", 5) == 0) kept_path = true;
+        }
+        check("proc: the override is in the child environment", found);
+        check("proc: the inherited environment survived it", kept_path);
+        rs_env_free(env);
+    }
+
+    // 5. A pipe carries bytes and then reports end-of-file once the write end
+    //    is gone. drain_stderr in ffrun.c depends on exactly this to notice a
+    //    pipeline has died.
+    {
+        rs_pipe p;
+        char buf[64];
+        check("proc: a pipe opens", rs_pipe_open(&p) == 0);
+        check("proc: an idle pipe reads as empty, not as EOF",
+              rs_fd_read_nonblocking(p.read_end, buf, sizeof(buf)) == 0);
+        rs_fd_close(p.write_end);
+        check("proc: closing the write end reports EOF",
+              rs_fd_read_nonblocking(p.read_end, buf, sizeof(buf)) == -1);
+        rs_fd_close(p.read_end);
+    }
+}
+
+int main(int argc, char **argv) {
+    // Spawned by test_proc below; not a mode anyone runs by hand.
+    int child = run_child_mode(argc, argv);
+    if (child >= 0) return child;
+
+    test_threads();
+    test_proc(argv[0]);
+
     test_sha256();
     test_hmac();
     test_pbkdf2();

@@ -3,19 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <time.h>
-#include <errno.h>
-#include <signal.h>  // kill() — timeout kill of the spawned script
-extern char **environ;
-#endif
+#include "rs_proc.h"
 
 static bool needs_encoding(const char *value) {
     for (const char *p = value; *p; p++) {
@@ -161,143 +149,43 @@ char* rs_script_arg(const char *key, const char *value, bool force) {
     return res;
 }
 
-static const char* get_ext(const char *path) {
-    const char *dot = strrchr(path, '.');
-    if (!dot || dot == path) return "";
-    return dot + 1;
-}
-
-int rs_script_run_sync(const char *script_path, const char **args, int argc, double timeout, char **out_stdout, char **out_stderr) {
+int rs_script_run_sync(const char *script_path, const char **args, int argc, double timeout,
+                       char **out_stdout, char **out_stderr) {
     if (out_stdout) *out_stdout = rs_strdup("");
     if (out_stderr) *out_stderr = rs_strdup("");
-    
-#ifdef _WIN32
-    // Windows implementation (placeholder)
-    return -1;
-#else
-    rs_strv spawn_args = RS_STRV_INIT;
-    const char *ext = get_ext(script_path);
-    if (strcasecmp(ext, "py") == 0) {
-        rs_strv_push(&spawn_args, "python3");
-        rs_strv_push(&spawn_args, script_path);
-    } else if (strcasecmp(ext, "sh") == 0 || strcasecmp(ext, "bash") == 0) {
-        rs_strv_push(&spawn_args, "/bin/sh");
-        rs_strv_push(&spawn_args, script_path);
-    } else {
-        rs_strv_push(&spawn_args, script_path);
-    }
-    for (int i = 0; i < argc; i++) {
-        rs_strv_push(&spawn_args, args[i]);
-    }
-    
-    int out_pipe[2];
-    int err_pipe[2];
-    if (pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
-        rs_strv_dispose(&spawn_args);
-        return -1;
-    }
-    
-    posix_spawn_file_actions_t action;
-    posix_spawn_file_actions_init(&action);
-    posix_spawn_file_actions_adddup2(&action, out_pipe[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&action, err_pipe[1], STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&action, out_pipe[0]);
-    posix_spawn_file_actions_addclose(&action, err_pipe[0]);
-    
-    pid_t pid;
-    const char *exe = spawn_args.items[0];
-    if (strcmp(exe, "python3") == 0) exe = "/usr/bin/env"; // resolve python3 off PATH
+    if (!script_path || !script_path[0]) return -1;
 
-    if (strcmp(spawn_args.items[0], "python3") == 0) {
-        spawn_args.items[0] = "/usr/bin/env";
-        rs_strv_dispose(&spawn_args);
-        rs_strv_push(&spawn_args, "/usr/bin/env");
-        rs_strv_push(&spawn_args, "python3");
-        rs_strv_push(&spawn_args, script_path);
-        for (int i = 0; i < argc; i++) rs_strv_push(&spawn_args, args[i]);
-        exe = spawn_args.items[0];
-    }
-    
-    int status = posix_spawnp(&pid, exe, &action, NULL, spawn_args.items, environ);
-    posix_spawn_file_actions_destroy(&action);
-    close(out_pipe[1]);
-    close(err_pipe[1]);
+    // The interpreter the extension implies, if any: python for .py, a shell for
+    // .sh, cmd.exe or PowerShell for the Windows script kinds, and nothing at
+    // all for a file that is directly executable. argv[0] is searched on PATH by
+    // the spawn itself, so no /usr/bin/env indirection is needed to find it.
+    const char *prefix[8];
+    size_t nprefix = rs_proc_interpreter_for(script_path, prefix, 8);
+
+    rs_strv spawn_args = RS_STRV_INIT;
+    for (size_t i = 0; i < nprefix; i++) rs_strv_push(&spawn_args, prefix[i]);
+    rs_strv_push(&spawn_args, script_path);
+    for (int i = 0; i < argc; i++) rs_strv_push(&spawn_args, args[i]);
+    if (spawn_args.err) { rs_strv_dispose(&spawn_args); return -1; }
+    // rs_strv reserves the slot but does not write it, and an argv that is not
+    // NULL-terminated is read past its end by the spawn.
+    spawn_args.items[spawn_args.len] = NULL;
+
+    // Both streams are captured, and rs_proc_run drains them while the script
+    // runs — a script that writes more than a pipe buffer to stderr while the
+    // caller reads stdout would otherwise wedge until the timeout.
+    rs_run_result res;
+    int rc = rs_proc_run((const char *const *)spawn_args.items, NULL, timeout,
+                         true, true, NULL, &res, NULL, 0);
     rs_strv_dispose(&spawn_args);
-    
-    if (status != 0) {
-        close(out_pipe[0]);
-        close(err_pipe[0]);
-        return -1;
-    }
-    
-    rs_buf b_out = RS_BUF_INIT;
-    rs_buf b_err = RS_BUF_INIT;
-    
-    struct pollfd pfds[2];
-    pfds[0].fd = out_pipe[0]; pfds[0].events = POLLIN;
-    pfds[1].fd = err_pipe[0]; pfds[1].events = POLLIN;
-    
-    struct timespec start_time, now;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-    
-    while (pfds[0].fd >= 0 || pfds[1].fd >= 0) {
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (double)(now.tv_sec - start_time.tv_sec) + (double)(now.tv_nsec - start_time.tv_nsec) / 1e9;
-        if (elapsed >= timeout) {
-            kill(pid, SIGTERM);
-            break;
-        }
-        
-        int wait_ms = (int)((timeout - elapsed) * 1000);
-        if (wait_ms < 0) wait_ms = 0;
-        
-        int r = poll(pfds, 2, wait_ms);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            break;
-        } else if (r == 0) {
-            kill(pid, SIGTERM);
-            break;
-        }
-        
-        for (int i = 0; i < 2; i++) {
-            if (pfds[i].fd >= 0 && (pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) {
-                char buf[4096];
-                ssize_t n = read(pfds[i].fd, buf, sizeof(buf));
-                if (n > 0) {
-                    if (i == 0) rs_buf_append(&b_out, buf, n);
-                    else rs_buf_append(&b_err, buf, n);
-                } else if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
-                    close(pfds[i].fd);
-                    pfds[i].fd = -1;
-                }
-            }
-        }
-    }
-    
-    if (pfds[0].fd >= 0) close(pfds[0].fd);
-    if (pfds[1].fd >= 0) close(pfds[1].fd);
-    
-    int wstatus;
-    waitpid(pid, &wstatus, 0);
-    
-    if (out_stdout) {
-        rs_free(*out_stdout);
-        *out_stdout = rs_buf_take(&b_out);
-        if (!*out_stdout) *out_stdout = rs_strdup("");
-    } else {
-        rs_buf_dispose(&b_out);
-    }
-    
-    if (out_stderr) {
-        rs_free(*out_stderr);
-        *out_stderr = rs_buf_take(&b_err);
-        if (!*out_stderr) *out_stderr = rs_strdup("");
-    } else {
-        rs_buf_dispose(&b_err);
-    }
-    
-    if (WIFEXITED(wstatus)) return WEXITSTATUS(wstatus);
-    return -1;
-#endif
+
+    // Whatever it managed to say is worth returning even when it was killed: a
+    // script that times out has usually already printed the reason.
+    if (out_stdout && res.out) { rs_free(*out_stdout); *out_stdout = res.out; res.out = NULL; }
+    if (out_stderr && res.err) { rs_free(*out_stderr); *out_stderr = res.err; res.err = NULL; }
+    rs_run_result_dispose(&res);
+
+    if (rc != 0) return -1;                            // could not be started
+    if (res.timed_out || res.term_signal != 0) return -1;   // killed, not finished
+    return res.exit_code;
 }

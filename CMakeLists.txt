@@ -13,7 +13,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
     set(RS_WARNINGS /W4)
-    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    # _CRT_SECURE_NO_WARNINGS silences the "use snprintf_s" advice; the NONSTDC
+    # one silences the same advice for the POSIX spellings (strdup, _access and
+    # friends) that the tree uses deliberately for portability.
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
 else()
     set(RS_WARNINGS -Wall -Wextra -Wconversion -Wno-sign-conversion)
 endif()
@@ -34,7 +37,10 @@ endif()
 
 # ---- restream_base: portable logic, no sockets and no third-party code -------
 # Everything here is pure C11 and platform-independent, which is what lets the
-# self-test binary link it without dragging in mongoose or Winsock.
+# self-test binary link it without dragging in mongoose or Winsock. Where a
+# platform genuinely differs — threads, child processes, system stats — the
+# difference is confined to rs_thread.h, proc.c and sysstats.c rather than
+# spread through the callers.
 add_library(restream_base STATIC
     core/src/common.c
     core/src/crypto.c
@@ -56,6 +62,7 @@ add_library(restream_base STATIC
     core/src/audio_delay.c
     core/src/live_window.c
     core/src/live_backoff.c
+    core/src/proc.c
     core/src/script.c
     core/src/cdm.c
     core/src/metrics.c
@@ -66,8 +73,10 @@ add_library(restream_base STATIC
 target_include_directories(restream_base PUBLIC core/include)
 target_compile_options(restream_base PRIVATE ${RS_WARNINGS})
 if(WIN32)
-    # BCryptGenRandom, for rs_random_bytes.
-    target_link_libraries(restream_base PUBLIC bcrypt)
+    # bcrypt: BCryptGenRandom, for rs_random_bytes.
+    # advapi32: the token and ACL calls state.c uses to create state.json with an
+    #           owner-only DACL, since Windows has no 0600.
+    target_link_libraries(restream_base PUBLIC bcrypt advapi32)
 endif()
 
 # ---- restream_core: the HTTP server, built on mongoose ----------------------
@@ -86,7 +95,10 @@ target_link_libraries(restream_core PUBLIC Threads::Threads)
 # Warnings apply to our source only; mongoose is vendored and compiles as-is.
 set_source_files_properties(core/src/server.c core/src/live.c PROPERTIES COMPILE_OPTIONS "${RS_WARNINGS}")
 if(WIN32)
-    target_compile_definitions(restream_core PRIVATE _WIN32_WINNT=0x0601)  # Windows 7+
+    # 0x0601 (Windows 7) is the floor for the APIs the tree uses: SRWLOCK and
+    # CONDITION_VARIABLE in rs_thread.h, and the PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+    # that proc.c uses to keep one child from inheriting another's pipes.
+    target_compile_definitions(restream_base PUBLIC _WIN32_WINNT=0x0601)
     target_link_libraries(restream_core PUBLIC ws2_32)
 endif()
 
@@ -98,7 +110,7 @@ target_compile_options(restream_selftest PRIVATE ${RS_WARNINGS})
 enable_testing()
 add_test(NAME selftest COMMAND restream_selftest)
 
-# ---- restreamair-server: the Linux/Windows panel executable ----------------
+# ---- restreamair-server: the panel executable ------------------------------
 # Source auto-detect (/api/probe) needs outbound HTTPS (libcurl) and MPD parsing
 # (libxml2). These are linked into the server executable ONLY — the core never
 # sees them, since the probe handler is registered at runtime through a function
@@ -106,9 +118,13 @@ add_test(NAME selftest COMMAND restream_selftest)
 # and the self-test build on a platform where those two dev packages are
 # awkward to get.
 #
-# -DRS_BUILD_SERVER=OFF builds the libraries and the self-test without them, so
-# a platform where those two dev packages are awkward to get (Windows, without
-# vcpkg) can still compile and verify the core on every CI run.
+# On macOS and Linux both come from the system. On Windows they come from the
+# vcpkg manifest at the root of the tree, built into a static triplet so the
+# release is one exe with no DLLs beside it; see vcpkg.json.
+#
+# -DRS_BUILD_SERVER=OFF builds the libraries and the self-test without either,
+# which is how a machine with neither available can still compile and verify the
+# core.
 option(RS_BUILD_SERVER "Build restreamair-server (needs libcurl + libxml2)" ON)
 if(NOT RS_BUILD_SERVER)
     message(STATUS "restreamair: RS_BUILD_SERVER=OFF — libraries and self-test only")

@@ -10,6 +10,10 @@ scripts/*_user.json
 # Build products — binaries are published on GitHub Releases, never committed
 .build/
 build/
+# One tree per toolchain: the native build, the Windows cross-build, the
+# sanitizer build. CI uses these names too.
+build-*/
+*.exe
 *.dSYM/
 restreamair
 restreamair-menubar

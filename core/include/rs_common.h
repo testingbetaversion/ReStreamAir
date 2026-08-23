@@ -16,6 +16,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// strcasecmp / strncasecmp are POSIX and live in <strings.h>, which the MSVC
+// CRT does not have — there they are _stricmp / _strnicmp in <string.h>.
+// Every module that compares case-insensitively already includes this header,
+// so the spelling is reconciled once here rather than in each of them.
+#ifdef _WIN32
+#include <string.h>
+#define strcasecmp  _stricmp
+#define strncasecmp _strnicmp
+#else
+#include <strings.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

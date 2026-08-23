@@ -4,9 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <time.h>
-#include <pthread.h>
+#include "rs_thread.h"
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>

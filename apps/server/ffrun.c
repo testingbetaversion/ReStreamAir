@@ -2,21 +2,15 @@
 
 #include "rs_common.h"
 
+#include "rs_proc.h"
+#include "rs_thread.h"   // clock_gettime, on the platforms that lack it
+
 #include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <time.h>
-#include <unistd.h>
-
-#ifndef _WIN32
-#include <spawn.h>
-extern char **environ;
-#endif
 
 #define RS_FFRUN_MAX_STREAMS 64
 
@@ -39,9 +33,9 @@ typedef struct {
     bool used;
     char *stream_id;
 
-    pid_t pid;          // the main process (ffmpeg)
-    pid_t feeder_pid;   // optional producer piped into its stdin, or -1
-    int stderr_fd;      // read end of its stderr, O_NONBLOCK, or -1
+    rs_proc proc;       // the main process (ffmpeg)
+    rs_proc feeder;     // optional producer piped into its stdin
+    rs_fd stderr_fd;    // read end of its stderr, read without blocking
 
     char **argv;
     char **feeder_argv;
@@ -148,130 +142,95 @@ static char *argv_describe(char *const *argv) {
     return out;
 }
 
-#ifndef _WIN32
-
-static bool env_is_overridden(const ffrun_entry *e, const char *item) {
-    const char *eq = strchr(item, '=');
-    size_t name_len = eq ? (size_t)(eq - item) : strlen(item);
-    for (size_t i = 0; i < e->env_count; i++)
-        if (strlen(e->env_keys[i]) == name_len && strncmp(e->env_keys[i], item, name_len) == 0)
-            return true;
-    return false;
-}
-
-static char **pipeline_env(const ffrun_entry *e) {
-    size_t inherited = 0;
-    while (environ[inherited]) inherited++;
-    char **out = (char **)calloc(inherited + e->env_count + 1, sizeof(char *));
-    if (!out) return NULL;
-    size_t used = 0;
-    for (size_t i = 0; i < inherited; i++) {
-        if (env_is_overridden(e, environ[i])) continue;
-        out[used++] = rs_strdup(environ[i]);
-        if (!out[used - 1]) { argv_free(out); return NULL; }
-    }
-    for (size_t i = 0; i < e->env_count; i++) {
-        size_t need = strlen(e->env_keys[i]) + strlen(e->env_values[i]) + 2;
-        out[used] = (char *)malloc(need);
-        if (!out[used]) { argv_free(out); return NULL; }
-        snprintf(out[used++], need, "%s=%s", e->env_keys[i], e->env_values[i]);
-    }
-    return out;
-}
-
-// Spawns the pipeline. Returns 0 on success and fills pid/feeder_pid/stderr_fd.
+// Spawns the pipeline. Returns 0 on success and fills proc/feeder/stderr_fd.
 static int spawn_pipeline(rs_ffrun *r, ffrun_entry *e) {
-    int err_pipe[2] = {-1, -1};
-    int feed_pipe[2] = {-1, -1};
+    rs_pipe err_pipe = { RS_FD_INVALID, RS_FD_INVALID };
+    rs_pipe feed_pipe = { RS_FD_INVALID, RS_FD_INVALID };
+    char **child_env = NULL;
+    char errbuf[256];
+    rs_stdio in_io, out_io, err_io;
+    int rc;
 
-    if (pipe(err_pipe) != 0) {
-        lgf(r, e->stream_id, "error", "ffmpegSpawn", "could not create a pipe: %s", strerror(errno));
+    if (rs_pipe_open(&err_pipe) != 0) {
+        lg(r, e->stream_id, "error", "ffmpegSpawn", "could not create a pipe");
         return -1;
     }
-    if (e->feeder_argv && pipe(feed_pipe) != 0) {
-        lgf(r, e->stream_id, "error", "ffmpegSpawn", "could not create a pipe: %s", strerror(errno));
-        close(err_pipe[0]); close(err_pipe[1]);
+    if (e->feeder_argv && rs_pipe_open(&feed_pipe) != 0) {
+        lg(r, e->stream_id, "error", "ffmpegSpawn", "could not create a pipe");
+        rs_fd_close(err_pipe.read_end); rs_fd_close(err_pipe.write_end);
         return -1;
     }
 
-    char **child_env = pipeline_env(e);
+    child_env = rs_env_build((const char *const *)e->env_keys,
+                             (const char *const *)e->env_values, e->env_count);
     if (!child_env) {
-        close(err_pipe[0]); close(err_pipe[1]);
-        if (feed_pipe[0] >= 0) close(feed_pipe[0]);
-        if (feed_pipe[1] >= 0) close(feed_pipe[1]);
+        rs_fd_close(err_pipe.read_end); rs_fd_close(err_pipe.write_end);
+        rs_fd_close(feed_pipe.read_end); rs_fd_close(feed_pipe.write_end);
         return -1;
     }
 
-    pid_t feeder = -1;
     if (e->feeder_argv) {
         // Producer: stdout -> the pipe ffmpeg reads, stderr -> the same log pipe
         // so a failing streamlink is as visible as a failing ffmpeg.
-        posix_spawn_file_actions_t fa;
-        posix_spawn_file_actions_init(&fa);
-        posix_spawn_file_actions_adddup2(&fa, feed_pipe[1], STDOUT_FILENO);
-        posix_spawn_file_actions_adddup2(&fa, err_pipe[1], STDERR_FILENO);
-        posix_spawn_file_actions_addclose(&fa, feed_pipe[0]);
-        posix_spawn_file_actions_addclose(&fa, err_pipe[0]);
-        int rc = posix_spawnp(&feeder, e->feeder_argv[0], &fa, NULL, e->feeder_argv, child_env);
-        posix_spawn_file_actions_destroy(&fa);
+        in_io  = rs_stdio_null();
+        out_io = rs_stdio_fd(feed_pipe.write_end);
+        err_io = rs_stdio_fd(err_pipe.write_end);
+        rc = rs_proc_spawn(&e->feeder, (const char *const *)e->feeder_argv,
+                           (const char *const *)child_env, &in_io, &out_io, &err_io,
+                           errbuf, sizeof(errbuf));
         if (rc != 0) {
-            lgf(r, e->stream_id, "error", "ffmpegSpawn", "could not run \"%s\": %s",
-                e->feeder_argv[0], strerror(rc));
-            close(err_pipe[0]); close(err_pipe[1]);
-            close(feed_pipe[0]); close(feed_pipe[1]);
-            argv_free(child_env);
+            lg(r, e->stream_id, "error", "ffmpegSpawn", errbuf);
+            rs_fd_close(err_pipe.read_end); rs_fd_close(err_pipe.write_end);
+            rs_fd_close(feed_pipe.read_end); rs_fd_close(feed_pipe.write_end);
+            rs_env_free(child_env);
             return -1;
         }
     }
 
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, err_pipe[1], STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&fa, err_pipe[0]);
-    if (e->feeder_argv) {
-        posix_spawn_file_actions_adddup2(&fa, feed_pipe[0], STDIN_FILENO);
-        posix_spawn_file_actions_addclose(&fa, feed_pipe[1]);
-    } else {
-        // No producer: give it /dev/null rather than the server's stdin, or
-        // ffmpeg's "press [q] to stop" reader eats the terminal.
-        posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    }
-    pid_t pid = -1;
-    int rc = posix_spawnp(&pid, e->argv[0], &fa, NULL, e->argv, child_env);
-    posix_spawn_file_actions_destroy(&fa);
-    argv_free(child_env);
+    // No producer: give ffmpeg the null device rather than the server's stdin,
+    // or its "press [q] to stop" reader eats the terminal.
+    in_io  = e->feeder_argv ? rs_stdio_fd(feed_pipe.read_end) : rs_stdio_null();
+    out_io = rs_stdio_inherit();
+    err_io = rs_stdio_fd(err_pipe.write_end);
+    rc = rs_proc_spawn(&e->proc, (const char *const *)e->argv,
+                       (const char *const *)child_env, &in_io, &out_io, &err_io,
+                       errbuf, sizeof(errbuf));
+    rs_env_free(child_env);
 
-    // The parent keeps only the read end of stderr and none of the feed pipe.
-    close(err_pipe[1]);
-    if (feed_pipe[0] >= 0) close(feed_pipe[0]);
-    if (feed_pipe[1] >= 0) close(feed_pipe[1]);
+    // The parent keeps only the read end of stderr and neither end of the feed
+    // pipe. Holding a write end here would keep stderr from ever reaching
+    // end-of-file, so a dead ffmpeg would never be noticed.
+    rs_fd_close(err_pipe.write_end);
+    rs_fd_close(feed_pipe.read_end);
+    rs_fd_close(feed_pipe.write_end);
 
     if (rc != 0) {
-        lgf(r, e->stream_id, "error", "ffmpegSpawn", "could not run \"%s\": %s",
-            e->argv[0], strerror(rc));
-        close(err_pipe[0]);
-        if (feeder > 0) { kill(feeder, SIGKILL); waitpid(feeder, NULL, 0); }
+        lg(r, e->stream_id, "error", "ffmpegSpawn", errbuf);
+        rs_fd_close(err_pipe.read_end);
+        if (rs_proc_valid(&e->feeder)) {
+            rs_proc_kill(&e->feeder);
+            rs_proc_wait(&e->feeder, 0, NULL, NULL);
+            rs_proc_release(&e->feeder);
+        }
         return -1;
     }
 
-    fcntl(err_pipe[0], F_SETFL, O_NONBLOCK);
-    e->pid = pid;
-    e->feeder_pid = feeder;
-    e->stderr_fd = err_pipe[0];
+    e->stderr_fd = err_pipe.read_end;
     e->started_at = now_seconds();
     e->line_len = 0;
 
     char *desc = argv_describe(e->argv);
-    lgf(r, e->stream_id, "info", "ffmpegStart", "pid %d: %s", (int)pid, desc ? desc : "");
+    lgf(r, e->stream_id, "info", "ffmpegStart", "pid %ld: %s",
+        rs_proc_id(&e->proc), desc ? desc : "");
     rs_free(desc);
-    if (feeder > 0) {
+    if (rs_proc_valid(&e->feeder)) {
         size_t feeder_argc = 0;
         while (e->feeder_argv[feeder_argc]) feeder_argc++;
         // A generic producer commonly carries account tokens or passwords in
         // its argv. Log the executable and shape, never its argument values.
         lgf(r, e->stream_id, "info", "ffmpegStart",
-            "feeder pid %d: %s (%lu argument%s redacted)",
-            (int)feeder, e->feeder_argv[0],
+            "feeder pid %ld: %s (%lu argument%s redacted)",
+            rs_proc_id(&e->feeder), e->feeder_argv[0],
             (unsigned long)(feeder_argc > 0 ? feeder_argc - 1 : 0),
             feeder_argc == 2 ? "" : "s");
     }
@@ -279,32 +238,27 @@ static int spawn_pipeline(rs_ffrun *r, ffrun_entry *e) {
 }
 
 static void kill_pipeline(ffrun_entry *e) {
-    if (e->feeder_pid > 0) {
-        kill(e->feeder_pid, SIGTERM);
-    }
-    if (e->pid > 0) {
-        kill(e->pid, SIGTERM);
-        // Give it a moment to flush, then insist. ffmpeg normally exits on the
-        // first signal; a wedged one would otherwise linger holding the output.
-        for (int i = 0; i < 20; i++) {
-            if (waitpid(e->pid, NULL, WNOHANG) == e->pid) { e->pid = -1; break; }
-            struct timespec ts = {0, 10 * 1000 * 1000};
-            nanosleep(&ts, NULL);
+    if (rs_proc_valid(&e->feeder)) rs_proc_terminate(&e->feeder);
+    if (rs_proc_valid(&e->proc)) {
+        // Ask first, then insist. ffmpeg exits on the first signal where there
+        // is one; a wedged one would otherwise linger holding the output. On
+        // Windows rs_proc_terminate is already the hard kill, so the wait below
+        // simply returns at once.
+        rs_proc_terminate(&e->proc);
+        if (rs_proc_wait(&e->proc, 0.2, NULL, NULL) != 1) {
+            rs_proc_kill(&e->proc);
+            rs_proc_wait(&e->proc, 0, NULL, NULL);
         }
-        if (e->pid > 0) {
-            kill(e->pid, SIGKILL);
-            waitpid(e->pid, NULL, 0);
-            e->pid = -1;
-        }
+        rs_proc_release(&e->proc);
     }
-    if (e->feeder_pid > 0) {
-        if (waitpid(e->feeder_pid, NULL, WNOHANG) != e->feeder_pid) {
-            kill(e->feeder_pid, SIGKILL);
-            waitpid(e->feeder_pid, NULL, 0);
+    if (rs_proc_valid(&e->feeder)) {
+        if (rs_proc_try_wait(&e->feeder, NULL, NULL) != 1) {
+            rs_proc_kill(&e->feeder);
+            rs_proc_wait(&e->feeder, 0, NULL, NULL);
         }
-        e->feeder_pid = -1;
+        rs_proc_release(&e->feeder);
     }
-    if (e->stderr_fd >= 0) { close(e->stderr_fd); e->stderr_fd = -1; }
+    if (e->stderr_fd != RS_FD_INVALID) { rs_fd_close(e->stderr_fd); e->stderr_fd = RS_FD_INVALID; }
 }
 
 // True when an ffmpeg stderr line is worth putting in the log. Progress lines
@@ -319,12 +273,12 @@ static bool line_is_interesting(const char *s) {
 }
 
 static void drain_stderr(rs_ffrun *r, ffrun_entry *e) {
-    if (e->stderr_fd < 0) return;
+    if (e->stderr_fd == RS_FD_INVALID) return;
     char buf[1024];
     for (;;) {
-        ssize_t n = read(e->stderr_fd, buf, sizeof(buf));
+        long n = rs_fd_read_nonblocking(e->stderr_fd, buf, sizeof(buf));
         if (n <= 0) break;
-        for (ssize_t i = 0; i < n; i++) {
+        for (long i = 0; i < n; i++) {
             char c = buf[i];
             // ffmpeg separates progress updates with '\r' and real messages
             // with '\n'; both end a line for our purposes.
@@ -344,17 +298,6 @@ static void drain_stderr(rs_ffrun *r, ffrun_entry *e) {
     }
 }
 
-#else  // _WIN32 — process supervision is not ported here yet.
-
-static int spawn_pipeline(rs_ffrun *r, ffrun_entry *e) {
-    lg(r, e->stream_id, "error", "ffmpegSpawn", "ffmpeg modes are not supported on this platform yet");
-    return -1;
-}
-static void kill_pipeline(ffrun_entry *e) { (void)e; }
-static void drain_stderr(rs_ffrun *r, ffrun_entry *e) { (void)r; (void)e; }
-
-#endif
-
 static ffrun_entry *find(rs_ffrun *r, const char *stream_id) {
     for (size_t i = 0; i < RS_FFRUN_MAX_STREAMS; i++)
         if (r->entries[i].used && strcmp(r->entries[i].stream_id, stream_id) == 0)
@@ -370,9 +313,7 @@ static void entry_release(ffrun_entry *e) {
     argv_free(e->env_values);
     free(e->stream_id);
     memset(e, 0, sizeof(*e));
-    e->pid = -1;
-    e->feeder_pid = -1;
-    e->stderr_fd = -1;
+    e->stderr_fd = RS_FD_INVALID;
 }
 
 rs_ffrun *rs_ffrun_create(rs_ffrun_log_fn log, void *log_ctx) {
@@ -380,11 +321,8 @@ rs_ffrun *rs_ffrun_create(rs_ffrun_log_fn log, void *log_ctx) {
     if (!r) return NULL;
     r->log = log;
     r->log_ctx = log_ctx;
-    for (size_t i = 0; i < RS_FFRUN_MAX_STREAMS; i++) {
-        r->entries[i].pid = -1;
-        r->entries[i].feeder_pid = -1;
-        r->entries[i].stderr_fd = -1;
-    }
+    for (size_t i = 0; i < RS_FFRUN_MAX_STREAMS; i++)
+        r->entries[i].stderr_fd = RS_FD_INVALID;
     return r;
 }
 
@@ -416,9 +354,7 @@ int rs_ffrun_start(rs_ffrun *r, const char *stream_id,
 
     memset(e, 0, sizeof(*e));
     e->used = true;
-    e->pid = -1;
-    e->feeder_pid = -1;
-    e->stderr_fd = -1;
+    e->stderr_fd = RS_FD_INVALID;
     e->stream_id = rs_strdup(stream_id);
     e->argv = argv_copy(argv);
     e->feeder_argv = feeder_argv && feeder_argv[0] ? argv_copy(feeder_argv) : NULL;
@@ -446,7 +382,7 @@ void rs_ffrun_stop(rs_ffrun *r, const char *stream_id) {
     ffrun_entry *e = find(r, stream_id);
     if (!e) return;
     e->stopping = true;
-    lgf(r, stream_id, "info", "ffmpegStop", "stopping pid %d", (int)e->pid);
+    lgf(r, stream_id, "info", "ffmpegStop", "stopping pid %ld", rs_proc_id(&e->proc));
     entry_release(e);
 }
 
@@ -465,29 +401,25 @@ void rs_ffrun_poll(rs_ffrun *r) {
 
         drain_stderr(r, e);
 
-#ifndef _WIN32
         // A dead feeder with a live ffmpeg is a stalled pipeline: ffmpeg will sit
         // on an stdin that will never produce another byte. Treat the pair as one
         // unit and restart both.
-        if (e->feeder_pid > 0 && waitpid(e->feeder_pid, NULL, WNOHANG) == e->feeder_pid) {
-            e->feeder_pid = -1;
+        if (rs_proc_valid(&e->feeder) && rs_proc_try_wait(&e->feeder, NULL, NULL) == 1) {
             lg(r, e->stream_id, "error", "ffmpegExit", "the input command exited — restarting the pipeline");
             kill_pipeline(e);
         }
 
-        if (e->pid > 0) {
-            int status = 0;
-            pid_t done = waitpid(e->pid, &status, WNOHANG);
-            if (done == e->pid) {
+        if (rs_proc_valid(&e->proc)) {
+            int status = 0, sig = 0;
+            if (rs_proc_try_wait(&e->proc, &status, &sig) == 1) {
                 double uptime = now - e->started_at;
-                e->pid = -1;
                 drain_stderr(r, e);   // whatever it said on the way out
-                if (WIFEXITED(status))
+                if (sig)
                     lgf(r, e->stream_id, "error", "ffmpegExit",
-                        "exited with status %d after %.0fs", WEXITSTATUS(status), uptime);
+                        "killed by signal %d after %.0fs", sig, uptime);
                 else
                     lgf(r, e->stream_id, "error", "ffmpegExit",
-                        "killed by signal %d after %.0fs", WTERMSIG(status), uptime);
+                        "exited with status %d after %.0fs", status, uptime);
                 kill_pipeline(e);
                 if (uptime >= RS_FFRUN_HEALTHY_AFTER) {
                     e->consecutive_failures = 0;   // it ran; this is a blip
@@ -505,9 +437,8 @@ void rs_ffrun_poll(rs_ffrun *r) {
                 }
             }
         }
-#endif
 
-        if (e->pid <= 0 && (e->retry_at == 0 || now >= e->retry_at)) {
+        if (!rs_proc_valid(&e->proc) && (e->retry_at == 0 || now >= e->retry_at)) {
             e->retry_at = 0;
             if (spawn_pipeline(r, e) == 0) {
                 e->restarts++;
@@ -526,9 +457,9 @@ char *rs_ffrun_status_line(const rs_ffrun *r, const char *stream_id) {
     ffrun_entry *e = find((rs_ffrun *)r, stream_id);
     if (!e) return NULL;
     char buf[256];
-    if (e->pid > 0)
-        snprintf(buf, sizeof(buf), "ffmpeg pid %d, up %.0fs, %d restart%s",
-                 (int)e->pid, now_seconds() - e->started_at, e->restarts,
+    if (rs_proc_valid(&e->proc))
+        snprintf(buf, sizeof(buf), "ffmpeg pid %ld, up %.0fs, %d restart%s",
+                 rs_proc_id(&e->proc), now_seconds() - e->started_at, e->restarts,
                  e->restarts == 1 ? "" : "s");
     else
         snprintf(buf, sizeof(buf), "ffmpeg not running, %d failed start%s in a row",

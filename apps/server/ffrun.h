@@ -16,10 +16,11 @@
 //
 // Supervision runs off the server's existing one-second timer rather than a
 // thread. That keeps every ffmpeg state change on the event-loop thread, so the
-// log sink and the stream table need no locking, and it costs nothing: a
-// waitpid(WNOHANG) plus a non-blocking read per running stream. The stderr pipe
-// is therefore O_NONBLOCK — a blocking read here would stall the whole server
-// behind ffmpeg's progress output.
+// log sink and the stream table need no locking, and it costs nothing: one
+// rs_proc_try_wait plus a non-blocking read per running stream. That read must
+// never block — a blocking one here would stall the whole server behind
+// ffmpeg's progress output — which is what rs_fd_read_nonblocking guarantees on
+// both platforms (O_NONBLOCK on POSIX, PeekNamedPipe on Windows).
 
 #include <stdbool.h>
 #include <stddef.h>

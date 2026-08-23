@@ -223,12 +223,37 @@ def test_setup_and_cookie(client):
 
 
 def test_state_permissions(workdir):
+    """state.json holds password hashes, session tokens and — for script
+    providers — account passwords in the clear, so who can read it is a real
+    check rather than a tidiness one. The two platforms express it differently:
+    POSIX has mode bits, Windows has a DACL, and both are verified here rather
+    than the Windows side being skipped as it used to be."""
     print("secrets at rest")
     path = os.path.join(workdir, "state.json")
     check("state.json exists", os.path.exists(path))
-    if os.path.exists(path) and os.name != "nt":
+    if not os.path.exists(path):
+        return
+
+    if os.name != "nt":
         mode = os.stat(path).st_mode & 0o777
         check("state.json is not group/world readable", mode == 0o600, f"mode is {oct(mode)}")
+        return
+
+    # icacls prints one "principal:(rights)" line per ACE. The file is created
+    # with an explicit owner-only DACL, so none of the broad principals should
+    # appear — if one does, the descriptor in state.c did not take effect and
+    # the file inherited the directory's permissions instead.
+    try:
+        acl = subprocess.run(["icacls", path], capture_output=True, text=True,
+                             timeout=30).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        check("state.json ACL could be read", False, str(exc))
+        return
+    broad = [name for name in ("Everyone", "BUILTIN\\Users", "Authenticated Users",
+                               "BUILTIN\\Administrators")
+             if name.lower() in acl.lower()]
+    check("state.json grants no broad principals", not broad,
+          f"icacls lists {', '.join(broad)}\n{acl.strip()}")
 
 
 def test_legacy_account_upgrade(workdir, client):
@@ -474,15 +499,39 @@ def test_hls_playback_routes(client, origin):
     status, _, _ = client.request("GET", f"/download/{stream['id']}.mp4?key={key}")
     check("HLS buffered MP4 download fails explicitly", status == 400, f"got {status}")
 
+    # A mode with no supervisor behind it must fail at Start with a reason,
+    # rather than reporting a stream as running that nothing is producing.
+    # N_m3u8DL-RE is the one that is genuinely unwired on every platform; this
+    # check used to use ffmpegResident, which stopped being a fixed answer once
+    # the FFmpeg supervisor was wired in — from then on it passed or failed
+    # depending on whether the machine happened to have ffmpeg installed.
     status, body, _ = client.json(
         "POST", f"/api/providers/{provider['id']}/streams",
         body={"name": "Unsupported Pipeline", "kind": "m3u8", "url": source,
-              "inputMode": "ffmpegResident", "outputMode": "hls"},
+              "inputMode": "nm3u8dlre", "outputMode": "hls"},
     )
     unsupported = next((s for p in body.get("providers", []) if p["id"] == provider["id"]
                         for s in p.get("streams", []) if s["name"] == "Unsupported Pipeline"), None)
     status = client.request("POST", f"/api/streams/{unsupported['id']}/start", body={})[0] if unsupported else 0
     check("unwired external pipeline is rejected at Start", status == 400, f"got {status}")
+
+    # The FFmpeg pipeline has a supervisor, so its answer depends on whether
+    # ffmpeg is on this machine: it either starts, or it says ffmpeg is missing.
+    # What it must never do is report success without one.
+    status, body, _ = client.json(
+        "POST", f"/api/providers/{provider['id']}/streams",
+        body={"name": "FFmpeg Pipeline", "kind": "m3u8", "url": source,
+              "inputMode": "ffmpegResident", "outputMode": "hls"},
+    )
+    ff = next((s for p in body.get("providers", []) if p["id"] == provider["id"]
+               for s in p.get("streams", []) if s["name"] == "FFmpeg Pipeline"), None)
+    if ff:
+        status, payload, _ = client.request("POST", f"/api/streams/{ff['id']}/start", body={})
+        detail = payload.decode(errors="replace")
+        check("ffmpeg pipeline either starts or explains why it cannot",
+              status == 200 or (status == 400 and "FFmpeg" in detail), f"{status} {detail}")
+        if status == 200:
+            client.request("POST", f"/api/streams/{ff['id']}/stop", body={})
 
 
 def test_sessions_are_hashed_at_rest(workdir, admin):

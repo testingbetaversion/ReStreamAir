@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>  // strcasecmp — on Linux it lives here, not in <string.h>
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>

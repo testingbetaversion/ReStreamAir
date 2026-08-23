@@ -16,15 +16,17 @@ static inline uint64_t read_u64(const uint8_t *d) {
 }
 
 static inline void write_u32(uint8_t *d, uint32_t val) {
-    d[0] = (val >> 24) & 0xFF;
-    d[1] = (val >> 16) & 0xFF;
-    d[2] = (val >> 8) & 0xFF;
-    d[3] = val & 0xFF;
+    // The casts are the point of the masks made explicit: GCC's -Wconversion
+    // cannot see that the & 0xFF already made each byte fit.
+    d[0] = (uint8_t)((val >> 24) & 0xFF);
+    d[1] = (uint8_t)((val >> 16) & 0xFF);
+    d[2] = (uint8_t)((val >> 8) & 0xFF);
+    d[3] = (uint8_t)(val & 0xFF);
 }
 
 static inline void write_u64(uint8_t *d, uint64_t val) {
-    write_u32(d, val >> 32);
-    write_u32(d + 4, val & 0xFFFFFFFF);
+    write_u32(d, (uint32_t)(val >> 32));
+    write_u32(d + 4, (uint32_t)(val & 0xFFFFFFFF));
 }
 
 static bool find_box(const uint8_t *data, size_t start, size_t end, const char *type, rs_box_info *out) {

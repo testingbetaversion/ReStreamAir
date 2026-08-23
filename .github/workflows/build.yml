@@ -1,11 +1,12 @@
 name: Build
 
 on:
-  # Auto-build on every push to main is DISABLED to save Actions minutes —
-  # re-enable by uncommenting the push block below. PRs and manual runs still
-  # build.
-  # push:
-  #   branches: [ main ]
+  # Every commit to main is verified on all three platforms. This was disabled
+  # to save Actions minutes, and the cost of that was a Windows build that had
+  # been broken for a while without anyone finding out — the whole point of the
+  # tree being C is that it runs everywhere, which is only true if it is checked.
+  push:
+    branches: [ main ]
   pull_request:
   workflow_dispatch:
 
@@ -21,36 +22,99 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+
       - name: Install libcurl + libxml2 (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libxml2-dev
+
       - name: Install libxml2 (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install libxml2 pkg-config
           echo "PKG_CONFIG_PATH=$(brew --prefix libxml2)/lib/pkgconfig" >> "$GITHUB_ENV"
-      # Windows has no libcurl/libxml2 without vcpkg, so it builds the core and
-      # the self-test only — which is the part that has to be right everywhere.
-      - name: Configure
+
+      # Windows has no system libcurl or libxml2, so they come from vcpkg.json,
+      # built static so the result is a single exe with no DLLs beside it. The
+      # cache key is the manifest: it only rebuilds when the dependencies change.
+      - name: Cache vcpkg packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VCPKG_INSTALLATION_ROOT }}/installed
+            ${{ env.VCPKG_INSTALLATION_ROOT }}/packages
+          key: vcpkg-x64-windows-static-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-x64-windows-static-
+
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
         shell: bash
-        run: cmake -S . -B build ${{ runner.os == 'Windows' && '-DRS_BUILD_SERVER=OFF' || '' }}
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+
       - name: Build
         run: cmake --build build --config Release
-      - name: Self-test (NIST vectors + module goldens)
+
+      # The self-test covers the crypto vectors and the module goldens, and now
+      # also the threading and process layers that differ per platform — the
+      # parts where compiling proves least about whether they work.
+      - name: Self-test (NIST vectors + module goldens + portability layer)
         run: ctest --test-dir build -C Release --output-on-failure
+
       # The HTTP layer the self-test cannot reach: the auth gate, the viewer
       # role, the login throttle, session persistence across a restart, cookie
       # attributes and the mode of state.json.
       - name: API end-to-end
-        if: runner.os != 'Windows'
-        run: python3 scripts/api-smoke.py --binary build/restreamair-server
-      - name: Smoke test the panel binary
+        shell: bash
+        run: |
+          BIN=build/restreamair-server
+          [ -f "$BIN" ] || BIN=build/Release/restreamair-server.exe
+          python3 scripts/api-smoke.py --binary "$BIN"
+
+      - name: Smoke test the panel binary (Unix)
         if: runner.os != 'Windows'
         run: |
           ./build/restreamair-server --port 8799 --bind 127.0.0.1 --root public &
           sleep 3
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/)" = "200"
           curl -fsS http://127.0.0.1:8799/ping
+
+      - name: Smoke test the panel binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath build\Release\restreamair-server.exe `
+                 -ArgumentList '--port','8799','--bind','127.0.0.1','--root','public' -PassThru
+          Start-Sleep -Seconds 5
+          try {
+            $r = Invoke-WebRequest -Uri http://127.0.0.1:8799/ -UseBasicParsing
+            if ($r.StatusCode -ne 200) { throw "panel returned $($r.StatusCode)" }
+            Invoke-WebRequest -Uri http://127.0.0.1:8799/ping -UseBasicParsing | Out-Null
+            Write-Output "panel serves the UI on Windows: OK"
+          } finally { Stop-Process -Id $p.Id -Force }
+
+      # A single self-contained exe is the whole point of the static triplet, so
+      # check it rather than trusting it: nothing outside the system DLLs may be
+      # required to run it.
+      - name: The Windows binary needs no third-party DLLs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $deps = & dumpbin /dependents build\Release\restreamair-server.exe |
+                  Select-String -Pattern '^\s+\S+\.dll$' |
+                  ForEach-Object { $_.Line.Trim() }
+          Write-Output $deps
+          $allowed = '^(KERNEL32|ADVAPI32|WS2_32|CRYPT32|BCRYPT|SECUR32|USER32|NORMALIZ|WLDAP32|IPHLPAPI|SHELL32|ole32|OLEAUT32|VERSION|dbghelp|api-ms-win-.*)\.dll$'
+          $bad = $deps | Where-Object { $_ -notmatch $allowed }
+          if ($bad) { throw "unexpected DLL dependencies: $($bad -join ', ')" }
+          Write-Output "no third-party DLLs required"
 
   # ASan + UBSan over the same suites. The core parses attacker-supplied bytes
   # (MPD XML, MP4 boxes, playlists), which is exactly where a memory bug becomes
@@ -79,3 +143,27 @@ jobs:
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: python3 scripts/api-smoke.py --binary build-asan/restreamair-server
+
+  # A MinGW cross-build, which catches a POSIX-ism reaching a Windows path in a
+  # couple of minutes on a Linux runner — and keeps the core honest about being
+  # portable to a second Windows toolchain rather than to one compiler.
+  windows-cross:
+    name: C core (MinGW cross-build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - name: Configure
+        run: |
+          cat > /tmp/mingw.cmake <<'TC'
+          set(CMAKE_SYSTEM_NAME Windows)
+          set(CMAKE_SYSTEM_PROCESSOR x86_64)
+          set(CMAKE_C_COMPILER   x86_64-w64-mingw32-gcc)
+          set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++)
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+          TC
+          cmake -S . -B build-mingw -DCMAKE_TOOLCHAIN_FILE=/tmp/mingw.cmake -DRS_BUILD_SERVER=OFF
+      - name: Build
+        run: cmake --build build-mingw -j"$(nproc)"

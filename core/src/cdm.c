@@ -7,12 +7,79 @@
 #include <ctype.h>
 #include <stdio.h>
 
-#ifndef _WIN32
-#include <regex.h>
-#else
-// Ensure a regex.h exists or is provided in the environment.
-#include <regex.h>
-#endif
+
+// --- the three patterns this file needs -------------------------------------
+//
+// These used to be POSIX <regex.h>. That header does not exist on Windows and
+// has no MSVC equivalent, and the placeholder that "handled" it here included
+// the same missing header from both branches — so this file had never been
+// compiled for Windows at all. All three patterns are simple enough that a
+// scanner is shorter than any portability shim would have been, and it drops a
+// regex engine from the code path that parses attacker-supplied playlists.
+
+// Copies [start, end) into a fresh NUL-terminated string.
+static char *dup_range(const char *start, const char *end) {
+    size_t n = (size_t)(end - start);
+    char *out = (char *)malloc(n + 1);
+    if (!out) return NULL;
+    memcpy(out, start, n);
+    out[n] = '\0';
+    return out;
+}
+
+// Exactly 32 hex digits at `p`, lowercased into `out`. Was "[0-9a-fA-F]{32}".
+static bool take_hex32(const char *p, char out[33]) {
+    for (int i = 0; i < 32; i++) {
+        if (!isxdigit((unsigned char)p[i])) return false;
+        out[i] = (char)tolower((unsigned char)p[i]);
+    }
+    out[32] = '\0';
+    return true;
+}
+
+// "<32 hex>[ \t]*:[ \t]*<32 hex>" — the shape a key script prints when it is
+// not returning JSON. Returns just past the match, or NULL when there is none.
+// Scanning one character at a time matches the regex's leftmost rule: in a hex
+// run longer than 32, the match simply starts further along.
+static const char *scan_kid_key_pair(const char *s, char kid_out[33], char key_out[33]) {
+    for (; *s; s++) {
+        const char *p;
+        if (!take_hex32(s, kid_out)) continue;
+        p = s + 32;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != ':') continue;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!take_hex32(p, key_out)) continue;
+        return p + 32;
+    }
+    return NULL;
+}
+
+// default_KID[ \t]*=[ \t]*["']<hex and dashes>["'] — case-sensitive on the
+// name, as the pattern was. On a match, *out is the KID and the return value is
+// just past the closing quote.
+static const char *scan_default_kid(const char *s, char **out) {
+    static const char NEEDLE[] = "default_KID";
+    const char *hit = strstr(s, NEEDLE);
+    for (; hit; hit = strstr(hit + 1, NEEDLE)) {
+        const char *p = hit + (sizeof(NEEDLE) - 1);
+        char quote;
+        const char *start;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != '=') continue;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != '"' && *p != '\'') continue;
+        quote = *p++;
+        start = p;
+        while (isxdigit((unsigned char)*p) || *p == '-') p++;
+        if (p == start || *p != quote) continue;
+        *out = dup_range(start, p);
+        return p + 1;
+    }
+    return NULL;
+}
 
 static const char *WIDEVINE_SYSTEM_ID = "edef8ba979d64acea3c827dcd51d21ed";
 static const char *PLAYREADY_SYSTEM_ID = "9a04f07998404286ab92e65be0885f95";
@@ -144,63 +211,42 @@ rs_drm_challenge rs_cdm_challenge_from_mpd(const char *xml) {
         }
     }
     
-    // regex for default_KID
-    regex_t preg;
-    if (regcomp(&preg, "default_KID[ \t]*=[ \t]*[\"']([0-9a-fA-F-]+)[\"']", REG_EXTENDED) == 0) {
-        regmatch_t pmatch[2];
-        const char *search = xml;
-        while (regexec(&preg, search, 2, pmatch, 0) == 0) {
-            if (pmatch[1].rm_so != -1) {
-                int len = (int)(pmatch[1].rm_eo - pmatch[1].rm_so);
-                char *kid = malloc(len + 1);
-                if (kid) {
-                    strncpy(kid, search + pmatch[1].rm_so, len);
-                    kid[len] = '\0';
-                    add_kid(&ch, kid);
-                    free(kid);
-                }
-            }
-            search += pmatch[0].rm_eo;
-        }
-        regfree(&preg);
+    // Every default_KID the manifest carries.
+    for (const char *search = xml; search && *search;) {
+        char *kid = NULL;
+        search = scan_default_kid(search, &kid);
+        if (!search) break;
+        if (kid) { add_kid(&ch, kid); free(kid); }
     }
     
     return ch;
 }
 
+// NAME="value", or NAME=value up to a delimiter. The name match is
+// case-insensitive. Both passes run over the whole line before the next one
+// starts, which is what the two regexes did: a quoted value anywhere on the
+// line wins over an unquoted one earlier in it.
 static char* get_attr(const char *line, const char *name) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "%s=\"([^\"]+)\"", name);
-    regex_t preg;
-    if (regcomp(&preg, pattern, REG_EXTENDED | REG_ICASE) == 0) {
-        regmatch_t pmatch[2];
-        if (regexec(&preg, line, 2, pmatch, 0) == 0 && pmatch[1].rm_so != -1) {
-            int len = (int)(pmatch[1].rm_eo - pmatch[1].rm_so);
-            char *val = malloc(len + 1);
-            if (val) {
-                strncpy(val, line + pmatch[1].rm_so, len);
-                val[len] = '\0';
-                regfree(&preg);
-                return val;
-            }
-        }
-        regfree(&preg);
+    size_t nlen = strlen(name);
+
+    for (const char *p = line; *p; p++) {
+        const char *q, *start;
+        if (strncasecmp(p, name, nlen) != 0) continue;
+        q = p + nlen;
+        if (*q != '=' || q[1] != '"') continue;
+        start = q + 2;
+        for (q = start; *q && *q != '"'; q++) {}
+        if (*q == '"' && q > start) return dup_range(start, q);
     }
-    
-    snprintf(pattern, sizeof(pattern), "%s=([^, \t\r\n]+)", name);
-    if (regcomp(&preg, pattern, REG_EXTENDED | REG_ICASE) == 0) {
-        regmatch_t pmatch[2];
-        if (regexec(&preg, line, 2, pmatch, 0) == 0 && pmatch[1].rm_so != -1) {
-            int len = (int)(pmatch[1].rm_eo - pmatch[1].rm_so);
-            char *val = malloc(len + 1);
-            if (val) {
-                strncpy(val, line + pmatch[1].rm_so, len);
-                val[len] = '\0';
-                regfree(&preg);
-                return val;
-            }
-        }
-        regfree(&preg);
+
+    for (const char *p = line; *p; p++) {
+        const char *q, *start;
+        if (strncasecmp(p, name, nlen) != 0) continue;
+        q = p + nlen;
+        if (*q != '=') continue;
+        start = ++q;
+        while (*q && *q != ',' && *q != ' ' && *q != '\t' && *q != '\r' && *q != '\n') q++;
+        if (q > start) return dup_range(start, q);
     }
     return NULL;
 }
@@ -362,28 +408,12 @@ char* rs_cdm_resolve_keys(const char *script_path, const char *cdm_type, const r
     }
     
     if (!parsed_json) {
-        // Regex / Line-based parsing
-        regex_t preg;
-        if (regcomp(&preg, "([0-9a-fA-F]{32})[ \t]*:[ \t]*([0-9a-fA-F]{32})", REG_EXTENDED) == 0) {
-            regmatch_t pmatch[3];
-            const char *search = out_stdout;
-            while (regexec(&preg, search, 3, pmatch, 0) == 0) {
-                int kid_len = (int)(pmatch[1].rm_eo - pmatch[1].rm_so);
-                int key_len = (int)(pmatch[2].rm_eo - pmatch[2].rm_so);
-                char kid_val[33], key_val[33];
-                strncpy(kid_val, search + pmatch[1].rm_so, kid_len);
-                kid_val[kid_len] = '\0';
-                strncpy(key_val, search + pmatch[2].rm_so, key_len);
-                key_val[key_len] = '\0';
-                
-                // Lowercase them
-                for (int i=0; i<32; i++) kid_val[i] = (char)tolower((unsigned char)kid_val[i]);
-                for (int i=0; i<32; i++) key_val[i] = (char)tolower((unsigned char)key_val[i]);
-                
-                rs_strv_pushf(&pairs, "%s:%s", kid_val, key_val);
-                search += pmatch[0].rm_eo;
-            }
-            regfree(&preg);
+        // Line-based parsing: every "<kid>:<key>" pair in the output.
+        char kid_val[33], key_val[33];
+        for (const char *search = out_stdout; search && *search;) {
+            search = scan_kid_key_pair(search, kid_val, key_val);
+            if (!search) break;
+            rs_strv_pushf(&pairs, "%s:%s", kid_val, key_val);
         }
     }
     

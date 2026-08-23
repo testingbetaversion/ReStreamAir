@@ -2,21 +2,19 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <ctype.h>
 #include <errno.h>
 
 #include <curl/curl.h>
 
-#ifndef _WIN32
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <fcntl.h>
-extern char **environ;
-#endif
-
 #include "rs_common.h"
+#include "rs_proc.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>   // mkstemp/close, for the downloader's temp files
+#endif
 
 typedef struct {
     char *data;
@@ -120,8 +118,7 @@ static void append_body_snippet(char *errbuf, size_t errbuf_len, const char *bod
 // DNS and TLS session state are still shared process-wide: both are documented
 // as safe to share, and a resumed TLS session skips a round trip on the
 // connections that genuinely do have to be opened.
-#ifndef _WIN32
-#include <pthread.h>
+#include "rs_thread.h"
 
 static CURLSH *g_conn_share = NULL;
 static pthread_mutex_t g_share_locks[CURL_LOCK_DATA_LAST];
@@ -182,15 +179,6 @@ static CURL *thread_handle(void) {
 
 static bool thread_handle_is_owned(void) { return g_handle_key_ok; }
 
-#else
-// Windows in this build has no pthreads (see live.c), and the fetch path there
-// is single-threaded, so a plain per-request handle is both correct and no
-// slower than it was.
-static CURLSH *shared_dns_cache(void) { return NULL; }
-static CURL *thread_handle(void) { return curl_easy_init(); }
-static bool thread_handle_is_owned(void) { return false; }
-#endif
-
 // --- HTTP/2, and the origins that cannot do it ------------------------------
 //
 // HTTP/2 multiplexes every request for one origin onto a single connection, so
@@ -210,14 +198,9 @@ static bool thread_handle_is_owned(void) { return false; }
 
 static char *g_h2_deny[RS_H2_DENY_MAX];
 static size_t g_h2_deny_n = 0;
-#ifndef _WIN32
 static pthread_mutex_t g_h2_mu = PTHREAD_MUTEX_INITIALIZER;
 #define H2_LOCK()   pthread_mutex_lock(&g_h2_mu)
 #define H2_UNLOCK() pthread_mutex_unlock(&g_h2_mu)
-#else
-#define H2_LOCK()   ((void)0)
-#define H2_UNLOCK() ((void)0)
-#endif
 
 // The host part of an absolute URL, lowercased, into `out`.
 static void url_host(const char *url, char *out, size_t outlen) {
@@ -443,8 +426,6 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
 // aren't recoverable) so it reports no status and suits whole-segment
 // downloads. If the chosen tool is missing, the caller falls back to libcurl.
 
-#ifndef _WIN32
-
 typedef struct { char **v; int n; int cap; } argv_b;
 static void ab_push(argv_b *a, const char *s) {
     if (a->n + 2 >= a->cap) { a->cap = a->cap ? a->cap * 2 : 32; a->v = realloc(a->v, (size_t)a->cap * sizeof(char *)); }
@@ -453,21 +434,62 @@ static void ab_push(argv_b *a, const char *s) {
 static void ab_free(argv_b *a) { for (int i = 0; i < a->n; i++) free(a->v[i]); free(a->v); }
 
 static int read_whole_file(const char *path, char **out, size_t *out_len) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
     size_t cap = 65536, len = 0;
     char *buf = malloc(cap);
-    if (!buf) { close(fd); return -1; }
-    ssize_t n;
-    while ((n = read(fd, buf + len, cap - len - 1)) > 0) {
-        len += (size_t)n;
-        if (len + 1 >= cap) { cap *= 2; char *g = realloc(buf, cap); if (!g) { free(buf); close(fd); return -1; } buf = g; }
+    if (!buf) { fclose(f); return -1; }
+    for (;;) {
+        if (len + 1 >= cap) {
+            char *g = realloc(buf, cap * 2);
+            if (!g) { free(buf); fclose(f); return -1; }
+            buf = g; cap *= 2;
+        }
+        size_t n = fread(buf + len, 1, cap - len - 1, f);
+        len += n;
+        if (n == 0) break;
     }
-    close(fd);
-    if (n < 0) { free(buf); return -1; }
+    int bad = ferror(f);
+    fclose(f);
+    if (bad) { free(buf); return -1; }
     buf[len] = '\0';
     *out = buf; *out_len = len;
     return 0;
+}
+
+// --- temp files -------------------------------------------------------------
+// The external tools write the body and the response headers to files rather
+// than to pipes, so this needs a real unique path on both platforms.
+
+static const char *temp_dir(char *buf, size_t cap) {
+#ifdef _WIN32
+    DWORD n = GetTempPathA((DWORD)cap, buf);
+    if (n == 0 || n >= cap) { snprintf(buf, cap, "."); return buf; }
+    if (n && (buf[n - 1] == '\\' || buf[n - 1] == '/')) buf[n - 1] = '\0';   // no trailing separator
+    return buf;
+#else
+    const char *t = getenv("TMPDIR");
+    snprintf(buf, cap, "%s", (t && t[0]) ? t : "/tmp");
+    return buf;
+#endif
+}
+
+// Creates a unique empty file under `dir` and writes its full path into `path`.
+static int make_temp_file(const char *dir, const char *prefix, char *path, size_t cap) {
+#ifdef _WIN32
+    char full[MAX_PATH];
+    if (!GetTempFileNameA(dir, prefix, 0, full)) return -1;   // creates it, too
+    if (strlen(full) + 1 > cap) { remove(full); return -1; }
+    snprintf(path, cap, "%s", full);
+    return 0;
+#else
+    int fd;
+    snprintf(path, cap, "%s/%sXXXXXX", dir, prefix);
+    fd = mkstemp(path);
+    if (fd < 0) return -1;
+    close(fd);
+    return 0;
+#endif
 }
 
 // Push each "Name: value" header line as an argv entry, styled per tool:
@@ -517,19 +539,23 @@ static void parse_meta(const char *meta, long *status, char **content_type, char
 // Spawn argv (searching PATH), redirecting stdout to /dev/null and stderr to
 // `err_path` (for wget). Returns the exit code, -2 if the binary is missing,
 // -1 on spawn failure.
-static int spawn_wait(char *const argv[], const char *err_path) {
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
-    if (err_path) posix_spawn_file_actions_addopen(&fa, 2, err_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    else posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
-    pid_t pid;
-    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
-    posix_spawn_file_actions_destroy(&fa);
-    if (rc != 0) return rc == ENOENT ? -2 : -1;
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+static int spawn_wait(const char *const argv[], const char *err_path) {
+    rs_run_result res;
+    // 180s: a whole segment over a slow link is legitimately slow, but a tool
+    // that wedges must not pin this thread for the life of the process.
+    int rc = rs_proc_run(argv, NULL, 180.0, false, false, err_path, &res, NULL, 0);
+    int code;
+    if (rc != 0) {
+        // ENOENT is the one failure the caller can recover from: it means the
+        // tool simply is not installed, so libcurl takes the request instead.
+        code = (res.spawn_error == ENOENT) ? -2 : -1;
+    } else if (res.timed_out || res.term_signal != 0) {
+        code = -1;
+    } else {
+        code = res.exit_code;
+    }
+    rs_run_result_dispose(&res);
+    return code;
 }
 
 static int fetch_external(const char *tool, const char *dl_params,
@@ -541,14 +567,18 @@ static int fetch_external(const char *tool, const char *dl_params,
     if (effective_url) *effective_url = NULL;  // external tools don't report it
     if (status) *status = 0;
 
-    const char *tmpdir = getenv("TMPDIR"); if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
+    char tmpdir_buf[1024];
+    const char *tmpdir = temp_dir(tmpdir_buf, sizeof(tmpdir_buf));
     char body_tmpl[1024], meta_tmpl[1024];
-    snprintf(body_tmpl, sizeof(body_tmpl), "%s/rsdl_body_XXXXXX", tmpdir);
-    snprintf(meta_tmpl, sizeof(meta_tmpl), "%s/rsdl_meta_XXXXXX", tmpdir);
-    int bfd = mkstemp(body_tmpl); if (bfd < 0) { snprintf(errbuf, errbuf_len, "Could not create temp file."); return -1; }
-    close(bfd);
-    int mfd = mkstemp(meta_tmpl); if (mfd < 0) { unlink(body_tmpl); snprintf(errbuf, errbuf_len, "Could not create temp file."); return -1; }
-    close(mfd);
+    if (make_temp_file(tmpdir, "rsb", body_tmpl, sizeof(body_tmpl)) != 0) {
+        snprintf(errbuf, errbuf_len, "Could not create temp file.");
+        return -1;
+    }
+    if (make_temp_file(tmpdir, "rsm", meta_tmpl, sizeof(meta_tmpl)) != 0) {
+        remove(body_tmpl);
+        snprintf(errbuf, errbuf_len, "Could not create temp file.");
+        return -1;
+    }
 
     const char *range_spec = range && range[0]
         ? (strncasecmp(range, "bytes=", 6) == 0 ? range + 6 : range) : NULL;
@@ -574,7 +604,12 @@ static int fetch_external(const char *tool, const char *dl_params,
         err_redirect = meta_tmpl;  // wget prints response headers to stderr
     } else if (is_aria) {
         char basebuf[1024]; snprintf(basebuf, sizeof(basebuf), "%s", body_tmpl);
-        char *base = strrchr(basebuf, '/'); base = base ? base + 1 : basebuf;
+        char *base = strrchr(basebuf, '/');
+#ifdef _WIN32
+        char *back = strrchr(basebuf, '\\');
+        if (back && (!base || back > base)) base = back;
+#endif
+        base = base ? base + 1 : basebuf;
         ab_push(&a, "aria2c"); ab_push(&a, "--quiet=true"); ab_push(&a, "--allow-overwrite=true");
         ab_push(&a, "--auto-file-renaming=false"); ab_push(&a, "-x1"); ab_push(&a, "-s1");
         ab_push(&a, "--connect-timeout=10"); ab_push(&a, "--timeout=60"); ab_push(&a, "-U"); ab_push(&a, "ReStreamAir/1.0");
@@ -596,17 +631,17 @@ static int fetch_external(const char *tool, const char *dl_params,
     }
     ab_push(&a, NULL);
 
-    int code = spawn_wait(a.v, err_redirect);
+    int code = spawn_wait((const char *const *)a.v, err_redirect);
     ab_free(&a);
 
     if (code == -2) {
         snprintf(errbuf, errbuf_len, "Downloader '%s' is not installed.", tool);
-        unlink(body_tmpl); unlink(meta_tmpl);
+        remove(body_tmpl); remove(meta_tmpl);
         return -2;  // signal "missing tool" so the caller can fall back
     }
     if (code != 0) {
         snprintf(errbuf, errbuf_len, "%s exited with code %d.", tool, code);
-        unlink(body_tmpl); unlink(meta_tmpl);
+        remove(body_tmpl); remove(meta_tmpl);
         return -1;
     }
 
@@ -615,17 +650,17 @@ static int fetch_external(const char *tool, const char *dl_params,
         parse_meta(meta, status, content_type, content_range);
         free(meta);
     }
-    unlink(meta_tmpl);
+    remove(meta_tmpl);
 
     char *body = NULL; size_t body_len = 0;
     if (read_whole_file(body_tmpl, &body, &body_len) != 0) {
-        unlink(body_tmpl);
+        remove(body_tmpl);
         snprintf(errbuf, errbuf_len, "Could not read %s output.", tool);
         if (content_type) { free(*content_type); *content_type = NULL; }
         if (content_range) { free(*content_range); *content_range = NULL; }
         return -1;
     }
-    unlink(body_tmpl);
+    remove(body_tmpl);
 
     long st = status ? *status : 0;
     if (st != 0 && (st < 200 || st >= 400)) {
@@ -647,8 +682,6 @@ static int fetch_external(const char *tool, const char *dl_params,
     return 0;
 }
 
-#endif  // !_WIN32
-
 int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
                  const char *downloader, const char *dl_params,
                  char **out, size_t *out_len, long *status, char **content_type,
@@ -660,15 +693,11 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
     bool internal = !downloader || !downloader[0] ||
                     strcasecmp(downloader, "internal") == 0 || strcasecmp(downloader, "libcurl") == 0 ||
                     strcasecmp(downloader, "native") == 0;
-#ifndef _WIN32
     if (!internal) {
         int rc = fetch_external(downloader, dl_params, url, proxy, headers, range,
                                 out, out_len, status, content_type, content_range, effective_url, errbuf, errbuf_len);
         if (rc != -2) return rc;  // -2 = tool missing → fall through to libcurl
     }
-#else
-    (void)dl_params;
-#endif
     return fetch_libcurl(url, proxy, headers, range, out, out_len, status, content_type,
                          content_range, effective_url, errbuf, errbuf_len,
                          timeout_ms, should_cancel, cancel_ctx);

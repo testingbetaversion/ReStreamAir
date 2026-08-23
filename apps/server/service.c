@@ -16,6 +16,10 @@ extern char **environ;
 #define RS_SERVICE_DEFAULT_UNIT "restreamair.service"
 #define RS_SERVICE_UNIT_DIR "/etc/systemd/system"
 
+// Everything below is systemd, so it is Linux-only by nature rather than by
+// omission — the Windows half of this file reports that honestly.
+#ifndef _WIN32
+
 // A unit name reaches systemctl as an argument, so it is constrained to what a
 // unit name may actually contain. Nothing here is passed through a shell, but a
 // name with a slash in it could still point systemctl at another directory.
@@ -30,8 +34,6 @@ static bool unit_name_ok(const char *name) {
     if (strstr(name, "..")) return false;
     return true;
 }
-
-#ifndef _WIN32
 
 // Runs argv, capturing stdout. Returns the exit status, or -1 if it could not be
 // started. `out` (optional) receives up to `out_cap-1` bytes, NUL-terminated.

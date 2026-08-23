@@ -27,7 +27,9 @@ Two shared libraries are resolved at runtime. If you hit `error while loading sh
 sudo apt-get update && sudo apt-get install -y libcurl4 libxml2
 ```
 
-The Linux binary is built against the oldest glibc still supported, so it runs on newer distributions too — the other direction does not work. There is no Windows release: the panel needs libcurl and libxml2, which Windows CI has no supply of without vcpkg, so it compiles and self-tests the core there but ships nothing. [Build from source](#building-from-source) on any platform — it is two cmake commands.
+The Linux binary is built against the oldest glibc still supported, so it runs on newer distributions too — the other direction does not work.
+
+The Windows build is a `.zip` rather than a tarball, and needs nothing installed alongside it: libcurl and libxml2 are linked statically from the [vcpkg manifest](vcpkg.json), together with the MSVC runtime, so it is one `restreamair.exe` plus `public/`. CI checks that with `dumpbin /dependents` on every run rather than taking it on trust. [Build from source](#building-from-source) on any platform — it is two cmake commands.
 
 ## Quick start
 
@@ -315,7 +317,19 @@ That produces `build/restreamair-server` (the panel) and `build/restream_selftes
 ./build/restreamair-server --port 8787 --root public
 ```
 
-The same commands build on macOS, Linux and Windows, under Clang, GCC and MSVC. `-DRS_BUILD_SERVER=OFF` builds the libraries and the self-test alone, without libcurl or libxml2 — which is how Windows CI verifies the core.
+The same commands build on macOS, Linux and Windows, under Clang, GCC, MSVC and MinGW. `-DRS_BUILD_SERVER=OFF` builds the libraries and the self-test alone, without libcurl or libxml2, for a machine where neither is available.
+
+On Windows the two dependencies come from [`vcpkg.json`](vcpkg.json). With vcpkg installed:
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+  -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+  -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+cmake --build build --config Release
+```
+
+The static triplet is what makes the result a single self-contained exe.
 
 Tests:
 
@@ -342,7 +356,15 @@ Everything is C, in two libraries and two executables:
 - **`restreamair-server`** — the panel executable. Thin: it parses argv, registers the handlers that need libcurl (fetch) and libxml2 (MPD parsing) through function pointers, and runs the poll loop.
 - **`restream_selftest`** — links `librestream_base` alone, which is why the core has to stay free of the server's dependencies.
 
-That split is load-bearing rather than tidy: because the fetch, DASH and probe handlers are registered at runtime, the core and the self-test compile on a platform where libcurl and libxml2 are awkward to get — `-DRS_BUILD_SERVER=OFF` is how Windows CI verifies the core on every run.
+That split is load-bearing rather than tidy: because the fetch, DASH and probe handlers are registered at runtime, the core and the self-test compile on a platform where libcurl and libxml2 are awkward to get.
+
+Where the platforms genuinely differ, the difference is confined to three files rather than spread through their callers:
+
+- **[`rs_thread.h`](core/include/rs_thread.h)** — `<pthread.h>` on POSIX, and a shim over `SRWLOCK` / `CONDITION_VARIABLE` / `_beginthreadex` / FLS on Windows. The live engine is ~160 lock/unlock pairs of careful ordering, and a second copy of it under `#ifdef` would be the kind of thing that works until it deadlocks on the platform nobody tests.
+- **[`proc.c`](core/src/proc.c)** — starting a child with its stdio pointed somewhere specific, reading it without deadlocking, and ending it. `posix_spawn` and `CreateProcess` disagree about argv versus a quoted command line, fd versus HANDLE inheritance, and `SIGTERM` versus `TerminateProcess`; this is where that is resolved once. On Windows the child inherits an explicit handle list, so one pipeline cannot hold another's pipes open.
+- **[`sysstats.c`](core/src/sysstats.c)** — CPU, memory and disk, per platform.
+
+Both layers are exercised at runtime by the self-test, not merely compiled: threads, mutexes, condition-variable deadlines, TLS destructors, argv round-tripping through the Windows command-line quoting, exit codes, timeouts and pipe EOF.
 
 `/ping` reports the build time, so a stale binary is one request away from being identified.
 
@@ -397,7 +419,7 @@ Three kinds of check, all in `restream_selftest`:
 
 `scripts/api-smoke.py` covers the layer no unit test reaches: it runs the real server in a scratch directory and drives it over HTTP — the auth gate, the viewer role, the login throttle, cookie attributes, session persistence across a restart, the mode of `state.json`, the M3U export and the provider export/import round trip.
 
-CI runs both suites on Linux and macOS, plus a third pass under AddressSanitizer and UBSan, and compiles the core on Windows. Fixtures are generated: rerun `scripts/gen-fixtures.py` after editing its tables.
+CI runs both suites on Linux, macOS and Windows, plus a pass under AddressSanitizer and UBSan and a MinGW cross-build that catches a POSIX-ism reaching a Windows path without waiting for the MSVC leg. Fixtures are generated: rerun `scripts/gen-fixtures.py` after editing its tables.
 
 Trusted-proxy IP/CIDR matching lives in the core rather than in the request handler for the same reason the goldens are frozen — getting `10.0.0.0/8` wrong is a security bug in either direction, so it is one implementation with its own tests instead of a comparison written twice.
 

@@ -26,8 +26,10 @@ static uint64_t read_u64(const uint8_t *b, size_t off) {
     return v;
 }
 static void write_u32(uint8_t *b, size_t off, uint32_t v) {
-    b[off] = (v >> 24) & 0xFF; b[off+1] = (v >> 16) & 0xFF;
-    b[off+2] = (v >> 8) & 0xFF; b[off+3] = v & 0xFF;
+    // The casts are the point of the masks made explicit: GCC's -Wconversion
+    // cannot see that the & 0xFF already made each byte fit.
+    b[off] = (uint8_t)((v >> 24) & 0xFF); b[off+1] = (uint8_t)((v >> 16) & 0xFF);
+    b[off+2] = (uint8_t)((v >> 8) & 0xFF); b[off+3] = (uint8_t)(v & 0xFF);
 }
 static void write_u64(uint8_t *b, size_t off, uint64_t v) {
     for (int i=0; i<8; i++) b[off+i] = (v >> (8 * (7 - i))) & 0xFF;

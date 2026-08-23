@@ -24,9 +24,7 @@
 #include <string.h>
 #include <time.h>
 
-#ifndef _WIN32
-
-#include <pthread.h>
+#include "rs_thread.h"
 
 // Live engines tracked at once.
 #define RS_LIVE_MAX_STREAMS 64
@@ -3062,47 +3060,3 @@ long long rs_live_drain_ingest(rs_live *live, const char *stream_id) {
     return bytes;
 }
 
-#else  // _WIN32 — no pthreads here yet; DASH playback falls back to the
-       // request-time path in server.c.
-
-rs_live *rs_live_create(rs_live_fetch_fn fetch, rs_live_dash_fn dash,
-                        rs_live_log_fn log, void *log_ctx) {
-    (void)fetch; (void)dash; (void)log; (void)log_ctx;
-    return NULL;
-}
-void rs_live_destroy(rs_live *live) { (void)live; }
-int rs_live_start(rs_live *live, const char *stream_id, const rs_live_config *cfg) {
-    (void)live; (void)stream_id; (void)cfg; return -1;
-}
-void rs_live_stop(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; }
-bool rs_live_is_running(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return false; }
-void rs_live_reap(rs_live *live) { (void)live; }
-bool rs_live_is_ready(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return false; }
-char *rs_live_master_playlist(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return NULL; }
-char *rs_live_media_playlist(rs_live *live, const char *stream_id, const char *rep) {
-    (void)live; (void)stream_id; (void)rep; return NULL;
-}
-uint8_t *rs_live_take_indexed(rs_live *live, const char *stream_id, int rep_index,
-                              long long seq, bool want_init, size_t *out_len) {
-    (void)live; (void)stream_id; (void)rep_index; (void)seq; (void)want_init; (void)out_len;
-    return NULL;
-}
-size_t rs_live_reps(rs_live *live, const char *stream_id, rs_live_rep_desc **out) {
-    (void)live; (void)stream_id;
-    if (out) *out = NULL;
-    return 0;
-}
-void rs_live_reps_free(rs_live_rep_desc *reps, size_t count) { (void)reps; (void)count; }
-uint8_t *rs_live_take_after(rs_live *live, const char *stream_id, int rep_index,
-                            long long after_seq, long long *out_seq,
-                            double *out_duration, size_t *out_len) {
-    (void)live; (void)stream_id; (void)rep_index; (void)after_seq;
-    (void)out_seq; (void)out_duration; (void)out_len;
-    return NULL;
-}
-char *rs_live_status_line(rs_live *live, const char *stream_id) { (void)live; (void)stream_id; return NULL; }
-long long rs_live_drain_ingest(rs_live *live, const char *stream_id) {
-    (void)live; (void)stream_id; return 0;
-}
-
-#endif  // _WIN32

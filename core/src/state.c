@@ -4,7 +4,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -12,12 +19,77 @@
 
 // state.json holds admin password hashes, session tokens' hashes, API keys and
 // — for script providers — account passwords in the clear, because the script
-// has to be handed the real thing. It has no business being world-readable, and
-// the default umask would make it exactly that. Opening with an explicit 0600
-// (rather than fopen + chmod) means it is never briefly readable by anyone else.
+// has to be handed the real thing. It has no business being readable by anyone
+// but the account running the panel, and the platform default would make it
+// exactly that. Restricting it at creation (rather than opening it wide and
+// tightening afterwards) means it is never briefly readable by anyone else.
+//
+// POSIX: an explicit 0600 mode, which the umask cannot widen.
+// Windows: an explicit owner-only DACL. Windows has no mode bits, and without
+// this the file simply inherits whatever the containing directory grants —
+// which for a panel unpacked into a shared location is everyone.
+
+#ifdef _WIN32
+// A security descriptor whose DACL contains exactly one entry: full access for
+// the account this process runs as. Because it is set explicitly at creation,
+// the directory's inheritable entries do not apply. Returns false if the SID
+// could not be resolved, in which case the caller refuses rather than falling
+// back to an unprotected file.
+static bool owner_only_sa(SECURITY_ATTRIBUTES *sa, SECURITY_DESCRIPTOR *sd,
+                          unsigned char *acl_buf, size_t acl_cap,
+                          unsigned char *tok_buf, size_t tok_cap) {
+    HANDLE token = NULL;
+    DWORD needed = 0;
+    TOKEN_USER *user;
+    PACL acl = (PACL)acl_buf;
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    if (!GetTokenInformation(token, TokenUser, tok_buf, (DWORD)tok_cap, &needed)) {
+        CloseHandle(token);
+        return false;
+    }
+    CloseHandle(token);
+    user = (TOKEN_USER *)tok_buf;
+
+    if (!InitializeAcl(acl, (DWORD)acl_cap, ACL_REVISION)) return false;
+    if (!AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_READ | GENERIC_WRITE | DELETE,
+                             user->User.Sid)) return false;
+    if (!InitializeSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION)) return false;
+    if (!SetSecurityDescriptorDacl(sd, TRUE, acl, FALSE)) return false;
+
+    sa->nLength = sizeof(*sa);
+    sa->lpSecurityDescriptor = sd;
+    sa->bInheritHandle = FALSE;
+    return true;
+}
+#endif
+
 static FILE *open_private(const char *path) {
 #ifdef _WIN32
-    return fopen(path, "wb");
+    SECURITY_ATTRIBUTES sa;
+    SECURITY_DESCRIPTOR sd;
+    unsigned char acl_buf[1024];
+    unsigned char tok_buf[512];
+    HANDLE h;
+    int fd;
+    FILE *f;
+
+    if (!owner_only_sa(&sa, &sd, acl_buf, sizeof(acl_buf), tok_buf, sizeof(tok_buf)))
+        return NULL;
+
+    // CREATE_ALWAYS truncates an existing file but keeps its existing ACL, so
+    // the descriptor above only applies to a file we are creating. Removing any
+    // previous one first means the restriction is applied every time, including
+    // to a state.json that an earlier build wrote without it.
+    DeleteFileA(path);
+    h = CreateFileA(path, GENERIC_WRITE, 0, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+
+    fd = _open_osfhandle((intptr_t)h, _O_WRONLY | _O_BINARY);
+    if (fd < 0) { CloseHandle(h); return NULL; }
+    f = _fdopen(fd, "wb");
+    if (!f) _close(fd);   // closes the underlying handle too
+    return f;
 #else
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
     if (fd < 0) return NULL;

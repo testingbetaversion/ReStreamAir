@@ -25,10 +25,11 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
-// live.c already spawns pthreads unconditionally (director/rep/prefetch workers)
-// and restream_core links Threads::Threads on every platform including Windows,
-// so this is available everywhere the live engine already relies on it being.
-#include <pthread.h>
+// live.c spawns threads unconditionally (director/rep/prefetch workers), so the
+// same primitives are needed here for the log ring those workers write into.
+// rs_thread.h is <pthread.h> on POSIX and a SRWLOCK/CONDITION_VARIABLE shim on
+// Windows, so there is exactly one spelling of this in the tree.
+#include "rs_thread.h"
 #ifdef _WIN32
 #include <direct.h>
 #define RS_MKDIR(path) _mkdir(path)
@@ -107,9 +108,7 @@ struct restream_server {
     size_t log_head;        // next write slot
     size_t log_count;       // entries in use (<= RS_LOG_CAP)
     rs_log_clear_entry *log_clears; // per-sid "cleared before" cutoffs; guarded by log_mu
-#ifndef _WIN32
     pthread_mutex_t log_mu; // the live engine's worker threads write here too
-#endif
 };
 
 // A live Server-Sent Events subscriber is marked in mongoose's per-connection
@@ -207,20 +206,8 @@ static bool log_always(const char *event) {
     return false;
 }
 
-static void log_lock(restream_server_t *s) {
-#ifndef _WIN32
-    pthread_mutex_lock(&s->log_mu);
-#else
-    (void)s;
-#endif
-}
-static void log_unlock(restream_server_t *s) {
-#ifndef _WIN32
-    pthread_mutex_unlock(&s->log_mu);
-#else
-    (void)s;
-#endif
-}
+static void log_lock(restream_server_t *s)   { pthread_mutex_lock(&s->log_mu); }
+static void log_unlock(restream_server_t *s) { pthread_mutex_unlock(&s->log_mu); }
 
 // Records one log entry (ring buffer overwrites the oldest). url/message may be
 // NULL; status 0 and bytes -1 mean "absent". Never blocks on I/O, and is safe to
@@ -1145,9 +1132,7 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
 
     char sessiondir[512];
     snprintf(sessiondir, sizeof(sessiondir), "runtime/sessions/%s", pid);
-#ifndef _WIN32
-    mkdir("runtime", 0755); mkdir("runtime/sessions", 0755); mkdir(sessiondir, 0755);
-#endif
+    RS_MKDIR("runtime"); RS_MKDIR("runtime/sessions"); RS_MKDIR(sessiondir);
 
     // Heap-allocated (rather than the stack array this used to be) because
     // dispatch_script_action hands it to a worker thread that outlives this
@@ -1336,9 +1321,7 @@ static void handle_provider_import(restream_server_t *s, struct mg_connection *c
         uint8_t *decoded = (uint8_t *)malloc(cap + 1);
         size_t decoded_len = 0;
         if (decoded && rs_base64_decode(encoded, decoded, cap, &decoded_len) == 0) {
-#ifndef _WIN32
-            mkdir("scripts", 0755);
-#endif
+            RS_MKDIR("scripts");
             char candidate[512];
             snprintf(candidate, sizeof(candidate), "scripts/%s", filename);
             for (int attempt = 1; attempt < 100; attempt++) {
@@ -1832,15 +1815,21 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     if (mg_match(hm->uri, mg_str("/api/ffmpeg-install"), NULL) && (method_is(hm, "GET") || method_is(hm, "POST"))) {
         char *cmd_plan = rs_ffmpeg_install_plan();
         if (cmd_plan) {
-#ifndef _WIN32
             if (method_is(hm, "POST")) {
+#ifdef _WIN32
+                // GET still returns the winget line to run by hand; only
+                // installing it for you is what is not offered here.
+                free(cmd_plan);
+                reply_error(c, 501, "Installing FFmpeg for you isn't supported on Windows — "
+                                    "run the command this endpoint returns instead.");
+#else
                 int started = start_ffmpeg_install(s, cmd_plan);
                 if (started == 1) reply_error(c, 409, "An FFmpeg install is already running.");
                 else if (started != 0) reply_error(c, 500, "Could not start the FFmpeg installer.");
                 else { rs_json *o = rs_json_new_obj(); rs_json_obj_set_bool(o, "started", true); reply_json(c, 202, o, NULL); }
+#endif
                 return true;
             }
-#endif
             rs_json *o = rs_json_new_obj();
             rs_json_obj_set_str(o, "command", cmd_plan);
             reply_json(c, 200, o, NULL);
@@ -3089,8 +3078,8 @@ static void serve_dash_master(restream_server_t *server, struct mg_connection *c
                               struct mg_http_message *hm, const rs_json *stream) {
     const char *stream_id = rs_json_obj_str(stream, "id", "");
     if (!server->live) {
-        reply_error(c, 501, "DASH playback needs the threaded live engine, which this build "
-                            "does not have. Use an HLS (.m3u8) source.");
+        reply_error(c, 501, "DASH playback needs the fetch and MPD handlers, which this "
+                            "build does not register. Use an HLS (.m3u8) source.");
         return;
     }
 
@@ -3148,8 +3137,8 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
                              struct mg_http_message *hm, const rs_json *stream, const char *rep) {
     const char *stream_id = rs_json_obj_str(stream, "id", "");
     if (!server->live) {
-        reply_error(c, 501, "DASH playback needs the threaded live engine, which this build "
-                            "does not have. Use an HLS (.m3u8) source.");
+        reply_error(c, 501, "DASH playback needs the fetch and MPD handlers, which this "
+                            "build does not register. Use an HLS (.m3u8) source.");
         return;
     }
 
@@ -4277,9 +4266,7 @@ restream_server_t* restream_server_create(void) {
     pthread_mutex_init(&server->pending_mu, NULL);
     pthread_cond_init(&server->pending_cv, NULL);
     pthread_mutex_init(&server->logo_mu, NULL);
-#ifndef _WIN32
     pthread_mutex_init(&server->log_mu, NULL);
-#endif
     // The engine needs both hooks; without them (a core-only build registers
     // neither) it stays NULL and the DASH routes report that honestly instead
     // of half-working. The C++ app registers them before calling this.
@@ -4297,9 +4284,7 @@ restream_server_t* restream_server_create(void) {
         pthread_mutex_destroy(&server->pending_mu);
         pthread_cond_destroy(&server->pending_cv);
         pthread_mutex_destroy(&server->logo_mu);
-#ifndef _WIN32
         pthread_mutex_destroy(&server->log_mu);
-#endif
         free(server);
         return NULL;
     }
@@ -4459,9 +4444,7 @@ void restream_server_destroy(restream_server_t* server) {
         pthread_mutex_destroy(&server->pending_mu);
         pthread_cond_destroy(&server->pending_cv);
         pthread_mutex_destroy(&server->logo_mu);
-#ifndef _WIN32
         pthread_mutex_destroy(&server->log_mu);
-#endif
         rs_state_dispose(&server->state);
         free(server->web_root);
         free(server);

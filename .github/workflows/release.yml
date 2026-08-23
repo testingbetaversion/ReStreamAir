@@ -103,8 +103,71 @@ jobs:
           path: restreamair-${{ steps.ver.outputs.tag }}-linux-x86_64.tar.gz
           if-no-files-found: error
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag }}"; [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
+          if [ "$TAG" = "main" ]; then TAG="nightly"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      # libcurl and libxml2 come from vcpkg.json in a static triplet, together
+      # with the static MSVC runtime. That is what makes the zip below a single
+      # exe the user unpacks and runs, with nothing to install first — the same
+      # deal the macOS and Linux tarballs give.
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VCPKG_INSTALLATION_ROOT }}/installed
+            ${{ env.VCPKG_INSTALLATION_ROOT }}/packages
+          key: vcpkg-x64-windows-static-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-x64-windows-static-
+      - name: Build
+        shell: bash
+        run: |
+          cmake -S . -B build-release \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-release --config Release
+      - name: Self-test
+        run: ctest --test-dir build-release -C Release --output-on-failure
+      - name: Stage the zip
+        shell: bash
+        run: |
+          STAGE="restreamair-${{ steps.ver.outputs.tag }}-windows-x86_64"
+          mkdir -p "$STAGE"
+          cp build-release/Release/restreamair-server.exe "$STAGE/restreamair.exe"
+          cp -R public "$STAGE/public"
+          7z a "$STAGE.zip" "$STAGE" >/dev/null
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+      # The same gold-standard check the Linux job does: unpack it somewhere
+      # clean and confirm the panel actually answers.
+      - name: The unpacked panel serves the UI
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "$env:STAGE\restreamair.exe" `
+                 -ArgumentList '--port','8799','--bind','127.0.0.1','--root',"$env:STAGE\public" -PassThru
+          Start-Sleep -Seconds 5
+          try {
+            $r = Invoke-WebRequest -Uri http://127.0.0.1:8799/ -UseBasicParsing
+            if ($r.StatusCode -ne 200) { throw "panel returned $($r.StatusCode)" }
+            Invoke-WebRequest -Uri http://127.0.0.1:8799/ping -UseBasicParsing | Out-Null
+            Write-Output "panel serves the UI from the unpacked zip: OK"
+          } finally { Stop-Process -Id $p.Id -Force }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: restreamair-${{ steps.ver.outputs.tag }}-windows-x86_64.zip
+          if-no-files-found: error
+
   release:
-    needs: [build-macos, build-linux]
+    needs: [build-macos, build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Resolve tag
