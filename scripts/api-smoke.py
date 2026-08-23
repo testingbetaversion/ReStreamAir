@@ -98,7 +98,10 @@ class Server:
 
     def start(self):
         self.process = subprocess.Popen(
-            [self.binary, "--port", str(self.port), "--bind", "127.0.0.1"],
+            # --no-download: the scratch directory has no public/, and this
+            # test has no business reaching out to GitHub for one.
+            [self.binary, "--port", str(self.port), "--bind", "127.0.0.1",
+             "--no-download"],
             cwd=self.workdir,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,

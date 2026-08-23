@@ -2,24 +2,12 @@
 // the core, and this file only parses argv, wires up the handlers that need
 // libcurl and libxml2, runs the poll loop and shuts down cleanly.
 
-#include <sys/stat.h>
-
 #include <climits>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
-
-#ifdef _WIN32
-#include <direct.h>
-#define rs_realpath(rel, abs) _fullpath((abs), (rel), _MAX_PATH)
-#define RS_PATH_MAX _MAX_PATH
-#else
-#include <limits.h>
-#define rs_realpath(rel, abs) realpath((rel), (abs))
-#define RS_PATH_MAX PATH_MAX
-#endif
 
 #include <curl/curl.h>
 
@@ -28,6 +16,7 @@
 #include "rs_dash.h"
 #include "ffrun.h"
 #include "service.h"
+#include "webroot.h"
 #include "restream.h"
 
 namespace {
@@ -45,32 +34,14 @@ void print_usage(const char *program) {
                  "  serve             optional; the default action, accepted for symmetry\n"
                  "  -p, --port N      port to listen on (default 8787, or the panel's stored value)\n"
                  "  -b, --bind ADDR   address to bind (default 0.0.0.0)\n"
-                 "  --root DIR        serve the panel's static files from DIR (auto-detects public/)\n"
+                 "  --root DIR        serve the panel's static files from DIR (auto-detects public/,\n"
+                 "                    and downloads it from GitHub into a cache if there is none)\n"
+                 "  --refresh-web     re-download the front-end over the cached copy\n"
+                 "  --web-ref REF     branch, tag or commit to fetch the front-end from (default main)\n"
+                 "  --no-download     never fetch; use public/ or an existing cache only\n"
                  "  --verbose         full mongoose trace logging (default: errors only)\n"
                  "  -h, --help        this message\n",
                  program);
-}
-
-bool is_dir(const std::string &path) {
-    struct stat st;
-    return stat(path.c_str(), &st) == 0 && (st.st_mode & S_IFDIR);
-}
-
-// Looks for the panel's public/ directory next to the current directory or one
-// level up (the binary usually runs from build/, with public/ a sibling of it).
-std::string autodetect_web_root() {
-    for (const char *candidate : {"public", "../public", "./public"}) {
-        if (is_dir(candidate)) return candidate;
-    }
-    return "";
-}
-
-// mongoose's mg_http_serve_dir rejects any root containing "..", so a relative
-// path like "../public" has to be made absolute before it's handed over.
-std::string absolute_path(const std::string &path) {
-    char buffer[RS_PATH_MAX];
-    if (rs_realpath(path.c_str(), buffer)) return buffer;
-    return path;  // best effort — let the server report the failure
 }
 
 bool needs_value(const char *arg, int index, int argc, const char *flag) {
@@ -189,8 +160,7 @@ static int service_action(const char *action, unsigned port, const char *bind,
 int main(int argc, char **argv) {
     unsigned short port = 8787;
     std::string bind_address = "0.0.0.0";
-    std::string web_root;
-    bool web_root_set = false;
+    rs_webroot_options web;
     bool verbose = false;
     // Whether the port/bind came from the command line. The panel's Settings
     // page stores both and tells the operator they "take effect after restart" —
@@ -223,8 +193,14 @@ int main(int argc, char **argv) {
             bind_from_argv = true;
         } else if (std::strcmp(arg, "--root") == 0) {
             if (!needs_value(arg, i, argc, arg)) return 2;
-            web_root = argv[++i];
-            web_root_set = true;
+            web.explicit_root = argv[++i];
+        } else if (std::strcmp(arg, "--refresh-web") == 0) {
+            web.refresh = true;
+        } else if (std::strcmp(arg, "--web-ref") == 0) {
+            if (!needs_value(arg, i, argc, arg)) return 2;
+            web.ref = argv[++i];
+        } else if (std::strcmp(arg, "--no-download") == 0) {
+            web.no_download = true;
         } else if (std::strcmp(arg, "--verbose") == 0) {
             verbose = true;
         } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
@@ -237,14 +213,20 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!web_root_set) web_root = autodetect_web_root();
-    if (!web_root.empty()) web_root = absolute_path(web_root);
-
     restream_server_set_verbose(verbose);
 
     // Enable source auto-detect (/api/probe): libcurl for the fetch, libxml2 for
     // MPD parsing. Both are initialised once here; the handler lives in probe.c.
     curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    // The front-end: public/ if it is next to us, otherwise a cached copy, and
+    // failing that a download from the (public) repository — the binary alone
+    // is enough to run the panel, and nothing is written into the install
+    // directory. Needs libcurl up, hence its place here.
+    web.verbose = verbose;
+    std::string web_root_error;
+    std::string web_root = rs_webroot_resolve(web, &web_root_error, nullptr);
+
     restream_server_set_probe_handler(rs_probe_source);
     restream_server_set_fetch_handler(rs_fetch_url);
     restream_server_set_dash_handler(rs_dash_describe);
@@ -289,7 +271,9 @@ int main(int argc, char **argv) {
     std::signal(SIGTERM, handle_signal);
     std::printf("restreamair-server listening on http://%s:%u\n", bind_address.c_str(), port);
     if (web_root.empty()) {
-        std::printf("  no web root — serving /ping only. Pass --root public/ to serve the panel's files.\n");
+        std::printf("  no web root — serving /ping only: %s.\n", web_root_error.c_str());
+        std::printf("  pass --root DIR, or allow the front-end to be fetched from github.com/%s.\n",
+                    rs_webroot_repo());
     } else {
         std::printf("  serving %s + the panel API: auth, provider/stream/user/key management,\n"
                     "  live monitoring, source auto-detect, script providers, and direct /\n"

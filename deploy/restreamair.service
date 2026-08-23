@@ -3,10 +3,16 @@
 #
 #   sudo useradd --system --home /var/lib/restreamair --create-home restreamair
 #   sudo cp restreamair /usr/local/bin/
-#   sudo cp -r public /var/lib/restreamair/
+#   sudo cp -r public /var/lib/restreamair/     # optional, see below
 #   sudo chown -R restreamair:restreamair /var/lib/restreamair
 #   sudo cp deploy/restreamair.service /etc/systemd/system/
 #   sudo systemctl enable --now restreamair
+#
+# Copying public/ in is optional: without it the panel downloads the front-end
+# from github.com/testingbetaversion/ReStreamAir on the first start. ProtectHome
+# and PrivateTmp leave it nowhere durable to cache that, so it would be fetched
+# again after every reboot — uncomment the RESTREAMAIR_WEB_CACHE line below to
+# keep the cache in the state directory instead.
 #
 # The panel speaks plain HTTP. Leave --bind at 127.0.0.1 and put a TLS
 # terminator (nginx, Caddy) in front of it unless this is a trusted LAN; then
@@ -26,6 +32,8 @@ Group=restreamair
 # state.json, runtime/, logs/ and logo-cache.json all resolve relative to this.
 WorkingDirectory=/var/lib/restreamair
 ExecStart=/usr/local/bin/restreamair serve --bind 127.0.0.1 --port 8787
+# Where the downloaded front-end is cached when public/ was not copied in.
+#Environment=RESTREAMAIR_WEB_CACHE=/var/lib/restreamair/web
 Restart=on-failure
 RestartSec=5s
 

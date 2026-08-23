@@ -51,7 +51,7 @@ Open `http://127.0.0.1:8787`. The first launch serves a **Create admin account**
 
 **Port** resolves in this order: `--port`, the Settings panel's saved value, then `8787`. **Bind address** works the same way (`--bind`, Settings, then all interfaces). Both take effect on the next restart — a live listener can't rebind. A leading `serve` is accepted and ignored, so `./restreamair serve --port 9000` works too.
 
-The panel's static files are found automatically when `public/` sits next to the working directory or one level up; `--root` is for everything else. Without a web root it serves `/ping` and says so on startup rather than pretending.
+The panel's static files are found automatically when `public/` sits next to the working directory or one level up; `--root` is for everything else. **A binary on its own is also enough**: with no `public/` in sight, the first run downloads the front-end from this repository into a cache directory outside the install — `~/Library/Caches/ReStreamAir/public` on macOS, `${XDG_CACHE_HOME:-~/.cache}/restreamair/public` on Linux, and a per-user directory under `$TMPDIR` when neither is writable (a hardened systemd unit, a container with no home). Later runs use the cache and never touch the network. `--refresh-web` fetches a fresh copy over it, `--web-ref` pins a branch, tag or commit instead of `main`, `--no-download` forbids the fetch entirely, and `RESTREAMAIR_WEB_CACHE` puts the cache wherever you like. A `public/` next to the binary always wins, and a checkout's copy is never written over. Without a web root and without a download it serves `/ping` and says why on startup rather than pretending.
 
 Starting a second instance on a taken port fails immediately with the address it could not bind, rather than hanging silently.
 
@@ -274,6 +274,7 @@ The binary does one thing — serve the panel — so its argv is short:
 
 ```
 restreamair [serve] [-p|--port N] [-b|--bind ADDRESS] [--root DIR] [--verbose]
+            [--refresh-web] [--web-ref REF] [--no-download]
 ```
 
 | Flag | Purpose |
@@ -281,8 +282,11 @@ restreamair [serve] [-p|--port N] [-b|--bind ADDRESS] [--root DIR] [--verbose]
 | `serve` | Optional and a no-op. Accepted because that is how the panel is documented and deployed. |
 | `-p`, `--port` | Port to listen on. Defaults to the panel's stored value, else 8787. |
 | `-b`, `--bind` | Address to bind. Defaults to the stored value, else all interfaces. |
-| `--root` | Serve the panel's static files from this directory. Auto-detects `public/` next to the working directory or one level up. |
-| `--verbose` | Full HTTP trace logging; without it, errors only. |
+| `--root` | Serve the panel's static files from this directory. Auto-detects `public/` next to the working directory or one level up, and downloads it from GitHub into a cache when there is none. |
+| `--refresh-web` | Re-download the front-end over the cached copy. Leaves a local `public/` alone. |
+| `--web-ref` | Branch, tag or commit to fetch the front-end from. Defaults to `main`. |
+| `--no-download` | Never fetch: use `public/` or an existing cache, or serve `/ping` only. |
+| `--verbose` | Full HTTP trace logging; without it, errors only. Also names each front-end file as it downloads. |
 
 An explicit flag always beats the stored setting — that is what a flag is for — and the Settings page's "takes effect after restart" means exactly that.
 
@@ -423,7 +427,7 @@ The panel port is not published — only Caddy can reach it — so the plain-HTT
 
 ### systemd
 
-`deploy/restreamair.service` is a hardened unit for a bare-metal install; the header comment carries the install steps. It binds `127.0.0.1` by default, expecting a proxy in front. Copy `public/` alongside the binary — the unit sets `WorkingDirectory=/var/lib/restreamair`, and the panel looks for its static files there.
+`deploy/restreamair.service` is a hardened unit for a bare-metal install; the header comment carries the install steps. It binds `127.0.0.1` by default, expecting a proxy in front. Copying `public/` into `/var/lib/restreamair` is optional — the unit sets `WorkingDirectory` there and the panel looks for its static files in it first, but with nothing there it downloads them on the first start. `ProtectHome=true` and `PrivateTmp=true` mean that cache lands in the unit's private `/tmp` and is re-fetched after a reboot; set `Environment=RESTREAMAIR_WEB_CACHE=/var/lib/restreamair/web` to keep it, or copy `public/` in and skip the download altogether.
 
 ### Running behind a reverse proxy
 
