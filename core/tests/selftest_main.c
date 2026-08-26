@@ -1036,12 +1036,19 @@ static void test_panel(void) {
     check("panel/state-seed", st.root != NULL);
 
     const char *err = NULL;
-    rs_json *pbody = parse_json("{\"name\":\"P1\"}");
+    rs_json *pbody = parse_json("{\"name\":\"P1\",\"errorWebhookUrl\":\"https://discord.com/api/webhooks/1/token\"}");
     check("panel/create-provider", rs_panel_create_provider(&st, pbody, &err) == 0);
     rs_json_free(pbody);
     const rs_json *providers = rs_json_obj_get(st.root, "providers");
     check("panel/provider-count", rs_json_arr_len(providers) == 1);
     const char *pid = rs_json_obj_str(rs_json_arr_at(providers, 0), "id", "");
+    check_str("panel/provider-webhook",
+              rs_json_obj_str(rs_json_arr_at(providers, 0), "errorWebhookUrl", ""),
+              "https://discord.com/api/webhooks/1/token");
+
+    rs_json *bad_provider = parse_json("{\"name\":\"Bad webhook\",\"errorWebhookUrl\":\"discord://not-http\"}");
+    check("panel/reject-bad-webhook", rs_panel_create_provider(&st, bad_provider, &err) == -400);
+    rs_json_free(bad_provider);
 
     // Window floors and memory-protection ceilings are enforced server-side;
     // the browser's numeric input is only a convenience and can be bypassed.

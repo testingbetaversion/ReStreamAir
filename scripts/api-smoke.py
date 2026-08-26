@@ -182,6 +182,51 @@ class HLSOrigin:
         self.thread.join(timeout=5)
 
 
+class WebhookSink:
+    """Captures Discord-compatible JSON POSTs from the background worker."""
+
+    class Handler(BaseHTTPRequestHandler):
+        received = []
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            try:
+                self.received.append(json.loads(raw))
+            except json.JSONDecodeError:
+                self.received.append({"invalid": raw.decode(errors="replace")})
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    def __init__(self):
+        self.Handler.received = []
+        self.port = free_port()
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self.Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    @property
+    def received(self):
+        return self.Handler.received
+
+    def wait_for(self, count, timeout=8):
+        deadline = time.time() + timeout
+        while len(self.received) < count and time.time() < deadline:
+            time.sleep(0.05)
+        return len(self.received) >= count
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+
 def test_health_and_gate(client):
     print("health and the authentication gate")
     status, _, _ = client.request("GET", "/ping")
@@ -448,6 +493,43 @@ def test_provider_routes(client):
     return provider
 
 
+def test_provider_webhooks(client, sink):
+    print("provider error webhooks")
+    webhook = f"http://127.0.0.1:{sink.port}/discord"
+    status, body, _ = client.json("POST", "/api/providers",
+                                  body={"name": "Webhook Provider", "errorWebhookUrl": webhook})
+    provider = next((p for p in body.get("providers", []) if p["name"] == "Webhook Provider"), None)
+    check("a provider webhook URL is persisted",
+          status == 200 and provider and provider.get("errorWebhookUrl") == webhook, f"{status} {body}")
+    if not provider:
+        return
+
+    status, _, _ = client.request("POST", f"/api/providers/{provider['id']}/webhook/test", body={})
+    check("a webhook test is accepted asynchronously", status == 202, f"got {status}")
+    check("the webhook worker POSTs the test", sink.wait_for(1), f"received {len(sink.received)}")
+    first = sink.received[0] if sink.received else {}
+    first_text = json.dumps(first)
+    check("the test uses a Discord embed", "embeds" in first and "Webhook Provider" in first_text, first_text)
+
+    # A dead local MPD fails immediately and proves that ordinary provider
+    # stream errors—not only the test button—enter the same delivery path.
+    status, body, _ = client.json("POST", f"/api/providers/{provider['id']}/streams",
+                                  body={"name": "Broken stream", "kind": "mpd",
+                                        "url": "http://127.0.0.1:1/dead.mpd"})
+    stream = next((s for p in body.get("providers", []) if p["id"] == provider["id"]
+                   for s in p.get("streams", []) if s["name"] == "Broken stream"), None)
+    check("a webhook test stream is created", status == 200 and stream is not None, f"{status}")
+    if stream:
+        status, _, _ = client.request("POST", f"/api/streams/{stream['id']}/start", body={})
+        check("the broken stream starts in the background", status == 200, f"got {status}")
+        check("a real stream error reaches the webhook", sink.wait_for(2), f"received {len(sink.received)}")
+        error_text = json.dumps(sink.received[1] if len(sink.received) > 1 else {})
+        check("the alert identifies provider and stream",
+              "Webhook Provider" in error_text and "Broken stream" in error_text, error_text)
+        check("the alert redacts the source URL", "127.0.0.1:1" not in error_text, error_text)
+        client.request("POST", f"/api/streams/{stream['id']}/stop", body={})
+
+
 def test_hls_playback_routes(client, origin):
     print("live HLS playback routing")
     status, body, _ = client.json("POST", "/api/providers", body={"name": "Playback Test"})
@@ -568,7 +650,7 @@ def main():
     port = free_port()
     print(f"running {args.binary} in {workdir} on port {port}\n")
     try:
-        with HLSOrigin() as origin:
+        with HLSOrigin() as origin, WebhookSink() as webhook_sink:
             with Server(args.binary, workdir, port) as server:
                 admin = Client(port)
                 test_health_and_gate(admin)
@@ -579,6 +661,7 @@ def main():
                 test_proxy_headers(admin)
                 viewer = test_viewer_role(admin, port)
                 test_provider_routes(admin)
+                test_provider_webhooks(admin, webhook_sink)
                 test_hls_playback_routes(admin, origin)
                 test_sessions_are_hashed_at_rest(workdir, admin)
                 test_session_persistence(server, admin, viewer)

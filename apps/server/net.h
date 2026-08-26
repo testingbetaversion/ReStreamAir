@@ -36,6 +36,12 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
                  char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
                  long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx);
 
+// POSTs a JSON document to an HTTP(S) endpoint. Used by the provider error
+// webhook worker; deliberately separate from rs_fetch_url so a configured
+// downloader or stream proxy can never alter where operational alerts go.
+int rs_post_json(const char *url, const char *json, long *status,
+                 char *errbuf, size_t errbuf_len);
+
 #ifdef __cplusplus
 }
 #endif

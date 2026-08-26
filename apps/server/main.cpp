@@ -229,6 +229,7 @@ int main(int argc, char **argv) {
 
     restream_server_set_probe_handler(rs_probe_source);
     restream_server_set_fetch_handler(rs_fetch_url);
+    restream_server_set_webhook_handler(rs_post_json);
     restream_server_set_dash_handler(rs_dash_describe);
 
     restream_server_set_service_handler(service_status_json, service_action);

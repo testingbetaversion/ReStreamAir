@@ -78,6 +78,33 @@ typedef struct rs_direct_client rs_direct_client;
 typedef struct rs_ts_client rs_ts_client;
 typedef struct rs_ts_session rs_ts_session;
 
+// Provider webhook configuration is copied out of the mutable state DOM into
+// this small immutable-under-lock cache. Live workers can therefore route an
+// error without racing a provider/stream edit on the mongoose thread.
+typedef struct rs_webhook_target {
+    char *provider_id;
+    char *provider_name;
+    char *url;
+    char **stream_ids;
+    char **stream_names;
+    size_t stream_count;
+    double last_queued_ms;
+    unsigned suppressed;
+    struct rs_webhook_target *next;
+} rs_webhook_target;
+
+typedef struct rs_webhook_job {
+    char *url;
+    char *provider_name;
+    char *stream_name;
+    char *event;
+    char *message;
+    long status;
+    unsigned suppressed;
+    bool test;
+    struct rs_webhook_job *next;
+} rs_webhook_job;
+
 struct restream_server {
     struct mg_mgr mgr;
     struct mg_connection *c;
@@ -109,6 +136,15 @@ struct restream_server {
     size_t log_count;       // entries in use (<= RS_LOG_CAP)
     rs_log_clear_entry *log_clears; // per-sid "cleared before" cutoffs; guarded by log_mu
     pthread_mutex_t log_mu; // the live engine's worker threads write here too
+    pthread_mutex_t webhook_mu;
+    pthread_cond_t webhook_cv;
+    pthread_t webhook_thread;
+    bool webhook_thread_started;
+    bool webhook_stop;
+    rs_webhook_target *webhook_targets;
+    rs_webhook_job *webhook_head;
+    rs_webhook_job *webhook_tail;
+    size_t webhook_count;
 };
 
 // A live Server-Sent Events subscriber is marked in mongoose's per-connection
@@ -121,6 +157,7 @@ struct restream_server {
 // reference them before their setters are defined.
 static restream_probe_fn g_probe_handler = NULL;
 static restream_fetch_fn g_fetch_handler = NULL;
+static restream_webhook_fn g_webhook_handler = NULL;
 static restream_dash_fn g_dash_handler = NULL;
 static restream_service_status_fn g_service_status = NULL;
 static restream_service_action_fn g_service_action = NULL;
@@ -150,6 +187,11 @@ static char *query_var(struct mg_http_message *hm, const char *name);
 static void pending_job_cancel(restream_server_t *s, unsigned long conn_id);
 static void pending_job_finish(restream_server_t *s, struct mg_connection *c, struct mg_str *data);
 static void pending_job_wait_idle(restream_server_t *s);
+static void webhook_rebuild_targets(restream_server_t *s);
+static bool webhook_enqueue_test(restream_server_t *s, const char *provider_id);
+static void log_record(restream_server_t *s, const char *sid, const char *level,
+                       const char *event, const char *url, long status, long long bytes,
+                       const char *message);
 
 // Forward declaration: apply_cenc is defined between serve_hls_playlist and
 // serve_restream_item, but pending_job_finish_item (defined just above
@@ -187,6 +229,281 @@ static double now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_REALTIME, &t);
     return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6;
+}
+
+#define RS_WEBHOOK_QUEUE_CAP 64
+#define RS_WEBHOOK_BURST_MS 5000.0
+
+static void webhook_target_free(rs_webhook_target *t) {
+    if (!t) return;
+    free(t->provider_id);
+    free(t->provider_name);
+    free(t->url);
+    for (size_t i = 0; i < t->stream_count; i++) {
+        if (t->stream_ids) free(t->stream_ids[i]);
+        if (t->stream_names) free(t->stream_names[i]);
+    }
+    free(t->stream_ids);
+    free(t->stream_names);
+    free(t);
+}
+
+static void webhook_targets_free(rs_webhook_target *head) {
+    while (head) {
+        rs_webhook_target *next = head->next;
+        webhook_target_free(head);
+        head = next;
+    }
+}
+
+static void webhook_job_free(rs_webhook_job *job) {
+    if (!job) return;
+    free(job->url);
+    free(job->provider_name);
+    free(job->stream_name);
+    free(job->event);
+    free(job->message);
+    free(job);
+}
+
+static bool webhook_url_valid(const char *url) {
+    return url && (strncmp(url, "https://", 8) == 0 || strncmp(url, "http://", 7) == 0);
+}
+
+static char *webhook_redact_message(const char *message) {
+    const char *input = message && message[0] ? message : "An error was reported.";
+    rs_buf out = RS_BUF_INIT;
+    for (const char *p = input; *p;) {
+        bool url = strncmp(p, "https://", 8) == 0 || strncmp(p, "http://", 7) == 0;
+        if (!url) {
+            rs_buf_append_char(&out, *p++);
+            continue;
+        }
+        rs_buf_append_str(&out, "[redacted URL]");
+        while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' &&
+               *p != '"' && *p != '<' && *p != '>') p++;
+    }
+    char *redacted = rs_buf_take(&out);
+    return redacted ? redacted : rs_strdup("An error was reported.");
+}
+
+static void webhook_rebuild_targets(restream_server_t *s) {
+    rs_webhook_target *fresh = NULL;
+    const rs_json *providers = rs_state_providers(&s->state);
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *provider = rs_json_arr_at(providers, i);
+        const char *url = rs_json_obj_str(provider, "errorWebhookUrl", "");
+        if (!webhook_url_valid(url)) continue;
+        rs_webhook_target *t = (rs_webhook_target *)calloc(1, sizeof(*t));
+        if (!t) continue;
+        t->provider_id = rs_strdup(rs_json_obj_str(provider, "id", ""));
+        t->provider_name = rs_strdup(rs_json_obj_str(provider, "name", "Provider"));
+        t->url = rs_strdup(url);
+        const rs_json *streams = rs_json_obj_get(provider, "streams");
+        t->stream_count = rs_json_arr_len(streams);
+        t->stream_ids = (char **)calloc(t->stream_count ? t->stream_count : 1, sizeof(char *));
+        t->stream_names = (char **)calloc(t->stream_count ? t->stream_count : 1, sizeof(char *));
+        if (!t->provider_id || !t->provider_name || !t->url || !t->stream_ids || !t->stream_names) {
+            webhook_target_free(t);
+            continue;
+        }
+        for (size_t j = 0; j < t->stream_count; j++) {
+            const rs_json *stream = rs_json_arr_at(streams, j);
+            t->stream_ids[j] = rs_strdup(rs_json_obj_str(stream, "id", ""));
+            t->stream_names[j] = rs_strdup(rs_json_obj_str(stream, "name", "Stream"));
+        }
+        t->next = fresh;
+        fresh = t;
+    }
+
+    pthread_mutex_lock(&s->webhook_mu);
+    rs_webhook_target *old = s->webhook_targets;
+    // Ordinary state mutations (including Start/Stop) rebuild this cache. Keep
+    // the provider's burst window when its webhook did not change, otherwise a
+    // button click could accidentally reset the Discord flood protection.
+    for (rs_webhook_target *n = fresh; n; n = n->next) {
+        for (rs_webhook_target *o = old; o; o = o->next) {
+            if (strcmp(n->provider_id, o->provider_id) == 0 && strcmp(n->url, o->url) == 0) {
+                n->last_queued_ms = o->last_queued_ms;
+                n->suppressed = o->suppressed;
+                break;
+            }
+        }
+    }
+    s->webhook_targets = fresh;
+    pthread_mutex_unlock(&s->webhook_mu);
+    webhook_targets_free(old);
+}
+
+static rs_webhook_target *webhook_target_for_sid_locked(restream_server_t *s, const char *sid,
+                                                         const char **stream_name) {
+    if (!sid) return NULL;
+    const char *script_provider = strncmp(sid, "script:", 7) == 0 ? sid + 7 : NULL;
+    for (rs_webhook_target *t = s->webhook_targets; t; t = t->next) {
+        if (script_provider && strcmp(t->provider_id, script_provider) == 0) {
+            *stream_name = "Provider script";
+            return t;
+        }
+        for (size_t i = 0; i < t->stream_count; i++) {
+            if (t->stream_ids[i] && strcmp(t->stream_ids[i], sid) == 0) {
+                *stream_name = t->stream_names[i] ? t->stream_names[i] : "Stream";
+                return t;
+            }
+        }
+    }
+    return NULL;
+}
+
+static bool webhook_queue_locked(restream_server_t *s, rs_webhook_target *target,
+                                 const char *stream_name, const char *event,
+                                 const char *message, long status, bool test) {
+    if (!target || s->webhook_count >= RS_WEBHOOK_QUEUE_CAP) return false;
+    rs_webhook_job *job = (rs_webhook_job *)calloc(1, sizeof(*job));
+    if (!job) return false;
+    job->url = rs_strdup(target->url);
+    job->provider_name = rs_strdup(target->provider_name);
+    job->stream_name = rs_strdup(stream_name ? stream_name : "Provider");
+    job->event = rs_strdup(event ? event : "error");
+    job->message = webhook_redact_message(message);
+    job->status = status;
+    job->suppressed = target->suppressed;
+    job->test = test;
+    if (!job->url || !job->provider_name || !job->stream_name || !job->event || !job->message) {
+        webhook_job_free(job);
+        return false;
+    }
+    target->suppressed = 0;
+    if (s->webhook_tail) s->webhook_tail->next = job;
+    else s->webhook_head = job;
+    s->webhook_tail = job;
+    s->webhook_count++;
+    pthread_cond_signal(&s->webhook_cv);
+    return true;
+}
+
+static void webhook_enqueue_error(restream_server_t *s, const char *sid, const char *event,
+                                  const char *message, long status) {
+    pthread_mutex_lock(&s->webhook_mu);
+    const char *stream_name = NULL;
+    rs_webhook_target *target = webhook_target_for_sid_locked(s, sid, &stream_name);
+    if (target) {
+        double now = now_ms();
+        if (target->last_queued_ms > 0 && now - target->last_queued_ms < RS_WEBHOOK_BURST_MS) {
+            target->suppressed++;
+        } else if (webhook_queue_locked(s, target, stream_name, event, message, status, false)) {
+            target->last_queued_ms = now;
+        }
+    }
+    pthread_mutex_unlock(&s->webhook_mu);
+}
+
+static bool webhook_enqueue_test(restream_server_t *s, const char *provider_id) {
+    if (!g_webhook_handler) return false;
+    bool queued = false;
+    pthread_mutex_lock(&s->webhook_mu);
+    for (rs_webhook_target *t = s->webhook_targets; t; t = t->next) {
+        if (strcmp(t->provider_id, provider_id ? provider_id : "") == 0) {
+            queued = webhook_queue_locked(s, t, "Webhook test", "test",
+                                           "The provider error webhook is configured correctly.",
+                                           0, true);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s->webhook_mu);
+    return queued;
+}
+
+static char *webhook_payload(const rs_webhook_job *job) {
+    rs_json *root = rs_json_new_obj();
+    rs_json_obj_set_str(root, "username", "ReStreamAir");
+    rs_json *allowed = rs_json_new_obj();
+    rs_json_obj_set(allowed, "parse", rs_json_new_arr());
+    rs_json_obj_set(root, "allowed_mentions", allowed);
+    rs_json *embeds = rs_json_new_arr();
+    rs_json *embed = rs_json_new_obj();
+    rs_json_obj_set_str(embed, "title", job->test ? "Webhook test" : "Provider error");
+    rs_json_obj_set_int(embed, "color", job->test ? 5763719 : 15548997);
+    char description[1200];
+    snprintf(description, sizeof(description), "%.1000s%s", job->message,
+             strlen(job->message) > 1000 ? "…" : "");
+    rs_json_obj_set_str(embed, "description", description);
+    rs_json *fields = rs_json_new_arr();
+    const char *names[] = {"Provider", "Stream", "Event"};
+    const char *values[] = {job->provider_name, job->stream_name, job->event};
+    for (size_t i = 0; i < 3; i++) {
+        rs_json *field = rs_json_new_obj();
+        rs_json_obj_set_str(field, "name", names[i]);
+        rs_json_obj_set_str(field, "value", values[i] && values[i][0] ? values[i] : "—");
+        rs_json_obj_set_bool(field, "inline", true);
+        rs_json_arr_push(fields, field);
+    }
+    if (job->status > 0) {
+        char status[32];
+        snprintf(status, sizeof(status), "%ld", job->status);
+        rs_json *field = rs_json_new_obj();
+        rs_json_obj_set_str(field, "name", "HTTP status");
+        rs_json_obj_set_str(field, "value", status);
+        rs_json_obj_set_bool(field, "inline", true);
+        rs_json_arr_push(fields, field);
+    }
+    rs_json_obj_set(embed, "fields", fields);
+    if (job->suppressed > 0) {
+        char text[128];
+        snprintf(text, sizeof(text), "%u additional error%s collapsed since the previous alert",
+                 job->suppressed, job->suppressed == 1 ? "" : "s");
+        rs_json *footer = rs_json_new_obj();
+        rs_json_obj_set_str(footer, "text", text);
+        rs_json_obj_set(embed, "footer", footer);
+    }
+    rs_json_arr_push(embeds, embed);
+    rs_json_obj_set(root, "embeds", embeds);
+    char *payload = rs_json_serialize(root, false);
+    rs_json_free(root);
+    return payload;
+}
+
+static void *webhook_worker(void *opaque) {
+    restream_server_t *s = (restream_server_t *)opaque;
+    for (;;) {
+        pthread_mutex_lock(&s->webhook_mu);
+        while (!s->webhook_stop && !s->webhook_head)
+            pthread_cond_wait(&s->webhook_cv, &s->webhook_mu);
+        if (s->webhook_stop) {
+            pthread_mutex_unlock(&s->webhook_mu);
+            break;
+        }
+        rs_webhook_job *job = s->webhook_head;
+        s->webhook_head = job->next;
+        if (!s->webhook_head) s->webhook_tail = NULL;
+        if (s->webhook_count > 0) s->webhook_count--;
+        pthread_mutex_unlock(&s->webhook_mu);
+
+        char *payload = webhook_payload(job);
+        long status = 0;
+        char err[192] = {0};
+        int rc = (!payload || !g_webhook_handler)
+                     ? -1 : g_webhook_handler(job->url, payload, &status, err, sizeof(err));
+        if (rc != 0) {
+            char msg[384];
+            snprintf(msg, sizeof(msg), "Webhook delivery for provider \"%s\" failed: %s",
+                     job->provider_name, err[0] ? err : "webhook delivery is unavailable");
+            // Informational level prevents delivery failures recursively
+            // creating more webhook deliveries.
+            log_record(s, "__panel__", "info", "webhookDelivery", NULL, status, -1, msg);
+        }
+        rs_free(payload);
+        webhook_job_free(job);
+    }
+    return NULL;
+}
+
+static void webhook_stop(restream_server_t *s) {
+    pthread_mutex_lock(&s->webhook_mu);
+    s->webhook_stop = true;
+    pthread_cond_broadcast(&s->webhook_cv);
+    pthread_mutex_unlock(&s->webhook_mu);
+    if (s->webhook_thread_started) pthread_join(s->webhook_thread, NULL);
+    s->webhook_thread_started = false;
 }
 
 // Lifecycle events that must reach the log verbatim, however often they repeat.
@@ -252,6 +569,8 @@ static void log_record(restream_server_t *s, const char *sid, const char *level,
     s->log_head = (s->log_head + 1) % RS_LOG_CAP;
     if (s->log_count < RS_LOG_CAP) s->log_count++;
     log_unlock(s);
+    if (level && strcmp(level, "error") == 0)
+        webhook_enqueue_error(s, sid ? sid : "__panel__", event, message, status);
 }
 
 // printf-style log_record, for the many call sites that have to assemble a
@@ -843,6 +1162,7 @@ static void reply_after_mutation(restream_server_t *s, struct mg_connection *c,
                                  struct mg_http_message *hm, int rc, const char *err) {
     if (rc != 0) { reply_error(c, -rc, err ? err : "Request failed."); return; }
     if (rs_state_save(&s->state) != 0) { reply_error(c, 500, "Could not save state."); return; }
+    webhook_rebuild_targets(s);
     handle_state(s, c, hm);
 }
 
@@ -1523,6 +1843,17 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
             run_provider_script(s, c, provider, action);  // always replies, sync or async
             return true;
         }
+    }
+
+    // --- provider webhook test + CRUD ---
+    if (mg_match(hm->uri, mg_str("/api/providers/*/webhook/test"), NULL) && method_is(hm, "POST")) {
+        char *id = capture(hm, "/api/providers/*/webhook/test");
+        bool queued = webhook_enqueue_test(s, id);
+        free(id);
+        if (!queued) reply_error(c, 400, "Provider has no valid error webhook, or the delivery queue is full.");
+        else mg_http_reply(c, 202, "Content-Type: application/json\r\nCache-Control: no-store\r\n",
+                           "{\"ok\":true,\"queued\":true}");
+        return true;
     }
 
     // --- provider CRUD ---
@@ -4267,6 +4598,8 @@ restream_server_t* restream_server_create(void) {
     pthread_cond_init(&server->pending_cv, NULL);
     pthread_mutex_init(&server->logo_mu, NULL);
     pthread_mutex_init(&server->log_mu, NULL);
+    pthread_mutex_init(&server->webhook_mu, NULL);
+    pthread_cond_init(&server->webhook_cv, NULL);
     // The engine needs both hooks; without them (a core-only build registers
     // neither) it stays NULL and the DASH routes report that honestly instead
     // of half-working. The C++ app registers them before calling this.
@@ -4285,9 +4618,14 @@ restream_server_t* restream_server_create(void) {
         pthread_cond_destroy(&server->pending_cv);
         pthread_mutex_destroy(&server->logo_mu);
         pthread_mutex_destroy(&server->log_mu);
+        pthread_mutex_destroy(&server->webhook_mu);
+        pthread_cond_destroy(&server->webhook_cv);
         free(server);
         return NULL;
     }
+    webhook_rebuild_targets(server);
+    if (g_webhook_handler && pthread_create(&server->webhook_thread, NULL, webhook_worker, server) == 0)
+        server->webhook_thread_started = true;
     // Resume the sessions the previous run persisted, so a restart (or a switch
     // across a restart, since state.json carries them) leaves signed-in
     // browsers signed in.
@@ -4339,6 +4677,10 @@ void restream_server_set_probe_handler(restream_probe_fn handler) {
 
 void restream_server_set_fetch_handler(restream_fetch_fn handler) {
     g_fetch_handler = handler;
+}
+
+void restream_server_set_webhook_handler(restream_webhook_fn handler) {
+    g_webhook_handler = handler;
 }
 
 void restream_server_set_dash_handler(restream_dash_fn handler) {
@@ -4436,6 +4778,9 @@ void restream_server_destroy(restream_server_t* server) {
         // is still running.
         rs_live_destroy(server->live);
         server->live = NULL;
+        // No live worker can enqueue another provider error now. Stop after
+        // any in-flight delivery and discard queued alerts during shutdown.
+        webhook_stop(server);
         rs_auth_destroy(server->auth);
         rs_sysstats_destroy(server->sysstats);
         rs_metrics_destroy(server->metrics);
@@ -4445,6 +4790,14 @@ void restream_server_destroy(restream_server_t* server) {
         pthread_cond_destroy(&server->pending_cv);
         pthread_mutex_destroy(&server->logo_mu);
         pthread_mutex_destroy(&server->log_mu);
+        pthread_mutex_destroy(&server->webhook_mu);
+        pthread_cond_destroy(&server->webhook_cv);
+        webhook_targets_free(server->webhook_targets);
+        while (server->webhook_head) {
+            rs_webhook_job *job = server->webhook_head;
+            server->webhook_head = job->next;
+            webhook_job_free(job);
+        }
         rs_state_dispose(&server->state);
         free(server->web_root);
         free(server);

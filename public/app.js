@@ -56,6 +56,7 @@ let authenticated = false;
 let probeResult = null;
 let selectedRepIds = new Set();
 let bootStarted = false;
+let bootPromise = null;
 let editingNewStream = false;
 let lastEditorStreamId = null;
 let decryptionKeysManuallyShown = false;
@@ -2143,6 +2144,7 @@ function openProviderSettingsDialog() {
   if (!provider) return;
   form.elements.name.value = provider.name || "";
   form.elements.proxy.value = provider.proxy || "";
+  form.elements.errorWebhookUrl.value = provider.errorWebhookUrl || "";
   form.elements.headers.value = provider.headers || "";
   form.elements.downloader.value = provider.downloader || "native";
   form.elements.downloaderParams.value = provider.downloaderParams || "";
@@ -2214,7 +2216,8 @@ async function saveProviderSettings() {
     method: "PUT",
     body: JSON.stringify({
       name: form.elements.name.value, logo: provider.logo,
-      proxy: form.elements.proxy.value, headers: form.elements.headers.value, segmentUrlParams: form.elements.segmentUrlParams.value,
+      proxy: form.elements.proxy.value, errorWebhookUrl: form.elements.errorWebhookUrl.value,
+      headers: form.elements.headers.value, segmentUrlParams: form.elements.segmentUrlParams.value,
       downloader: form.elements.downloader.value, downloaderParams: form.elements.downloaderParams.value,
       inheritUrlParams: form.elements.inheritUrlParams.checked,
       scriptPath: form.elements.scriptPath.value, scriptBind: form.elements.scriptBind.value,
@@ -2225,6 +2228,23 @@ async function saveProviderSettings() {
     }),
   });
 }
+
+$("#testProviderWebhookBtn").addEventListener("click", async () => {
+  const button = $("#testProviderWebhookBtn");
+  try {
+    button.disabled = true;
+    await saveProviderSettings();
+    const provider = selectedProvider();
+    if (!provider?.errorWebhookUrl) throw new Error("Enter a webhook URL first.");
+    await request(`/api/providers/${provider.id}/webhook/test`, { method: "POST", body: "{}" });
+    button.textContent = "Test queued";
+    setTimeout(() => { button.innerHTML = '<span data-icon="play"></span>Send test notification'; applyIcons(button); }, 1800);
+  } catch (error) {
+    alert(`Couldn't send webhook test: ${error.message || error}`);
+  } finally {
+    button.disabled = false;
+  }
+});
 
 $("#providerSettingsForm").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -2910,14 +2930,31 @@ function showApp() {
 }
 
 async function checkAuth() {
-  const status = await fetch("/api/auth/status").then((r) => r.json()).catch(() => ({ needsSetup: true, authenticated: false }));
+  let status;
+  try {
+    const response = await fetch("/api/auth/status", { cache: "no-store" });
+    status = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(status.error || `HTTP ${response.status}`);
+    $("#authError").classList.add("hidden");
+  } catch (error) {
+    authenticated = false;
+    $("#authSubtitle").textContent = "Can't reach the server";
+    $("#authForm").dataset.mode = "retry";
+    $("#authSubmit").textContent = "Try again";
+    $("#authError").textContent = String(error.message || error);
+    $("#authError").classList.remove("hidden");
+    showAuthScreen();
+    return false;
+  }
   authenticated = Boolean(status.authenticated);
   if (status.needsSetup) {
     $("#authSubtitle").textContent = "Create the admin account";
+    $("#authForm").dataset.mode = "setup";
     $("#authSubmit").textContent = "Create account";
     showAuthScreen();
     return false;
   }
+  $("#authForm").dataset.mode = "login";
   if (!authenticated) {
     $("#authSubtitle").textContent = "Sign in";
     $("#authSubmit").textContent = "Sign in";
@@ -2938,10 +2975,18 @@ async function checkAuth() {
 $("#authForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
+  const button = $("#authSubmit");
+  if (button.disabled) return;
   $("#authError").classList.add("hidden");
-  const status = await fetch("/api/auth/status").then((r) => r.json()).catch(() => ({ needsSetup: true }));
-  const path = status.needsSetup ? "/api/auth/setup" : "/api/auth/login";
+  button.disabled = true;
   try {
+    const statusResponse = await fetch("/api/auth/status", { cache: "no-store" });
+    const status = await statusResponse.json().catch(() => ({}));
+    if (!statusResponse.ok) throw new Error(status.error || `HTTP ${statusResponse.status}`);
+    const settingUp = Boolean(status.needsSetup);
+    const path = settingUp ? "/api/auth/setup" : "/api/auth/login";
+    form.dataset.mode = settingUp ? "setup" : "login";
+    button.textContent = settingUp ? "Creating…" : "Signing in…";
     const response = await fetch(path, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -2954,17 +2999,33 @@ $("#authForm").addEventListener("submit", async (event) => {
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     form.reset();
-    boot();
+    await boot();
   } catch (error) {
     $("#authError").textContent = String(error.message || error);
     $("#authError").classList.remove("hidden");
+  } finally {
+    button.disabled = false;
+    button.textContent = form.dataset.mode === "setup" ? "Create account"
+      : form.dataset.mode === "retry" ? "Try again" : "Sign in";
   }
 });
 
-$("#signOutBtn").addEventListener("click", async () => {
-  await fetch("/api/auth/logout", { method: "POST" }).catch(() => {});
-  authenticated = false;
-  showAuthScreen();
+$("#signOutBtn").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    await fetch("/api/auth/logout", { method: "POST" });
+  } catch {
+    // Still return to the sign-in screen when the server disappears mid-request.
+  } finally {
+    authenticated = false;
+    showAuthScreen();
+    button.disabled = false;
+    // Refresh the auth mode and labels. The polling/event infrastructure stays
+    // alive and boot() will reconnect it after the next successful sign-in.
+    await checkAuth();
+  }
 });
 
 // MARK: - Theme
@@ -3182,26 +3243,49 @@ if ("serviceWorker" in navigator) {
 }
 
 async function boot() {
-  if (bootStarted) return;
-  const ok = await checkAuth();
-  if (!ok) return;
-  bootStarted = true;
-  document.querySelectorAll(".stream-form label, #providerChips").forEach((el) => el.classList.add("skeleton"));
-  refresh()
-    .then(() => {
+  // Coalesce simultaneous boot attempts (for example Enter plus a button
+  // click), but do not permanently short-circuit here. A signed-out or expired
+  // session must be able to refresh state and reconnect SSE after signing in
+  // again without requiring a page reload.
+  if (bootPromise) return bootPromise;
+  bootPromise = (async () => {
+    const ok = await checkAuth();
+    if (!ok) return false;
+
+    if (!bootStarted) {
+      bootStarted = true;
+      document.querySelectorAll(".stream-form label, #providerChips").forEach((el) => el.classList.add("skeleton"));
+      setInterval(() => refresh().catch(() => {}), 4000);
+    }
+
+    try {
+      // A poll sent with the expired cookie may still be in flight while the
+      // login request succeeds. Let that stale request finish before starting
+      // the authenticated refresh; otherwise refresh() would coalesce onto its
+      // 401 and put the sign-in screen straight back.
+      if (refreshPromise) await refreshPromise.catch(() => {});
+      await refresh();
+      authenticated = true;
+      showApp();
       document.querySelectorAll(".skeleton").forEach((el) => el.classList.remove("skeleton"));
       // Once state exists, open whichever view the address names. Deferred to
       // here because the per-view loaders (logs, settings) need state and an
       // authenticated session, and because the log/provider filters are only
       // populated after the first render.
       applyRoute();
-    })
-    .catch((error) => {
+      connectEvents();
+      return true;
+    } catch (error) {
       document.querySelectorAll(".skeleton").forEach((el) => el.classList.remove("skeleton"));
       $("#statusBox").textContent = String(error.message || error);
-    });
-  setInterval(() => refresh().catch(() => {}), 4000);
-  connectEvents();
+      return false;
+    }
+  })();
+  try {
+    return await bootPromise;
+  } finally {
+    bootPromise = null;
+  }
 }
 
 boot();

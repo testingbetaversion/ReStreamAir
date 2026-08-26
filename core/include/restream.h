@@ -105,6 +105,12 @@ typedef int (*restream_fetch_fn)(const char *url, const char *proxy, const char 
                                  long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx);
 void restream_server_set_fetch_handler(restream_fetch_fn handler);
 
+// JSON POST handler used by provider error webhooks. Delivery is performed on
+// the server's background webhook worker, never on a live-stream thread.
+typedef int (*restream_webhook_fn)(const char *url, const char *json, long *status,
+                                   char *errbuf, size_t errbuf_len);
+void restream_server_set_webhook_handler(restream_webhook_fn handler);
+
 // A DASH describe handler: fetches an MPD (through proxy/headers/downloader),
 // follows redirects, and returns a malloc'd JSON description (freed with
 // rs_free) — default video/audio renditions plus, when `rep` is given, that

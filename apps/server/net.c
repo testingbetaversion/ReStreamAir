@@ -702,3 +702,49 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
                          content_range, effective_url, errbuf, errbuf_len,
                          timeout_ms, should_cancel, cancel_ctx);
 }
+
+int rs_post_json(const char *url, const char *json, long *status,
+                 char *errbuf, size_t errbuf_len) {
+    if (status) *status = 0;
+    if (!url || !url[0] || !json) {
+        snprintf(errbuf, errbuf_len, "Webhook URL and JSON body are required.");
+        return -1;
+    }
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        snprintf(errbuf, errbuf_len, "Could not initialise webhook HTTP client.");
+        return -1;
+    }
+    struct curl_slist *headers = curl_slist_append(NULL, "Content-Type: application/json");
+    http_buf response = {NULL, 0, 0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json));
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ReStreamAir/1.0");
+
+    CURLcode rc = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    if (status) *status = code;
+    if (rc != CURLE_OK) {
+        snprintf(errbuf, errbuf_len, "Webhook request failed: %s", curl_easy_strerror(rc));
+    } else if (code < 200 || code >= 300) {
+        snprintf(errbuf, errbuf_len, "Webhook returned HTTP %ld.", code);
+        rc = CURLE_HTTP_RETURNED_ERROR;
+    }
+    free(response.data);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return rc == CURLE_OK ? 0 : -1;
+}

@@ -477,8 +477,10 @@ rs_json *rs_panel_keys_view(const rs_state *st) {
 
 int rs_panel_create_provider(rs_state *st, const rs_json *body, const char **err) {
     const char *name = rs_json_obj_str(body, "name", "");
+    const char *webhook = rs_json_obj_str(body, "errorWebhookUrl", "");
     const char *trimmed = NULL;
     if (rs_trim(name, strlen(name), true, &trimmed) == 0) { *err = "Provider name is required."; return -400; }
+    if (webhook[0] && !is_http_url(webhook)) { *err = "Webhook URL must begin with http:// or https://."; return -400; }
 
     rs_json *p = rs_json_new_obj();
     char *id = make_id("provider");
@@ -487,6 +489,7 @@ int rs_panel_create_provider(rs_state *st, const rs_json *body, const char **err
     rs_json_obj_set_str(p, "name", name);
     rs_json_obj_set_str(p, "logo", rs_json_obj_str(body, "logo", ""));
     rs_json_obj_set_str(p, "proxy", rs_json_obj_str(body, "proxy", ""));
+    rs_json_obj_set_str(p, "errorWebhookUrl", rs_json_obj_str(body, "errorWebhookUrl", ""));
     rs_json_obj_set_str(p, "headers", rs_json_obj_str(body, "headers", ""));
     rs_json_obj_set_str(p, "downloader", normalize_downloader(rs_json_obj_str(body, "downloader", "")));
     rs_json_obj_set_str(p, "downloaderParams", rs_json_obj_str(body, "downloaderParams", ""));
@@ -516,13 +519,16 @@ int rs_panel_update_provider(rs_state *st, const char *id, const rs_json *body, 
     rs_json *p = find_provider(st, id);
     if (!p) { *err = "Provider not found."; return -404; }
     const char *name = rs_json_obj_str(body, "name", "");
+    const char *webhook = rs_json_obj_str(body, "errorWebhookUrl", "");
     const char *trimmed = NULL;
     if (rs_trim(name, strlen(name), true, &trimmed) == 0) { *err = "Provider name is required."; return -400; }
+    if (webhook[0] && !is_http_url(webhook)) { *err = "Webhook URL must begin with http:// or https://."; return -400; }
 
     rs_json_obj_set_str(p, "name", name);
     // logo keeps its existing value when the body omits it.
     if (rs_json_obj_get(body, "logo")) set_str_from(p, "logo", body, "");
     set_str_from(p, "proxy", body, "");
+    set_str_from(p, "errorWebhookUrl", body, "");
     set_str_from(p, "headers", body, "");
     rs_json_obj_set_str(p, "downloader", normalize_downloader(rs_json_obj_str(body, "downloader", "")));
     set_str_from(p, "downloaderParams", body, "");
@@ -740,7 +746,7 @@ rs_json *rs_panel_export_provider(const rs_state *st, const char *provider_id) {
     // reason.
     rs_json *provider = rs_json_new_obj();
     static const char *const copied[] = {
-        "name", "logo", "proxy", "headers", "segmentUrlParams",
+        "name", "logo", "proxy", "errorWebhookUrl", "headers", "segmentUrlParams",
         "scriptBind", "scriptDoh", "scriptWorker", "accountSelectionMode", NULL,
     };
     for (size_t i = 0; copied[i]; i++) {

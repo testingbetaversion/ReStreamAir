@@ -4,8 +4,17 @@ A local DASH → HLS restreaming toolkit with a web control panel. Point it at a
 
 Written in C. One binary — `restreamair` — serves the panel, runs the live engines and does its own decryption; there is no runtime, no interpreter and no worker subprocess behind it. The two libraries it needs, libcurl and libxml2, are on every distro. See [Architecture](#architecture).
 
-**Contents** — [Install](#install) · [Quick start](#quick-start) · [How it fits together](#how-it-fits-together) · [Web panel](#web-panel) · [Playback endpoints](#playback-endpoints) · [Script providers](#script-providers) · [Building](#building-from-source) · [Architecture](#architecture) · [Deployment](#deployment) · [Data layout](#data-layout) · [Troubleshooting](#troubleshooting) · [License](#license)
 
+**Contents** — [ScreenShots](#ScreenShots) · [Install](#install) · [Quick start](#quick-start) · [How it fits together](#how-it-fits-together) · [Web panel](#web-panel) · [Playback endpoints](#playback-endpoints) · [Script providers](#script-providers) · [Building](#building-from-source) · [Architecture](#architecture) · [Deployment](#deployment) · [Data layout](#data-layout) · [Troubleshooting](#troubleshooting) · [License](#license)
+
+
+## ScreenShots
+
+![alt text](images/image.png)
+![alt text](<images/Screenshot 2026-08-27 at 1.06.58 AM.png>)
+![alt text](images/2.png)
+![alt text](images/3.png)
+![alt text](images/4.png)
 ## Install
 
 Grab a tarball from the [latest release](https://github.com/testingbetaversion/ReStreamAir/releases/latest), or the [nightly](https://github.com/testingbetaversion/ReStreamAir/releases/tag/nightly) for the newest features.
@@ -153,7 +162,7 @@ The subtitle rendition never blocks playback: it is `DEFAULT=NO`, and a text tra
 
 ### Network settings
 
-A provider sets a default **Proxy**, generic **Headers**, and a **Downloader** for every request its streams make. Each stream can override the proxy and adds three header buckets on top: **Manifest headers**, **Media headers**, and **HLS key headers** (`kind=m3u8` only). **Use proxy for** scopes the proxy to any of Script / Manifest / Media independently. Proxies may be HTTP or SOCKS5 (`socks5h://user:pass@host:port`), and credentials embedded in the proxy URL are answered on a Basic-auth challenge.
+A provider sets a default **Proxy**, generic **Headers**, and a **Downloader** for every request its streams make. It may also carry an **Error webhook**: paste a Discord webhook URL and errors from that provider's streams and script actions are delivered in the background. Alert bursts are collapsed to protect Discord from floods, and source URLs—which often contain session tokens—are redacted. Each stream can override the proxy and adds three header buckets on top: **Manifest headers**, **Media headers**, and **HLS key headers** (`kind=m3u8` only). **Use proxy for** scopes the proxy to any of Script / Manifest / Media independently. Proxies may be HTTP or SOCKS5 (`socks5h://user:pass@host:port`), and credentials embedded in the proxy URL are answered on a Basic-auth challenge.
 
 **Downloader** picks the tool that fetches manifests and segments:
 
@@ -231,7 +240,7 @@ action=<name> bind= proxy= doh= worker= sessiondir= cookies= [user=] [password=]
 
 **`manifest` also serves as failure recovery.** When a manifest fetch fails on its primary URL *and* every CDN mirror, a script-backed provider is asked for a fresh `ManifestUrl`/`Cdn`/`Headers`, which is persisted and retried. This fires inline for m3u8 passthrough, and in the background once a `kind=mpd` worker has needed two consecutive restarts. Throttled to one refresh per stream per minute, never concurrent for the same stream.
 
-**Export / import** — the download icon on a provider card (`GET /api/providers/<id>/export`) produces one JSON file with every setting, stream, script account (**passwords included — treat it as sensitively as `state.json`**) and the script's own source, base64-embedded. **Import provider** (`POST /api/providers/import`) reverses it on any install: ids are regenerated, the active account is re-resolved by name, and the embedded script is written into `scripts/` and `chmod +x`'d, never overwriting an existing file.
+**Export / import** — the download icon on a provider card (`GET /api/providers/<id>/export`) produces one JSON file with every setting, stream, script account (**passwords and webhook URLs included — treat it as sensitively as `state.json`**) and the script's own source, base64-embedded. **Import provider** (`POST /api/providers/import`) reverses it on any install: ids are regenerated, the active account is re-resolved by name, and the embedded script is written into `scripts/` and `chmod +x`'d, never overwriting an existing file.
 
 ## Monitoring and logs
 
