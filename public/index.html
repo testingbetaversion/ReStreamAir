@@ -112,7 +112,7 @@
           </div>
           <form id="providerSettingsForm" class="stream-form">
             <label>Name<input name="name" placeholder="Provider name" required></label>
-            <label>Proxy<span class="field-hint">Default for every stream under this provider</span><input name="proxy" placeholder="http://127.0.0.1:8888"></label>
+            <label>Proxies<span class="field-hint">Default for every stream. Up to 16 HTTP or SOCKS5 proxies, one per line in fallback order.</span><textarea name="proxy" rows="3" placeholder="http://127.0.0.1:8888&#10;socks5h://127.0.0.1:1080"></textarea></label>
             <label>Error webhook<span class="field-hint">Optional Discord webhook URL. Errors from this provider's streams and scripts are sent with source URLs redacted.</span><input name="errorWebhookUrl" type="url" placeholder="https://discord.com/api/webhooks/…"></label>
             <div class="actions"><button id="testProviderWebhookBtn" type="button" class="ghost"><span data-icon="play"></span>Send test notification</button></div>
             <label>Generic headers<span class="field-hint">Applied to all requests for all streams, one "Name: value" per line</span><textarea name="headers" placeholder="Authorization: Bearer TOKEN"></textarea></label>
@@ -286,7 +286,7 @@
 
             <label>Manifest headers<span class="field-hint">Manifest/playlist fetch (MPD or M3U8)</span><textarea name="manifestHeaders" placeholder="Name: value"></textarea></label>
             <label>Media headers<span class="field-hint">Segment/init fetch</span><textarea name="mediaHeaders" placeholder="Name: value"></textarea></label>
-            <label>Proxy<span class="field-hint">Blank = inherit provider proxy. HTTP or SOCKS5 (socks5h://user:pass@host:port).</span><input name="proxy" placeholder="socks5h://127.0.0.1:1080"></label>
+            <label>Proxies<span class="field-hint">Blank = inherit provider list. Up to 16, one per line in fallback order. Script and FFmpeg modes use the first entry.</span><textarea name="proxy" rows="3" placeholder="socks5h://127.0.0.1:1080&#10;http://127.0.0.1:8888"></textarea></label>
             <div class="proxy-scope" title="Which requests go through the proxy above">
               <span class="field-hint">Use proxy for:</span>
               <label class="check"><input name="proxyScript" type="checkbox" checked> Script (login/session/keys/heartbeat)</label>
@@ -554,7 +554,7 @@
                 <h3>Providers &amp; streams</h3>
                 <p><b>Provider settings</b> hold defaults shared by every stream under them: proxy, generic headers, downloader, and a provider <b>script</b> + accounts. A stream inherits these unless it overrides them.</p>
                 <ul>
-                  <li><b>Proxy</b> — set once on the provider; a stream's own Proxy field wins if filled, and <b>Use proxy for</b> scopes it to Script / Manifest / Media independently.</li>
+                  <li><b>Proxies</b> — add one HTTP/SOCKS5 proxy per line in fallback order. Set the list once on the provider; a stream's own list wins if filled, and <b>Use proxy for</b> scopes it to Script / Manifest / Media independently. The last working proxy is preferred on later requests. Provider scripts and long-running FFmpeg modes use only the first entry.</li>
                   <li><b>Error webhook</b> — add a Discord webhook URL to receive provider stream/script errors. Bursts are collapsed to avoid flooding Discord; source URLs are redacted.</li>
                   <li><b>Stream tuning</b> (Playlist count, Keep count, Download ahead, Poll seconds, Playout buffer) is per-stream, in the stream editor's DASH options — see below.</li>
                   <li><b>All Streams</b> view: bulk start/stop/delete, filter by provider and by Channels / Events / Manually added, and import channels or events from a provider script.</li>
@@ -588,7 +588,7 @@
                   <li><code>native</code> (default) — in-process libcurl, no subprocess per fetch. It pins HTTP/1.1, because some origins run a flaky HTTP/2 stack that drops mid-segment.</li>
                   <li><code>curl</code> / <code>wget</code> / <code>aria2c</code> — spawns that binary instead; <b>Downloader params</b> appends extra arguments (<code>--retry 3</code>, <code>-x 8</code>).</li>
                 </ul>
-                <p><b>Proxies</b> may be HTTP or SOCKS5 (<code>socks5h://user:pass@host:port</code>). Credentials embedded in the URL are used when the proxy challenges for them.</p>
+                <p><b>Proxies</b> may be HTTP or SOCKS5 (<code>socks5h://user:pass@host:port</code>). Add one per line; failures move to the next entry and the last working proxy is remembered. Credentials embedded in the URL are used when the proxy challenges for them.</p>
                 <p class="help-note"><b>Tokens in the query string.</b> Tick <b>Append each stream's own Source URL query params to its segments</b> when a CDN signs a token onto the manifest URL and expects it on every segment. The params are read from the URL that <i>actually answered</i> the poll, not the one you configured — some CDNs only sign the redirect target, where the configured URL has no token at all. For a fixed string that isn't part of any stream's URL, use the provider's <b>Segment URL params</b> instead.</p>
               </article>
 

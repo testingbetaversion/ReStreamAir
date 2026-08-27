@@ -192,6 +192,7 @@ static bool webhook_enqueue_test(restream_server_t *s, const char *provider_id);
 static void log_record(restream_server_t *s, const char *sid, const char *level,
                        const char *event, const char *url, long status, long long bytes,
                        const char *message);
+static char *primary_proxy(const char *list);
 
 // Forward declaration: apply_cenc is defined between serve_hls_playlist and
 // serve_restream_item, but pending_job_finish_item (defined just above
@@ -1468,6 +1469,9 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     if (bind[0]) args[n++] = rs_script_arg("bind", bind, false);
     if (doh[0]) args[n++] = rs_script_arg("doh", doh, false);
     if (worker[0]) args[n++] = rs_script_arg("worker", worker, false);
+    char *script_proxy = primary_proxy(rs_json_obj_str(provider, "proxy", ""));
+    if (script_proxy && script_proxy[0]) args[n++] = rs_script_arg("proxy", script_proxy, true);
+    free(script_proxy);
     const rs_json *accounts = rs_json_obj_get(provider, "scriptAccounts");
     const char *active = rs_json_obj_str(provider, "activeScriptAccountId", "");
     for (size_t i = 0; i < rs_json_arr_len(accounts) && n < 22; i++) {
@@ -2285,6 +2289,23 @@ static char *effective_proxy(const rs_json *provider, const rs_json *stream, boo
     const char *sp = rs_json_obj_str(stream, "proxy", "");
     if (sp[0]) return rs_strdup(sp);
     return rs_strdup(rs_json_obj_str(provider, "proxy", ""));
+}
+
+// FFmpeg is one long-lived process and cannot switch proxy environment values
+// between requests. Give it the first configured entry; the in-process and
+// external per-request downloaders receive the full fallback list.
+static char *primary_proxy(const char *list) {
+    if (!list) return rs_strdup("");
+    while (*list == ' ' || *list == '\t' || *list == '\r' || *list == '\n') list++;
+    const char *end = list;
+    while (*end && *end != '\r' && *end != '\n') end++;
+    while (end > list && (end[-1] == ' ' || end[-1] == '\t')) end--;
+    size_t len = (size_t)(end - list);
+    char *out = (char *)malloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, list, len);
+    out[len] = '\0';
+    return out;
 }
 
 // Provider generic headers plus the stream's category headers, newline-joined.
@@ -3165,7 +3186,9 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
     }
 
     const rs_json *provider = provider_of(&s->state, stream);
-    char *proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    char *proxy_list = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    char *proxy = primary_proxy(proxy_list);
+    free(proxy_list);
     char *headers = effective_headers(provider, stream, "manifestHeaders");
     rs_ffargs_inputs in;
     memset(&in, 0, sizeof(in));

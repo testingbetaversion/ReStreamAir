@@ -936,7 +936,7 @@ async function enlistQualitiesForEditor(stream) {
   try {
     const result = await request("/api/probe", {
       method: "POST",
-      body: JSON.stringify({ url, proxy: stream.proxy || "", headers: stream.manifestHeaders || "" }),
+      body: JSON.stringify({ url, proxy: stream.proxy || selectedProvider()?.proxy || "", headers: stream.manifestHeaders || "" }),
     });
     // The user may have switched to another stream (or started editing the
     // URL, which triggers its own detect) while the probe was in flight.

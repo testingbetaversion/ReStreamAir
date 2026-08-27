@@ -10,6 +10,8 @@ extern "C" {
 // Fetches `url` (through an optional proxy and "Name: value"-per-line headers)
 // into a freshly malloc'd buffer (caller frees *out with free; always
 // NUL-terminated), writing the byte length to *out_len.
+// `proxy` may contain one proxy URL per line. They are tried in order on
+// failure, and the last successful entry is preferred by later requests.
 //
 // `range` (e.g. "bytes=0-1023", or NULL) is forwarded as the Range request, so
 // byte-range HLS and seeking fetch only the requested bytes. When non-NULL,

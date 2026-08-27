@@ -6,7 +6,6 @@
     {
       "name": "curl",
       "default-features": false,
-      "comment": "Schannel rather than OpenSSL: it is the platform's own TLS stack, so certificate validation follows the machine's trust store and no CA bundle has to ship alongside the exe. http2 matters as much here as it does on Linux — see the HTTP/2 note in apps/server/net.c.",
       "features": [ "schannel", "http2" ]
     },
     "libxml2"

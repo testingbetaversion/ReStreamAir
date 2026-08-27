@@ -682,11 +682,15 @@ static int fetch_external(const char *tool, const char *dl_params,
     return 0;
 }
 
-int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
-                 const char *downloader, const char *dl_params,
-                 char **out, size_t *out_len, long *status, char **content_type,
-                 char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
-                 long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx) {
+// One fetch through one proxy. The public wrapper below expands a newline-
+// separated proxy list and calls this until one succeeds.
+static int fetch_through_one_proxy(const char *url, const char *proxy,
+                                   const char *headers, const char *range,
+                                   const char *downloader, const char *dl_params,
+                                   char **out, size_t *out_len, long *status,
+                                   char **content_type, char **content_range,
+                                   char **effective_url, char *errbuf, size_t errbuf_len,
+                                   long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx) {
     // NULL / "" / "internal" / "libcurl" → in-process libcurl. Otherwise run the
     // chosen external tool, falling back to libcurl if it isn't installed so a
     // missing binary never dead-ends a stream.
@@ -701,6 +705,124 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
     return fetch_libcurl(url, proxy, headers, range, out, out_len, status, content_type,
                          content_range, effective_url, errbuf, errbuf_len,
                          timeout_ms, should_cancel, cancel_ctx);
+}
+
+#define RS_PROXY_FALLBACK_MAX 16
+#define RS_PROXY_PREF_MAX 64
+
+typedef struct {
+    char *list;
+    size_t preferred;
+} proxy_preference;
+
+static proxy_preference g_proxy_preferences[RS_PROXY_PREF_MAX];
+static size_t g_proxy_preference_count = 0;
+static pthread_mutex_t g_proxy_preference_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// Split one-proxy-per-line in place, trimming surrounding spaces. A legacy
+// single URL naturally produces one entry, so no state migration is needed.
+static size_t split_proxy_list(char *copy, char **items, size_t cap) {
+    size_t count = 0;
+    char *cursor = copy;
+    while (cursor && *cursor && count < cap) {
+        while (*cursor == '\r' || *cursor == '\n') cursor++;
+        if (!*cursor) break;
+        char *line = cursor;
+        while (*cursor && *cursor != '\r' && *cursor != '\n') cursor++;
+        if (*cursor) *cursor++ = '\0';
+        while (*line == ' ' || *line == '\t') line++;
+        char *end = line + strlen(line);
+        while (end > line && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+        if (*line) items[count++] = line;
+    }
+    return count;
+}
+
+static size_t preferred_proxy_index(const char *list, size_t count) {
+    if (count < 2) return 0;
+    size_t preferred = 0;
+    pthread_mutex_lock(&g_proxy_preference_mu);
+    for (size_t i = 0; i < g_proxy_preference_count; i++) {
+        if (strcmp(g_proxy_preferences[i].list, list) == 0) {
+            preferred = g_proxy_preferences[i].preferred < count
+                ? g_proxy_preferences[i].preferred : 0;
+            pthread_mutex_unlock(&g_proxy_preference_mu);
+            return preferred;
+        }
+    }
+    if (g_proxy_preference_count < RS_PROXY_PREF_MAX) {
+        char *copy = rs_strdup(list);
+        if (copy) {
+            proxy_preference *slot = &g_proxy_preferences[g_proxy_preference_count++];
+            slot->list = copy;
+            slot->preferred = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_proxy_preference_mu);
+    return preferred;
+}
+
+static void remember_proxy_index(const char *list, size_t index) {
+    pthread_mutex_lock(&g_proxy_preference_mu);
+    for (size_t i = 0; i < g_proxy_preference_count; i++) {
+        if (strcmp(g_proxy_preferences[i].list, list) == 0) {
+            g_proxy_preferences[i].preferred = index;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_proxy_preference_mu);
+}
+
+int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
+                 const char *downloader, const char *dl_params,
+                 char **out, size_t *out_len, long *status, char **content_type,
+                 char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
+                 long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx) {
+    if (!proxy || !strpbrk(proxy, "\r\n")) {
+        return fetch_through_one_proxy(url, proxy, headers, range, downloader, dl_params,
+                                       out, out_len, status, content_type, content_range,
+                                       effective_url, errbuf, errbuf_len,
+                                       timeout_ms, should_cancel, cancel_ctx);
+    }
+
+    char *copy = rs_strdup(proxy);
+    if (!copy) {
+        snprintf(errbuf, errbuf_len, "Out of memory while reading proxy fallbacks.");
+        return -1;
+    }
+    char *items[RS_PROXY_FALLBACK_MAX];
+    size_t count = split_proxy_list(copy, items, RS_PROXY_FALLBACK_MAX);
+    if (count == 0) {
+        free(copy);
+        return fetch_through_one_proxy(url, NULL, headers, range, downloader, dl_params,
+                                       out, out_len, status, content_type, content_range,
+                                       effective_url, errbuf, errbuf_len,
+                                       timeout_ms, should_cancel, cancel_ctx);
+    }
+
+    size_t preferred = preferred_proxy_index(proxy, count);
+    int rc = -1;
+    size_t attempted = 0;
+    for (size_t attempt = 0; attempt < count; attempt++) {
+        if (attempt > 0 && should_cancel && should_cancel(cancel_ctx)) break;
+        size_t index = (preferred + attempt) % count;
+        attempted++;
+        rc = fetch_through_one_proxy(url, items[index], headers, range, downloader, dl_params,
+                                     out, out_len, status, content_type, content_range,
+                                     effective_url, errbuf, errbuf_len,
+                                     timeout_ms, should_cancel, cancel_ctx);
+        if (rc == 0) {
+            remember_proxy_index(proxy, index);
+            break;
+        }
+    }
+    if (rc != 0 && count > 1 && attempted == count && errbuf && errbuf_len) {
+        size_t used = strnlen(errbuf, errbuf_len);
+        const char *suffix = " (all configured proxies failed)";
+        if (used + strlen(suffix) + 1 < errbuf_len) strcat(errbuf, suffix);
+    }
+    free(copy);
+    return rc;
 }
 
 int rs_post_json(const char *url, const char *json, long *status,
