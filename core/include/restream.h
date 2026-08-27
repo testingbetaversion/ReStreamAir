@@ -77,6 +77,7 @@ void restream_server_set_verbose(bool verbose);
 // only holds the function pointer, so a build without the server never pulls in those
 // libraries. When no handler is registered, /api/probe returns 501.
 typedef char *(*restream_probe_fn)(const char *url, const char *proxy, const char *headers,
+                                   int force_ipv6, int rotate_proxies,
                                    char *errbuf, size_t errbuf_len);
 void restream_server_set_probe_handler(restream_probe_fn handler);
 
@@ -94,15 +95,19 @@ void restream_server_set_probe_handler(restream_probe_fn handler);
 // redirects — needed to resolve a DASH MPD's relative segment URLs when the
 // manifest 302s to a session-tokenized host. Only the libcurl path fills it.
 // `timeout_ms` is the whole-request timeout (<= 0 uses 30 seconds). For the
-// in-process client, `should_cancel(cancel_ctx)` is polled during the transfer;
-// returning non-zero aborts it. External downloader processes cannot use that
-// callback and retain their own timeout behaviour.
+// in-process client, `should_cancel(cancel_ctx, downloaded)` is polled during
+// the transfer; returning non-zero aborts it. `downloaded` is the response-body
+// byte count for the current request. External downloader processes cannot use
+// that callback and retain their own timeout behaviour.
+// `force_ipv6` is non-zero when the provider forbids IPv4 fallback.
+// `rotate_proxies` is non-zero for round-robin selection among healthy entries.
 typedef int (*restream_fetch_fn)(const char *url, const char *proxy, const char *headers,
                                  const char *range, const char *downloader, const char *dl_params,
+                                 int force_ipv6, int rotate_proxies,
                                  char **out, size_t *out_len,
                                  long *status, char **content_type, char **content_range,
                                  char **effective_url, char *errbuf, size_t errbuf_len,
-                                 long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx);
+                                 long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx);
 void restream_server_set_fetch_handler(restream_fetch_fn handler);
 
 // JSON POST handler used by provider error webhooks. Delivery is performed on
@@ -127,6 +132,7 @@ void restream_server_set_webhook_handler(restream_webhook_fn handler);
 // segment_url_params to have captured ahead of time.
 typedef char *(*restream_dash_fn)(const char *url, const char *proxy, const char *headers,
                                   const char *downloader, const char *dl_params,
+                                  int force_ipv6, int rotate_proxies,
                                   const char *rep, int want,
                                   const char *segment_url_params, int inherit_url_params,
                                   char *errbuf, size_t errbuf_len);

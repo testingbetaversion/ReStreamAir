@@ -705,6 +705,7 @@ static char *url_query(const char *url) {
 
 char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
                        const char *downloader, const char *dl_params,
+                       int force_ipv6, int rotate_proxies,
                        const char *rep, int want,
                        const char *segment_url_params, int inherit_url_params,
                        char *errbuf, size_t errbuf_len) {
@@ -720,6 +721,7 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         char *xml;
         size_t len;
         char *effurl;
+        int force_ipv6;
         time_t time;
         bool fetching;
         bool failed;
@@ -764,7 +766,8 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
 
     while (entry->fetching) pthread_cond_wait(&entry->cv, &g_dash_mu);
 
-    bool match = ((!proxy && !entry->proxy) || (proxy && entry->proxy && strcmp(proxy, entry->proxy) == 0)) &&
+    bool match = entry->force_ipv6 == force_ipv6 &&
+                 ((!proxy && !entry->proxy) || (proxy && entry->proxy && strcmp(proxy, entry->proxy) == 0)) &&
                  ((!headers && !entry->headers) || (headers && entry->headers && strcmp(headers, entry->headers) == 0));
     
     if (match && (time(NULL) - entry->time <= 2) && (entry->xml || entry->failed)) {
@@ -782,7 +785,8 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         entry->fetching = true;
         pthread_mutex_unlock(&g_dash_mu);
 
-        int rc = rs_fetch_url(url, proxy, headers, NULL, NULL, NULL, &xml, &len,
+        int rc = rs_fetch_url(url, proxy, headers, NULL, NULL, NULL,
+                              force_ipv6, rotate_proxies, &xml, &len,
                               NULL, NULL, NULL, &effurl, errbuf, errbuf_len,
                               30000, NULL, NULL);
 
@@ -796,6 +800,7 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
             entry->xml = xml ? rs_strdup(xml) : NULL;
             entry->len = len;
             entry->effurl = effurl ? rs_strdup(effurl) : NULL;
+            entry->force_ipv6 = force_ipv6;
             entry->time = time(NULL);
             entry->failed = false;
             entry->error[0] = '\0';
@@ -808,6 +813,7 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
             free(entry->xml); free(entry->effurl);
             entry->proxy = proxy ? rs_strdup(proxy) : NULL;
             entry->headers = headers ? rs_strdup(headers) : NULL;
+            entry->force_ipv6 = force_ipv6;
             entry->xml = NULL; entry->effurl = NULL; entry->len = 0;
             entry->time = time(NULL);
             entry->failed = true;

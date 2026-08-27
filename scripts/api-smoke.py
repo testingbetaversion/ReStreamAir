@@ -434,10 +434,12 @@ def test_session_persistence(server, admin, viewer):
 
 def test_provider_routes(client):
     print("providers, M3U export and provider export/import")
-    status, body, _ = client.json("POST", "/api/providers", body={"name": "Test Provider"})
+    status, body, _ = client.json("POST", "/api/providers", body={"name": "Test Provider", "forceIpv6": True, "rotateProxies": True})
     check("a provider can be created", status == 200, f"{status}")
     provider = next((p for p in body.get("providers", []) if p["name"] == "Test Provider"), None)
     check("the new provider is in the state view", provider is not None)
+    check("provider IPv6-only mode is persisted", provider and provider.get("forceIpv6") is True)
+    check("provider proxy rotation is persisted", provider and provider.get("rotateProxies") is True)
     if not provider:
         return None
 
@@ -469,6 +471,8 @@ def test_provider_routes(client):
     status, exported, headers = client.json("GET", f"/api/providers/{provider['id']}/export")
     check("the provider exports", status == 200 and exported.get("restreamairExport") == 1, f"{status}")
     check("the export carries the provider", exported.get("provider", {}).get("name") == "Test Provider")
+    check("the export carries IPv6-only mode", exported.get("provider", {}).get("forceIpv6") is True)
+    check("the export carries proxy rotation", exported.get("provider", {}).get("rotateProxies") is True)
     check("the export carries streams", len(exported.get("streams", [])) == 1)
     check("the export omits ids", "id" not in exported.get("provider", {}))
 

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <time.h>
 
 #include <curl/curl.h>
 
@@ -250,22 +251,23 @@ static bool is_http2_failure(CURLcode rc) {
 }
 
 typedef struct {
-    int (*should_cancel)(void *);
+    int (*should_cancel)(void *, size_t);
     void *ctx;
 } fetch_cancel;
 
 static int transfer_progress(void *opaque, curl_off_t dltotal, curl_off_t dlnow,
                              curl_off_t ultotal, curl_off_t ulnow) {
-    (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    (void)dltotal; (void)ultotal; (void)ulnow;
     fetch_cancel *cancel = (fetch_cancel *)opaque;
-    return cancel && cancel->should_cancel && cancel->should_cancel(cancel->ctx) ? 1 : 0;
+    size_t downloaded = dlnow > 0 ? (size_t)dlnow : 0;
+    return cancel && cancel->should_cancel && cancel->should_cancel(cancel->ctx, downloaded) ? 1 : 0;
 }
 
 // One transfer on the calling thread's handle. `force_http11` is set by the
 // caller when retrying after an HTTP/2 framing error.
 static int fetch_once(CURL *curl, const char *url, const char *proxy, const char *headers,
-                      const char *range, bool force_http11, long timeout_ms,
-                      int (*should_cancel)(void *), void *cancel_ctx,
+                      const char *range, bool force_http11, int force_ipv6, long timeout_ms,
+                      int (*should_cancel)(void *, size_t), void *cancel_ctx,
                       char **out, size_t *out_len, long *status, char **content_type,
                       char **content_range, char **effective_url,
                       CURLcode *out_rc, char *errbuf, size_t errbuf_len) {
@@ -285,6 +287,8 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl, CURLOPT_IPRESOLVE,
+                     force_ipv6 ? (long)CURL_IPRESOLVE_V6 : (long)CURL_IPRESOLVE_WHATEVER);
     if (timeout_ms <= 0) timeout_ms = 30000;
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, timeout_ms < 10000 ? timeout_ms : 10000);
@@ -379,9 +383,10 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
 }
 
 static int fetch_libcurl(const char *url, const char *proxy, const char *headers, const char *range,
+                         int force_ipv6,
                          char **out, size_t *out_len, long *status, char **content_type,
                          char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
-                         long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx) {
+                         long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx) {
     if (content_type) *content_type = NULL;
     if (content_range) *content_range = NULL;
     if (effective_url) *effective_url = NULL;
@@ -396,7 +401,7 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     bool force11 = h2_denied(host);
 
     CURLcode rc = CURLE_OK;
-    int result = fetch_once(curl, url, proxy, headers, range, force11,
+    int result = fetch_once(curl, url, proxy, headers, range, force11, force_ipv6,
                             timeout_ms, should_cancel, cancel_ctx,
                             out, out_len, status, content_type, content_range, effective_url,
                             &rc, errbuf, errbuf_len);
@@ -406,7 +411,7 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     if (result != 0 && !force11 && is_http2_failure(rc)) {
         h2_deny(host);
         if (borrowed) curl_easy_reset(curl);
-        result = fetch_once(curl, url, proxy, headers, range, true,
+        result = fetch_once(curl, url, proxy, headers, range, true, force_ipv6,
                             timeout_ms, should_cancel, cancel_ctx,
                             out, out_len, status, content_type, content_range, effective_url,
                             &rc, errbuf, errbuf_len);
@@ -560,6 +565,7 @@ static int spawn_wait(const char *const argv[], const char *err_path) {
 
 static int fetch_external(const char *tool, const char *dl_params,
                           const char *url, const char *proxy, const char *headers, const char *range,
+                          int force_ipv6,
                           char **out, size_t *out_len, long *status, char **content_type,
                           char **content_range, char **effective_url, char *errbuf, size_t errbuf_len) {
     if (content_type) *content_type = NULL;
@@ -590,6 +596,7 @@ static int fetch_external(const char *tool, const char *dl_params,
 
     if (is_wget) {
         ab_push(&a, "wget"); ab_push(&a, "--server-response"); ab_push(&a, "-O"); ab_push(&a, body_tmpl);
+        if (force_ipv6) ab_push(&a, "-6");
         ab_push(&a, "--timeout=60"); ab_push(&a, "--tries=2"); ab_push(&a, "-U"); ab_push(&a, "ReStreamAir/1.0");
         if (proxy && proxy[0]) {
             char e[1200];
@@ -621,6 +628,7 @@ static int fetch_external(const char *tool, const char *dl_params,
         ab_push(&a, url);
     } else {  // curl (default)
         ab_push(&a, "curl"); ab_push(&a, "-sS"); ab_push(&a, "-L"); ab_push(&a, "--max-time"); ab_push(&a, "60");
+        if (force_ipv6) ab_push(&a, "-6");
         ab_push(&a, "--connect-timeout"); ab_push(&a, "10"); ab_push(&a, "-A"); ab_push(&a, "ReStreamAir/1.0");
         ab_push(&a, "-o"); ab_push(&a, body_tmpl); ab_push(&a, "-D"); ab_push(&a, meta_tmpl);
         if (proxy && proxy[0]) { ab_push(&a, "-x"); ab_push(&a, proxy); }
@@ -686,38 +694,54 @@ static int fetch_external(const char *tool, const char *dl_params,
 // separated proxy list and calls this until one succeeds.
 static int fetch_through_one_proxy(const char *url, const char *proxy,
                                    const char *headers, const char *range,
-                                   const char *downloader, const char *dl_params,
+                                   const char *downloader, const char *dl_params, int force_ipv6,
                                    char **out, size_t *out_len, long *status,
                                    char **content_type, char **content_range,
                                    char **effective_url, char *errbuf, size_t errbuf_len,
-                                   long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx) {
+                                   long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx) {
     // NULL / "" / "internal" / "libcurl" → in-process libcurl. Otherwise run the
     // chosen external tool, falling back to libcurl if it isn't installed so a
     // missing binary never dead-ends a stream.
     bool internal = !downloader || !downloader[0] ||
                     strcasecmp(downloader, "internal") == 0 || strcasecmp(downloader, "libcurl") == 0 ||
                     strcasecmp(downloader, "native") == 0;
+    // aria2 can enable IPv6 but has no IPv6-only equivalent to curl/wget -6.
+    // Use libcurl for this combination so "force" never silently falls back
+    // to an IPv4 origin address.
+    if (force_ipv6 && (strcasecmp(downloader ? downloader : "", "aria2c") == 0 ||
+                       strcasecmp(downloader ? downloader : "", "aria2") == 0 ||
+                       strcasecmp(downloader ? downloader : "", "aria") == 0))
+        internal = true;
     if (!internal) {
-        int rc = fetch_external(downloader, dl_params, url, proxy, headers, range,
+        int rc = fetch_external(downloader, dl_params, url, proxy, headers, range, force_ipv6,
                                 out, out_len, status, content_type, content_range, effective_url, errbuf, errbuf_len);
         if (rc != -2) return rc;  // -2 = tool missing → fall through to libcurl
     }
-    return fetch_libcurl(url, proxy, headers, range, out, out_len, status, content_type,
+    return fetch_libcurl(url, proxy, headers, range, force_ipv6, out, out_len, status, content_type,
                          content_range, effective_url, errbuf, errbuf_len,
                          timeout_ms, should_cancel, cancel_ctx);
 }
 
 #define RS_PROXY_FALLBACK_MAX 16
-#define RS_PROXY_PREF_MAX 64
+#define RS_PROXY_POOL_MAX 64
+
+typedef struct {
+    bool known;
+    bool healthy;
+    unsigned failures;
+    unsigned in_flight;
+    time_t retry_at;
+} proxy_health;
 
 typedef struct {
     char *list;
-    size_t preferred;
-} proxy_preference;
+    size_t next_rotate;
+    proxy_health proxy[RS_PROXY_FALLBACK_MAX];
+} proxy_pool;
 
-static proxy_preference g_proxy_preferences[RS_PROXY_PREF_MAX];
-static size_t g_proxy_preference_count = 0;
-static pthread_mutex_t g_proxy_preference_mu = PTHREAD_MUTEX_INITIALIZER;
+static proxy_pool g_proxy_pools[RS_PROXY_POOL_MAX];
+static size_t g_proxy_pool_count = 0;
+static pthread_mutex_t g_proxy_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 
 // Split one-proxy-per-line in place, trimming surrounding spaces. A legacy
 // single URL naturally produces one entry, so no state migration is needed.
@@ -738,48 +762,117 @@ static size_t split_proxy_list(char *copy, char **items, size_t cap) {
     return count;
 }
 
-static size_t preferred_proxy_index(const char *list, size_t count) {
-    if (count < 2) return 0;
-    size_t preferred = 0;
-    pthread_mutex_lock(&g_proxy_preference_mu);
-    for (size_t i = 0; i < g_proxy_preference_count; i++) {
-        if (strcmp(g_proxy_preferences[i].list, list) == 0) {
-            preferred = g_proxy_preferences[i].preferred < count
-                ? g_proxy_preferences[i].preferred : 0;
-            pthread_mutex_unlock(&g_proxy_preference_mu);
-            return preferred;
-        }
-    }
-    if (g_proxy_preference_count < RS_PROXY_PREF_MAX) {
-        char *copy = rs_strdup(list);
-        if (copy) {
-            proxy_preference *slot = &g_proxy_preferences[g_proxy_preference_count++];
-            slot->list = copy;
-            slot->preferred = 0;
-        }
-    }
-    pthread_mutex_unlock(&g_proxy_preference_mu);
-    return preferred;
+// Finds (or creates) health state for an exact configured list. A changed list
+// gets a fresh pool because its indices no longer identify the same proxies.
+static proxy_pool *proxy_pool_locked(const char *list, size_t count) {
+    for (size_t i = 0; i < g_proxy_pool_count; i++)
+        if (strcmp(g_proxy_pools[i].list, list) == 0) return &g_proxy_pools[i];
+    if (g_proxy_pool_count >= RS_PROXY_POOL_MAX) return NULL;
+    char *copy = rs_strdup(list);
+    if (!copy) return NULL;
+    proxy_pool *pool = &g_proxy_pools[g_proxy_pool_count++];
+    memset(pool, 0, sizeof(*pool));
+    pool->list = copy;
+    (void)count;
+    return pool;
 }
 
-static void remember_proxy_index(const char *list, size_t index) {
-    pthread_mutex_lock(&g_proxy_preference_mu);
-    for (size_t i = 0; i < g_proxy_preference_count; i++) {
-        if (strcmp(g_proxy_preferences[i].list, list) == 0) {
-            g_proxy_preferences[i].preferred = index;
+// Unknown proxies go first so the first few real requests check every entry
+// without fetching one object more than once. Failed entries are quarantined
+// with exponential backoff, then receive an ordinary request as a recovery
+// probe. If the whole pool is quarantined, the oldest entry is allowed through
+// so it can recover without external intervention.
+static size_t proxy_acquire(const char *list, size_t count, bool rotate,
+                            unsigned tried_mask) {
+    time_t now = time(NULL);
+    size_t chosen = count;
+    pthread_mutex_lock(&g_proxy_pool_mu);
+    proxy_pool *pool = proxy_pool_locked(list, count);
+    if (!pool) {
+        pthread_mutex_unlock(&g_proxy_pool_mu);
+        for (size_t i = 0; i < count; i++) if (!(tried_mask & (1u << i))) return i;
+        return count;
+    }
+
+    // Spread initial health checks across concurrent download workers.
+    for (size_t i = 0; i < count; i++) {
+        if (!(tried_mask & (1u << i)) && !pool->proxy[i].known && pool->proxy[i].in_flight == 0) {
+            chosen = i;
             break;
         }
     }
-    pthread_mutex_unlock(&g_proxy_preference_mu);
+    if (chosen == count) {
+        for (size_t i = 0; i < count; i++) {
+            proxy_health *h = &pool->proxy[i];
+            if (!(tried_mask & (1u << i)) && h->known && !h->healthy &&
+                h->retry_at <= now && h->in_flight == 0) {
+                chosen = i;
+                break;
+            }
+        }
+    }
+    if (chosen == count) {
+        size_t start = rotate && count ? pool->next_rotate % count : 0;
+        for (size_t step = 0; step < count; step++) {
+            size_t i = rotate ? (start + step) % count : step;
+            if (!(tried_mask & (1u << i)) && pool->proxy[i].healthy) {
+                chosen = i;
+                break;
+            }
+        }
+    }
+    // Healthy entries may all be busy. Sharing one is still better than using
+    // a proxy that is inside its failure cooldown.
+    if (chosen == count) {
+        for (size_t i = 0; i < count; i++)
+            if (!(tried_mask & (1u << i)) && pool->proxy[i].healthy) { chosen = i; break; }
+    }
+    if (chosen == count) {
+        time_t earliest = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (tried_mask & (1u << i)) continue;
+            if (chosen == count || pool->proxy[i].retry_at < earliest) {
+                chosen = i;
+                earliest = pool->proxy[i].retry_at;
+            }
+        }
+    }
+    if (chosen < count) pool->proxy[chosen].in_flight++;
+    pthread_mutex_unlock(&g_proxy_pool_mu);
+    return chosen;
+}
+
+static void proxy_release(const char *list, size_t count, size_t index,
+                          bool rotate, bool usable) {
+    pthread_mutex_lock(&g_proxy_pool_mu);
+    proxy_pool *pool = proxy_pool_locked(list, count);
+    if (pool && index < count) {
+        proxy_health *h = &pool->proxy[index];
+        if (h->in_flight) h->in_flight--;
+        h->known = true;
+        if (usable) {
+            h->healthy = true;
+            h->failures = 0;
+            h->retry_at = 0;
+            if (rotate && count) pool->next_rotate = (index + 1) % count;
+        } else {
+            h->healthy = false;
+            if (h->failures < 6) h->failures++;
+            unsigned delay = 15u << (h->failures ? h->failures - 1 : 0);
+            if (delay > 300u) delay = 300u;
+            h->retry_at = time(NULL) + (time_t)delay;
+        }
+    }
+    pthread_mutex_unlock(&g_proxy_pool_mu);
 }
 
 int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
-                 const char *downloader, const char *dl_params,
+                 const char *downloader, const char *dl_params, int force_ipv6, int rotate_proxies,
                  char **out, size_t *out_len, long *status, char **content_type,
                  char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
-                 long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx) {
+                 long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx) {
     if (!proxy || !strpbrk(proxy, "\r\n")) {
-        return fetch_through_one_proxy(url, proxy, headers, range, downloader, dl_params,
+        return fetch_through_one_proxy(url, proxy, headers, range, downloader, dl_params, force_ipv6,
                                        out, out_len, status, content_type, content_range,
                                        effective_url, errbuf, errbuf_len,
                                        timeout_ms, should_cancel, cancel_ctx);
@@ -794,31 +887,37 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
     size_t count = split_proxy_list(copy, items, RS_PROXY_FALLBACK_MAX);
     if (count == 0) {
         free(copy);
-        return fetch_through_one_proxy(url, NULL, headers, range, downloader, dl_params,
+        return fetch_through_one_proxy(url, NULL, headers, range, downloader, dl_params, force_ipv6,
                                        out, out_len, status, content_type, content_range,
                                        effective_url, errbuf, errbuf_len,
                                        timeout_ms, should_cancel, cancel_ctx);
     }
 
-    size_t preferred = preferred_proxy_index(proxy, count);
     int rc = -1;
     size_t attempted = 0;
-    for (size_t attempt = 0; attempt < count; attempt++) {
-        if (attempt > 0 && should_cancel && should_cancel(cancel_ctx)) break;
-        size_t index = (preferred + attempt) % count;
+    unsigned tried_mask = 0;
+    while (attempted < count) {
+        if (attempted > 0 && should_cancel && should_cancel(cancel_ctx, 0)) break;
+        size_t index = proxy_acquire(proxy, count, rotate_proxies != 0, tried_mask);
+        if (index >= count) break;
+        tried_mask |= 1u << index;
         attempted++;
-        rc = fetch_through_one_proxy(url, items[index], headers, range, downloader, dl_params,
-                                     out, out_len, status, content_type, content_range,
+        long attempt_status = 0;
+        long *status_out = status ? status : &attempt_status;
+        rc = fetch_through_one_proxy(url, items[index], headers, range, downloader, dl_params, force_ipv6,
+                                     out, out_len, status_out, content_type, content_range,
                                      effective_url, errbuf, errbuf_len,
                                      timeout_ms, should_cancel, cancel_ctx);
-        if (rc == 0) {
-            remember_proxy_index(proxy, index);
-            break;
-        }
+        // Health is provider-specific: a proxy that answers but cannot fetch
+        // this provider's URL is not useful to this pool, so any failed fetch
+        // moves it behind the working entries for a cooldown.
+        bool usable = rc == 0;
+        proxy_release(proxy, count, index, rotate_proxies != 0, usable);
+        if (rc == 0) break;
     }
-    if (rc != 0 && count > 1 && attempted == count && errbuf && errbuf_len) {
+    if (rc != 0 && count > 1 && attempted > 0 && errbuf && errbuf_len) {
         size_t used = strnlen(errbuf, errbuf_len);
-        const char *suffix = " (all configured proxies failed)";
+        const char *suffix = " (all available proxies failed)";
         if (used + strlen(suffix) + 1 < errbuf_len) strcat(errbuf, suffix);
     }
     free(copy);

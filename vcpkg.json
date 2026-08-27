@@ -6,7 +6,7 @@
     {
       "name": "curl",
       "default-features": false,
-      "features": [ "schannel", "http2" ]
+      "features": [ "ssl", "http2" ]
     },
     "libxml2"
   ]

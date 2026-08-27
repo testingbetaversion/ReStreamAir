@@ -127,6 +127,8 @@
               </label>
               <label>Downloader params<span class="field-hint">Extra CLI args passed to the tool, e.g. --retry 3 or aria2c -x 8</span><input name="downloaderParams" placeholder="optional"></label>
             </div>
+            <label class="check"><input name="forceIpv6" type="checkbox"> Force IPv6 for this provider's manifest and media requests<span class="field-hint">Fails instead of falling back to IPv4 when the origin or network has no working IPv6 path.</span></label>
+            <label class="check"><input name="rotateProxies" type="checkbox"> Rotate healthy proxies<span class="field-hint">Checks every configured proxy through normal traffic, round-robins healthy entries, temporarily omits failures, and retries them automatically.</span></label>
             <label class="check"><input name="inheritUrlParams" type="checkbox"> Append each stream's own Source URL query params to its segments</label>
             <label id="segmentUrlParamsField">Segment URL params<span class="field-hint">Fixed fallback appended to every media/init segment URL when the option above is off, e.g. token=abc&amp;region=us</span><input name="segmentUrlParams" placeholder="token=abc&region=us"></label>
 
@@ -554,7 +556,9 @@
                 <h3>Providers &amp; streams</h3>
                 <p><b>Provider settings</b> hold defaults shared by every stream under them: proxy, generic headers, downloader, and a provider <b>script</b> + accounts. A stream inherits these unless it overrides them.</p>
                 <ul>
-                  <li><b>Proxies</b> — add one HTTP/SOCKS5 proxy per line in fallback order. Set the list once on the provider; a stream's own list wins if filled, and <b>Use proxy for</b> scopes it to Script / Manifest / Media independently. The last working proxy is preferred on later requests. Provider scripts and long-running FFmpeg modes use only the first entry.</li>
+                  <li><b>Proxies</b> — add one HTTP/SOCKS5 proxy per line in fallback order. Set the list once on the provider; a stream's own list wins if filled, and <b>Use proxy for</b> scopes it to Script / Manifest / Media independently. Every entry is checked through normal traffic; failed entries are cooled down and retried later. Provider scripts and long-running FFmpeg modes use only the first entry.</li>
+                  <li><b>Force IPv6</b> — resolves and connects provider manifest/media requests over IPv6 only. Requests fail rather than silently falling back to IPv4.</li>
+                  <li><b>Rotate healthy proxies</b> — checks every proxy through real requests, rotates across working entries, moves failures into a 15-second-to-5-minute cooldown, and automatically restores them after a successful retry. With rotation off, the first healthy proxy in configured order is preferred.</li>
                   <li><b>Error webhook</b> — add a Discord webhook URL to receive provider stream/script errors. Bursts are collapsed to avoid flooding Discord; source URLs are redacted.</li>
                   <li><b>Stream tuning</b> (Playlist count, Keep count, Download ahead, Poll seconds, Playout buffer) is per-stream, in the stream editor's DASH options — see below.</li>
                   <li><b>All Streams</b> view: bulk start/stop/delete, filter by provider and by Channels / Events / Manually added, and import channels or events from a provider script.</li>
@@ -588,7 +592,7 @@
                   <li><code>native</code> (default) — in-process libcurl, no subprocess per fetch. It pins HTTP/1.1, because some origins run a flaky HTTP/2 stack that drops mid-segment.</li>
                   <li><code>curl</code> / <code>wget</code> / <code>aria2c</code> — spawns that binary instead; <b>Downloader params</b> appends extra arguments (<code>--retry 3</code>, <code>-x 8</code>).</li>
                 </ul>
-                <p><b>Proxies</b> may be HTTP or SOCKS5 (<code>socks5h://user:pass@host:port</code>). Add one per line; failures move to the next entry and the last working proxy is remembered. Credentials embedded in the URL are used when the proxy challenges for them.</p>
+                <p><b>Proxies</b> may be HTTP or SOCKS5 (<code>socks5h://user:pass@host:port</code>). Add one per line; failures are temporarily omitted, working entries remain available, and cooled-down entries are retried automatically. Credentials embedded in the URL are used when the proxy challenges for them.</p>
                 <p class="help-note"><b>Tokens in the query string.</b> Tick <b>Append each stream's own Source URL query params to its segments</b> when a CDN signs a token onto the manifest URL and expects it on every segment. The params are read from the URL that <i>actually answered</i> the poll, not the one you configured — some CDNs only sign the redirect target, where the configured URL has no token at all. For a fixed string that isn't part of any stream's URL, use the provider's <b>Segment URL params</b> instead.</p>
               </article>
 

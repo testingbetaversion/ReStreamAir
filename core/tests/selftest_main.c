@@ -1036,7 +1036,7 @@ static void test_panel(void) {
     check("panel/state-seed", st.root != NULL);
 
     const char *err = NULL;
-    rs_json *pbody = parse_json("{\"name\":\"P1\",\"errorWebhookUrl\":\"https://discord.com/api/webhooks/1/token\"}");
+    rs_json *pbody = parse_json("{\"name\":\"P1\",\"errorWebhookUrl\":\"https://discord.com/api/webhooks/1/token\",\"forceIpv6\":true,\"rotateProxies\":true}");
     check("panel/create-provider", rs_panel_create_provider(&st, pbody, &err) == 0);
     rs_json_free(pbody);
     const rs_json *providers = rs_json_obj_get(st.root, "providers");
@@ -1045,6 +1045,17 @@ static void test_panel(void) {
     check_str("panel/provider-webhook",
               rs_json_obj_str(rs_json_arr_at(providers, 0), "errorWebhookUrl", ""),
               "https://discord.com/api/webhooks/1/token");
+    check("panel/provider-force-ipv6",
+          rs_json_obj_bool(rs_json_arr_at(providers, 0), "forceIpv6", false));
+    check("panel/provider-rotate-proxies",
+          rs_json_obj_bool(rs_json_arr_at(providers, 0), "rotateProxies", false));
+
+    rs_json *exported = rs_panel_export_provider(&st, pid);
+    check("panel/export-force-ipv6",
+          rs_json_obj_bool(rs_json_obj_get(exported, "provider"), "forceIpv6", false));
+    check("panel/export-rotate-proxies",
+          rs_json_obj_bool(rs_json_obj_get(exported, "provider"), "rotateProxies", false));
+    rs_json_free(exported);
 
     rs_json *bad_provider = parse_json("{\"name\":\"Bad webhook\",\"errorWebhookUrl\":\"discord://not-http\"}");
     check("panel/reject-bad-webhook", rs_panel_create_provider(&st, bad_provider, &err) == -400);

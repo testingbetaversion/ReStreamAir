@@ -80,6 +80,7 @@ void rs_dash_plan_dispose(rs_dash_plan *plan);
 // the configured MPD URL itself.
 char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
                        const char *downloader, const char *dl_params,
+                       int force_ipv6, int rotate_proxies,
                        const char *rep, int want,
                        const char *segment_url_params, int inherit_url_params,
                        char *errbuf, size_t errbuf_len);

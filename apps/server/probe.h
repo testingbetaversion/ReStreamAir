@@ -14,6 +14,7 @@ extern "C" {
 // failure, with a message written to errbuf. Uses libcurl + libxml2, which is
 // why it lives in the server app rather than the core.
 char *rs_probe_source(const char *url, const char *proxy, const char *headers,
+                      int force_ipv6, int rotate_proxies,
                       char *errbuf, size_t errbuf_len);
 
 #ifdef __cplusplus

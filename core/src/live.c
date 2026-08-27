@@ -74,10 +74,10 @@
 // all publishing even when the next twenty segments are downloaded and waiting.
 // Seen in production: an expired URL that the CDN simply never answered held a
 // rendition at "+0 segments, 20 in flight" for a minute at a time, then dumped
-// +19 at once. Scaled off the segment duration. Six times leaves enough room
-// for a large video segment that is progressing through a slow proxy, while a
-// request that is truly silent is still removed before it can age out a signed
-// live URL.
+// +19 at once. Scaled off the segment duration. This is an inactivity limit,
+// not a whole-request limit: a large video segment progressing through a slow
+// proxy may use the full media timeout below, while a request that receives no
+// bytes is removed before it can age out a signed live URL.
 #define RS_LIVE_HEAD_STALL_FACTOR 6.0
 #define RS_LIVE_HEAD_STALL_MIN 12.0
 
@@ -370,6 +370,8 @@ typedef struct {
     int attempts;
     pend_state state;
     double started;          // when a download thread claimed it
+    size_t progress_bytes;   // body bytes received on the current attempt
+    double last_progress;    // when progress_bytes most recently increased
     double fetch_seconds;    // wall time the successful transfer took
     // Stamped when the slot is filled and re-stamped whenever it is reused. A
     // download thread captures it alongside the slot pointer and only writes
@@ -490,6 +492,8 @@ typedef struct live_stream {
     char *manifest_headers, *media_headers;
     char *downloader, *dl_params, *keys;
     char *segment_url_params;
+    int force_ipv6;
+    int rotate_proxies;
     int inherit_url_params;
     int reduced_manifest_polling;
     int playlist_segments, hls_segment_seconds, keep_segments, download_ahead;
@@ -551,6 +555,8 @@ typedef struct {
     char *segment_url_params;
     rs_live_representation *representations;
     size_t representation_count;
+    int force_ipv6;
+    int rotate_proxies;
     int inherit_url_params;
     int reduced_manifest_polling;
     int playlist_segments, hls_segment_seconds, keep_segments, download_ahead;
@@ -597,6 +603,8 @@ static void cfg_snapshot_locked(const live_stream *st, cfg_snap *out) {
     out->dl_params = rs_strdup(st->dl_params ? st->dl_params : "");
     out->keys = rs_strdup(st->keys ? st->keys : "");
     out->segment_url_params = rs_strdup(st->segment_url_params ? st->segment_url_params : "");
+    out->force_ipv6 = st->force_ipv6;
+    out->rotate_proxies = st->rotate_proxies;
     out->representations = (rs_live_representation *)calloc(st->representation_count, sizeof(*out->representations));
     if (out->representations) {
         out->representation_count = st->representation_count;
@@ -804,12 +812,16 @@ typedef struct {
 // Called by libcurl's progress hook. It turns a logical queue cancellation into
 // a real network cancellation, so a dead CDN request no longer owns a worker
 // connection until the request timeout expires.
-static int download_should_cancel(void *opaque) {
+static int download_should_cancel(void *opaque, size_t downloaded) {
     download_cancel_ctx *ctx = (download_cancel_ctx *)opaque;
     pthread_mutex_lock(&ctx->st->mu);
     bool cancel = ctx->st->stop || ctx->slot->gen != ctx->slot_gen ||
                   ctx->slot->state != PEND_FETCHING ||
                   ctx->slot->request_gen != ctx->request_gen;
+    if (!cancel && downloaded > ctx->slot->progress_bytes) {
+        ctx->slot->progress_bytes = downloaded;
+        ctx->slot->last_progress = now_seconds();
+    }
     pthread_mutex_unlock(&ctx->st->mu);
     return cancel ? 1 : 0;
 }
@@ -929,6 +941,8 @@ static void *download_main(void *arg) {
             uint64_t request_gen = slot->request_gen;
             slot->attempts = attempt + 1;
             slot->started = now_seconds();
+            slot->progress_bytes = 0;
+            slot->last_progress = 0;
             double duration = slot->duration;
             pthread_mutex_unlock(&st->mu);
             if (!url) {
@@ -943,7 +957,7 @@ static void *download_main(void *arg) {
             download_cancel_ctx cancel = {st, slot, slot_gen, request_gen};
             double attempt_start = now_seconds();
             int rc = st->mgr->fetch(url, cfg.media_proxy, cfg.media_headers, NULL,
-                                    cfg.downloader, cfg.dl_params,
+                                    cfg.downloader, cfg.dl_params, cfg.force_ipv6, cfg.rotate_proxies,
                                     &body, &blen, &status, NULL, NULL, NULL, err, sizeof(err),
                                     media_timeout_ms(duration), download_should_cancel, &cancel);
             free(url);
@@ -1135,7 +1149,7 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
     char err[192] = {0};
     lg(st, "info", "initFetch", init_url, 0, -1, rep->rep_id);
     int rc = st->mgr->fetch(init_url, cfg->media_proxy, cfg->media_headers, NULL,
-                            cfg->downloader, cfg->dl_params,
+                            cfg->downloader, cfg->dl_params, cfg->force_ipv6, cfg->rotate_proxies,
                             &body, &len, &status, NULL, NULL, NULL, err, sizeof(err),
                             30000, NULL, NULL);
     ingest_record(st, len);
@@ -1254,7 +1268,8 @@ static char *manifest_fetch(live_stream *st, const cfg_snap *cfg, const char *re
         const char *url = cfg->sources[idx];
         err[0] = '\0';
         char *json = st->mgr->dash(url, cfg->manifest_proxy, cfg->manifest_headers,
-                                   cfg->downloader, cfg->dl_params, rep_id, want,
+                                   cfg->downloader, cfg->dl_params,
+                                   cfg->force_ipv6, cfg->rotate_proxies, rep_id, want,
                                    cfg->segment_url_params, cfg->inherit_url_params,
                                    err, errlen);
         if (json) {
@@ -1736,10 +1751,12 @@ static void *writer_main(void *arg) {
 
         double seg_dur = rep->seg_duration > 0 ? rep->seg_duration : 2.0;
 
-        // Head-of-line rule. If the head has been fetching far longer than the
+        // Head-of-line rule. If the head has been silent far longer than the
         // segment is worth, and there is finished work stuck behind it, give up
-        // on it and let the rest through. Re-stamping the generation is what
-        // makes this safe: the download thread that still owns this slot will
+        // on it and let the rest through. A slow request that is still receiving
+        // bytes remains governed by the whole-request timeout instead.
+        // Re-stamping the generation makes this safe: the download thread that
+        // still owns this slot will
         // find its stamp no longer matches and drop its result instead of
         // writing it into whatever occupies the slot by then.
         bool abandoned = false;
@@ -1750,14 +1767,20 @@ static void *writer_main(void *arg) {
             bool ready_behind = false;
             for (size_t i = 1; i < rep->pend_count && !ready_behind; i++)
                 if (pend_at_locked(rep, i)->state == PEND_READY) ready_behind = true;
-            double waited = head->started > 0 ? now_seconds() - head->started : 0;
+            double now = now_seconds();
+            double waited = head->started > 0 ? now - head->started : 0;
+            double last_activity = head->last_progress > head->started
+                                       ? head->last_progress : head->started;
+            double silent = last_activity > 0 ? now - last_activity : waited;
             // Normally we only give up on the head once something behind it is
             // finished — that is the proof it is the head, not the path, that
             // is the problem. But when every thread is stuck on unanswerable
             // requests nothing ever becomes ready, so there is a second, looser
             // bound: past a few times the stall threshold the segment is too
             // old to be worth having whatever the rest of the queue is doing.
-            bool overdue = ready_behind ? waited > stall : waited > stall * 3.0;
+            bool overdue = ready_behind
+                               ? waited > stall && silent > stall
+                               : waited > stall * 3.0 && silent > stall;
             if (head->state == PEND_FETCHING && overdue && head->started > 0) {
                 if (head->attempts < RS_LIVE_FETCH_TRIES) {
                     // Abort only this request. The worker keeps ownership of
@@ -2634,6 +2657,8 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     }
 
     st->inherit_url_params = cfg->inherit_url_params;
+    st->force_ipv6 = cfg->force_ipv6;
+    st->rotate_proxies = cfg->rotate_proxies;
     st->reduced_manifest_polling = cfg->reduced_manifest_polling;
     st->playlist_segments = cfg->playlist_segments > 0 ? cfg->playlist_segments : 6;
     if (st->playlist_segments < 3) st->playlist_segments = 3;
@@ -3059,4 +3084,3 @@ long long rs_live_drain_ingest(rs_live *live, const char *stream_id) {
     pthread_mutex_unlock(&live->mu);
     return bytes;
 }
-

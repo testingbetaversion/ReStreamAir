@@ -36,7 +36,7 @@ void print_usage(const char *program) {
                  "  -b, --bind ADDR   address to bind (default 0.0.0.0)\n"
                  "  --root DIR        serve the panel's static files from DIR (auto-detects public/,\n"
                  "                    and downloads it from GitHub into a cache if there is none)\n"
-                 "  --refresh-web     re-download the front-end over the cached copy\n"
+                 "  --refresh-web     fetch into the cache even when local public/ exists\n"
                  "  --web-ref REF     branch, tag or commit to fetch the front-end from (default main)\n"
                  "  --no-download     never fetch; use public/ or an existing cache only\n"
                  "  --verbose         full mongoose trace logging (default: errors only)\n"
@@ -219,10 +219,10 @@ int main(int argc, char **argv) {
     // MPD parsing. Both are initialised once here; the handler lives in probe.c.
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    // The front-end: public/ if it is next to us, otherwise a cached copy, and
-    // failing that a download from the (public) repository — the binary alone
-    // is enough to run the panel, and nothing is written into the install
-    // directory. Needs libcurl up, hence its place here.
+    // The front-end: public/ if it is next to us, otherwise refresh the cache
+    // from the public repository and fall back to its previous contents when
+    // offline. Nothing is written into the install directory. Needs libcurl
+    // up, hence its place here.
     web.verbose = verbose;
     std::string web_root_error;
     std::string web_root = rs_webroot_resolve(web, &web_root_error, nullptr);

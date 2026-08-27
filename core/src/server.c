@@ -206,7 +206,8 @@ static uint8_t *apply_cenc(const char *decryption_keys, bool is_map, uint8_t *bo
 // asynchronously once the worker finishes.
 static void dispatch_logo_lookup(restream_server_t *server, struct mg_connection *c, const char *name);
 static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
-                           char *url, char *proxy, char *headers);
+                           char *url, char *proxy, char *headers,
+                           bool force_ipv6, bool rotate_proxies);
 static void dispatch_script_action(restream_server_t *server, struct mg_connection *c,
                                    const char *sid, const char *script_path, char **args, int argc);
 
@@ -217,7 +218,7 @@ static char *logo_fetch_wrapper(const char *url, void *ctx) {
     size_t body_len = 0;
     long status = 0;
     char err[128] = {0};
-    int rc = g_fetch_handler(url, NULL, NULL, NULL, NULL, NULL, &body, &body_len, &status,
+    int rc = g_fetch_handler(url, NULL, NULL, NULL, NULL, NULL, 0, 0, &body, &body_len, &status,
                              NULL, NULL, NULL, err, sizeof(err), 30000, NULL, NULL);
     if (rc == 0 && status == 200 && body) return body;
     free(body);
@@ -1818,8 +1819,10 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         char *url = body_str(body, "url");
         char *proxy = body_str(body, "proxy");
         char *headers = body_str(body, "headers");
+        bool force_ipv6 = rs_json_obj_bool(body, "forceIpv6", false);
+        bool rotate_proxies = rs_json_obj_bool(body, "rotateProxies", false);
         rs_json_free(body);
-        dispatch_probe(s, c, url, proxy, headers);  // takes ownership, always replies
+        dispatch_probe(s, c, url, proxy, headers, force_ipv6, rotate_proxies);  // takes ownership
         return true;
     }
 
@@ -2518,6 +2521,8 @@ struct rs_pending_job {
     char *range;                   // ITEM only
     char *downloader;               // PLAYLIST/ITEM only
     char *downloader_params;       // PLAYLIST/ITEM only
+    bool force_ipv6;               // PLAYLIST/ITEM/PROBE
+    bool rotate_proxies;           // PLAYLIST/ITEM/PROBE
     bool decrypt, is_map, is_key;  // ITEM only
     char *decryption_keys;         // ITEM only, "KID:KEY[,KID:KEY...]"
     char *hls_key, *hls_iv;        // ITEM only
@@ -2565,6 +2570,7 @@ static void *pending_job_worker(void *arg) {
     case RS_PENDING_ITEM:
         pf->rc = g_fetch_handler(pf->url, pf->proxy, pf->headers, pf->range,
                                  pf->downloader, pf->downloader_params,
+                                 pf->force_ipv6, pf->rotate_proxies,
                                  &pf->body, &pf->body_len, &pf->status,
                                  &pf->content_type, &pf->content_range, NULL,
                                  pf->err, sizeof(pf->err), 30000, NULL, NULL);
@@ -2582,7 +2588,9 @@ static void *pending_job_worker(void *arg) {
         pf->rc = pf->body ? 0 : -1;
         break;
     case RS_PENDING_PROBE:
-        pf->body = g_probe_handler(pf->url, pf->proxy, pf->headers, pf->err, sizeof(pf->err));
+        pf->body = g_probe_handler(pf->url, pf->proxy, pf->headers,
+                                   pf->force_ipv6, pf->rotate_proxies,
+                                   pf->err, sizeof(pf->err));
         pf->rc = pf->body ? 0 : -1;
         break;
     case RS_PENDING_SCRIPT:
@@ -2656,7 +2664,8 @@ static void dispatch_logo_lookup(restream_server_t *server, struct mg_connection
 // pending_job_finish_probe. Takes ownership of url/proxy/headers. Always
 // replies to `c`.
 static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
-                           char *url, char *proxy, char *headers) {
+                           char *url, char *proxy, char *headers,
+                           bool force_ipv6, bool rotate_proxies) {
     rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
     if (!pf) {
         free(url); free(proxy); free(headers);
@@ -2667,6 +2676,8 @@ static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
     pf->url = url;
     pf->proxy = proxy;
     pf->headers = headers;  // pf owns all three now
+    pf->force_ipv6 = force_ipv6;
+    pf->rotate_proxies = rotate_proxies;
     if (!pending_job_dispatch(server, c, pf)) {
         pending_job_free(pf);
         reply_error(c, 500, "Could not start the probe.");
@@ -2899,6 +2910,8 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     pf->headers = effective_headers(provider, stream, "manifestHeaders");
     pf->downloader = rs_strdup(effective_downloader(provider, stream));
     pf->downloader_params = rs_strdup(effective_downloader_params(provider, stream));
+    pf->force_ipv6 = provider && rs_json_obj_bool(provider, "forceIpv6", false);
+    pf->rotate_proxies = provider && rs_json_obj_bool(provider, "rotateProxies", false);
     pf->hls_key = rs_strdup(rs_json_obj_str(stream, "hlsKey", ""));
     pf->playback_key_str = playback_key(hm);
     free(variant);
@@ -3065,6 +3078,8 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     pf->headers = effective_headers(provider, stream, is_key ? "hlsKeyHeaders" : "mediaHeaders");
     pf->downloader = rs_strdup(effective_downloader(provider, stream));
     pf->downloader_params = rs_strdup(effective_downloader_params(provider, stream));
+    pf->force_ipv6 = provider && rs_json_obj_bool(provider, "forceIpv6", false);
+    pf->rotate_proxies = provider && rs_json_obj_bool(provider, "rotateProxies", false);
     pf->decryption_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
     pf->hls_key = rs_strdup(rs_json_obj_str(stream, "hlsKey", ""));
     pf->hls_iv = rs_strdup(rs_json_obj_str(stream, "hlsIV", ""));
@@ -3336,6 +3351,8 @@ static int live_sync_stream(restream_server_t *s, const char *stream_id) {
     cfg.media_headers = dheaders;
     cfg.downloader = effective_downloader(provider, stream);
     cfg.dl_params = effective_downloader_params(provider, stream);
+    cfg.force_ipv6 = provider && rs_json_obj_bool(provider, "forceIpv6", false);
+    cfg.rotate_proxies = provider && rs_json_obj_bool(provider, "rotateProxies", false);
     cfg.decryption_keys = rs_json_obj_str(stream, "decryptionKeys", "");
     // inheritUrlParams wins: some CDNs sign a token only onto the manifest's
     // redirect target, so a segmentUrlParams typed ahead of time from the

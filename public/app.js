@@ -936,7 +936,7 @@ async function enlistQualitiesForEditor(stream) {
   try {
     const result = await request("/api/probe", {
       method: "POST",
-      body: JSON.stringify({ url, proxy: stream.proxy || selectedProvider()?.proxy || "", headers: stream.manifestHeaders || "" }),
+      body: JSON.stringify({ url, proxy: stream.proxy || selectedProvider()?.proxy || "", headers: stream.manifestHeaders || "", forceIpv6: Boolean(selectedProvider()?.forceIpv6), rotateProxies: Boolean(selectedProvider()?.rotateProxies) }),
     });
     // The user may have switched to another stream (or started editing the
     // URL, which triggers its own detect) while the probe was in flight.
@@ -1865,7 +1865,7 @@ async function detectSource() {
     const proxy = form.elements.proxy.value || selectedProvider()?.proxy || "";
     const result = await request("/api/probe", {
       method: "POST",
-      body: JSON.stringify({ url, proxy, headers: form.elements.manifestHeaders.value }),
+      body: JSON.stringify({ url, proxy, headers: form.elements.manifestHeaders.value, forceIpv6: Boolean(selectedProvider()?.forceIpv6), rotateProxies: Boolean(selectedProvider()?.rotateProxies) }),
     });
     probeResult = result;
     selectedRepIds = new Set();
@@ -2148,6 +2148,8 @@ function openProviderSettingsDialog() {
   form.elements.headers.value = provider.headers || "";
   form.elements.downloader.value = provider.downloader || "native";
   form.elements.downloaderParams.value = provider.downloaderParams || "";
+  form.elements.forceIpv6.checked = Boolean(provider.forceIpv6);
+  form.elements.rotateProxies.checked = Boolean(provider.rotateProxies);
   form.elements.segmentUrlParams.value = provider.segmentUrlParams || "";
   form.elements.inheritUrlParams.checked = Boolean(provider.inheritUrlParams);
   form.elements.scriptPath.value = provider.scriptPath || "";
@@ -2219,6 +2221,8 @@ async function saveProviderSettings() {
       proxy: form.elements.proxy.value, errorWebhookUrl: form.elements.errorWebhookUrl.value,
       headers: form.elements.headers.value, segmentUrlParams: form.elements.segmentUrlParams.value,
       downloader: form.elements.downloader.value, downloaderParams: form.elements.downloaderParams.value,
+      forceIpv6: form.elements.forceIpv6.checked,
+      rotateProxies: form.elements.rotateProxies.checked,
       inheritUrlParams: form.elements.inheritUrlParams.checked,
       scriptPath: form.elements.scriptPath.value, scriptBind: form.elements.scriptBind.value,
       scriptDoh: form.elements.scriptDoh.value, scriptWorker: form.elements.scriptWorker.value,

@@ -493,6 +493,8 @@ int rs_panel_create_provider(rs_state *st, const rs_json *body, const char **err
     rs_json_obj_set_str(p, "headers", rs_json_obj_str(body, "headers", ""));
     rs_json_obj_set_str(p, "downloader", normalize_downloader(rs_json_obj_str(body, "downloader", "")));
     rs_json_obj_set_str(p, "downloaderParams", rs_json_obj_str(body, "downloaderParams", ""));
+    rs_json_obj_set_bool(p, "forceIpv6", rs_json_obj_bool(body, "forceIpv6", false));
+    rs_json_obj_set_bool(p, "rotateProxies", rs_json_obj_bool(body, "rotateProxies", false));
     rs_json_obj_set_str(p, "segmentUrlParams", rs_json_obj_str(body, "segmentUrlParams", ""));
     rs_json_obj_set_bool(p, "inheritUrlParams", rs_json_obj_bool(body, "inheritUrlParams", false));
     rs_json_obj_set(p, "streams", rs_json_new_arr());
@@ -532,6 +534,8 @@ int rs_panel_update_provider(rs_state *st, const char *id, const rs_json *body, 
     set_str_from(p, "headers", body, "");
     rs_json_obj_set_str(p, "downloader", normalize_downloader(rs_json_obj_str(body, "downloader", "")));
     set_str_from(p, "downloaderParams", body, "");
+    rs_json_obj_set_bool(p, "forceIpv6", rs_json_obj_bool(body, "forceIpv6", false));
+    rs_json_obj_set_bool(p, "rotateProxies", rs_json_obj_bool(body, "rotateProxies", false));
     set_str_from(p, "segmentUrlParams", body, "");
     rs_json_obj_set_bool(p, "inheritUrlParams", rs_json_obj_bool(body, "inheritUrlParams", false));
     set_str_from(p, "scriptPath", body, "");
@@ -754,6 +758,8 @@ rs_json *rs_panel_export_provider(const rs_state *st, const char *provider_id) {
                             rs_json_obj_str(found, copied[i], strcmp(copied[i], "accountSelectionMode") == 0 ? "fixed" : ""));
     }
     rs_json_obj_set_bool(provider, "inheritUrlParams", rs_json_obj_bool(found, "inheritUrlParams", false));
+    rs_json_obj_set_bool(provider, "forceIpv6", rs_json_obj_bool(found, "forceIpv6", false));
+    rs_json_obj_set_bool(provider, "rotateProxies", rs_json_obj_bool(found, "rotateProxies", false));
 
     const rs_json *accounts = rs_json_obj_get(found, "scriptAccounts");
     rs_json_obj_set(provider, "scriptAccounts",

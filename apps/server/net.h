@@ -26,17 +26,25 @@ extern "C" {
 // in-process libcurl fetch; "curl"/"wget"/"aria2c" shell out to that binary
 // (with `dl_params` appended verbatim), falling back to libcurl if it is not
 // installed. `dl_params` is a free-form extra-arguments string (may be NULL).
+// `force_ipv6` makes hostname resolution IPv6-only; curl/wget receive their
+// IPv6-only flag, while aria2c uses the internal client because it has no
+// equivalent strict mode.
+// With `rotate_proxies`, healthy entries are selected round-robin. Without it,
+// configured order remains the priority. Both modes quarantine connection
+// failures and periodically retry them, and initially exercise every entry.
 // `effective_url` (may be NULL) receives the final URL after redirects (libcurl
 // path only) — used to resolve a redirected DASH MPD's segment URLs.
 // `timeout_ms` is the whole-request timeout (<= 0 means 30 seconds). The
-// in-process client periodically calls `should_cancel(cancel_ctx)`, when set,
-// and aborts as soon as it returns non-zero. External tools use their own
-// timeout and cannot call back into the process.
+// in-process client periodically calls `should_cancel(cancel_ctx, downloaded)`,
+// when set, and aborts as soon as it returns non-zero. `downloaded` is the
+// number of response-body bytes received on the current request, which lets a
+// caller distinguish a slow but progressing transfer from a silent one.
+// External tools use their own timeout and cannot call back into the process.
 int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
-                 const char *downloader, const char *dl_params,
+                 const char *downloader, const char *dl_params, int force_ipv6, int rotate_proxies,
                  char **out, size_t *out_len, long *status, char **content_type,
                  char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
-                 long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx);
+                 long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx);
 
 // POSTs a JSON document to an HTTP(S) endpoint. Used by the provider error
 // webhook worker; deliberately separate from rs_fetch_url so a configured

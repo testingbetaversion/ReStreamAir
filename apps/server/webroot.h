@@ -10,14 +10,14 @@
 // tarball has that directory sitting next to the binary and nothing here does
 // any work. A bare executable — one copied to /usr/local/bin, an image built
 // from the binary alone — fetches public/ from the public GitHub repository on
-// first run and keeps it in a cache directory (~/.cache, or /tmp when home is
-// not writable), so the front-end never has to be shipped alongside the
-// executable or written into the install directory.
+// each run and keeps it in a cache directory (~/.cache, or /tmp when home is
+// not writable). A completed older cache remains available when a refresh
+// cannot reach GitHub, so the panel can still start offline.
 
 struct rs_webroot_options {
     std::string explicit_root;  // --root: used as given, never downloaded over
     std::string ref = "main";   // --web-ref: branch, tag or commit to fetch
-    bool refresh = false;       // --refresh-web: re-download over a cached copy
+    bool refresh = false;       // --refresh-web: fetch even when local public/ exists
     bool no_download = false;   // --no-download: local copies only, never fetch
     bool verbose = false;       // print each file as it arrives
 };

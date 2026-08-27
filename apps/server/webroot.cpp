@@ -1,11 +1,11 @@
 // Finding — and, on a first run, fetching — the panel's static files.
 //
 // See webroot.h for the shape of the problem. The order is: an explicit --root,
-// then public/ next to the working directory, then a cached download, then the
-// network. Nothing is ever written next to the binary: the cache lives in the
-// user's cache directory, falling back to a per-uid directory under /tmp when
-// that is not writable (a systemd unit with ProtectHome=true, a container
-// running as a user with no home).
+// then public/ next to the working directory, then a freshly downloaded copy
+// with the previous cache as an offline fallback. Nothing is ever written next
+// to the binary: the cache lives in the user's cache directory, falling back
+// to a per-uid directory under /tmp when that is not writable (a systemd unit
+// with ProtectHome=true, a container running as a user with no home).
 
 #include "webroot.h"
 
@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -206,7 +207,7 @@ bool fetch(const std::string &url, const char *accept, size_t limit,
     char errbuf[512] = {0};
     std::string headers = accept ? std::string("Accept: ") + accept : std::string();
     int rc = rs_fetch_url(url.c_str(), nullptr, headers.empty() ? nullptr : headers.c_str(),
-                          nullptr, nullptr, nullptr, &out, &len, &status, nullptr, nullptr,
+                          nullptr, nullptr, nullptr, 0, 0, &out, &len, &status, nullptr, nullptr,
                           nullptr, errbuf, sizeof(errbuf), kTimeoutMs, nullptr, nullptr);
     if (rc != 0) {
         err = errbuf[0] ? errbuf : "request failed";
@@ -322,6 +323,10 @@ bool download_into(const std::string &dir, const rs_webroot_options &options, st
     std::remove(join(dir, kStamp).c_str());
 
     size_t total = 0;
+    // Pin all raw-file reads to the SHA returned with the listing. Otherwise a
+    // push to a moving branch midway through the loop could create a mixture of
+    // files from two commits.
+    const std::string source_ref = listed && !commit.empty() ? commit : options.ref;
     for (size_t i = 0; i < files.size(); i++) {
         const std::string &rel = files[i];
         if (!safe_relative(rel)) {
@@ -329,7 +334,7 @@ bool download_into(const std::string &dir, const rs_webroot_options &options, st
             return false;
         }
         std::string url = std::string("https://raw.githubusercontent.com/") + kRepo + "/" +
-                          options.ref + "/public/" + rel;
+                          source_ref + "/public/" + rel;
         std::string body;
         if (!fetch(url, nullptr, kMaxFileBytes, body, err)) {
             err = "public/" + rel + ": " + err;
@@ -361,8 +366,71 @@ bool download_into(const std::string &dir, const rs_webroot_options &options, st
                   "\"bytes\":%zu,\"fetched\":%lld,\"listed\":%s}\n",
                   kRepo, options.ref.c_str(), commit.c_str(), files.size(), total,
                   (long long)std::time(nullptr), listed ? "true" : "false");
-    std::string ignored;
-    write_file(join(dir, kStamp), stamp, ignored);  // best effort; only a marker
+    if (!write_file(join(dir, kStamp), stamp, err)) return false;
+    return true;
+}
+
+// Download into a sibling directory, then swap it into place. Updating the
+// live cache file-by-file could leave old HTML loading new JavaScript (or the
+// reverse) when the network drops halfway through a refresh. The old cache is
+// kept until the complete replacement, including its stamp, is ready.
+bool refresh_cache(const std::string &dir, const rs_webroot_options &options, std::string &err) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    std::string stage = dir + ".refresh";
+    std::string backup = dir + ".previous";
+
+    if (!dir_is_ours(stage) || !dir_is_ours(backup)) {
+        err = "a refresh directory exists but is not ours to use";
+        return false;
+    }
+    fs::remove_all(stage, ec);
+    if (!ec && fs::exists(stage, ec)) {
+        err = "cannot clear the refresh directory";
+        return false;
+    }
+    if (ec) {
+        err = "cannot clear the refresh directory";
+        return false;
+    }
+    if (!download_into(stage, options, err)) {
+        fs::remove_all(stage, ec);
+        return false;
+    }
+
+    fs::remove_all(backup, ec);
+    if (!ec && fs::exists(backup, ec)) {
+        err = "cannot clear the previous-cache directory";
+        fs::remove_all(stage, ec);
+        return false;
+    }
+    if (ec) {
+        err = "cannot clear the previous-cache directory";
+        fs::remove_all(stage, ec);
+        return false;
+    }
+    bool had_old = is_dir(dir);
+    if (had_old) {
+        fs::rename(dir, backup, ec);
+        if (ec) {
+            err = "cannot preserve the previous cache: " + ec.message();
+            fs::remove_all(stage, ec);
+            return false;
+        }
+    }
+
+    fs::rename(stage, dir, ec);
+    if (ec) {
+        std::string message = ec.message();
+        if (had_old) {
+            std::error_code restore_error;
+            fs::rename(backup, dir, restore_error);
+        }
+        fs::remove_all(stage, ec);
+        err = "cannot activate the refreshed cache: " + message;
+        return false;
+    }
+    fs::remove_all(backup, ec);
     return true;
 }
 
@@ -392,15 +460,16 @@ std::string rs_webroot_resolve(const rs_webroot_options &options, std::string *e
     }
 
     std::vector<std::string> candidates = cache_candidates();
-    if (!options.refresh) {
+
+    // With downloads disabled, a complete cache is still usable. Normally a
+    // missing local public/ means checking Git on every launch, so a new binary
+    // does not silently keep serving front-end files fetched by an older one.
+    if (options.no_download) {
         for (size_t i = 0; i < candidates.size(); i++) {
             if (dir_is_ours(candidates[i]) && cache_is_complete(candidates[i])) {
                 return absolute_path(candidates[i]);
             }
         }
-    }
-
-    if (options.no_download) {
         *err = "no public/ beside the binary and no cached copy (--no-download)";
         return "";
     }
@@ -418,15 +487,20 @@ std::string rs_webroot_resolve(const rs_webroot_options &options, std::string *e
         std::printf("fetching the panel's front-end from github.com/%s (%s) into %s\n",
                     kRepo, options.ref.c_str(), candidates[i].c_str());
         std::fflush(stdout);
-        bool existed = is_dir(candidates[i]);
+        bool had_cache = cache_is_complete(candidates[i]);
         std::string attempt;
-        if (download_into(candidates[i], options, attempt)) {
+        if (refresh_cache(candidates[i], options, attempt)) {
             if (downloaded) *downloaded = true;
             return absolute_path(candidates[i]);
         }
         std::printf("  %s\n", attempt.c_str());
         std::fflush(stdout);
-        if (!existed) remove_if_empty(candidates[i], 3);
+        if (had_cache) {
+            std::printf("  using the previous cached front-end\n");
+            std::fflush(stdout);
+            return absolute_path(candidates[i]);
+        }
+        if (!is_dir(candidates[i])) remove_if_empty(candidates[i], 3);
         last = attempt;
     }
     *err = "could not fetch the panel's front-end: " + last;

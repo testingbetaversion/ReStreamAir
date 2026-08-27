@@ -78,13 +78,15 @@ typedef struct {
 // links libcurl or libxml2.
 typedef int (*rs_live_fetch_fn)(const char *url, const char *proxy, const char *headers,
                                 const char *range, const char *downloader, const char *dl_params,
+                                int force_ipv6, int rotate_proxies,
                                 char **out, size_t *out_len, long *status,
                                 char **content_type, char **content_range,
                                 char **effective_url, char *errbuf, size_t errbuf_len,
-                                long timeout_ms, int (*should_cancel)(void *), void *cancel_ctx);
+                                long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx);
 
 typedef char *(*rs_live_dash_fn)(const char *url, const char *proxy, const char *headers,
                                  const char *downloader, const char *dl_params,
+                                 int force_ipv6, int rotate_proxies,
                                  const char *rep, int want,
                                  const char *segment_url_params, int inherit_url_params,
                                  char *errbuf, size_t errbuf_len);
@@ -116,6 +118,8 @@ typedef struct {
     const char *media_headers;
     const char *downloader;         // "curl" | "wget" | "aria2c" | "" (libcurl)
     const char *dl_params;
+    int force_ipv6;                 // non-zero: resolve/connect using IPv6 only
+    int rotate_proxies;             // non-zero: round-robin healthy proxies
     const char *decryption_keys;    // "kid:key\nkid:key" ClearKey pairs
     const char *segment_url_params; // raw query-string fragment for every segment/init URL
     int inherit_url_params;         // non-zero: derive it from the MPD's redirect target instead
