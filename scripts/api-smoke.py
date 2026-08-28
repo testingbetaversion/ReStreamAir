@@ -497,6 +497,65 @@ def test_provider_routes(client):
     return provider
 
 
+def test_script_action_api(workdir, client):
+    print("provider script actions")
+    script_path = os.path.join(workdir, "api-provider.py")
+    with open(script_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "import json, os, sys\n"
+            "args = dict(a.split('=', 1) for a in sys.argv[1:] if '=' in a)\n"
+            "session = args['sessiondir']\n"
+            "os.makedirs(os.path.join(session, 'nested'), exist_ok=True)\n"
+            "with open(os.path.join(session, 'nested', 'marker'), 'w') as out:\n"
+            "    out.write(args.get('action', ''))\n"
+            "print(json.dumps(args, sort_keys=True))\n"
+        )
+
+    status, body, _ = client.json("POST", "/api/providers", body={"name": "Script API"})
+    provider = next((p for p in body.get("providers", []) if p["name"] == "Script API"), None)
+    check("script test provider is created", status == 200 and provider is not None, f"{status} {body}")
+    if not provider:
+        return
+
+    account = {"id": "account_api", "name": "robot", "username": "robot",
+               "password": "secret", "enabled": True}
+    status, body, _ = client.json(
+        "PUT", f"/api/providers/{provider['id']}",
+        body={"name": "Script API", "scriptPath": script_path,
+              "scriptAccounts": [account], "activeScriptAccountId": account["id"],
+              "scriptActions": ["pssh"]},
+    )
+    check("provider script settings can be saved through the API", status == 200, f"{status} {body}")
+
+    status, body, _ = client.json(
+        "POST", f"/api/providers/{provider['id']}/streams",
+        body={"name": "Script Channel", "kind": "m3u8", "url": "https://example.test/live.m3u8"},
+    )
+    stream = next((s for p in body.get("providers", []) if p["id"] == provider["id"]
+                   for s in p.get("streams", []) if s["name"] == "Script Channel"), None)
+    check("script test stream is created", status == 200 and stream is not None, f"{status} {body}")
+    if not stream:
+        return
+
+    status, result, _ = client.json(
+        "POST", f"/api/providers/{provider['id']}/script/run",
+        body={"action": "pssh", "streamId": stream["id"]},
+    )
+    output = result.get("output", "")
+    check("stream script action API returns output", status == 200 and result.get("exitCode") == 0,
+          f"{status} {result}")
+    check("stream action receives its action and stream id",
+          '"action": "pssh"' in output and f'"id": "{stream["id"]}"' in output, output)
+    check("documented user and cookies arguments are supplied",
+          '"user": "robot"' in output and '"cookies":' in output, output)
+
+    session_dir = os.path.join(workdir, "runtime", "sessions", provider["id"])
+    check("script can persist nested session state", os.path.exists(os.path.join(session_dir, "nested", "marker")))
+    status, _, _ = client.request("POST", f"/api/providers/{provider['id']}/script/clear-session", body={})
+    check("clear-session API succeeds", status == 200, f"got {status}")
+    check("clear-session recursively removes the session", not os.path.exists(session_dir), session_dir)
+
+
 def test_provider_webhooks(client, sink):
     print("provider error webhooks")
     webhook = f"http://127.0.0.1:{sink.port}/discord"
@@ -665,6 +724,7 @@ def main():
                 test_proxy_headers(admin)
                 viewer = test_viewer_role(admin, port)
                 test_provider_routes(admin)
+                test_script_action_api(workdir, admin)
                 test_provider_webhooks(admin, webhook_sink)
                 test_hls_playback_routes(admin, origin)
                 test_sessions_are_hashed_at_rest(workdir, admin)

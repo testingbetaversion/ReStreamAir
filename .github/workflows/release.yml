@@ -44,6 +44,7 @@ jobs:
           mkdir -p "$STAGE"
           cp build/restreamair-server "$STAGE/restreamair"
           cp -R public "$STAGE/public"
+          cp README.md SCRIPTING.md API.md "$STAGE/"
           tar -czf "$STAGE.tar.gz" "$STAGE"
       - uses: actions/upload-artifact@v4
         with:
@@ -81,6 +82,7 @@ jobs:
           mkdir -p "$STAGE"
           cp build-release/restreamair-server "$STAGE/restreamair"
           cp -R public "$STAGE/public"
+          cp README.md SCRIPTING.md API.md "$STAGE/"
           tar -czf "$STAGE.tar.gz" "$STAGE"
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"
       # Gold standard: unpack on a bare Ubuntu carrying only the two runtime
@@ -144,6 +146,7 @@ jobs:
           mkdir -p "$STAGE"
           cp build-release/Release/restreamair-server.exe "$STAGE/restreamair.exe"
           cp -R public "$STAGE/public"
+          cp README.md SCRIPTING.md API.md "$STAGE/"
           7z a "$STAGE.zip" "$STAGE" >/dev/null
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"
       # The same gold-standard check the Linux job does: unpack it somewhere

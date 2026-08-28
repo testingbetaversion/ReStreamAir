@@ -25,6 +25,8 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <errno.h>
+#include <sys/stat.h>
 // live.c spawns threads unconditionally (director/rep/prefetch workers), so the
 // same primitives are needed here for the log ring those workers write into.
 // rs_thread.h is <pthread.h> on POSIX and a SRWLOCK/CONDITION_VARIABLE shim on
@@ -32,9 +34,11 @@
 #include "rs_thread.h"
 #ifdef _WIN32
 #include <direct.h>
+#include <io.h>
 #define RS_MKDIR(path) _mkdir(path)
 #else
-#include <sys/stat.h>   // mkdir for the script session dir
+#include <dirent.h>
+#include <unistd.h>
 #define RS_MKDIR(path) mkdir((path), 0755)
 #endif
 
@@ -1445,7 +1449,8 @@ static rs_json *find_provider_by_id(rs_state *st, const char *id) {
 // under "script:<providerId>" so the panel's script output + Logs tab show it.
 // This is the C port of PanelServer's script-action runner (ScriptRunner).
 static void run_provider_script(restream_server_t *s, struct mg_connection *c,
-                                const rs_json *provider, const char *action) {
+                                const rs_json *provider, const char *action,
+                                const rs_json *request) {
     const char *script = rs_json_obj_str(provider, "scriptPath", "");
     if (!script[0]) { reply_error(c, 400, "No script path set on this provider."); return; }
     const char *pid = rs_json_obj_str(provider, "id", "");
@@ -1456,14 +1461,18 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     snprintf(sessiondir, sizeof(sessiondir), "runtime/sessions/%s", pid);
     RS_MKDIR("runtime"); RS_MKDIR("runtime/sessions"); RS_MKDIR(sessiondir);
 
+    char cookies[640];
+    snprintf(cookies, sizeof(cookies), "%s/cookies.txt", sessiondir);
+
     // Heap-allocated (rather than the stack array this used to be) because
     // dispatch_script_action hands it to a worker thread that outlives this
     // call — the stack array would be gone by the time the worker ran.
-    char **args = (char **)malloc(24 * sizeof(char *));
+    char **args = (char **)malloc(32 * sizeof(char *));
     if (!args) { reply_error(c, 500, "Out of memory."); return; }
     int n = 0;
     args[n++] = rs_script_arg("action", action, false);
     args[n++] = rs_script_arg("sessiondir", sessiondir, false);
+    args[n++] = rs_script_arg("cookies", cookies, false);
     const char *bind = rs_json_obj_str(provider, "scriptBind", "");
     const char *doh = rs_json_obj_str(provider, "scriptDoh", "");
     const char *worker = rs_json_obj_str(provider, "scriptWorker", "");
@@ -1480,13 +1489,96 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
         if (strcmp(rs_json_obj_str(a, "id", ""), active) != 0) continue;
         const char *u = rs_json_obj_str(a, "username", "");
         const char *p = rs_json_obj_str(a, "password", "");
-        if (u[0]) args[n++] = rs_script_arg("username", u, false);
+        // `user=` is the documented spelling. Keep `username=` too for scripts
+        // written against early C builds that accidentally exposed that name.
+        if (u[0]) {
+            args[n++] = rs_script_arg("user", u, false);
+            args[n++] = rs_script_arg("username", u, false);
+        }
         if (p[0]) args[n++] = rs_script_arg("password", p, true);
         break;
     }
 
+    // Stream-level test actions use the same runner as ordinary provider
+    // actions, but add the stream context the panel selected. This is also a
+    // public API: callers can exercise a hook without driving the browser.
+    const char *stream_id = request ? rs_json_obj_str(request, "streamId", "") : "";
+    if (stream_id[0]) {
+        const rs_json *streams = rs_json_obj_get(provider, "streams");
+        const rs_json *stream = NULL;
+        for (size_t i = 0; i < rs_json_arr_len(streams); i++) {
+            const rs_json *candidate = rs_json_arr_at(streams, i);
+            if (strcmp(rs_json_obj_str(candidate, "id", ""), stream_id) == 0) {
+                stream = candidate;
+                break;
+            }
+        }
+        if (!stream) {
+            for (int i = 0; i < n; i++) free(args[i]);
+            free(args);
+            reply_error(c, 404, "Stream not found on this provider.");
+            return;
+        }
+        args[n++] = rs_script_arg("id", stream_id, false);
+        args[n++] = rs_script_arg("url", rs_json_obj_str(stream, "url", ""), true);
+    }
+
     log_record(s, sid, "info", "scriptStart", NULL, 0, -1, action);
     dispatch_script_action(s, c, sid, script, args, n);  // always replies
+}
+
+// Removes a provider-owned script session recursively without invoking a shell.
+// Scripts are allowed to create arbitrary subdirectories in their session
+// store, so unlinking only cookies.txt would make the panel's Clear action lie.
+static int remove_tree(const char *path) {
+#ifdef _WIN32
+    struct _stat st;
+    if (_stat(path, &st) != 0) return errno == ENOENT ? 0 : -1;
+    if (!(st.st_mode & _S_IFDIR)) return remove(path);
+    char pattern[768];
+    snprintf(pattern, sizeof(pattern), "%s/*", path);
+    struct _finddata_t entry;
+    intptr_t handle = _findfirst(pattern, &entry);
+    if (handle != -1) {
+        do {
+            if (strcmp(entry.name, ".") == 0 || strcmp(entry.name, "..") == 0) continue;
+            char child[768];
+            snprintf(child, sizeof(child), "%s/%s", path, entry.name);
+            if (remove_tree(child) != 0) { _findclose(handle); return -1; }
+        } while (_findnext(handle, &entry) == 0);
+        _findclose(handle);
+    }
+    return _rmdir(path);
+#else
+    struct stat st;
+    if (lstat(path, &st) != 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(st.st_mode)) return unlink(path);
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        char child[768];
+        if (snprintf(child, sizeof(child), "%s/%s", path, entry->d_name) >= (int)sizeof(child)) {
+            closedir(dir);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (remove_tree(child) != 0) { closedir(dir); return -1; }
+    }
+    closedir(dir);
+    return rmdir(path);
+#endif
+}
+
+static int clear_provider_session(const char *provider_id) {
+    char path[640];
+    snprintf(path, sizeof(path), "runtime/sessions/%s", provider_id);
+    if (remove_tree(path) != 0) return -1;
+    // Clean the path advertised by older panel builds as well. It was never
+    // used by the C runner, but an operator may have put script state there.
+    snprintf(path, sizeof(path), "runtime/scripts/%s", provider_id);
+    return remove_tree(path);
 }
 
 // --- M3U export, provider export/import, EPG --------------------------------
@@ -1839,15 +1931,26 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
             if (!provider) { reply_error(c, 404, "Provider not found."); return true; }
 
             if (strcmp(action, "clear-session") == 0) {
-                // Best-effort: the script owns the files; just log it and let the
-                // next run start fresh (the script recreates its session dir).
                 char sid[192]; snprintf(sid, sizeof(sid), "script:%s", pid);
+                if (clear_provider_session(pid) != 0) {
+                    reply_error(c, 500, "Could not clear the provider session store.");
+                    return true;
+                }
                 log_record(s, sid, "info", "clearSession", NULL, 0, -1, "session cleared");
                 reply_json(c, 200, log_view(s, sid, 150), NULL);
                 return true;
             }
 
-            run_provider_script(s, c, provider, action);  // always replies, sync or async
+            rs_json *body = parse_body(hm);
+            const char *requested_action = action;
+            if (strcmp(action, "run") == 0) requested_action = rs_json_obj_str(body, "action", "");
+            if (!requested_action[0]) {
+                rs_json_free(body);
+                reply_error(c, 400, "Missing script action.");
+                return true;
+            }
+            run_provider_script(s, c, provider, requested_action, body);  // always replies
+            rs_json_free(body);
             return true;
         }
     }
@@ -1886,6 +1989,9 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         char *id = capture(hm, "/api/providers/*");
         const char *err = NULL;
         int rc = rs_panel_delete_provider(&s->state, id, &err);
+        if (rc == 0 && clear_provider_session(id) != 0)
+            log_record(s, "__panel__", "error", "sessionCleanup", NULL, 0, -1,
+                       "provider deleted, but its script session could not be removed");
         free(id);
         reply_after_mutation(s, c, hm, rc, err);
         return true;
@@ -2871,7 +2977,18 @@ static void pending_job_finish_script(restream_server_t *server, struct mg_conne
     // the log, not as an HTTP error — matches the original synchronous handler,
     // and the panel surfaces it via the script output/Logs tab either way.
     rs_state_save(&server->state);
-    reply_json(c, 200, log_view(server, pf->stream_id, 150), NULL);
+    rs_json *result = log_view(server, pf->stream_id, 150);
+    rs_buf output = RS_BUF_INIT;
+    if (pf->script_stdout && pf->script_stdout[0]) rs_buf_append_str(&output, pf->script_stdout);
+    if (pf->script_stderr && pf->script_stderr[0]) {
+        if (output.len) rs_buf_append_char(&output, '\n');
+        rs_buf_append_str(&output, pf->script_stderr);
+    }
+    char *combined = rs_buf_take(&output);
+    rs_json_obj_set_str(result, "output", combined ? combined : "");
+    rs_json_obj_set_int(result, "exitCode", pf->rc);
+    free(combined);
+    reply_json(c, 200, result, NULL);
 }
 
 static void pending_job_finish(restream_server_t *server, struct mg_connection *c, struct mg_str *data) {

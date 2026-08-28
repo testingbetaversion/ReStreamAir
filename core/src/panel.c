@@ -392,7 +392,7 @@ static rs_json *provider_view(const rs_state *st, const rs_json *provider, const
     rs_json_obj_set(v, "streams", out_streams);
     // The session dir the script UI shows (computed, not stored).
     char dir[1024];
-    snprintf(dir, sizeof(dir), "runtime/scripts/%s", rs_json_obj_str(provider, "id", ""));
+    snprintf(dir, sizeof(dir), "runtime/sessions/%s", rs_json_obj_str(provider, "id", ""));
     rs_json_obj_set_str(v, "scriptSessionDir", dir);
     return v;
 }

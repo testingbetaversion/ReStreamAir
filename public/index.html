@@ -538,7 +538,7 @@
               <a href="#help-trouble">Troubleshooting</a>
               <a href="#help-accounts">Accounts &amp; security</a>
               <a href="#help-run">Running the binary</a>
-              <a href="#help-api">API keys &amp; CLI</a>
+              <a href="#help-api">HTTP API, keys &amp; CLI</a>
             </nav>
             <div class="help-body">
               <article id="help-start" class="help-card">
@@ -612,78 +612,53 @@
               </article>
 
               <article id="help-scripts" class="help-card">
-                <h3>Provider scripts &amp; Protocol</h3>
-                <p>A script is any <code>.py</code> / <code>.sh</code> / executable that owns login, session management, or DRM/key logic. It's invoked with flat <code>key=value</code> arguments and prints its output to <b>stdout</b> (logs/debug to stderr). See <b>SCRIPTING.md</b> for the full guide with worked examples.</p>
+                <h3>Provider scripts</h3>
+                <p>A provider script is optional. Use one only when a source needs custom login, device pairing, channel discovery, expiring stream URLs, heartbeats, or an external key workflow.</p>
 
-                <p class="help-callout"><b>Script actions are opt-in.</b> Each provider declares which actions its script implements, as a checkbox grid in <b>Provider settings → Script actions</b>. ReStreamAir only ever calls the ticked ones — a script that only does <code>channels</code> is never handed a <code>start</code> it can't answer. A stream inherits its provider's set and can override it (including to nothing).</p>
+                <h4 class="help-subhead">Set up a script</h4>
+                <ol>
+                  <li>Enter its full path in <b>Provider settings → Script path</b>.</li>
+                  <li>Add an account if the source needs one.</li>
+                  <li>Enable only the actions the script implements.</li>
+                  <li>Save, then use Login, Pair, Load channels/events/EPG, or the stream test buttons.</li>
+                </ol>
 
-                <p class="help-note"><b>Common input (every action):</b><br><code>action=&lt;name&gt; bind= proxy= doh= worker= sessiondir=&lt;dir&gt; cookies=&lt;file&gt;</code>, then <code>user=</code>/<code>password=</code> <b>only when non-empty</b>, then per-stream <b>Script params</b> (e.g. <code>id=123</code>). <code>sessiondir</code>/<code>cookies</code> point at a durable per-provider folder the script keeps its login in.</p>
+                <p class="help-note"><b>How it is called:</b> ReStreamAir runs the program with flat <code>key=value</code> arguments such as <code>action=login</code>, <code>user=...</code>, <code>sessiondir=...</code>, and action-specific values. A password or any complex value arrives as <code>b64:&lt;base64&gt;</code>, so scripts must decode marked values.</p>
 
-                <p class="help-note"><b>Values may be base64.</b> A value containing whitespace, a quote, a backslash or non-ASCII — and <b>always</b> a <code>password</code> — is base64-encoded and prefixed <code>b64:</code>, so secrets never appear in <code>ps</code> and spaces don't split. URLs and <code>? &amp; ; *</code> stay plain (there's no shell). <b>Decode every arg</b> (strip a leading <code>b64:</code>); output you print is auto-detected the same way.</p>
+                <p class="help-callout"><b>Keep sessions in <code>sessiondir</code>.</b> It survives server restarts. <b>Clear session</b> recursively deletes everything stored there, and the next script call creates it again.</p>
 
                 <table class="help-table">
-                  <tr><th>Action</th><th>Wired</th><th>Inputs passed</th><th>Expected output (stdout)</th></tr>
-                  <tr><td><code>login</code> / <code>pair</code></td><td>yes</td><td>Common args</td><td>Live progress text; the script persists its own session.</td></tr>
-                  <tr><td><code>channels</code></td><td>yes</td><td>Common args</td><td>JSON: <code>{"Channels": [{"Name": "...", "Mode": "live", "SessionManifest": true, "UseCdm": true, "ScriptParams": "id=101"}]}</code></td></tr>
-                  <tr><td><code>events</code></td><td>yes</td><td>Common args</td><td>JSON: <code>{"Events": [{"Name": "...", "Autostart": true, "Start": 1700000000, "End": 1700007200, "ScriptParams": "eventId=50"}]}</code></td></tr>
-                  <tr><td><code>epg</code></td><td>yes</td><td>Common args</td><td>Guide data, <b>stored verbatim</b> and served back byte-for-byte at <code>/api/providers/&lt;id&gt;/epg</code>. XMLTV is the useful choice — nothing parses it.</td></tr>
-                  <tr><td><code>start</code> / <code>stop</code></td><td>yes</td><td>Common args + Script params</td><td>Fired when a stream goes live / stops (claim or release a slot). Exit 0. Optional.</td></tr>
-                  <tr><td><code>manifest</code></td><td>yes</td><td>Common args + Script params</td><td>JSON: <code>{"ManifestUrl": "...", "Cdn": [...], "Headers": {"manifest": {...}, "media": {...}}, "Heartbeat": {"PeriodMs": 300000}}</code></td></tr>
-                  <tr><td><code>url</code></td><td>yes</td><td>Common args + <code>url=&lt;url&gt;</code></td><td>The rewritten URL, or <code>{"Url": "..."}</code>. Print nothing to leave it unchanged.</td></tr>
-                  <tr><td><code>downloadmanifest</code></td><td>yes</td><td>Common args + <code>url=&lt;url&gt;</code></td><td>Raw manifest text (MPD/M3U8), or JSON <code>{"ManifestContent": "..."}</code>.</td></tr>
-                  <tr><td><code>pssh</code></td><td>yes</td><td>Common args + <code>pssh=&lt;pssh&gt; url=&lt;url&gt;</code></td><td>JSON: <code>{"ProcessedPssh": "AAAA..."}</code>. Print nothing to keep the original.</td></tr>
-                  <tr><td><code>initparse</code></td><td>yes</td><td>Common args + <code>url=</code> <code>init=&lt;base64&gt;</code></td><td>JSON with any of <code>Kid</code>/<code>Pssh</code>/<code>PsshWidevine</code>/<code>PsshPlayReady</code> — folded into the next <code>cdm</code> call.</td></tr>
-                  <tr><td><code>cdm</code></td><td>yes</td><td>Common args + <code>cdm=external cdmType= pssh= kid= keyUri=</code></td><td>Clear keys: <code>KID:KEY</code> lines, <code>--&gt; KID:KEY</code> lines, or JSON <code>{"keys": [{"kid": "...", "key": "..."}]}</code>.</td></tr>
-                  <tr><td><code>heartbeat</code></td><td>yes</td><td>Common args + <code>heartbeaturl= heartbeatparams=</code></td><td>Pings the session. Exit 0 = success.</td></tr>
-                  <tr><td><code>downloadinit</code> / <code>downloadmedia</code></td><td><b>not yet</b></td><td>Common args + <code>url=</code></td><td>Raw segment bytes. Configurable now, but not invoked yet (a subprocess per segment needs a persistent worker).</td></tr>
+                  <tr><th>Actions</th><th>What they do</th></tr>
+                  <tr><td><code>login</code>, <code>pair</code></td><td>Create and save a source session.</td></tr>
+                  <tr><td><code>channels</code>, <code>events</code>, <code>epg</code></td><td>Return streams or guide data for import.</td></tr>
+                  <tr><td><code>manifest</code></td><td>Return a fresh source URL, mirrors, headers, and heartbeat interval.</td></tr>
+                  <tr><td><code>start</code>, <code>stop</code>, <code>heartbeat</code></td><td>Manage the source-side session lifecycle.</td></tr>
+                  <tr><td><code>url</code>, <code>downloadmanifest</code>, <code>pssh</code>, <code>initparse</code></td><td>Adjust inputs used by the pipeline.</td></tr>
+                  <tr><td><code>cdm</code></td><td>Return clear <code>KID:KEY</code> pairs from an external authorized key workflow.</td></tr>
                 </table>
-                <p class="field-hint">Timeouts: <code>channels</code>/<code>events</code> 60s, <code>epg</code> 120s, <code>manifest</code> 45s, <code>cdm</code> 60s, pipeline hooks 15–20s, lifecycle 20s; <code>login</code>/<code>pair</code> run in the background with none. Pipeline hooks fail soft — a hook that errors or times out is logged and ReStreamAir falls back to its built-in behaviour.</p>
-                <p>Channel/event import per item uses keys: <code>Name</code>, <code>Mode</code> (live/vod), <code>SessionManifest</code>, <code>UseCdm</code>, <code>CdmType</code>, <code>Video</code>, <code>Audio</code>, <code>OnDemand</code>, <code>SpeedUp</code>, <code>Autostart</code>, <code>Start</code>/<code>End</code>, <code>RecordEvent</code>, and <code>ScriptParams</code> — each also accepted lowerCamelCase. Re-running an import updates matching streams in place, matched by name. A logo is looked up by channel name and filled in if you haven't set one.</p>
-                <p class="help-callout"><b>Imported streams have no source URL.</b> The import fills in everything above but leaves the URL empty, so an imported channel only plays if it can resolve one — that means <code>SessionManifest</code> plus a working <code>manifest</code> action, or typing the URL in by hand afterwards.</p>
 
-                <h4 class="help-subhead">Expected output — worked examples</h4>
-                <p class="field-hint">The <code>//</code> comments below are explanation only. Your script must print <b>valid JSON</b> (no comments) to stdout — put logs/debug on stderr. ReStreamAir tolerates a few log lines before the JSON blob, and reads the first <code>{ … }</code>.</p>
-
-                <p class="help-note"><code>channels</code> — one entry becomes one stream under the provider:</p>
+                <h4 class="help-subhead">Small channel response</h4>
                 <pre class="help-pre">{
-  "Channels": [
-    {
-      "Name": "Channel One",     // stream name (also the match key on re-import)
-      "Mode": "live",            // "live" or "vod"
-      "ScriptParams": "id=101",  // passed to manifest/cdm/heartbeat for THIS stream
-      "SessionManifest": true,   // fetch a fresh URL from `manifest` on every start
-      "UseCdm": true,            // resolve DRM keys via the `cdm` action
-      "CdmType": "widevine",     // hint only; ReStreamAir forwards all DRM it finds
-      "Video": "best",           // preferred quality (optional)
-      "Autostart": false         // start automatically after import (events use Start/End)
-    }
-  ]
+  "Channels": [{
+    "Name": "News",
+    "Mode": "live",
+    "ScriptParams": "id=101",
+    "SessionManifest": true,
+    "UseCdm": false
+  }]
 }</pre>
 
-                <p class="help-note"><code>manifest</code> — a fresh, per-session source (Session manifest):</p>
+                <h4 class="help-subhead">Small manifest response</h4>
                 <pre class="help-pre">{
-  "ManifestUrl": "https://cdn1.example.com/live/abc123.mpd",  // the source to stream from
-  "Cdn": [                                                    // failover mirrors, tried in order
-    { "Name": "cdn2", "ManifestUrl": "https://cdn2.example.com/live/abc123.mpd" }
-  ],
-  "Headers": {                          // sent per fetch category
-    "manifest": { "User-Agent": "MyApp/1.0", "Authorization": "Bearer eyJ…" },
-    "media":    { "User-Agent": "MyApp/1.0" }
+  "ManifestUrl": "https://cdn.example/live/101.mpd",
+  "Headers": {
+    "manifest": { "Authorization": "Bearer ..." }
   },
-  "Heartbeat": {                        // keep the session alive (optional)
-    "Url": "https://example.com/keepalive",
-    "Params": ["id=101"],
-    "PeriodMs": 300000                  // run the `heartbeat` action every 5 min
-  }
+  "Heartbeat": { "PeriodMs": 300000 }
 }</pre>
 
-                <p class="help-note"><code>cdm</code> — clear keys for a protected stream. Print one pair per line, or JSON:</p>
-                <pre class="help-pre">// simplest: one KID:KEY hex pair per line (KID and key are 32 hex chars)
-c3d43de9ff5b5a45cdc9f4e7f177a1a5:11223344556677889900aabbccddeeff
-
-// or JSON:
-{ "keys": [ { "kid": "c3d43de9ff5b5a45cdc9f4e7f177a1a5",
-              "key": "11223344556677889900aabbccddeeff" } ] }</pre>
+                <p><b>Output:</b> put JSON or keys on stdout, debugging on stderr, and exit nonzero on failure. Output appears in this panel and in Logs.</p>
+                <p><b>More examples:</b> <a href="https://github.com/testingbetaversion/ReStreamAir/blob/main/SCRIPTING.md" target="_blank" rel="noopener">Provider scripting guide</a> starts with a working script and HTTP examples. <a href="https://github.com/testingbetaversion/ReStreamAir/blob/main/API.md" target="_blank" rel="noopener">HTTP API reference</a> lists every management route.</p>
               </article>
 
               <article id="help-drm" class="help-card">
@@ -768,8 +743,10 @@ cd restreamair-vX-linux-x86_64
               </article>
 
               <article id="help-api" class="help-card">
-                <h3>API keys &amp; CLI</h3>
+                <h3>HTTP API, keys &amp; CLI</h3>
                 <ul>
+                  <li><b>Every server action in this panel uses the public HTTP API.</b> Scripts can use HTTP Basic auth with a panel admin account: <code>curl --user 'admin:password' http://host:8787/api/state</code>. Provider/stream CRUD, start/stop, probe, imports/exports, script actions, logs, users, keys, settings, service control and installers all live under <code>/api/</code>; the repository's <code>API.md</code> is the complete route reference.</li>
+                  <li><b>Common automation routes:</b> <code>POST /api/streams/&lt;id&gt;/start</code> and <code>/stop</code>, <code>POST /api/providers/&lt;id&gt;/script/&lt;action&gt;</code>, and <code>GET /api/logs?streamId=&lt;id&gt;</code>. Mutations return fresh state JSON. Viewer accounts can read but receive <code>403</code> on writes.</li>
                   <li><b>API Keys</b> view — generate keys to require auth on playback; add <code>?key=…</code> to the play URL, or send <code>Authorization: Bearer &lt;key&gt;</code>. The gate covers every playback route (<code>/play/</code>, <code>/restream/</code>, <code>/proxy/</code>, <code>/direct/</code>, <code>/download/</code>, <code>/source/</code>). <b>With no keys defined, playback is open to anyone who can reach the port.</b></li>
                   <li><b>Panel logins</b> are separate — an API key never gets you into <code>/api/*</code>, and an admin account is not a playback key.</li>
                   <li><b>Export playlist</b> — one M3U of every stream, for VLC/Kodi/an IPTV app.</li>

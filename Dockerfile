@@ -37,6 +37,7 @@ RUN useradd --system --create-home --uid 10001 restreamair
 WORKDIR /data
 COPY --from=build /src/build/restreamair-server /usr/local/bin/restreamair
 COPY public /app/public
+COPY README.md SCRIPTING.md API.md /app/
 # The panel serves ./public relative to the working directory; symlink rather
 # than copy into /data so a mounted volume doesn't shadow the UI.
 RUN ln -s /app/public /data/public && chown -R restreamair:restreamair /data /app
