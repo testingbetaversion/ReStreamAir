@@ -1,13 +1,9 @@
 name: Build
 
 on:
-  # Every commit to main is verified on all three platforms. This was disabled
-  # to save Actions minutes, and the cost of that was a Windows build that had
-  # been broken for a while without anyone finding out — the whole point of the
-  # tree being C is that it runs everywhere, which is only true if it is checked.
-  push:
-    branches: [ main ]
-  pull_request:
+  # Run the cross-platform verification only when explicitly launched from
+  # GitHub's Actions tab. Ordinary pushes and pull requests do not consume
+  # Actions minutes or create a new build run.
   workflow_dispatch:
 
 jobs:

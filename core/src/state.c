@@ -179,8 +179,19 @@ int rs_state_save(const rs_state *st) {
     rs_free(text);
     if (written != len || !flush_ok) { remove(tmp); free(tmp); return -1; }
 
+#ifdef _WIN32
+    // ISO C rename() cannot replace an existing file on Windows.  The first
+    // save therefore worked, but every later mutation failed once state.json
+    // existed.  MoveFileEx gives Windows the same atomic-replacement semantics
+    // as POSIX rename(); WRITE_THROUGH also asks it not to return before the
+    // directory entry has reached disk.
+    if (!MoveFileExA(tmp, st->path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        remove(tmp);
+        free(tmp);
+        return -1;
+    }
+#else
     if (rename(tmp, st->path) != 0) { remove(tmp); free(tmp); return -1; }
-#ifndef _WIN32
     // rename() keeps the temp file's mode, but an existing state.json written
     // by an older build (or restored from a backup) keeps its own — tighten it
     // either way, every save.

@@ -37,7 +37,7 @@ A DASH stream may return `503 Retry-After` for a few seconds while its first seg
 - A **provider** groups streams that share network settings, credentials, a webhook, or a provider script.
 - A **stream** is one channel or event with its own source, quality selection, buffering, headers, decryption, and output settings.
 - A **panel account** signs into the management UI and HTTP API.
-- A **playback API key** protects viewing URLs. It does not grant panel access.
+- A **playback API key** protects viewing URLs and can be used as an Xtream Codes login (label = username, key = password). It does not grant panel access.
 - A **provider script** handles source-specific work such as login or refreshing an expiring manifest URL.
 
 ## Web panel
@@ -101,6 +101,9 @@ Other useful routes:
 | `/source/<id>` | Redirect to the current source URL. |
 | `/api/playlist.m3u8` | Export all streams as M3U. |
 | `/api/providers/<id>/playlist.m3u8` | Export one provider as M3U. |
+| `/player_api.php?username=...&password=...` | Xtream Codes-compatible live-TV API. |
+| `/get.php?username=...&password=...&type=m3u_plus` | Credentialed Xtream M3U export. |
+| `/xmltv.php?username=...&password=...` | Xtream XMLTV channel metadata. |
 | `/ping` | Unauthenticated health check. |
 
 When at least one playback key exists, pass it as `?key=<key>` or `Authorization: Bearer <key>`. With no playback keys, viewing URLs are open to anyone who can reach the server.

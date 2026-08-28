@@ -466,6 +466,68 @@ def test_provider_routes(client):
     status, _, _ = client.request("GET", "/api/providers/does-not-exist/playlist.m3u8")
     check("an unknown provider 404s", status == 404, f"got {status}")
 
+    # Xtream live-TV compatibility reuses playback keys: label=username and
+    # key=password, so revoking the key revokes both Xtream and direct playback.
+    status, keys_body, _ = client.json("POST", "/api/keys", body={"label": "xc-test"})
+    xc_key = next((k.get("key") for k in keys_body.get("keys", [])
+                   if k.get("label") == "xc-test"), None)
+    check("an Xtream credential can be created", status == 200 and bool(xc_key),
+          f"{status} {keys_body}")
+    if xc_key:
+        base = f"username=xc-test&password={xc_key}"
+        status, auth, _ = client.json("GET", f"/player_api.php?{base}")
+        check("Xtream account handshake authenticates",
+              status == 200 and auth.get("user_info", {}).get("auth") == 1
+              and auth.get("server_info", {}).get("port") == str(client.port),
+              f"{status} {auth}")
+
+        status, categories, _ = client.json(
+            "GET", f"/player_api.php?{base}&action=get_live_categories")
+        check("Xtream exposes providers as live categories",
+              status == 200 and any(c.get("category_name") == "Test Provider"
+                                    for c in categories if isinstance(c, dict)),
+              f"{status} {categories}")
+
+        status, live, _ = client.json(
+            "GET", f"/player_api.php?{base}&action=get_live_streams")
+        xc_stream = next((s for s in live if isinstance(s, dict)
+                          and s.get("name") == "Test Channel"), None)
+        check("Xtream exposes live streams with numeric ids",
+              status == 200 and isinstance((xc_stream or {}).get("stream_id"), int),
+              f"{status} {live}")
+        status, all_live, _ = client.json(
+            "GET", f"/player_api.php?{base}&action=get_live_streams&category_id=0")
+        check("Xtream category zero means all live streams",
+              status == 200 and any(s.get("name") == "Test Channel"
+                                    for s in all_live if isinstance(s, dict)),
+              f"{status} {all_live}")
+
+        status, playlist, _ = client.request(
+            "GET", f"/get.php?{base}&type=m3u_plus&output=m3u8")
+        playlist_text = playlist.decode(errors="replace")
+        check("Xtream M3U export uses credentialed live URLs",
+              status == 200 and "#EXTM3U" in playlist_text
+              and f"/live/xc-test/{xc_key}/" in playlist_text,
+              f"{status} {playlist_text[:300]}")
+
+        status, xmltv, _ = client.request("GET", f"/xmltv.php?{base}")
+        check("Xtream XMLTV exposes channel metadata",
+              status == 200 and b'<channel id="test.channel">' in xmltv,
+              f"{status} {xmltv[:300]!r}")
+
+        if xc_stream:
+            status, _, headers = client.request(
+                "GET", f"/live/xc-test/{xc_key}/{xc_stream['stream_id']}.m3u8")
+            check("Xtream live URL enters authenticated playback",
+                  status == 302 and f"/play/{original_stream_id}/index.m3u8?key={xc_key}"
+                  == headers.get("Location"), f"{status} {headers}")
+
+    status, rejected, _ = client.json(
+        "GET", "/player_api.php?username=xc-test&password=wrong")
+    check("Xtream rejects invalid credentials in the expected response shape",
+          status == 200 and rejected.get("user_info", {}).get("auth") == 0,
+          f"{status} {rejected}")
+
     # Export, then import the same document back and confirm it lands as a
     # separate provider with regenerated ids.
     status, exported, headers = client.json("GET", f"/api/providers/{provider['id']}/export")

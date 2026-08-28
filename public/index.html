@@ -469,13 +469,14 @@
           <div class="keys-panel full-width">
             <div class="panel-head">
               <h3>API keys</h3>
-              <span class="field-hint">Gate playback (/play, /proxy, /restream) only. Admin panel uses its own sign-in.</span>
+              <span class="field-hint">Gate playback and provide Xtream Codes logins. Admin panel uses its own sign-in.</span>
             </div>
             <div class="keys-body">
               <form id="keyForm" class="actions">
-                <input name="label" placeholder="Label (e.g. Living room TV)">
+                <input name="label" placeholder="Label / Xtream username (e.g. living-room)">
                 <button type="submit"><span data-icon="plus"></span>Generate key</button>
               </form>
+              <div class="field-hint">Xtream setup: server URL = this ReStreamAir address, username = key label, password = generated key. Live TV is supported; VOD, series and catch-up are currently empty.</div>
               <div id="keyList" class="key-list empty-state">No keys yet — playback is open to anyone on the network.</div>
             </div>
           </div>
@@ -747,7 +748,7 @@ cd restreamair-vX-linux-x86_64
                 <ul>
                   <li><b>Every server action in this panel uses the public HTTP API.</b> Scripts can use HTTP Basic auth with a panel admin account: <code>curl --user 'admin:password' http://host:8787/api/state</code>. Provider/stream CRUD, start/stop, probe, imports/exports, script actions, logs, users, keys, settings, service control and installers all live under <code>/api/</code>; the repository's <code>API.md</code> is the complete route reference.</li>
                   <li><b>Common automation routes:</b> <code>POST /api/streams/&lt;id&gt;/start</code> and <code>/stop</code>, <code>POST /api/providers/&lt;id&gt;/script/&lt;action&gt;</code>, and <code>GET /api/logs?streamId=&lt;id&gt;</code>. Mutations return fresh state JSON. Viewer accounts can read but receive <code>403</code> on writes.</li>
-                  <li><b>API Keys</b> view — generate keys to require auth on playback; add <code>?key=…</code> to the play URL, or send <code>Authorization: Bearer &lt;key&gt;</code>. The gate covers every playback route (<code>/play/</code>, <code>/restream/</code>, <code>/proxy/</code>, <code>/direct/</code>, <code>/download/</code>, <code>/source/</code>). <b>With no keys defined, playback is open to anyone who can reach the port.</b></li>
+                  <li><b>API Keys</b> view — generate keys to require auth on playback; add <code>?key=…</code> to the play URL, or send <code>Authorization: Bearer &lt;key&gt;</code>. For an Xtream Codes client, enter this server's base URL, use the key label as its username, and the generated key as its password. The gate covers every playback route (<code>/play/</code>, <code>/restream/</code>, <code>/proxy/</code>, <code>/direct/</code>, <code>/download/</code>, <code>/source/</code>). <b>With no keys defined, playback is open to anyone who can reach the port.</b></li>
                   <li><b>Panel logins</b> are separate — an API key never gets you into <code>/api/*</code>, and an admin account is not a playback key.</li>
                   <li><b>Export playlist</b> — one M3U of every stream, for VLC/Kodi/an IPTV app.</li>
                   <li><b>CLI:</b> <code>restreamair cdmprobe mpd=&lt;url&gt; [script=&lt;path&gt;]</code> prints the DRM challenge (KIDs/PSSH) and, with a script, the clear keys it returned — the quickest way to test a CDM script.</li>

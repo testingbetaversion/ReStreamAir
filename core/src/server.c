@@ -2354,6 +2354,327 @@ static char *query_encode(const char *s) {
     return out;
 }
 
+// --- Xtream Codes-compatible live-TV API ----------------------------------
+//
+// Xtream Codes is a de-facto client protocol rather than a versioned standard;
+// live-TV clients consistently use this small common subset. Reuse playback
+// keys as accounts: `label` is the username and `key` is the password.
+
+static uint32_t xc_numeric_id(const char *text) {
+    uint32_t hash = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; p++) {
+        hash ^= *p;
+        hash *= 16777619u;
+    }
+    hash &= 0x7fffffffu;
+    return hash ? hash : 1u;
+}
+
+static const rs_json *xc_account(const rs_state *st, const char *username,
+                                 const char *password) {
+    if (!username || !password || !username[0] || !password[0]) return NULL;
+    const rs_json *keys = rs_json_obj_get(st->root, "apiKeys");
+    for (size_t i = 0; i < rs_json_arr_len(keys); i++) {
+        const rs_json *key = rs_json_arr_at(keys, i);
+        if (strcmp(rs_json_obj_str(key, "label", ""), username) == 0 &&
+            strcmp(rs_json_obj_str(key, "key", ""), password) == 0) return key;
+    }
+    return NULL;
+}
+
+static const rs_json *xc_stream_by_id(const rs_state *st, uint32_t wanted) {
+    const rs_json *providers = rs_json_obj_get(st->root, "providers");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *streams = rs_json_obj_get(rs_json_arr_at(providers, i), "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+            const rs_json *stream = rs_json_arr_at(streams, j);
+            if (xc_numeric_id(rs_json_obj_str(stream, "id", "")) == wanted) return stream;
+        }
+    }
+    return NULL;
+}
+
+static char *xc_decode_capture(struct mg_str value) {
+    char *out = (char *)malloc(value.len + 1);
+    if (!out) return NULL;
+    int n = mg_url_decode(value.buf, value.len, out, value.len + 1, 0);
+    if (n < 0) { free(out); return NULL; }
+    out[n] = '\0';
+    return out;
+}
+
+static void xc_reply_auth_failed(struct mg_connection *c) {
+    rs_json *root = rs_json_new_obj();
+    rs_json *user = rs_json_new_obj();
+    rs_json_obj_set_int(user, "auth", 0);
+    rs_json_obj_set_str(user, "status", "Disabled");
+    rs_json_obj_set(root, "user_info", user);
+    reply_json(c, 200, root, NULL);
+}
+
+static rs_json *xc_categories(const rs_state *st) {
+    rs_json *out = rs_json_new_arr();
+    const rs_json *providers = rs_json_obj_get(st->root, "providers");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *provider = rs_json_arr_at(providers, i);
+        char id[24];
+        snprintf(id, sizeof(id), "%u", xc_numeric_id(rs_json_obj_str(provider, "id", "")));
+        rs_json *row = rs_json_new_obj();
+        rs_json_obj_set_str(row, "category_id", id);
+        rs_json_obj_set_str(row, "category_name", rs_json_obj_str(provider, "name", ""));
+        rs_json_obj_set_int(row, "parent_id", 0);
+        rs_json_arr_push(out, row);
+    }
+    return out;
+}
+
+static rs_json *xc_live_streams(const rs_state *st, const char *category_filter) {
+    rs_json *out = rs_json_new_arr();
+    const rs_json *providers = rs_json_obj_get(st->root, "providers");
+    long long num = 1;
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *provider = rs_json_arr_at(providers, i);
+        char category_id[24];
+        snprintf(category_id, sizeof(category_id), "%u",
+                 xc_numeric_id(rs_json_obj_str(provider, "id", "")));
+        // Several clients explicitly send category_id=0 to mean "all".
+        if (category_filter && category_filter[0] && strcmp(category_filter, "0") != 0 &&
+            strcmp(category_filter, category_id) != 0) continue;
+        const rs_json *streams = rs_json_obj_get(provider, "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams); j++, num++) {
+            const rs_json *stream = rs_json_arr_at(streams, j);
+            rs_json *row = rs_json_new_obj();
+            rs_json_obj_set_int(row, "num", num);
+            rs_json_obj_set_str(row, "name", rs_json_obj_str(stream, "name", ""));
+            rs_json_obj_set_str(row, "stream_type", "live");
+            rs_json_obj_set_int(row, "stream_id",
+                                (long long)xc_numeric_id(rs_json_obj_str(stream, "id", "")));
+            const char *icon = rs_json_obj_str(stream, "logo", "");
+            if (!icon[0]) icon = rs_json_obj_str(provider, "logo", "");
+            rs_json_obj_set_str(row, "stream_icon", icon);
+            const char *epg = rs_json_obj_str(stream, "tvgId", "");
+            if (!epg[0]) epg = rs_json_obj_str(stream, "id", "");
+            rs_json_obj_set_str(row, "epg_channel_id", epg);
+            rs_json_obj_set_str(row, "added", "0");
+            rs_json_obj_set_str(row, "category_id", category_id);
+            rs_json_obj_set_str(row, "custom_sid", "");
+            rs_json_obj_set_int(row, "tv_archive", 0);
+            rs_json_obj_set_str(row, "direct_source", "");
+            rs_json_obj_set_int(row, "tv_archive_duration", 0);
+            rs_json_arr_push(out, row);
+        }
+    }
+    return out;
+}
+
+static void xc_reply_player_api(restream_server_t *s, struct mg_connection *c,
+                                struct mg_http_message *hm,
+                                const char *username, const char *password) {
+    if (!xc_account(&s->state, username, password)) { xc_reply_auth_failed(c); return; }
+    char *action = query_var(hm, "action");
+    if (action && strcmp(action, "get_live_categories") == 0) {
+        reply_json(c, 200, xc_categories(&s->state), NULL);
+    } else if (action && strcmp(action, "get_live_streams") == 0) {
+        char *category = query_var(hm, "category_id");
+        reply_json(c, 200, xc_live_streams(&s->state, category), NULL);
+        free(category);
+    } else if (action && (strcmp(action, "get_vod_categories") == 0 ||
+                          strcmp(action, "get_vod_streams") == 0 ||
+                          strcmp(action, "get_series_categories") == 0 ||
+                          strcmp(action, "get_series") == 0)) {
+        reply_json(c, 200, rs_json_new_arr(), NULL);
+    } else if (action && (strcmp(action, "get_short_epg") == 0 ||
+                          strcmp(action, "get_simple_data_table") == 0)) {
+        rs_json *epg = rs_json_new_obj();
+        rs_json_obj_set(epg, "epg_listings", rs_json_new_arr());
+        reply_json(c, 200, epg, NULL);
+    } else if (action && action[0]) {
+        reply_json(c, 200, rs_json_new_arr(), NULL);
+    } else {
+        time_t now = time(NULL);
+        rs_json *root = rs_json_new_obj();
+        rs_json *user = rs_json_new_obj();
+        rs_json_obj_set_str(user, "username", username);
+        rs_json_obj_set_str(user, "password", password);
+        rs_json_obj_set_str(user, "message", "ReStreamAir live TV");
+        rs_json_obj_set_int(user, "auth", 1);
+        rs_json_obj_set_str(user, "status", "Active");
+        rs_json_obj_set(user, "exp_date", rs_json_new_null());
+        rs_json_obj_set_str(user, "is_trial", "0");
+        rs_json_obj_set_str(user, "active_cons", "0");
+        rs_json_obj_set_str(user, "created_at", "0");
+        rs_json_obj_set_str(user, "max_connections", "0");
+        rs_json *formats = rs_json_new_arr();
+        rs_json_arr_push(formats, rs_json_new_str("m3u8"));
+        rs_json_arr_push(formats, rs_json_new_str("ts"));
+        rs_json_obj_set(user, "allowed_output_formats", formats);
+        rs_json_obj_set(root, "user_info", user);
+
+        char *host = request_host(hm);
+        char *hostname = rs_strdup(host);
+        const char *port = request_is_secure(s, c, hm) ? "443" : "80";
+        char *port_in_host = NULL;
+        if (hostname && hostname[0] == '[') {
+            char *bracket = strchr(hostname, ']');
+            if (bracket && bracket[1] == ':' && bracket[2]) {
+                port_in_host = bracket + 2;
+                bracket[1] = '\0';
+            }
+        } else if (hostname) {
+            char *colon = strrchr(hostname, ':');
+            if (colon && colon[1]) { *colon = '\0'; port_in_host = colon + 1; }
+        }
+        if (port_in_host) port = port_in_host;
+        char time_now[32] = "";
+        struct tm *utc = gmtime(&now);
+        if (utc) strftime(time_now, sizeof(time_now), "%Y-%m-%d %H:%M:%S", utc);
+        rs_json *server = rs_json_new_obj();
+        rs_json_obj_set_str(server, "url", hostname ? hostname : host);
+        rs_json_obj_set_str(server, "port", port);
+        rs_json_obj_set_str(server, "https_port", "443");
+        rs_json_obj_set_str(server, "rtmp_port", "");
+        rs_json_obj_set_str(server, "server_protocol", request_is_secure(s, c, hm) ? "https" : "http");
+        rs_json_obj_set_str(server, "timezone", "UTC");
+        rs_json_obj_set_int(server, "timestamp_now", (long long)now);
+        rs_json_obj_set_str(server, "time_now", time_now);
+        rs_json_obj_set(root, "server_info", server);
+        reply_json(c, 200, root, NULL);
+        free(hostname);
+        free(host);
+    }
+    free(action);
+}
+
+static void xc_xml_append(rs_buf *out, const char *text) {
+    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; p++) {
+        if (*p == '&') rs_buf_append_str(out, "&amp;");
+        else if (*p == '<') rs_buf_append_str(out, "&lt;");
+        else if (*p == '>') rs_buf_append_str(out, "&gt;");
+        else if (*p == '\"') rs_buf_append_str(out, "&quot;");
+        else if (*p == '\'') rs_buf_append_str(out, "&apos;");
+        else rs_buf_append_char(out, (char)*p);
+    }
+}
+
+static void xc_reply_xmltv(restream_server_t *s, struct mg_connection *c) {
+    rs_buf body = RS_BUF_INIT;
+    rs_buf_append_str(&body, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                            "<tv generator-info-name=\"ReStreamAir\">\n");
+    const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *streams = rs_json_obj_get(rs_json_arr_at(providers, i), "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+            const rs_json *stream = rs_json_arr_at(streams, j);
+            const char *id = rs_json_obj_str(stream, "tvgId", "");
+            if (!id[0]) id = rs_json_obj_str(stream, "id", "");
+            rs_buf_append_str(&body, "  <channel id=\""); xc_xml_append(&body, id);
+            rs_buf_append_str(&body, "\"><display-name>");
+            xc_xml_append(&body, rs_json_obj_str(stream, "name", ""));
+            rs_buf_append_str(&body, "</display-name>");
+            const char *logo = rs_json_obj_str(stream, "logo", "");
+            if (logo[0]) { rs_buf_append_str(&body, "<icon src=\""); xc_xml_append(&body, logo); rs_buf_append_str(&body, "\"/>"); }
+            rs_buf_append_str(&body, "</channel>\n");
+        }
+    }
+    rs_buf_append_str(&body, "</tv>\n");
+    char *text = rs_buf_take(&body);
+    if (!text) { reply_error(c, 500, "Out of memory building XMLTV."); return; }
+    mg_http_reply(c, 200, "Content-Type: application/xml; charset=utf-8\r\nCache-Control: no-store\r\n", "%s", text);
+    rs_free(text);
+}
+
+static bool handle_xtream(restream_server_t *s, struct mg_connection *c,
+                          struct mg_http_message *hm) {
+    bool player = mg_match(hm->uri, mg_str("/player_api.php"), NULL);
+    bool get = mg_match(hm->uri, mg_str("/get.php"), NULL);
+    bool xmltv = mg_match(hm->uri, mg_str("/xmltv.php"), NULL);
+    bool live = mg_match(hm->uri, mg_str("/live/#"), NULL);
+    if (!player && !get && !xmltv && !live) return false;
+    if (!method_is(hm, "GET")) { reply_error(c, 405, "GET required."); return true; }
+
+    if (live) {
+        struct mg_str caps[4];
+        if (!mg_match(hm->uri, mg_str("/live/*/*/*"), caps)) {
+            reply_error(c, 404, "Invalid live stream path."); return true;
+        }
+        char *username = xc_decode_capture(caps[0]);
+        char *password = xc_decode_capture(caps[1]);
+        char *filename = xc_decode_capture(caps[2]);
+        char *dot = filename ? strrchr(filename, '.') : NULL;
+        if (dot) *dot = '\0';
+        char *end = NULL;
+        unsigned long parsed = filename ? strtoul(filename, &end, 10) : 0;
+        const rs_json *stream = (end && *end == '\0' && parsed <= 0x7ffffffful)
+                              ? xc_stream_by_id(&s->state, (uint32_t)parsed) : NULL;
+        if (!xc_account(&s->state, username, password) || !stream) {
+            free(username); free(password); free(filename);
+            reply_error(c, 401, "Invalid Xtream credentials or stream."); return true;
+        }
+        char *encoded_key = query_encode(password);
+        char location[1024];
+        snprintf(location, sizeof(location), "/play/%s/index.m3u8?key=%s",
+                 rs_json_obj_str(stream, "id", ""), encoded_key ? encoded_key : "");
+        free(encoded_key); free(username); free(password); free(filename);
+        mg_printf(c, "HTTP/1.1 302 Found\r\nLocation: %s\r\nCache-Control: no-store\r\nContent-Length: 0\r\n\r\n", location);
+        c->is_resp = 0;
+        return true;
+    }
+
+    char *username = query_var(hm, "username");
+    char *password = query_var(hm, "password");
+    if (player) {
+        xc_reply_player_api(s, c, hm, username, password);
+    } else if (!xc_account(&s->state, username, password)) {
+        xc_reply_auth_failed(c);
+    } else if (xmltv) {
+        xc_reply_xmltv(s, c);
+    } else {
+        char *host = request_host(hm);
+        char *eu = query_encode(username), *ep = query_encode(password);
+        char *output = query_var(hm, "output");
+        const char *ext = output && (strcmp(output, "ts") == 0 || strcmp(output, "mpegts") == 0)
+                        ? "ts" : "m3u8";
+        const char *scheme = request_is_secure(s, c, hm) ? "https" : "http";
+        rs_buf body = RS_BUF_INIT;
+        rs_buf_append_str(&body, "#EXTM3U\n");
+        const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
+        for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+            const rs_json *provider = rs_json_arr_at(providers, i);
+            const rs_json *streams = rs_json_obj_get(provider, "streams");
+            for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+                const rs_json *stream = rs_json_arr_at(streams, j);
+                const char *name = rs_json_obj_str(stream, "name", "");
+                const char *tvg = rs_json_obj_str(stream, "tvgId", "");
+                if (!tvg[0]) tvg = rs_json_obj_str(stream, "id", "");
+                rs_buf_append_str(&body, "#EXTINF:-1 tvg-id=\""); m3u_attr_append(&body, tvg);
+                rs_buf_append_str(&body, "\" tvg-name=\""); m3u_attr_append(&body, name);
+                const char *logo = rs_json_obj_str(stream, "logo", "");
+                if (!logo[0]) logo = rs_json_obj_str(provider, "logo", "");
+                if (logo[0]) {
+                    rs_buf_append_str(&body, "\" tvg-logo=\"");
+                    m3u_attr_append(&body, logo);
+                }
+                rs_buf_append_str(&body, "\" group-title=\"");
+                m3u_attr_append(&body, rs_json_obj_str(provider, "name", ""));
+                rs_buf_append_str(&body, "\","); m3u_attr_append(&body, name);
+                rs_buf_append_char(&body, '\n');
+                rs_buf_appendf(&body, "%s://%s/live/%s/%s/%u.%s\n", scheme, host,
+                               eu ? eu : "", ep ? ep : "",
+                               xc_numeric_id(rs_json_obj_str(stream, "id", "")), ext);
+            }
+        }
+        char *text = rs_buf_take(&body);
+        if (!text) reply_error(c, 500, "Out of memory building playlist.");
+        else {
+            mg_http_reply(c, 200, "Content-Type: audio/x-mpegurl\r\nCache-Control: no-store\r\n", "%s", text);
+            rs_free(text);
+        }
+        free(output); free(eu); free(ep); free(host);
+    }
+    free(username); free(password);
+    return true;
+}
+
 // Content-Type for a proxied item, preferring the upstream value and falling
 // back to the URL's extension.
 static const char *content_type_from_ext(const char *url) {
@@ -4669,6 +4990,10 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         mg_http_reply(c, 200, JSON_HEADERS, "{\"status\":\"ok\",\"build\":\"%s %s\"}", __DATE__, __TIME__);
         return;
     }
+
+    // Xtream clients authenticate with playback-key credentials, not a panel
+    // session cookie, so these routes must be dispatched before /api and UI.
+    if (server && handle_xtream(server, c, hm)) return;
 
     // Playback routes: /source and direct-source /play redirect; HLS
     // passthrough is proxied live; /proxy streams the segments.

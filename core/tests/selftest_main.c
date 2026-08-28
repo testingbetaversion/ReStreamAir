@@ -1019,6 +1019,31 @@ static void test_netmatch(void) {
 // silently break a test.
 static rs_json *parse_json(const char *text) { return rs_json_parse(text, strlen(text)); }
 
+static void test_state_repeated_save(void) {
+    const char *path = "rs-selftest-state-save.json";
+    remove(path);
+    remove("rs-selftest-state-save.json.tmp");
+
+    rs_state st;
+    st.root = parse_json("{\"revision\":1}");
+    st.path = rs_strdup(path);
+    check("state/first-save", st.root && st.path && rs_state_save(&st) == 0);
+    rs_json_obj_set_int(st.root, "revision", 2);
+    check("state/replaces-existing-file", rs_state_save(&st) == 0);
+    rs_state_dispose(&st);
+
+    rs_state loaded;
+    int load_rc = rs_state_load(&loaded, path);
+    check("state/replacement-loads", load_rc == 0);
+    if (load_rc == 0) {
+        check("state/replacement-has-latest-data",
+              rs_json_obj_int(loaded.root, "revision", 0) == 2);
+        rs_state_dispose(&loaded);
+    }
+    remove(path);
+    remove("rs-selftest-state-save.json.tmp");
+}
+
 static void test_panel(void) {
     // Slug: alphanumeric runs joined by single dashes, lowercased.
     char *slug = rs_panel_slugify("My Cool Stream! (HD)");
@@ -2115,6 +2140,7 @@ int main(int argc, char **argv) {
     test_auth_sessions();
     test_auth_throttle();
     test_netmatch();
+    test_state_repeated_save();
     test_panel();
     test_cenc_multifragment();
     test_mpegts();

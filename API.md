@@ -111,6 +111,28 @@ for the argv and output contracts.
 | `GET /api/keys` | List playback API keys and their usage view. |
 | `POST /api/keys` | Generate a playback key: `{"label":"Living room"}`. |
 | `DELETE /api/keys/<id>` | Revoke a playback key. |
+
+## Xtream Codes-compatible live TV
+
+ReStreamAir implements the live-TV subset used by common Xtream clients. Create
+a playback key in the Keys view, then use its **label as the username** and its
+generated **key as the password**. The panel account password is never used.
+
+Configure a client with the ReStreamAir base URL plus those credentials. The
+following public, credential-protected endpoints are available:
+
+| Route | Purpose |
+|---|---|
+| `GET /player_api.php?username=...&password=...` | Account/server handshake. |
+| `GET /player_api.php?...&action=get_live_categories` | Providers as live categories. |
+| `GET /player_api.php?...&action=get_live_streams` | Live channels. |
+| `GET /get.php?username=...&password=...&type=m3u_plus&output=m3u8` | Xtream-style M3U export. |
+| `GET /xmltv.php?username=...&password=...` | XMLTV channel metadata. |
+| `GET /live/<username>/<password>/<stream-id>.m3u8` | Authenticated live playback. |
+
+VOD, series, catch-up, and programme schedules are not currently provided;
+their discovery actions return empty collections so live-only clients can
+finish setup cleanly.
 | `GET /api/settings` | Read saved bind/port/trusted-proxy settings plus the active port. |
 | `POST /api/settings` | Save `port`, `bindAddress`, and/or `trustedProxies`; bind changes apply after restart. |
 | `GET /api/service` | Read systemd availability, installation, and running state. |
