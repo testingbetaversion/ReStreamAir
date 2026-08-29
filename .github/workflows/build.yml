@@ -5,6 +5,14 @@ on:
   # GitHub's Actions tab. Ordinary pushes and pull requests do not consume
   # Actions minutes or create a new build run.
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to create, for example v0.14.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
   # The one build there is: the C core, the self-test and the panel executable,
@@ -122,6 +130,58 @@ jobs:
           if ($bad) { throw "unexpected DLL dependencies: $($bad -join ', ')" }
           Write-Output "no third-party DLLs required"
 
+      # A successful manually-triggered Build should leave something useful to
+      # download from its Summary page. Package the runnable server together
+      # with the panel files and documentation, just like a release archive.
+      - name: Package build artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            PLATFORM=macos
+          else
+            PLATFORM=linux-x86_64
+          fi
+          STAGE="restreamair-${RELEASE_TAG}-${PLATFORM}"
+          mkdir -p "$STAGE"
+          cp build/restreamair-server "$STAGE/restreamair"
+          cp -R public "$STAGE/public"
+          cp README.md SCRIPTING.md API.md "$STAGE/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+
+      - name: Upload build artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: restreamair-${{ inputs.release_tag }}-${{ runner.os == 'macOS' && 'macos' || 'linux-x86_64' }}
+          path: restreamair-${{ inputs.release_tag }}-${{ runner.os == 'macOS' && 'macos' || 'linux-x86_64' }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Package build artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          STAGE="restreamair-${RELEASE_TAG}-windows-x86_64"
+          mkdir -p "$STAGE"
+          cp build/Release/restreamair-server.exe "$STAGE/restreamair.exe"
+          cp -R public "$STAGE/public"
+          cp README.md SCRIPTING.md API.md "$STAGE/"
+          7z a "$STAGE.zip" "$STAGE" >/dev/null
+
+      - name: Upload build artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: restreamair-${{ inputs.release_tag }}-windows-x86_64
+          path: restreamair-${{ inputs.release_tag }}-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 30
+
   # ASan + UBSan over the same suites. The core parses attacker-supplied bytes
   # (MPD XML, MP4 boxes, playlists), which is exactly where a memory bug becomes
   # a security bug.
@@ -173,3 +233,24 @@ jobs:
           cmake -S . -B build-mingw -DCMAKE_TOOLCHAIN_FILE=/tmp/mingw.cmake -DRS_BUILD_SERVER=OFF
       - name: Build
         run: cmake --build build-mingw -j"$(nproc)"
+
+  # Publish only after every platform build and both diagnostic jobs pass. The
+  # same packages remain downloadable from the Build run's Artifacts section
+  # and are also attached to the requested entry on the Releases page.
+  release:
+    name: Publish GitHub release
+    needs: [core, core-sanitizers, windows-cross]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Publish ${{ inputs.release_tag }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_tag }}
+          generate_release_notes: true
+          files: dist/**/*
