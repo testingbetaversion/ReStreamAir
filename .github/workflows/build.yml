@@ -103,7 +103,17 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $deps = & dumpbin /dependents build\Release\restreamair-server.exe |
+          # Visual Studio's developer shells add dumpbin to PATH, but a normal
+          # pwsh Actions step does not. Ask vswhere for the copy belonging to
+          # the installed C++ toolchain instead of relying on runner PATH setup.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * `
+                        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                        -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' |
+                     Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe was not found in the Visual Studio C++ toolchain" }
+          Write-Output "using dumpbin: $dumpbin"
+          $deps = & $dumpbin /dependents build\Release\restreamair-server.exe |
                   Select-String -Pattern '^\s+\S+\.dll$' |
                   ForEach-Object { $_.Line.Trim() }
           Write-Output $deps
