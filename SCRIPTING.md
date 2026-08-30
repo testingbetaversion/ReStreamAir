@@ -80,7 +80,6 @@ The common arguments are:
 | `sessiondir` | Durable directory for this provider's cookies and tokens. |
 | `cookies` | Suggested cookie-jar path inside `sessiondir`. |
 | `user`, `password` | Selected provider account, when non-empty. |
-| `username` | Compatibility alias containing the same value as `user`. New scripts should use `user`. |
 | `bind`, `proxy`, `doh`, `worker` | Optional provider settings, present only when configured. |
 
 Action-specific arguments may follow. A stream test adds the stream's `id` and source `url`.

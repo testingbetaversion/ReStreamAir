@@ -1535,13 +1535,8 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
         if (strcmp(rs_json_obj_str(a, "id", ""), active) != 0) continue;
         const char *u = rs_json_obj_str(a, "username", "");
         const char *p = rs_json_obj_str(a, "password", "");
-        // `user=` is the documented spelling. Keep `username=` too for scripts
-        // written against early C builds that accidentally exposed that name.
-        if (u[0]) {
-            args[n++] = rs_script_arg("user", u, false);
-            args[n++] = rs_script_arg("username", u, false);
-        }
-        if (p[0]) args[n++] = rs_script_arg("password", p, true);
+        if (u[0]) args[n++] = rs_script_arg("user", u, false);
+        if (p[0]) args[n++] = rs_script_arg("password", p, false);
         break;
     }
 
