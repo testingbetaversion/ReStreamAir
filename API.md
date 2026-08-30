@@ -92,7 +92,7 @@ curl --fail-with-body --user "$auth" -X POST \
 
 | Method and route | Panel operation / result |
 |---|---|
-| `POST /api/providers/<id>/script/<action>` | Run Login, Pair, Load channels, Load events, Load EPG, or another provider action. The response includes `entries`, combined `output`, and `exitCode`. |
+| `POST /api/providers/<id>/script/<action>` | Run Login, Pair, Load channels, Load events, Load EPG, or another provider action. The response includes `entries`, combined `output`, and `exitCode`. For `channels` and `events` the printed document is also imported: one stream per entry, matched to existing ones by name, with the result logged as a `scriptImport` entry. |
 | `POST /api/providers/<id>/script/run` | Exercise an action for a selected stream. Body: `{"action":"pssh","streamId":"stream_..."}`. The script receives `id=` and `url=` in addition to the normal arguments. |
 | `POST /api/providers/<id>/script/clear-session` | Recursively delete the provider's stored script session and cookies. |
 

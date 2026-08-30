@@ -213,7 +213,8 @@ static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
                            char *url, char *proxy, char *headers,
                            bool force_ipv6, bool rotate_proxies);
 static void dispatch_script_action(restream_server_t *server, struct mg_connection *c,
-                                   const char *sid, const char *script_path, char **args, int argc);
+                                   const char *sid, const char *action, const char *script_path,
+                                   char **args, int argc);
 
 static char *logo_fetch_wrapper(const char *url, void *ctx) {
     (void)ctx;
@@ -522,7 +523,7 @@ static bool log_always(const char *event) {
         "streamDelete", "liveStart", "liveStop", "repStart", "repStop",
         "playlistReady", "renditions", "initReady", "discontinuity",
         "login", "logout", "loginFailed", "scriptStart", "scriptCommand", "scriptOutput",
-        "scriptError", "scriptEnd", "playbackDenied",
+        "scriptError", "scriptEnd", "scriptImport", "playbackDenied",
     };
     if (!event) return false;
     for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); i++)
@@ -1569,7 +1570,7 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     log_record(s, sid, "info", "scriptCommand", NULL, 0, -1,
                command ? command : script);
     free(command);
-    dispatch_script_action(s, c, sid, script, args, n);  // always replies
+    dispatch_script_action(s, c, sid, action, script, args, n);  // always replies
 }
 
 // Removes a provider-owned script session recursively without invoking a shell.
@@ -3005,6 +3006,7 @@ struct rs_pending_job {
                                    // request (and any X-Forwarded-For) is gone
                                    // by the time the worker reports back
     char *script_path;             // SCRIPT only
+    char *script_action;           // SCRIPT only, e.g. "login" / "channels"
     char **script_args;            // SCRIPT only, each rs_script_arg-owned
     int script_argc;               // SCRIPT only
 
@@ -3017,6 +3019,11 @@ struct rs_pending_job {
     char *content_range;
     char *script_stdout, *script_stderr;  // SCRIPT only
     rs_buf script_stdout_line, script_stderr_line;  // SCRIPT: partial live lines
+    // SCRIPT channels/events only: stdout parsed into the import document, and
+    // the channel-name -> logo-URL map resolved alongside it. Both are built on
+    // the worker (parsing is CPU, logo lookups are network) so the poll thread
+    // only has to fold them into the state.
+    rs_json *script_import, *script_logos;
     char err[256];
 };
 
@@ -3027,6 +3034,9 @@ static void pending_job_free(rs_pending_job *pf) {
     free(pf->decryption_keys); free(pf->hls_key); free(pf->hls_iv);
     free(pf->user_agent); free(pf->playback_key_str); free(pf->client_ip);
     free(pf->script_path);
+    free(pf->script_action);
+    rs_json_free(pf->script_import);
+    rs_json_free(pf->script_logos);
     for (int i = 0; i < pf->script_argc; i++) free(pf->script_args[i]);
     free(pf->script_args);
     free(pf->body); free(pf->content_type); free(pf->content_range);
@@ -3056,6 +3066,58 @@ static void script_output_chunk(void *ctx, bool is_stderr, const char *bytes, si
         if (bytes[i] == '\n' || bytes[i] == '\r') script_log_pending_line(pf, is_stderr);
         else rs_buf_append_char(pending, bytes[i]);
     }
+}
+
+// Only the catalogue actions turn stdout into streams; every other action's
+// output is transcript-only.
+static bool script_action_imports(const char *action) {
+    return action && (strcmp(action, "channels") == 0 || strcmp(action, "events") == 0);
+}
+
+// Parses a catalogue script's stdout. A well-behaved script prints nothing but
+// the JSON document (SCRIPTING.md puts progress on stderr), but plenty print a
+// stray line to stdout too, so fall back to the span between the first `{` and
+// the last `}` rather than dropping the whole import over it.
+static rs_json *parse_script_document(const char *stdout_text) {
+    if (!stdout_text || !stdout_text[0]) return NULL;
+    rs_json *doc = rs_json_parse(stdout_text, strlen(stdout_text));
+    if (!doc) {
+        const char *start = strchr(stdout_text, '{');
+        const char *end = start ? strrchr(start, '}') : NULL;
+        if (end) doc = rs_json_parse(start, (size_t)(end - start) + 1);
+    }
+    if (doc && rs_json_type_of(doc) != RS_JSON_OBJ) { rs_json_free(doc); return NULL; }
+    return doc;
+}
+
+// Resolves a logo for every distinct entry name in the parsed document, so the
+// poll thread can fill in the imported streams without making network calls of
+// its own. Each miss is an HTTP lookup, so this runs here on the worker and
+// under logo_mu — the cache is a plain JSON tree with no locking of its own,
+// exactly as the RS_PENDING_LOGO case above explains. Returns an object of
+// name -> URL holding only the names that resolved, or NULL when none did.
+static rs_json *resolve_import_logos(restream_server_t *server, rs_pending_job *pf) {
+    const rs_json *list = rs_json_obj_get(pf->script_import,
+                                          strcmp(pf->script_action, "events") == 0 ? "Events" : "Channels");
+    if (!list || rs_json_type_of(list) != RS_JSON_ARR) return NULL;
+    rs_json *logos = rs_json_new_obj();
+    pthread_mutex_lock(&server->logo_mu);
+    if (!server->logo_cache) server->logo_cache = rs_logo_cache_create("logos.json");
+    for (size_t i = 0; i < rs_json_arr_len(list); i++) {
+        const rs_json *entry = rs_json_arr_at(list, i);
+        const rs_json *raw = rs_json_obj_get(entry, "Name");
+        if (!raw) raw = rs_json_obj_get(entry, "name");
+        const char *value = rs_json_as_str(raw, "");
+        // Trimmed, because that is the key the import stores the stream under.
+        char *name = rs_trim_dup(value, strlen(value), true);
+        if (!name || !name[0] || rs_json_obj_get(logos, name)) { free(name); continue; }
+        char *url = rs_logo_lookup(server->logo_cache, name, logo_fetch_wrapper, NULL);
+        if (url && url[0]) rs_json_obj_set_str(logos, name, url);
+        free(url);
+        free(name);
+    }
+    pthread_mutex_unlock(&server->logo_mu);
+    return logos;
 }
 
 static void *pending_job_worker(void *arg) {
@@ -3096,6 +3158,10 @@ static void *pending_job_worker(void *arg) {
                                       script_output_chunk, pf);
         script_log_pending_line(pf, false);
         script_log_pending_line(pf, true);
+        if (pf->rc == 0 && script_action_imports(pf->script_action)) {
+            pf->script_import = parse_script_document(pf->script_stdout);
+            if (pf->script_import) pf->script_logos = resolve_import_logos(server, pf);
+        }
         break;
     }
 
@@ -3188,7 +3254,7 @@ static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
 // pending_job_finish_script. Takes ownership of args (each element and the
 // array itself). Always replies to `c`.
 static void dispatch_script_action(restream_server_t *server, struct mg_connection *c,
-                                   const char *sid, const char *script_path,
+                                   const char *sid, const char *action, const char *script_path,
                                    char **args, int argc) {
     rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
     if (!pf) {
@@ -3199,6 +3265,7 @@ static void dispatch_script_action(restream_server_t *server, struct mg_connecti
     }
     pf->kind = RS_PENDING_SCRIPT;
     pf->stream_id = rs_strdup(sid);
+    pf->script_action = rs_strdup(action);
     pf->script_path = rs_strdup(script_path);
     pf->script_args = args;  // pf owns it now
     pf->script_argc = argc;
@@ -3353,6 +3420,27 @@ static void pending_job_finish_probe(struct mg_connection *c, rs_pending_job *pf
 static void pending_job_finish_script(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf) {
     log_record(server, pf->stream_id, pf->rc == 0 ? "info" : "error", "scriptEnd", NULL, pf->rc, -1,
                pf->rc == 0 ? "ok" : "script exited non-zero");
+    // A catalogue action's whole point is the streams it produces, so fold the
+    // document the worker parsed into the provider before the save below. The
+    // state DOM is only ever touched from this thread; the worker did the
+    // parsing and the logo lookups so nothing here blocks the poll loop.
+    if (script_action_imports(pf->script_action) && pf->rc == 0) {
+        const char *provider_id = strchr(pf->stream_id, ':');
+        provider_id = provider_id ? provider_id + 1 : pf->stream_id;
+        int count = 0;
+        const char *err = NULL;
+        if (!pf->script_import) {
+            log_record(server, pf->stream_id, "error", "scriptImport", NULL, 0, -1,
+                       "the script exited 0 but printed no JSON document to import");
+        } else if (rs_panel_import_script_entries(&server->state, provider_id, pf->script_action,
+                                                  pf->script_import, pf->script_logos, &count, &err) != 0) {
+            log_record(server, pf->stream_id, "error", "scriptImport", NULL, 0, -1,
+                       err ? err : "the import failed");
+        } else {
+            log_recordf(server, pf->stream_id, "info", "scriptImport", NULL, 0, -1,
+                        "imported %d %s", count, pf->script_action);
+        }
+    }
     // A script action can change provider state (session cookies etc.) even on
     // a nonzero exit, so persist regardless. A nonzero exit is reported through
     // the log, not as an HTTP error — matches the original synchronous handler,

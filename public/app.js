@@ -2101,7 +2101,10 @@ async function pollGridImportStatus(providerId) {
       status.textContent = latest.message || latest.event;
       status.classList.remove("hidden");
     }
-    if (latest && latest.event === "scriptExit") {
+    // scriptEnd is the process exiting; scriptImport, which the server logs
+    // straight after it for channels/events, is the last word on how many
+    // streams the run actually produced.
+    if (latest && (latest.event === "scriptEnd" || latest.event === "scriptImport")) {
       clearInterval(gridImportPollTimer);
       gridImportPollTimer = null;
       refresh();
@@ -2342,6 +2345,7 @@ function scriptTranscriptText(entries) {
     if (entry.event === "scriptStart") return `[started ${entry.message || "script"}]`;
     if (entry.event === "scriptCommand") return `$ ${entry.message || ""}`;
     if (entry.event === "scriptEnd") return `[process exited with code ${entry.status ?? 0}]`;
+    if (entry.event === "scriptImport") return `[${entry.message || "import"}]`;
     return entry.message || entry.event;
   }).join("\n");
 }

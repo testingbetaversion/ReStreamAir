@@ -36,6 +36,19 @@ int rs_panel_create_stream(rs_state *st, const char *provider_id, const rs_json 
 int rs_panel_update_stream(rs_state *st, const char *stream_id, const rs_json *body, const char **err);
 int rs_panel_delete_stream(rs_state *st, const char *stream_id, const char **err);
 
+// Upserts one stream per entry from a `channels`/`events` script's stdout.
+// `doc` is that stdout already parsed — `{"Channels":[...]}` for action
+// "channels", `{"Events":[...]}` for "events" (see SCRIPTING.md). Entries are
+// matched to existing streams by (name, sourceType), the only identity the
+// protocol offers, so re-running an import updates in place instead of piling
+// up duplicates. `logos` is an optional name -> logo URL object used to fill
+// the logo of entries that don't have one yet; resolving those needs the
+// network, so the caller does it off the poll thread and passes the result
+// (NULL to skip). The number of entries applied lands in *imported.
+int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const char *action,
+                                   const rs_json *doc, const rs_json *logos,
+                                   int *imported, const char **err);
+
 // Marks a stream started/stopped. Playback in the C server is on-demand (the
 // player's playlist requests drive it — there is no worker to spawn), so this
 // only sets the stored status; the view reports `running` from it. -404 if the

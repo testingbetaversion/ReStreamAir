@@ -120,24 +120,15 @@ static const char *normalize_downloader(const char *d) {
 
 static long long clamp_ll(long long v, long long lo) { return v < lo ? lo : v; }
 
-// Builds a stream object from a request body, applying the same defaults,
-// clamps and validation as streamFromBody. `err` is set on failure.
-static rs_json *stream_from_body(const rs_json *body, const char *id, const char **err) {
+// Builds a stream object from a body, applying every default and clamp but no
+// validation. Split out of stream_from_body so the channel/event import can
+// mint a fully-formed stream from an empty body: an imported entry carries no
+// URL of its own (the script's `manifest` action supplies one at play time),
+// which stream_from_body would reject.
+static rs_json *stream_build(const rs_json *body, const char *id) {
     const char *name = rs_json_obj_str(body, "name", "");
     const char *url = rs_json_obj_str(body, "url", "");
     const char *input_mode = rs_json_obj_str(body, "inputMode", "internal");
-    // A trimmed-empty name is rejected.
-    const char *trimmed = NULL;
-    if (rs_trim(name, strlen(name), true, &trimmed) == 0) { *err = "Stream name is required."; return NULL; }
-    if (strcmp(input_mode, "pipe") != 0 && !is_http_url(url)) {
-        *err = "Stream URL must be http or https.";
-        return NULL;
-    }
-    if (strcmp(input_mode, "pipe") == 0 && !rs_json_obj_str(body, "pipeCommand", "")[0]) {
-        *err = "Program pipe command is required.";
-        return NULL;
-    }
-
     rs_json *s = rs_json_new_obj();
     rs_json_obj_set_str(s, "id", id);
     rs_json_obj_set_str(s, "name", name);
@@ -262,6 +253,26 @@ static rs_json *stream_from_body(const rs_json *body, const char *id, const char
     rs_json_obj_set(s, "scriptEnd", rs_json_new_null());
     rs_json_obj_set_bool(s, "recordEvent", false);
     return s;
+}
+
+// Builds a stream object from a request body, applying the same defaults,
+// clamps and validation as streamFromBody. `err` is set on failure.
+static rs_json *stream_from_body(const rs_json *body, const char *id, const char **err) {
+    const char *name = rs_json_obj_str(body, "name", "");
+    const char *url = rs_json_obj_str(body, "url", "");
+    const char *input_mode = rs_json_obj_str(body, "inputMode", "internal");
+    // A trimmed-empty name is rejected.
+    const char *trimmed = NULL;
+    if (rs_trim(name, strlen(name), true, &trimmed) == 0) { *err = "Stream name is required."; return NULL; }
+    if (strcmp(input_mode, "pipe") != 0 && !is_http_url(url)) {
+        *err = "Stream URL must be http or https.";
+        return NULL;
+    }
+    if (strcmp(input_mode, "pipe") == 0 && !rs_json_obj_str(body, "pipeCommand", "")[0]) {
+        *err = "Program pipe command is required.";
+        return NULL;
+    }
+    return stream_build(body, id);
 }
 
 // --- view builders ---------------------------------------------------------
@@ -662,6 +673,125 @@ int rs_panel_delete_stream(rs_state *st, const char *stream_id, const char **err
     bool found = false;
     rs_json *kept = array_without_id(rs_json_obj_get(provider, "streams"), stream_id, &found);
     rs_json_obj_set(provider, "streams", kept);
+    return 0;
+}
+
+// --- channel/event import --------------------------------------------------
+
+// The import protocol capitalises its keys ("Name", "SessionManifest"), but
+// scripts written against the panel's own JSON have always been accepted with
+// the lowercase spelling too. Look for both, capitalised first.
+static const rs_json *entry_get(const rs_json *entry, const char *upper, const char *lower) {
+    const rs_json *v = rs_json_obj_get(entry, upper);
+    return v ? v : rs_json_obj_get(entry, lower);
+}
+
+static const char *entry_str(const rs_json *entry, const char *upper, const char *lower) {
+    return rs_json_as_str(entry_get(entry, upper, lower), "");
+}
+
+static bool entry_bool(const rs_json *entry, const char *upper, const char *lower, bool fallback) {
+    const rs_json *v = entry_get(entry, upper, lower);
+    return v ? rs_json_as_bool(v, fallback) : fallback;
+}
+
+// Matches an already-imported entry: (name, sourceType) is all the protocol
+// gives us — entries carry no stable id — so that pair is the identity a
+// re-import updates in place.
+static rs_json *find_imported_stream(rs_json *streams, const char *name, const char *source_type) {
+    for (size_t i = 0; i < rs_json_arr_len(streams); i++) {
+        rs_json *s = (rs_json *)rs_json_arr_at(streams, i);
+        if (strcmp(rs_json_obj_str(s, "name", ""), name) == 0 &&
+            strcmp(rs_json_obj_str(s, "sourceType", ""), source_type) == 0)
+            return s;
+    }
+    return NULL;
+}
+
+int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const char *action,
+                                   const rs_json *doc, const rs_json *logos,
+                                   int *imported, const char **err) {
+    if (imported) *imported = 0;
+    rs_json *p = find_provider(st, provider_id);
+    if (!p) { *err = "Provider not found."; return -404; }
+
+    bool events = strcmp(action, "events") == 0;
+    const rs_json *list = rs_json_obj_get(doc, events ? "Events" : "Channels");
+    if (!list) list = rs_json_obj_get(doc, events ? "events" : "channels");
+    if (!list || rs_json_type_of(list) != RS_JSON_ARR) {
+        *err = events ? "Script output has no 'Events' array."
+                      : "Script output has no 'Channels' array.";
+        return -400;
+    }
+    const char *source_type = events ? "event" : "channel";
+
+    rs_json *streams = (rs_json *)rs_json_obj_get(p, "streams");
+    if (!streams || rs_json_type_of(streams) != RS_JSON_ARR) {
+        rs_json_obj_set(p, "streams", rs_json_new_arr());
+        streams = (rs_json *)rs_json_obj_get(p, "streams");
+    }
+
+    int count = 0;
+    for (size_t i = 0; i < rs_json_arr_len(list); i++) {
+        const rs_json *entry = rs_json_arr_at(list, i);
+        if (rs_json_type_of(entry) != RS_JSON_OBJ) continue;
+        const char *raw_name = entry_str(entry, "Name", "name");
+        char *name = rs_trim_dup(raw_name, strlen(raw_name), true);
+        if (!name || !name[0]) { free(name); continue; }
+
+        rs_json *stream = find_imported_stream(streams, name, source_type);
+        if (!stream) {
+            char *id = make_id("stream");
+            rs_json *empty = rs_json_new_obj();
+            rs_json *fresh = stream_build(empty, id);
+            rs_json_free(empty);
+            free(id);
+            size_t before = rs_json_arr_len(streams);
+            rs_json_arr_push(streams, fresh);
+            // rs_json_arr_push frees the value it could not store, so only
+            // keep the pointer once the array really took it.
+            if (rs_json_arr_len(streams) == before) { free(name); continue; }
+            stream = fresh;
+        }
+
+        rs_json_obj_set_str(stream, "name", name);
+        // A logo the operator set by hand (or a previous import resolved) wins
+        // over the freshly looked-up one; only an empty slot is filled.
+        const char *existing_logo = rs_json_obj_str(stream, "logo", "");
+        if (!existing_logo[0] && logos) {
+            const char *found = rs_json_obj_str(logos, name, "");
+            if (found[0]) rs_json_obj_set_str(stream, "logo", found);
+        }
+        rs_json_obj_set_str(stream, "sourceType", source_type);
+        const char *mode = entry_str(entry, "Mode", "mode");
+        rs_json_obj_set_str(stream, "mode", mode[0] ? mode : "live");
+        rs_json_obj_set_bool(stream, "sessionManifest",
+                             entry_bool(entry, "SessionManifest", "sessionManifest", false));
+        rs_json_obj_set_str(stream, "scriptParams", entry_str(entry, "ScriptParams", "scriptParams"));
+        rs_json_obj_set_str(stream, "cdmType", entry_str(entry, "CdmType", "cdmType"));
+        rs_json_obj_set_bool(stream, "useCdm", entry_bool(entry, "UseCdm", "useCdm", false));
+        rs_json_obj_set_str(stream, "scriptVideoSelector", entry_str(entry, "Video", "video"));
+        rs_json_obj_set_str(stream, "scriptAudioSelector", entry_str(entry, "Audio", "audio"));
+        rs_json_obj_set_bool(stream, "onDemand", entry_bool(entry, "OnDemand", "onDemand", false));
+        rs_json_obj_set_bool(stream, "speedUp", entry_bool(entry, "SpeedUp", "speedUp", false));
+        rs_json_obj_set_bool(stream, "autostart", entry_bool(entry, "Autostart", "autostart", false));
+        rs_json_obj_set_bool(stream, "recordEvent", entry_bool(entry, "RecordEvent", "recordEvent", false));
+        // Start/End are epoch seconds and only meaningful for events; absent
+        // (or non-numeric) leaves the stored null, which the grid reads as
+        // "no window".
+        static const char *const window[2][3] = {{"Start", "start", "scriptStart"},
+                                                 {"End", "end", "scriptEnd"}};
+        for (size_t w = 0; w < 2; w++) {
+            const rs_json *v = entry_get(entry, window[w][0], window[w][1]);
+            if (v && rs_json_type_of(v) == RS_JSON_NUM)
+                rs_json_obj_set_int(stream, window[w][2], (long long)rs_json_as_num(v, 0));
+            else
+                rs_json_obj_set(stream, window[w][2], rs_json_new_null());
+        }
+        free(name);
+        count++;
+    }
+    if (imported) *imported = count;
     return 0;
 }
 

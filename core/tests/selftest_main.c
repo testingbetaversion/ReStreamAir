@@ -1117,6 +1117,81 @@ static void test_panel(void) {
     rs_free(rendered);
     rs_json_free(view);
 
+    // A channels import upserts one stream per entry, and re-running it updates
+    // those streams in place instead of duplicating them. Entries are matched by
+    // (name, sourceType), so the manually created "S1" above is left alone.
+    rs_json *channels = parse_json(
+        "{\"Channels\":[{\"Name\":\"  News  \",\"Mode\":\"live\",\"SessionManifest\":true,"
+        "\"ScriptParams\":\"id=101\",\"CdmType\":\"widevine\",\"UseCdm\":true,"
+        "\"Video\":\"best\",\"Autostart\":true},"
+        "{\"Name\":\"Sport\"},{\"Name\":\"   \"}]}");
+    int imported = -1;
+    check("panel/import-channels", rs_panel_import_script_entries(&st, pid, "channels", channels,
+                                                                  NULL, &imported, &err) == 0);
+    check("panel/import-count", imported == 2);
+    check("panel/import-stream-count", rs_json_arr_len(streams) == 3);
+    const rs_json *news = rs_json_arr_at(streams, 1);
+    check_str("panel/import-name-trimmed", rs_json_obj_str(news, "name", ""), "News");
+    check_str("panel/import-source-type", rs_json_obj_str(news, "sourceType", ""), "channel");
+    check_str("panel/import-script-params", rs_json_obj_str(news, "scriptParams", ""), "id=101");
+    check_str("panel/import-cdm-type", rs_json_obj_str(news, "cdmType", ""), "widevine");
+    check_str("panel/import-video-selector", rs_json_obj_str(news, "scriptVideoSelector", ""), "best");
+    check("panel/import-session-manifest", rs_json_obj_bool(news, "sessionManifest", false));
+    check("panel/import-use-cdm", rs_json_obj_bool(news, "useCdm", false));
+    check("panel/import-autostart", rs_json_obj_bool(news, "autostart", false));
+    // Defaults the entry didn't mention still come from stream_build.
+    check("panel/import-defaults", rs_json_obj_int(news, "playlistSegments", 0) == 6);
+    rs_json_free(channels);
+
+    // Re-import: same names, changed fields — updated in place, no duplicates.
+    rs_json *again = parse_json("{\"Channels\":[{\"Name\":\"News\",\"UseCdm\":false,"
+                                "\"ScriptParams\":\"id=202\"},{\"Name\":\"Sport\"}]}");
+    check("panel/reimport", rs_panel_import_script_entries(&st, pid, "channels", again,
+                                                           NULL, &imported, &err) == 0);
+    check("panel/reimport-no-duplicates", rs_json_arr_len(streams) == 3);
+    check("panel/reimport-updates", !rs_json_obj_bool(rs_json_arr_at(streams, 1), "useCdm", true));
+    check_str("panel/reimport-replaces-params",
+              rs_json_obj_str(rs_json_arr_at(streams, 1), "scriptParams", ""), "id=202");
+    // The script is authoritative: a field the new entry omits is cleared, not
+    // left over from the previous import.
+    check_str("panel/reimport-clears-omitted",
+              rs_json_obj_str(rs_json_arr_at(streams, 1), "cdmType", ""), "");
+    rs_json_free(again);
+
+    // An events import is a separate namespace: the same name imported as an
+    // event is its own stream, and carries the Start/End window.
+    rs_json *evs = parse_json("{\"Events\":[{\"Name\":\"News\",\"Start\":1700000000,"
+                              "\"End\":1700003600,\"RecordEvent\":true}]}");
+    check("panel/import-events", rs_panel_import_script_entries(&st, pid, "events", evs,
+                                                                NULL, &imported, &err) == 0);
+    check("panel/import-events-count", rs_json_arr_len(streams) == 4);
+    const rs_json *event = rs_json_arr_at(streams, 3);
+    check_str("panel/import-event-source-type", rs_json_obj_str(event, "sourceType", ""), "event");
+    check("panel/import-event-start", rs_json_obj_int(event, "scriptStart", 0) == 1700000000);
+    check("panel/import-event-end", rs_json_obj_int(event, "scriptEnd", 0) == 1700003600);
+    check("panel/import-event-record", rs_json_obj_bool(event, "recordEvent", false));
+    rs_json_free(evs);
+
+    // A document without the expected array is a 400, and an unknown provider a 404.
+    rs_json *empty_doc = parse_json("{\"Nope\":[]}");
+    check("panel/import-missing-array",
+          rs_panel_import_script_entries(&st, pid, "channels", empty_doc, NULL, &imported, &err) == -400);
+    check("panel/import-unknown-provider",
+          rs_panel_import_script_entries(&st, "nope", "channels", empty_doc, NULL, &imported, &err) == -404);
+    rs_json_free(empty_doc);
+
+    // Imported streams survive an editor PUT that knows nothing about them.
+    rs_json *edit = parse_json("{\"name\":\"News\",\"url\":\"https://e.com/n.mpd\"}");
+    check("panel/import-then-edit",
+          rs_panel_update_stream(&st, rs_json_obj_str(rs_json_arr_at(streams, 1), "id", ""), edit, &err) == 0);
+    rs_json_free(edit);
+    // update_stream swaps in a rebuilt array, so re-read it before looking.
+    streams = rs_json_obj_get(rs_json_arr_at(providers, 0), "streams");
+    check_str("panel/import-edit-keeps-source-type",
+              rs_json_obj_str(rs_json_arr_at(streams, 1), "sourceType", ""), "channel");
+    check_str("panel/import-edit-keeps-params",
+              rs_json_obj_str(rs_json_arr_at(streams, 1), "scriptParams", ""), "id=202");
+
     // Delete leaves an empty provider list but keeps the unknown top-level key.
     check("panel/delete-provider", rs_panel_delete_provider(&st, pid, &err) == 0);
     check("panel/empty-after-delete", rs_json_arr_len(rs_json_obj_get(st.root, "providers")) == 0);
