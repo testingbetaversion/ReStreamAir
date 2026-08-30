@@ -1448,11 +1448,11 @@ static rs_json *find_provider_by_id(rs_state *st, const char *id) {
 // dispatched) asynchronously: see the "async jobs" section below. Its worker
 // records stdout/stderr under "script:<providerId>" as each line arrives so
 // the panel's script output + Logs tab can follow the run live.
-// Builds the command exactly as the process runner will see it, but never puts
-// credentials in the log. The string is for display/copying in the terminal,
-// not for execution, so ordinary shell-style quoting is used on every OS.
-static void script_command_append_token(rs_buf *out, const char *token, bool redact) {
-    const char *shown = redact ? "<redacted>" : (token ? token : "");
+// Builds a readable version of the command for the terminal. Password and
+// proxy values are encoded in the real argv, so decode them here to show the
+// complete effective values the script receives.
+static void script_command_append_token(rs_buf *out, const char *token) {
+    const char *shown = token ? token : "";
     bool quote = shown[0] == '\0';
     for (const char *p = shown; *p; p++)
         if (isspace((unsigned char)*p) || *p == '"' || *p == '\\') quote = true;
@@ -1471,21 +1471,23 @@ static char *script_command_describe(const char *script_path, char **args, int a
     rs_buf out = RS_BUF_INIT;
     for (size_t i = 0; i < nprefix; i++) {
         if (out.len) rs_buf_append_char(&out, ' ');
-        script_command_append_token(&out, prefix[i], false);
+        script_command_append_token(&out, prefix[i]);
     }
     if (out.len) rs_buf_append_char(&out, ' ');
-    script_command_append_token(&out, script_path, false);
+    script_command_append_token(&out, script_path);
     for (int i = 0; i < argc; i++) {
         const char *arg = args[i] ? args[i] : "";
         const char *eq = strchr(arg, '=');
-        bool redact = (eq && (size_t)(eq - arg) == 8 && strncmp(arg, "password", 8) == 0) ||
-                      (eq && (size_t)(eq - arg) == 5 && strncmp(arg, "proxy", 5) == 0);
+        bool decode_value = eq && (((size_t)(eq - arg) == 8 && strncmp(arg, "password", 8) == 0) ||
+                                   ((size_t)(eq - arg) == 5 && strncmp(arg, "proxy", 5) == 0));
         rs_buf_append_char(&out, ' ');
-        if (redact) {
+        if (decode_value) {
+            char *decoded = rs_script_decode_value(eq + 1);
             rs_buf_append(&out, arg, (size_t)(eq - arg) + 1);
-            script_command_append_token(&out, "<redacted>", false);
+            script_command_append_token(&out, decoded ? decoded : eq + 1);
+            free(decoded);
         } else {
-            script_command_append_token(&out, arg, false);
+            script_command_append_token(&out, arg);
         }
     }
     return rs_buf_take(&out);
