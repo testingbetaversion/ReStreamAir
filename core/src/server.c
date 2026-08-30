@@ -1526,7 +1526,7 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     if (doh[0]) args[n++] = rs_script_arg("doh", doh, false);
     if (worker[0]) args[n++] = rs_script_arg("worker", worker, false);
     char *script_proxy = primary_proxy(rs_json_obj_str(provider, "proxy", ""));
-    if (script_proxy && script_proxy[0]) args[n++] = rs_script_arg("proxy", script_proxy, true);
+    if (script_proxy && script_proxy[0]) args[n++] = rs_script_arg("proxy", script_proxy, false);
     free(script_proxy);
     const rs_json *accounts = rs_json_obj_get(provider, "scriptAccounts");
     const char *active = rs_json_obj_str(provider, "activeScriptAccountId", "");
