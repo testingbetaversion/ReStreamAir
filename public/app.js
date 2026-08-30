@@ -1144,13 +1144,10 @@ const INACTIVE_FIELDS = {
   speedUp: "not implemented in this build",
   recordEvent: "not implemented in this build",
   nm3u8dlreParams: "the N_m3u8DL-RE input mode isn't in this build",
-  useCdm: "CDM/script key resolution isn't in this build",
-  cdmType: "CDM/script key resolution isn't in this build",
-  heartbeatEnabled: "provider scripts aren't in this build",
-  heartbeatSeconds: "provider scripts aren't in this build",
-  scriptParams: "provider scripts aren't in this build",
-  scriptAudioSelector: "provider scripts aren't in this build",
-  scriptVideoSelector: "provider scripts aren't in this build",
+  heartbeatEnabled: "the manifest action's cadence is stored, but the periodic ping isn't wired yet",
+  heartbeatSeconds: "the manifest action's cadence is stored, but the periodic ping isn't wired yet",
+  scriptAudioSelector: "imported from the channel list; the engine picks renditions itself",
+  scriptVideoSelector: "imported from the channel list; the engine picks renditions itself",
 };
 
 // Dims each unimplemented control and appends the reason to its hint, so the
@@ -3293,9 +3290,15 @@ async function runStreamScriptAction(action, button) {
   }
 }
 
+// "Run manifest" is the session-manifest action — the one Start runs to get a
+// fresh source URL — not `downloadmanifest`, which is the separate hook for a
+// script that fetches the manifest document itself. Wiring the button to the
+// latter meant the button people press to test their session URL ran an action
+// most scripts don't implement, with an empty url= into the bargain.
+$("#scriptRunManifestBtn")?.addEventListener("click", (e) => runStreamScriptAction("manifest", e.currentTarget));
+$("#scriptRunCdmBtn")?.addEventListener("click", (e) => runStreamScriptAction("cdm", e.currentTarget));
 $("#scriptRunPsshBtn")?.addEventListener("click", (e) => runStreamScriptAction("pssh", e.currentTarget));
-$("#scriptRunManifestBtn")?.addEventListener("click", (e) => runStreamScriptAction("downloadmanifest", e.currentTarget));
-$("#scriptRunMediaBtn")?.addEventListener("click", (e) => runStreamScriptAction("downloadmedia", e.currentTarget));
+$("#scriptRunDownloadManifestBtn")?.addEventListener("click", (e) => runStreamScriptAction("downloadmanifest", e.currentTarget));
 
 applyIcons();
 const savedTheme = localStorage.getItem("restreamair-theme");

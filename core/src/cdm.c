@@ -179,6 +179,153 @@ static void classify_pssh(rs_drm_challenge *ch, const char *b64) {
     free(bytes);
 }
 
+// Appends one base64 box to pssh_all (deduplicated) and classifies it.
+static void add_pssh(rs_drm_challenge *ch, const char *b64) {
+    if (!b64 || !b64[0]) return;
+    for (size_t i = 0; i < ch->pssh_all_count; i++)
+        if (strcmp(ch->pssh_all[i], b64) == 0) return;
+    char **grown = realloc(ch->pssh_all, (ch->pssh_all_count + 1) * sizeof(char *));
+    if (!grown) return;
+    ch->pssh_all = grown;
+    ch->pssh_all[ch->pssh_all_count++] = rs_strdup(b64);
+    classify_pssh(ch, b64);
+}
+
+void rs_cdm_challenge_add_kid(rs_drm_challenge *ch, const char *hex) {
+    if (ch && hex) add_kid(ch, hex);
+}
+
+bool rs_cdm_is_pssh_box(const char *b64) {
+    if (!b64 || !b64[0]) return false;
+    size_t b64_len = strlen(b64);
+    uint8_t *bytes = malloc(b64_len);
+    if (!bytes) return false;
+    size_t len = 0;
+    bool ok = rs_base64_decode(b64, bytes, b64_len, &len) == 0 && len >= 28
+              && memcmp(bytes + 4, "pssh", 4) == 0;
+    free(bytes);
+    return ok;
+}
+
+void rs_cdm_challenge_add_pssh(rs_drm_challenge *ch, const char *b64) {
+    if (ch) add_pssh(ch, b64);
+}
+
+bool rs_drm_challenge_is_empty(const rs_drm_challenge *ch) {
+    if (!ch) return true;
+    return ch->kids_count == 0 && ch->pssh_all_count == 0 && ch->key_uris_count == 0
+        && !ch->pssh_widevine && !ch->pssh_playready && !ch->pssh_fairplay;
+}
+
+// --- init-segment scanning --------------------------------------------------
+//
+// A proper walk would descend moov > trak > mdia > minf > stbl > stsd and then
+// into the sample entry's sinf/schi, which is a lot of structure to model for
+// two leaf boxes. Since every box carries its own length, scanning for the
+// four-byte type and validating the size word in front of it finds the same
+// boxes wherever a source chose to put them, and cannot run off the buffer.
+
+static uint32_t be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+void rs_cdm_challenge_add_from_init(rs_drm_challenge *ch, const uint8_t *data, size_t len) {
+    if (!ch || !data || len < 16) return;
+    for (size_t i = 4; i + 4 <= len; i++) {
+        uint32_t size = be32(data + i - 4);
+        size_t start = i - 4;
+        // A box's declared size covers the size word and type themselves.
+        if (size < 8 || (size_t)size > len - start) continue;
+
+        if (memcmp(data + i, "pssh", 4) == 0 && size >= 32) {
+            char *b64 = rs_base64_encode(data + start, size);
+            if (b64) { add_pssh(ch, b64); rs_free(b64); }
+            continue;
+        }
+        // tenc: FullBox header (4), reserved (1), reserved/pattern (1),
+        // default_isProtected (1), default_Per_Sample_IV_Size (1), then the
+        // 16-byte default_KID.
+        if (memcmp(data + i, "tenc", 4) == 0 && size >= 8 + 8 + 16) {
+            const uint8_t *payload = data + i + 4;
+            char *hex = bytes_to_hex(payload + 8, 16);
+            if (hex) { add_kid(ch, hex); rs_free(hex); }
+        }
+    }
+}
+
+// --- PSSH synthesis ---------------------------------------------------------
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// 32 hex digits (dashes allowed) into 16 bytes. false if the input isn't one.
+static bool kid_to_bytes(const char *hex, uint8_t out[16]) {
+    int nibbles = 0;
+    for (const char *p = hex; *p; p++) {
+        int v;
+        if (*p == '-') continue;
+        v = hex_nibble(*p);
+        if (v < 0 || nibbles >= 32) return false;
+        if (nibbles % 2 == 0) out[nibbles / 2] = (uint8_t)(v << 4);
+        else out[nibbles / 2] |= (uint8_t)v;
+        nibbles++;
+    }
+    return nibbles == 32;
+}
+
+char *rs_cdm_pssh_from_kids(char *const *kids, size_t count) {
+    // WidevinePsshData is a protobuf; the only field a key request needs is
+    // `repeated bytes key_ids = 2`, which encodes as tag 0x12, length 0x10,
+    // then the raw KID. pywidevine's PSSH.new(key_ids=...) puts the same KIDs
+    // in a version 1 box header instead; a version 0 box carrying this payload
+    // is what CDMs and licence proxies actually read, and pywidevine parses it
+    // back into the same key_ids, so it round-trips either way.
+    uint8_t payload[64 * 18];
+    size_t payload_len = 0;
+    for (size_t i = 0; i < count && i < 64; i++) {
+        uint8_t raw[16];
+        if (!kids[i] || !kid_to_bytes(kids[i], raw)) continue;
+        payload[payload_len++] = 0x12;
+        payload[payload_len++] = 0x10;
+        memcpy(payload + payload_len, raw, 16);
+        payload_len += 16;
+    }
+    if (!payload_len) return NULL;
+
+    size_t box_len = 4 + 4 + 4 + 16 + 4 + payload_len;
+    uint8_t *box = (uint8_t *)malloc(box_len);
+    if (!box) return NULL;
+    size_t o = 0;
+    box[o++] = (uint8_t)(box_len >> 24); box[o++] = (uint8_t)(box_len >> 16);
+    box[o++] = (uint8_t)(box_len >> 8);  box[o++] = (uint8_t)box_len;
+    memcpy(box + o, "pssh", 4); o += 4;
+    box[o++] = 0; box[o++] = 0; box[o++] = 0; box[o++] = 0;  // version 0, no flags
+    for (int i = 0; i < 16; i++) {
+        box[o++] = (uint8_t)((hex_nibble(WIDEVINE_SYSTEM_ID[i * 2]) << 4)
+                             | hex_nibble(WIDEVINE_SYSTEM_ID[i * 2 + 1]));
+    }
+    box[o++] = (uint8_t)(payload_len >> 24); box[o++] = (uint8_t)(payload_len >> 16);
+    box[o++] = (uint8_t)(payload_len >> 8);  box[o++] = (uint8_t)payload_len;
+    memcpy(box + o, payload, payload_len);
+
+    char *b64 = rs_base64_encode(box, box_len);
+    free(box);
+    return b64;
+}
+
+bool rs_cdm_challenge_synthesize_pssh(rs_drm_challenge *ch) {
+    if (!ch || ch->pssh_widevine || ch->kids_count == 0) return false;
+    char *b64 = rs_cdm_pssh_from_kids(ch->kids, ch->kids_count);
+    if (!b64) return false;
+    add_pssh(ch, b64);
+    rs_free(b64);
+    return ch->pssh_widevine != NULL;
+}
+
 rs_drm_challenge rs_cdm_challenge_from_mpd(const char *xml) {
     rs_drm_challenge ch;
     memset(&ch, 0, sizeof(ch));
@@ -196,14 +343,7 @@ rs_drm_challenge rs_cdm_challenge_from_mpd(const char *xml) {
                 }
             }
             char *b64 = rs_buf_take(&b);
-            if (b64 && b64[0]) {
-                char **new_all = realloc(ch.pssh_all, (ch.pssh_all_count + 1) * sizeof(char*));
-                if (new_all) {
-                    ch.pssh_all = new_all;
-                    ch.pssh_all[ch.pssh_all_count++] = rs_strdup(b64);
-                    classify_pssh(&ch, b64);
-                }
-            }
+            if (b64 && b64[0]) add_pssh(&ch, b64);
             rs_free(b64);
             p = end + 2;
         } else {
@@ -298,13 +438,7 @@ rs_drm_challenge rs_cdm_challenge_from_hls(const char *playlist) {
                         if ((kf && strstr(kf, "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")) || strncmp(uri, "data:", 5) == 0) {
                             const char *comma = strstr(uri, "base64,");
                             if (comma) {
-                                const char *b64 = comma + 7;
-                                char **new_all = realloc(ch.pssh_all, (ch.pssh_all_count + 1) * sizeof(char*));
-                                if (new_all) {
-                                    ch.pssh_all = new_all;
-                                    ch.pssh_all[ch.pssh_all_count++] = rs_strdup(b64);
-                                    classify_pssh(&ch, b64);
-                                }
+                                    add_pssh(&ch, comma + 7);
                             }
                         }
                         rs_free(kf);
@@ -384,9 +518,16 @@ char* rs_cdm_resolve_keys(const char *script_path, const char *cdm_type, const r
         // Let's just return NULL for now, we don't have exception throwing.
     }
     rs_free(out_stderr);
-    
+
+    char *res = rs_cdm_parse_key_output(out_stdout);
+    rs_free(out_stdout);
+    return res;
+}
+
+char *rs_cdm_parse_key_output(const char *out_stdout) {
     rs_strv pairs = RS_STRV_INIT;
-    
+    if (!out_stdout) return rs_strdup("");
+
     // JSON parsing
     cJSON *json = cJSON_Parse(out_stdout);
     bool parsed_json = false;
@@ -417,13 +558,11 @@ char* rs_cdm_resolve_keys(const char *script_path, const char *cdm_type, const r
         }
     }
     
-    rs_free(out_stdout);
-    
     if (pairs.len == 0) {
         rs_strv_dispose(&pairs);
         return rs_strdup("");
     }
-    
+
     char *res = join_strings(pairs.items, pairs.len, "\n");
     rs_strv_dispose(&pairs);
     return res;

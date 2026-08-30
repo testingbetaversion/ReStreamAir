@@ -55,6 +55,18 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
 // stream isn't found.
 int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool running, const char **err);
 
+// Applies a `manifest` action's reply to a stream: the fresh source URL, its
+// CDN mirrors, and — when the script supplied them — the per-category headers
+// and heartbeat cadence. -400 if the URL isn't http(s), -404 if no such stream.
+int rs_panel_apply_session_manifest(rs_state *st, const char *stream_id, const char *url,
+                                    const rs_json *cdn_urls, const char *manifest_headers,
+                                    const char *media_headers, int heartbeat_seconds,
+                                    const char **err);
+
+// Stores clear KID:KEY pairs (newline-separated) acquired from the `cdm` action.
+int rs_panel_set_stream_keys(rs_state *st, const char *stream_id, const char *keys,
+                             const char **err);
+
 // User creation hashes the password, so it needs the auth module.
 int rs_panel_create_user(rs_state *st, const rs_json *body, const char **err);
 int rs_panel_delete_user(rs_state *st, const char *id, const char **err);
@@ -73,6 +85,29 @@ rs_json *rs_panel_export_provider(const rs_state *st, const char *provider_id);
 // `new_id` is non-NULL, stores the new provider id there (free with rs_free).
 int rs_panel_import_provider(rs_state *st, const rs_json *doc, const char *script_path,
                              char **new_id, const char **err);
+
+// --- provider script actions ----------------------------------------------
+
+// Whether ReStreamAir invokes `action` at all today. The two download hooks
+// (`downloadinit`, `downloadmedia`) are storable but inert — routing every
+// fetch through a spawned subprocess needs a persistent worker — so they are
+// never invoked whatever a provider declares.
+bool rs_panel_script_action_wired(const char *action);
+
+// Whether `action` may run. `stream` may be NULL for a provider-level action
+// (login/pair/channels/events/epg); when it is given and carries a
+// `scriptActionsOverride` array, that overrides the provider's `scriptActions`.
+// Every path that spawns a provider script goes through here.
+bool rs_panel_script_action_allowed(const rs_json *provider, const rs_json *stream,
+                                    const char *action);
+
+// The actions a brand-new provider declares. Also the fallback for a provider
+// stored before the field existed. Free with rs_json_free.
+rs_json *rs_panel_default_script_actions(void);
+
+// The script a stream runs: its own `scriptOverride` when set, else the
+// provider's `scriptPath`. Points into the state DOM — do not free.
+const char *rs_panel_effective_script_path(const rs_json *provider, const rs_json *stream);
 
 // An account's role, normalised: "admin" (full control) or "viewer"
 // (read-only). Accounts stored before roles existed report "admin".

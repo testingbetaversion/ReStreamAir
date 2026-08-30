@@ -48,6 +48,13 @@ const rs_json *rs_json_obj_get(const rs_json *obj, const char *key);
 size_t rs_json_arr_len(const rs_json *arr);
 const rs_json *rs_json_arr_at(const rs_json *arr, size_t index);
 
+// Object members in insertion order, for the cases that have to walk an object
+// whose keys aren't known ahead of time (a script's Headers block, say). Both
+// return NULL past the end or for a non-object.
+size_t rs_json_obj_len(const rs_json *obj);
+const char *rs_json_obj_key_at(const rs_json *obj, size_t index);
+const rs_json *rs_json_obj_value_at(const rs_json *obj, size_t index);
+
 // Coercing readers: return the value when the type matches, else the fallback.
 const char *rs_json_as_str(const rs_json *value, const char *fallback);
 double rs_json_as_num(const rs_json *value, double fallback);

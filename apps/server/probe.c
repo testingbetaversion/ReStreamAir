@@ -10,6 +10,7 @@
 
 #include "net.h"
 #include "rs_common.h"
+#include "rs_cdm.h"
 #include "rs_json.h"
 #include "rs_m3u8.h"
 
@@ -71,6 +72,43 @@ static char *normalize_kid(const char *raw) {
     return out;
 }
 
+// The default_KID of the last ContentProtection child of `node`, or NULL. The
+// attribute is namespaced (cenc:default_KID) but xmlGetProp matches on the
+// local name, so the prefix a manifest happens to use doesn't matter.
+static char *content_protection_kid(xmlNode *node) {
+    char *kid = NULL;
+    for (xmlNode *cp = node->children; cp; cp = cp->next) {
+        if (!node_is(cp, "ContentProtection")) continue;
+        char *k = attr(cp, "default_KID");
+        if (k) { free(kid); kid = k; }
+    }
+    return kid;
+}
+
+// Everything the manifest advertises about its DRM, in the shape the CDM
+// pipeline already uses: every KID, every PSSH box (with Widevine/PlayReady
+// split out), and any HLS key URIs. Attached to the probe result so the stream
+// editor can show what a source is protected with, not just that it is.
+static rs_json *build_drm(const rs_drm_challenge *ch) {
+    rs_json *drm = rs_json_new_obj();
+    rs_json *kids = rs_json_new_arr();
+    for (size_t i = 0; i < ch->kids_count; i++) rs_json_arr_push(kids, rs_json_new_str(ch->kids[i]));
+    rs_json_obj_set(drm, "kids", kids);
+    rs_json *boxes = rs_json_new_arr();
+    for (size_t i = 0; i < ch->pssh_all_count; i++)
+        rs_json_arr_push(boxes, rs_json_new_str(ch->pssh_all[i]));
+    rs_json_obj_set(drm, "pssh", boxes);
+    if (ch->pssh_widevine) rs_json_obj_set_str(drm, "psshWidevine", ch->pssh_widevine);
+    else rs_json_obj_set(drm, "psshWidevine", rs_json_new_null());
+    if (ch->pssh_playready) rs_json_obj_set_str(drm, "psshPlayReady", ch->pssh_playready);
+    else rs_json_obj_set(drm, "psshPlayReady", rs_json_new_null());
+    rs_json *uris = rs_json_new_arr();
+    for (size_t i = 0; i < ch->key_uris_count; i++)
+        rs_json_arr_push(uris, rs_json_new_str(ch->key_uris[i]));
+    rs_json_obj_set(drm, "keyUris", uris);
+    return drm;
+}
+
 static char *build_mpd(const char *text, size_t len) {
     xmlDoc *doc = xmlReadMemory(text, (int)len, "mpd.xml", NULL,
                                XML_PARSE_NOERROR | XML_PARSE_NOWARNING | XML_PARSE_RECOVER);
@@ -91,13 +129,14 @@ static char *build_mpd(const char *text, size_t len) {
             char *adap_codecs = attr(adap, "codecs");
             const char *type = classify(mime, content_type);
 
-            // A default_KID on any ContentProtection marks the set as encrypted.
-            char *kid = NULL;
-            for (xmlNode *cp = adap->children; cp; cp = cp->next) {
-                if (!node_is(cp, "ContentProtection")) continue;
-                char *k = attr(cp, "default_KID");
-                if (k) { free(kid); kid = k; }
-            }
+            // A default_KID on any ContentProtection marks the set as
+            // encrypted. Sources put it in three different places — on the
+            // Period, on the AdaptationSet, or on each Representation — and
+            // reading only the AdaptationSet meant a manifest that scopes its
+            // KIDs per representation came back with no protection at all.
+            char *set_kid = content_protection_kid(period);
+            char *adap_kid = content_protection_kid(adap);
+            if (adap_kid) { free(set_kid); set_kid = adap_kid; }
 
             for (xmlNode *rep = adap->children; rep; rep = rep->next) {
                 if (!node_is(rep, "Representation")) continue;
@@ -118,6 +157,8 @@ static char *build_mpd(const char *text, size_t len) {
                 set_attr_or_null(r, "frameRate", attr(rep, "frameRate"));
                 rs_json_arr_push(reps, r);
 
+                char *rep_kid = content_protection_kid(rep);
+                const char *kid = rep_kid ? rep_kid : set_kid;
                 if (kid) {
                     char *norm = normalize_kid(kid);
                     rs_json *kids = rs_json_new_arr();
@@ -125,21 +166,37 @@ static char *build_mpd(const char *text, size_t len) {
                     rs_json_obj_set(protection, id, kids);
                     free(norm);
                 }
+                free(rep_kid);
                 free(id);
             }
             free(mime);
             free(content_type);
             free(lang);
             free(adap_codecs);
-            free(kid);
+            free(set_kid);
         }
     }
     xmlFreeDoc(doc);
+
+    // The DOM walk above only sees default_KID attributes. The CDM scraper also
+    // reads every cenc:pssh box — including the KIDs a version 1 box lists,
+    // which is the only place some manifests name them — so run it too and let
+    // its findings stand in for any representation the walk left unprotected.
+    rs_drm_challenge ch = rs_cdm_challenge_from_mpd(text);
+    if (ch.kids_count == 1 && rs_json_obj_len(protection) == 0) {
+        for (size_t i = 0; i < rs_json_arr_len(reps); i++) {
+            rs_json *kids = rs_json_new_arr();
+            rs_json_arr_push(kids, rs_json_new_str(ch.kids[0]));
+            rs_json_obj_set(protection, rs_json_obj_str(rs_json_arr_at(reps, i), "id", ""), kids);
+        }
+    }
 
     rs_json *out = rs_json_new_obj();
     rs_json_obj_set_str(out, "kind", "mpd");
     rs_json_obj_set(out, "representations", reps);
     rs_json_obj_set(out, "protection", protection);
+    rs_json_obj_set(out, "drm", build_drm(&ch));
+    rs_drm_challenge_free(&ch);
     char *json = rs_json_serialize(out, false);
     rs_json_free(out);
     return json;
@@ -179,10 +236,25 @@ static char *build_hls(const char *text, const char *base_url) {
         }
         rs_m3u8_probe_dispose(&probe);
     }
+    // HLS carries its DRM on #EXT-X-KEY / #EXT-X-SESSION-KEY rather than per
+    // rendition, so whatever the master advertises applies to every variant.
+    // This used to report no protection at all for encrypted HLS.
+    rs_drm_challenge ch = rs_cdm_challenge_from_hls(text);
+    rs_json *protection = rs_json_new_obj();
+    if (ch.kids_count) {
+        for (size_t i = 0; i < rs_json_arr_len(reps); i++) {
+            rs_json *kids = rs_json_new_arr();
+            for (size_t k = 0; k < ch.kids_count; k++)
+                rs_json_arr_push(kids, rs_json_new_str(ch.kids[k]));
+            rs_json_obj_set(protection, rs_json_obj_str(rs_json_arr_at(reps, i), "id", ""), kids);
+        }
+    }
     rs_json *out = rs_json_new_obj();
     rs_json_obj_set_str(out, "kind", "m3u8");
     rs_json_obj_set(out, "representations", reps);
-    rs_json_obj_set(out, "protection", rs_json_new_obj());
+    rs_json_obj_set(out, "protection", protection);
+    rs_json_obj_set(out, "drm", build_drm(&ch));
+    rs_drm_challenge_free(&ch);
     char *json = rs_json_serialize(out, false);
     rs_json_free(out);
     return json;

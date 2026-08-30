@@ -2,6 +2,7 @@
 #include "rs_common.h"
 #include "rs_auth.h"
 #include "rs_cdm.h"
+#include "rs_url.h"
 #include "rs_cenc.h"
 #include "rs_hls_decrypt.h"
 #include "rs_ffargs.h"
@@ -197,6 +198,7 @@ static void log_record(restream_server_t *s, const char *sid, const char *level,
                        const char *event, const char *url, long status, long long bytes,
                        const char *message);
 static char *primary_proxy(const char *list);
+static char *effective_proxy(const rs_json *provider, const rs_json *stream, bool category_on);
 
 // Forward declaration: apply_cenc is defined between serve_hls_playlist and
 // serve_restream_item, but pending_job_finish_item (defined just above
@@ -215,6 +217,9 @@ static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
 static void dispatch_script_action(restream_server_t *server, struct mg_connection *c,
                                    const char *sid, const char *action, const char *script_path,
                                    char **args, int argc);
+static bool dispatch_stream_start(restream_server_t *server, struct mg_connection *c,
+                                  struct mg_http_message *hm, const char *stream_id,
+                                  const char *ip);
 
 static char *logo_fetch_wrapper(const char *url, void *ctx) {
     (void)ctx;
@@ -523,7 +528,8 @@ static bool log_always(const char *event) {
         "streamDelete", "liveStart", "liveStop", "repStart", "repStop",
         "playlistReady", "renditions", "initReady", "discontinuity",
         "login", "logout", "loginFailed", "scriptStart", "scriptCommand", "scriptOutput",
-        "scriptError", "scriptEnd", "scriptImport", "playbackDenied",
+        "scriptError", "scriptEnd", "scriptImport", "scriptManifest", "cdm",
+        "playbackDenied",
     };
     if (!event) return false;
     for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); i++)
@@ -1494,6 +1500,73 @@ static char *script_command_describe(const char *script_path, char **args, int a
     return rs_buf_take(&out);
 }
 
+// How many arguments one script invocation can carry. The fixed prefix is
+// about a dozen; the rest is the stream's scriptParams and, for `cdm`, the DRM
+// it scraped out of the manifest.
+#define RS_SCRIPT_ARG_CAP 64
+
+// Appends a stream's `scriptParams` ("id=123 streamId=456") as individual
+// arguments, stopping at `cap`. rs_script_split_params already returns encoded
+// key=value tokens, so they are copied through as they are. Returns the new
+// argument count.
+static int append_script_params(char **args, int n, int cap, const char *params) {
+    rs_strv split = rs_script_split_params(params);
+    for (size_t i = 0; i < split.len && n < cap; i++) {
+        if (split.items[i]) args[n++] = rs_strdup(split.items[i]);
+    }
+    rs_strv_dispose(&split);
+    return n;
+}
+
+// The per-provider directory a script keeps its session and cookies in, created
+// on demand. Passed as sessiondir=/cookies= on every invocation.
+static void provider_session_paths(const char *pid, char *sessiondir, size_t sd_len,
+                                   char *cookies, size_t ck_len) {
+    snprintf(sessiondir, sd_len, "runtime/sessions/%s", pid);
+    RS_MKDIR("runtime"); RS_MKDIR("runtime/sessions"); RS_MKDIR(sessiondir);
+    snprintf(cookies, ck_len, "%s/cookies.txt", sessiondir);
+}
+
+// Fills in the argument prefix every invocation of a provider's script carries:
+// the session store, the network overrides, and the active account. `action=`
+// is not included — the manual route puts it first, the playback pipeline adds
+// a different one per step. Returns the new argument count.
+static int fill_common_script_args(const rs_json *provider, const rs_json *stream,
+                                   char **args, int n, int cap) {
+    char sessiondir[512], cookies[640];
+    provider_session_paths(rs_json_obj_str(provider, "id", ""),
+                           sessiondir, sizeof(sessiondir), cookies, sizeof(cookies));
+    if (n < cap) args[n++] = rs_script_arg("sessiondir", sessiondir, false);
+    if (n < cap) args[n++] = rs_script_arg("cookies", cookies, false);
+    const char *bind = rs_json_obj_str(provider, "scriptBind", "");
+    const char *doh = rs_json_obj_str(provider, "scriptDoh", "");
+    const char *worker = rs_json_obj_str(provider, "scriptWorker", "");
+    if (bind[0] && n < cap) args[n++] = rs_script_arg("bind", bind, false);
+    if (doh[0] && n < cap) args[n++] = rs_script_arg("doh", doh, false);
+    if (worker[0] && n < cap) args[n++] = rs_script_arg("worker", worker, false);
+    // The stream's proxy scope decides whether the script itself goes through
+    // the proxy, the same way it decides for the manifest and media fetches.
+    char *scoped = effective_proxy(provider, stream,
+                                   !stream || rs_json_obj_bool(stream, "proxyScript", true));
+    char *script_proxy = primary_proxy(scoped ? scoped : "");
+    if (script_proxy && script_proxy[0] && n < cap)
+        args[n++] = rs_script_arg("proxy", script_proxy, false);
+    free(script_proxy);
+    free(scoped);
+    const rs_json *accounts = rs_json_obj_get(provider, "scriptAccounts");
+    const char *active = rs_json_obj_str(provider, "activeScriptAccountId", "");
+    for (size_t i = 0; i < rs_json_arr_len(accounts) && n + 1 < cap; i++) {
+        const rs_json *a = rs_json_arr_at(accounts, i);
+        if (strcmp(rs_json_obj_str(a, "id", ""), active) != 0) continue;
+        const char *u = rs_json_obj_str(a, "username", "");
+        const char *p = rs_json_obj_str(a, "password", "");
+        if (u[0]) args[n++] = rs_script_arg("user", u, false);
+        if (p[0]) args[n++] = rs_script_arg("password", p, false);
+        break;
+    }
+    return n;
+}
+
 // This is the C port of PanelServer's script-action runner (ScriptRunner).
 static void run_provider_script(restream_server_t *s, struct mg_connection *c,
                                 const rs_json *provider, const char *action,
@@ -1504,50 +1577,21 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     char sid[192];
     snprintf(sid, sizeof(sid), "script:%s", pid);
 
-    char sessiondir[512];
-    snprintf(sessiondir, sizeof(sessiondir), "runtime/sessions/%s", pid);
-    RS_MKDIR("runtime"); RS_MKDIR("runtime/sessions"); RS_MKDIR(sessiondir);
-
-    char cookies[640];
-    snprintf(cookies, sizeof(cookies), "%s/cookies.txt", sessiondir);
-
     // Heap-allocated (rather than the stack array this used to be) because
     // dispatch_script_action hands it to a worker thread that outlives this
     // call — the stack array would be gone by the time the worker ran.
-    char **args = (char **)malloc(32 * sizeof(char *));
+    char **args = (char **)malloc(RS_SCRIPT_ARG_CAP * sizeof(char *));
     if (!args) { reply_error(c, 500, "Out of memory."); return; }
     int n = 0;
     args[n++] = rs_script_arg("action", action, false);
-    args[n++] = rs_script_arg("sessiondir", sessiondir, false);
-    args[n++] = rs_script_arg("cookies", cookies, false);
-    const char *bind = rs_json_obj_str(provider, "scriptBind", "");
-    const char *doh = rs_json_obj_str(provider, "scriptDoh", "");
-    const char *worker = rs_json_obj_str(provider, "scriptWorker", "");
-    if (bind[0]) args[n++] = rs_script_arg("bind", bind, false);
-    if (doh[0]) args[n++] = rs_script_arg("doh", doh, false);
-    if (worker[0]) args[n++] = rs_script_arg("worker", worker, false);
-    char *script_proxy = primary_proxy(rs_json_obj_str(provider, "proxy", ""));
-    if (script_proxy && script_proxy[0]) args[n++] = rs_script_arg("proxy", script_proxy, false);
-    free(script_proxy);
-    const rs_json *accounts = rs_json_obj_get(provider, "scriptAccounts");
-    const char *active = rs_json_obj_str(provider, "activeScriptAccountId", "");
-    for (size_t i = 0; i < rs_json_arr_len(accounts) && n < 22; i++) {
-        const rs_json *a = rs_json_arr_at(accounts, i);
-        if (strcmp(rs_json_obj_str(a, "id", ""), active) != 0) continue;
-        const char *u = rs_json_obj_str(a, "username", "");
-        const char *p = rs_json_obj_str(a, "password", "");
-        if (u[0]) args[n++] = rs_script_arg("user", u, false);
-        if (p[0]) args[n++] = rs_script_arg("password", p, false);
-        break;
-    }
 
     // Stream-level test actions use the same runner as ordinary provider
     // actions, but add the stream context the panel selected. This is also a
     // public API: callers can exercise a hook without driving the browser.
     const char *stream_id = request ? rs_json_obj_str(request, "streamId", "") : "";
+    const rs_json *stream = NULL;
     if (stream_id[0]) {
         const rs_json *streams = rs_json_obj_get(provider, "streams");
-        const rs_json *stream = NULL;
         for (size_t i = 0; i < rs_json_arr_len(streams); i++) {
             const rs_json *candidate = rs_json_arr_at(streams, i);
             if (strcmp(rs_json_obj_str(candidate, "id", ""), stream_id) == 0) {
@@ -1561,8 +1605,36 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
             reply_error(c, 404, "Stream not found on this provider.");
             return;
         }
+    }
+    n = fill_common_script_args(provider, stream, args, n, RS_SCRIPT_ARG_CAP);
+    if (stream) {
         args[n++] = rs_script_arg("id", stream_id, false);
         args[n++] = rs_script_arg("url", rs_json_obj_str(stream, "url", ""), true);
+        // Every action a stream can run is parameterised by the tokens the
+        // channel/event import stored, exactly as the automatic pipeline
+        // passes them — otherwise a hook tested from the panel is invoked with
+        // different arguments from the one that runs at playback.
+        n = append_script_params(args, n, RS_SCRIPT_ARG_CAP, rs_json_obj_str(stream, "scriptParams", ""));
+    }
+
+    // Nothing spawns the script for an action the provider hasn't declared.
+    // Refused loudly rather than silently, since this route exists to be
+    // clicked: a script asked for an action it doesn't implement just prints a
+    // confusing error, and one that does implement it may charge a session
+    // against the account for a hook the operator never enabled.
+    if (!rs_panel_script_action_allowed(provider, stream, action)) {
+        char message[192];
+        if (!rs_panel_script_action_wired(action))
+            snprintf(message, sizeof(message),
+                     "ReStreamAir doesn't invoke the '%s' action yet, so it can't be run.", action);
+        else
+            snprintf(message, sizeof(message),
+                     "This provider's script doesn't declare the '%s' action — "
+                     "tick it in Provider settings first.", action);
+        for (int i = 0; i < n; i++) free(args[i]);
+        free(args);
+        reply_error(c, 400, message);
+        return;
     }
 
     log_record(s, sid, "info", "scriptStart", NULL, 0, -1, action);
@@ -2096,6 +2168,12 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         char *id = capture(hm, "/api/streams/*/start");
         char *ip = client_ip(s, c, hm);
         const char *err = NULL;
+        // A stream whose source URL (or keys) comes from its provider script
+        // can't be handed to the engine until those exist, and getting them
+        // means running a subprocess and fetching a manifest — so it goes to a
+        // worker and replies from there. Everything else starts inline, as it
+        // always has.
+        if (dispatch_stream_start(s, c, hm, id, ip)) { rs_free(ip); free(id); return true; }
         int rc = rs_panel_set_stream_running(&s->state, id, true, &err);
         char pipeline_err[256] = {0};
         if (rc == 0) {
@@ -2969,12 +3047,16 @@ static void send_redirect(struct mg_connection *c, const char *location) {
 // so the worker never touches `c`; mg_wakeup() is mongoose's documented
 // thread-safe way back into the poll loop, which is the only thing allowed to
 // build and send the reply.
+struct rs_stream_start;
+static void stream_start_free(struct rs_stream_start *st);
+
 typedef enum {
     RS_PENDING_PLAYLIST,
     RS_PENDING_ITEM,
     RS_PENDING_LOGO,
     RS_PENDING_PROBE,
     RS_PENDING_SCRIPT,
+    RS_PENDING_STREAM_START,
 } rs_pending_kind;
 
 struct rs_pending_job {
@@ -3024,6 +3106,7 @@ struct rs_pending_job {
     // the worker (parsing is CPU, logo lookups are network) so the poll thread
     // only has to fold them into the state.
     rs_json *script_import, *script_logos;
+    struct rs_stream_start *start;  // STREAM_START only
     char err[256];
 };
 
@@ -3037,6 +3120,7 @@ static void pending_job_free(rs_pending_job *pf) {
     free(pf->script_action);
     rs_json_free(pf->script_import);
     rs_json_free(pf->script_logos);
+    stream_start_free(pf->start);
     for (int i = 0; i < pf->script_argc; i++) free(pf->script_args[i]);
     free(pf->script_args);
     free(pf->body); free(pf->content_type); free(pf->content_range);
@@ -3120,6 +3204,451 @@ static rs_json *resolve_import_logos(restream_server_t *server, rs_pending_job *
     return logos;
 }
 
+// Small local helpers the pipeline below needs: a bounded strdup, a list
+// joiner, and the same http(s)-only check the panel validates URLs with.
+static char *dup_n(const char *s, size_t n) {
+    char *out = (char *)malloc(n + 1);
+    if (!out) return NULL;
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return out;
+}
+
+static char *join_list(char **items, size_t count, const char *sep) {
+    rs_buf b = RS_BUF_INIT;
+    for (size_t i = 0; i < count; i++) {
+        if (i) rs_buf_append_str(&b, sep);
+        rs_buf_append_str(&b, items[i]);
+    }
+    char *out = rs_buf_take(&b);
+    return out ? out : rs_strdup("");
+}
+
+static bool url_is_http(const char *s) {
+    return s && (strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0);
+}
+
+// --- script-driven stream start ---------------------------------------------
+//
+// An imported channel has no source URL of its own: the script mints one per
+// session, so "Start" has to ask for it before there is anything to poll. The
+// old start route only flipped the stored status and called the engine, which
+// meant every session-manifest stream failed with "no source URL" — the two
+// script actions the panel advertises for exactly this, `manifest` and `cdm`,
+// were never invoked by anything.
+//
+// The sequence is: `manifest` for a fresh URL (+ CDN mirrors, per-category
+// headers, heartbeat cadence), then the manifest is fetched and scraped for
+// DRM, then `cdm` turns that into clear keys. All of it is network and
+// subprocess work, so it runs on a pending job's worker; the poll thread only
+// folds the result into the state and starts the engine.
+
+typedef struct rs_stream_start {
+    // Snapshotted on the poll thread — the state DOM can change under us.
+    char *script_path;
+    char **args;  // common prefix, no action= (each rs_script_arg-owned)
+    int argc;
+    char *kind, *url, *proxy, *headers, *downloader, *dl_params, *rep, *host;
+    bool force_ipv6, rotate_proxies;
+    bool want_manifest, want_cdm, want_pssh_hook, want_initparse;
+    char *cdm_mode, *cdm_type;
+    int url_arg;  // index of the url= argument, rewritten once the manifest refreshes it
+
+    // Result, filled by the worker.
+    bool manifest_applied;
+    char *manifest_url;
+    rs_json *cdn_urls;
+    char *manifest_headers, *media_headers;
+    int heartbeat_seconds;
+    char *keys;
+    char err[256];  // non-empty aborts the start
+} rs_stream_start;
+
+static void stream_start_free(struct rs_stream_start *st) {
+    if (!st) return;
+    free(st->script_path);
+    for (int i = 0; i < st->argc; i++) free(st->args[i]);
+    free(st->args);
+    free(st->kind); free(st->url); free(st->proxy); free(st->headers);
+    free(st->downloader); free(st->dl_params); free(st->rep); free(st->host);
+    free(st->cdm_mode); free(st->cdm_type);
+    free(st->manifest_url); free(st->manifest_headers); free(st->media_headers);
+    free(st->keys);
+    rs_json_free(st->cdn_urls);
+    free(st);
+}
+
+// {"Authorization": "Bearer x"} -> "Authorization: Bearer x", one per line, in
+// the order the script wrote them. Non-string values are skipped rather than
+// stringified: a header whose value isn't text is a script bug, and inventing
+// "true" for it would send a wrong header rather than none.
+static char *header_object_to_text(const rs_json *obj) {
+    rs_buf out = RS_BUF_INIT;
+    if (obj && rs_json_type_of(obj) == RS_JSON_OBJ) {
+        for (size_t i = 0; i < rs_json_obj_len(obj); i++) {
+            const char *key = rs_json_obj_key_at(obj, i);
+            const rs_json *value = rs_json_obj_value_at(obj, i);
+            if (!key || !key[0] || rs_json_type_of(value) != RS_JSON_STR) continue;
+            if (out.len) rs_buf_append_char(&out, '\n');
+            rs_buf_append_str(&out, key);
+            rs_buf_append_str(&out, ": ");
+            rs_buf_append_str(&out, rs_json_as_str(value, ""));
+        }
+    }
+    char *text = rs_buf_take(&out);
+    return text ? text : rs_strdup("");
+}
+
+// Scripts spell the Headers block's keys inconsistently ("manifest" vs
+// "Manifest"), so accept either.
+static const rs_json *header_block(const rs_json *headers, const char *lower, const char *upper) {
+    const rs_json *v = rs_json_obj_get(headers, lower);
+    return v ? v : rs_json_obj_get(headers, upper);
+}
+
+// Runs one action of the stream's script: `action=` first, then the common
+// prefix, then whatever this action adds. Returns the exit code, with stdout in
+// *out (caller frees) — never NULL on success.
+static int stream_start_run(rs_stream_start *st, const char *action,
+                            char *const *extra, int extra_n, double timeout, char **out) {
+    const char **argv = (const char **)calloc((size_t)st->argc + (size_t)extra_n + 2, sizeof(char *));
+    if (!argv) return -1;
+    int n = 0;
+    char *action_arg = rs_script_arg("action", action, false);
+    argv[n++] = action_arg;
+    for (int i = 0; i < st->argc; i++) argv[n++] = st->args[i];
+    for (int i = 0; i < extra_n; i++) argv[n++] = extra[i];
+    char *err_text = NULL;
+    int rc = rs_script_run_sync(st->script_path, argv, n, timeout, out, &err_text);
+    rs_free(err_text);
+    free(action_arg);
+    free(argv);
+    return rc;
+}
+
+// Parses the `manifest` action's reply (SCRIPTING.md: ManifestUrl, Cdn,
+// Headers, Heartbeat) into the job's result fields. Tolerates a script that
+// logs a line to stdout before the JSON. Returns false with st->err set.
+static bool stream_start_parse_manifest(rs_stream_start *st, const char *stdout_text) {
+    rs_json *doc = parse_script_document(stdout_text);
+    const char *url = doc ? rs_json_obj_str(doc, "ManifestUrl", "") : "";
+    if (!url[0] && doc) url = rs_json_obj_str(doc, "manifestUrl", "");
+    if (!url_is_http(url)) {
+        snprintf(st->err, sizeof(st->err),
+                 "The manifest action returned no usable ManifestUrl.");
+        rs_json_free(doc);
+        return false;
+    }
+    free(st->manifest_url);
+    st->manifest_url = rs_strdup(url);
+
+    rs_json_free(st->cdn_urls);
+    st->cdn_urls = rs_json_new_arr();
+    const rs_json *cdn = rs_json_obj_get(doc, "Cdn");
+    if (!cdn) cdn = rs_json_obj_get(doc, "cdn");
+    for (size_t i = 0; i < rs_json_arr_len(cdn); i++) {
+        const rs_json *entry = rs_json_arr_at(cdn, i);
+        const char *mirror = rs_json_obj_str(entry, "ManifestUrl", "");
+        if (!mirror[0]) mirror = rs_json_obj_str(entry, "manifestUrl", "");
+        if (url_is_http(mirror) && strcmp(mirror, url) != 0)
+            rs_json_arr_push(st->cdn_urls, rs_json_new_str(mirror));
+    }
+
+    const rs_json *headers = rs_json_obj_get(doc, "Headers");
+    if (!headers) headers = rs_json_obj_get(doc, "headers");
+    free(st->manifest_headers);
+    free(st->media_headers);
+    st->manifest_headers = header_object_to_text(header_block(headers, "manifest", "Manifest"));
+    st->media_headers = header_object_to_text(header_block(headers, "media", "Media"));
+
+    const rs_json *hb = rs_json_obj_get(doc, "Heartbeat");
+    if (!hb) hb = rs_json_obj_get(doc, "heartbeat");
+    long long period_ms = rs_json_obj_int(hb, "PeriodMs", rs_json_obj_int(hb, "periodMs", 0));
+    st->heartbeat_seconds = period_ms > 0 ? (int)(period_ms / 1000 > 0 ? period_ms / 1000 : 1) : 0;
+
+    rs_json_free(doc);
+    return true;
+}
+
+// Fetches a URL with the stream's manifest-category settings. Returns the body
+// (caller frees) or NULL.
+static char *stream_start_fetch(rs_stream_start *st, const char *url, size_t *out_len) {
+    if (!g_fetch_handler || !url || !url[0]) return NULL;
+    char *body = NULL;
+    size_t len = 0;
+    long status = 0;
+    char err[128] = {0};
+    int rc = g_fetch_handler(url, st->proxy, st->headers, NULL, st->downloader, st->dl_params,
+                             st->force_ipv6 ? 1 : 0, st->rotate_proxies ? 1 : 0,
+                             &body, &len, &status, NULL, NULL, NULL, err, sizeof(err), 20000, NULL, NULL);
+    if (rc != 0 || status < 200 || status >= 300 || !body) { free(body); return NULL; }
+    if (out_len) *out_len = len;
+    return body;
+}
+
+// The third place PSSH can live. A manifest that advertises only a bare
+// default_KID (or nothing at all) may still ship real `pssh` boxes in the
+// initialization segment, so when the manifest scrape came up without one, go
+// and look there before falling back to synthesising a box from the KIDs.
+static uint8_t *stream_start_fetch_init(rs_stream_start *st, const char *manifest_url,
+                                        const char *manifest_text, size_t *out_len) {
+    char *init_url = NULL;
+    if (strcmp(st->kind, "m3u8") == 0) {
+        const char *map = strstr(manifest_text, "#EXT-X-MAP:");
+        const char *uri = map ? strstr(map, "URI=\"") : NULL;
+        if (uri) {
+            const char *start = uri + 5;
+            const char *end = strchr(start, '"');
+            if (end && end > start) {
+                char *ref = dup_n(start, (size_t)(end - start));
+                init_url = ref ? rs_url_resolve(manifest_url, ref) : NULL;
+                free(ref);
+            }
+        }
+    } else if (g_dash_handler) {
+        // The describe handler resolves the initialization template for one
+        // representation; when the stream has no rendition picked yet, its
+        // default video rendition is the one playback would use anyway.
+        char derr[256] = {0};
+        const char *rep = st->rep;
+        char *chosen = NULL;
+        if (!rep[0]) {
+            char *desc = g_dash_handler(manifest_url, st->proxy, st->headers, st->downloader,
+                                        st->dl_params, st->force_ipv6 ? 1 : 0,
+                                        st->rotate_proxies ? 1 : 0, NULL, 0, NULL, 0,
+                                        derr, sizeof(derr));
+            if (desc) {
+                rs_json *doc = rs_json_parse(desc, strlen(desc));
+                chosen = rs_strdup(rs_json_obj_str(rs_json_obj_get(doc, "video"), "id", ""));
+                rs_json_free(doc);
+                rs_free(desc);
+            }
+            rep = chosen ? chosen : "";
+        }
+        if (rep[0]) {
+            char *desc = g_dash_handler(manifest_url, st->proxy, st->headers, st->downloader,
+                                        st->dl_params, st->force_ipv6 ? 1 : 0,
+                                        st->rotate_proxies ? 1 : 0, rep, 0, NULL, 0,
+                                        derr, sizeof(derr));
+            if (desc) {
+                rs_json *doc = rs_json_parse(desc, strlen(desc));
+                const char *found = rs_json_obj_str(rs_json_obj_get(doc, "plan"), "initUrl", "");
+                if (found[0]) init_url = rs_strdup(found);
+                rs_json_free(doc);
+                rs_free(desc);
+            }
+        }
+        free(chosen);
+    }
+    if (!init_url) return NULL;
+    size_t len = 0;
+    char *body = stream_start_fetch(st, init_url, &len);
+    free(init_url);
+    if (!body) return NULL;
+    if (out_len) *out_len = len;
+    return (uint8_t *)body;
+}
+
+// Asks the script for clear keys: scrape the manifest for every scrap of DRM
+// it advertises, give the `pssh` hook first refusal on the box, then run `cdm`.
+// Best-effort — any failure logs and leaves the keys the operator typed (which
+// may be none), because a start that aborts here just restart-loops.
+static void stream_start_resolve_keys(restream_server_t *server, const char *sid,
+                                      rs_stream_start *st, const char *manifest_url) {
+    size_t text_len = 0;
+    char *text = stream_start_fetch(st, manifest_url, &text_len);
+    if (!text) {
+        log_record(server, sid, "warn", "cdm", manifest_url, 0, -1,
+                   "could not fetch the manifest to read its DRM — asking for keys without it");
+    }
+
+    rs_drm_challenge ch;
+    memset(&ch, 0, sizeof(ch));
+    if (text)
+        ch = strcmp(st->kind, "m3u8") == 0 ? rs_cdm_challenge_from_hls(text)
+                                           : rs_cdm_challenge_from_mpd(text);
+
+    // PSSH, in the three places it can be: the manifest above, the init
+    // segment, or — for a source that only ever names a KID — built from that.
+    // The init is only fetched when the manifest didn't carry a box, or when
+    // the script has asked to inspect it itself.
+    if (text && (ch.pssh_all_count == 0 || st->want_initparse)) {
+        size_t init_len = 0;
+        uint8_t *init = stream_start_fetch_init(st, manifest_url, text, &init_len);
+        if (init) {
+            size_t before = ch.pssh_all_count;
+            rs_cdm_challenge_add_from_init(&ch, init, init_len);
+            if (ch.pssh_all_count > before)
+                log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
+                            "no PSSH in the manifest — found %lu box(es) in the init segment",
+                            (unsigned long)(ch.pssh_all_count - before));
+            // `initparse` hook: some DRM only lives in the init segment, and a
+            // script may recognise a layout this parser doesn't.
+            if (st->want_initparse) {
+                char *encoded = rs_base64_encode(init, init_len);
+                char *extra[2];
+                int extra_n = 0;
+                extra[extra_n++] = rs_script_arg("url", manifest_url, true);
+                extra[extra_n++] = rs_script_arg("init", encoded ? encoded : "", true);
+                char *out = NULL;
+                if (stream_start_run(st, "initparse", extra, extra_n, 30.0, &out) == 0) {
+                    rs_json *doc = parse_script_document(out);
+                    static const char *const kid_keys[2] = {"Kid", "kid"};
+                    for (size_t k = 0; k < 2; k++) {
+                        const char *found = rs_json_obj_str(doc, kid_keys[k], "");
+                        if (found[0]) rs_cdm_challenge_add_kid(&ch, found);
+                    }
+                    static const char *const box_keys[6] = {"Pssh", "pssh", "PsshWidevine",
+                                                            "psshWidevine", "PsshPlayReady",
+                                                            "psshPlayReady"};
+                    for (size_t k = 0; k < 6; k++) {
+                        const char *found = rs_json_obj_str(doc, box_keys[k], "");
+                        if (rs_cdm_is_pssh_box(found)) rs_cdm_challenge_add_pssh(&ch, found);
+                    }
+                    rs_json_free(doc);
+                }
+                rs_free(out);
+                for (int i = 0; i < extra_n; i++) free(extra[i]);
+                rs_free(encoded);
+            }
+            free(init);
+        }
+    }
+    if (rs_cdm_challenge_synthesize_pssh(&ch))
+        log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
+                    "no PSSH advertised — built a Widevine box from the %lu KID(s) found",
+                    (unsigned long)ch.kids_count);
+
+    if (rs_drm_challenge_is_empty(&ch)) {
+        log_record(server, sid, "warn", "cdm", manifest_url, 0, -1,
+                   "no KIDs, PSSH or key URIs found — the script gets no DRM to license against");
+    } else {
+        char *kid_list = ch.kids_count ? join_list(ch.kids, ch.kids_count, ", ") : NULL;
+        log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
+                    "parsed DRM from the source — KID(s) [%s], %lu PSSH box(es), %lu key URI(s)",
+                    kid_list ? kid_list : "", (unsigned long)ch.pssh_all_count,
+                    (unsigned long)ch.key_uris_count);
+        free(kid_list);
+    }
+
+    // `pssh` hook: the script gets first refusal on the box we extracted and may
+    // hand back a different one to license against. Only a real `pssh` box is
+    // accepted — a script that prints a traceback, or echoes the argument back
+    // still wrapped in the protocol's b64: encoding, must not become the box we
+    // ask for keys with.
+    char *license_pssh = ch.pssh_all_count ? rs_strdup(ch.pssh_all[0]) : NULL;
+    if (st->want_pssh_hook && license_pssh) {
+        char *extra[2];
+        int extra_n = 0;
+        extra[extra_n++] = rs_script_arg("pssh", license_pssh, true);
+        extra[extra_n++] = rs_script_arg("url", manifest_url, true);
+        char *out = NULL;
+        if (stream_start_run(st, "pssh", extra, extra_n, 30.0, &out) == 0 && out) {
+            rs_json *doc = parse_script_document(out);
+            const char *replacement = doc ? rs_json_obj_str(doc, "ProcessedPssh", "") : NULL;
+            char *trimmed = replacement && replacement[0]
+                ? rs_strdup(replacement) : rs_trim_dup(out, strlen(out), true);
+            if (trimmed && strcmp(trimmed, license_pssh) != 0 && rs_cdm_is_pssh_box(trimmed)) {
+                rs_cdm_challenge_add_pssh(&ch, trimmed);
+                free(license_pssh);
+                license_pssh = trimmed;
+                trimmed = NULL;
+                log_record(server, sid, "info", "cdm", NULL, 0, -1,
+                           "the pssh action returned a different box — licensing against that one");
+            } else if (trimmed && trimmed[0] && strcmp(trimmed, license_pssh) != 0) {
+                log_record(server, sid, "warn", "cdm", NULL, 0, -1,
+                           "the pssh action returned something that isn't a PSSH box — ignoring it");
+            }
+            free(trimmed);
+            rs_json_free(doc);
+        }
+        rs_free(out);
+        for (int i = 0; i < extra_n; i++) free(extra[i]);
+    }
+
+    // The script owns the licence exchange — we don't run a CDM, we just hand
+    // over everything the source advertised and take back clear keys.
+    char *extra[10];
+    int extra_n = 0;
+    extra[extra_n++] = rs_script_arg("cdm", st->cdm_mode[0] ? st->cdm_mode : "external", false);
+    if (st->cdm_type[0]) extra[extra_n++] = rs_script_arg("cdmType", st->cdm_type, false);
+    if (ch.kids_count) {
+        char *j = join_list(ch.kids, ch.kids_count, ",");
+        extra[extra_n++] = rs_script_arg("kid", j, false);
+        free(j);
+    }
+    if (license_pssh) extra[extra_n++] = rs_script_arg("pssh", license_pssh, true);
+    if (ch.pssh_all_count) {
+        char *j = join_list(ch.pssh_all, ch.pssh_all_count, ",");
+        extra[extra_n++] = rs_script_arg("psshAll", j, true);
+        free(j);
+    }
+    if (ch.pssh_widevine) extra[extra_n++] = rs_script_arg("psshWidevine", ch.pssh_widevine, true);
+    if (ch.pssh_playready) extra[extra_n++] = rs_script_arg("psshPlayReady", ch.pssh_playready, true);
+    if (ch.key_uris_count) {
+        char *j = join_list(ch.key_uris, ch.key_uris_count, ",");
+        extra[extra_n++] = rs_script_arg("keyUri", j, true);
+        free(j);
+    }
+
+    char *out = NULL;
+    int rc = stream_start_run(st, "cdm", extra, extra_n, 60.0, &out);
+    for (int i = 0; i < extra_n; i++) free(extra[i]);
+    if (rc != 0) {
+        log_record(server, sid, "error", "cdm", NULL, rc, -1,
+                   "the cdm action exited non-zero — playing on without keys");
+    } else {
+        char *pairs = rs_cdm_parse_key_output(out);
+        if (pairs && pairs[0]) {
+            free(st->keys);
+            st->keys = pairs;
+            size_t count = 1;
+            for (const char *p = pairs; *p; p++) if (*p == '\n') count++;
+            log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
+                        "acquired %lu clear key(s) from the script", (unsigned long)count);
+        } else {
+            free(pairs);
+            log_record(server, sid, "warn", "cdm", NULL, 0, -1,
+                       "the cdm action returned no usable KID:KEY pairs");
+        }
+    }
+    rs_free(out);
+    free(license_pssh);
+    rs_drm_challenge_free(&ch);
+    free(text);
+}
+
+static void stream_start_worker(restream_server_t *server, const char *sid, rs_stream_start *st) {
+    const char *source = st->url;
+    if (st->want_manifest) {
+        char *out = NULL;
+        int rc = stream_start_run(st, "manifest", NULL, 0, 45.0, &out);
+        if (rc != 0) {
+            snprintf(st->err, sizeof(st->err),
+                     "The manifest action exited %d — no source URL for this session.", rc);
+        } else if (stream_start_parse_manifest(st, out)) {
+            st->manifest_applied = true;
+            source = st->manifest_url;
+            // Later steps must see the URL this session actually plays, not the
+            // expired one the stream was stored with.
+            if (st->url_arg >= 0 && st->url_arg < st->argc) {
+                free(st->args[st->url_arg]);
+                st->args[st->url_arg] = rs_script_arg("url", st->manifest_url, true);
+            }
+            log_recordf(server, sid, "info", "scriptManifest", st->manifest_url, 0, -1,
+                        "session manifest: fresh source (%lu CDN mirror(s)%s)",
+                        (unsigned long)rs_json_arr_len(st->cdn_urls),
+                        st->heartbeat_seconds ? ", heartbeat requested" : "");
+        }
+        rs_free(out);
+        if (st->err[0]) {
+            log_record(server, sid, "error", "scriptManifest", NULL, 0, -1, st->err);
+            return;
+        }
+    }
+    if (st->want_cdm && source && source[0]) stream_start_resolve_keys(server, sid, st, source);
+}
+
 static void *pending_job_worker(void *arg) {
     rs_pending_job *pf = (rs_pending_job *)arg;
     restream_server_t *server = pf->server;
@@ -3162,6 +3691,9 @@ static void *pending_job_worker(void *arg) {
             pf->script_import = parse_script_document(pf->script_stdout);
             if (pf->script_import) pf->script_logos = resolve_import_logos(server, pf);
         }
+        break;
+    case RS_PENDING_STREAM_START:
+        stream_start_worker(server, pf->stream_id, pf->start);
         break;
     }
 
@@ -3460,6 +3992,151 @@ static void pending_job_finish_script(restream_server_t *server, struct mg_conne
     reply_json(c, 200, result, NULL);
 }
 
+// Folds the pipeline's results into the state, then does what the plain start
+// route does: flip the stream to running and hand it to the engine. This is the
+// only point where any of it touches the state DOM.
+static void pending_job_finish_stream_start(restream_server_t *server, struct mg_connection *c,
+                                            rs_pending_job *pf) {
+    rs_stream_start *st = pf->start;
+    const char *ignored = NULL;
+    if (st->err[0]) {
+        // A session URL we could not refresh is fatal: there is nothing to
+        // poll, and starting anyway would just restart-loop against a dead URL.
+        rs_panel_set_stream_running(&server->state, pf->stream_id, false, &ignored);
+        log_recordf(server, "__panel__", "error", "streamStart", NULL, 0, -1,
+                    "START of %s from %s failed: %s", pf->stream_id,
+                    pf->client_ip ? pf->client_ip : "?", st->err);
+        reply_error(c, 502, st->err);
+        return;
+    }
+
+    const char *err = NULL;
+    if (st->manifest_applied)
+        rs_panel_apply_session_manifest(&server->state, pf->stream_id, st->manifest_url,
+                                        st->cdn_urls, st->manifest_headers, st->media_headers,
+                                        st->heartbeat_seconds, &err);
+    if (st->keys && st->keys[0])
+        rs_panel_set_stream_keys(&server->state, pf->stream_id, st->keys, &err);
+
+    int rc = rs_panel_set_stream_running(&server->state, pf->stream_id, true, &err);
+    char pipeline_err[256] = {0};
+    if (rc == 0) {
+        int live_rc = live_sync_stream(server, pf->stream_id);
+        if (live_rc != 0 ||
+            pipeline_sync_stream(server, pf->stream_id, pipeline_err, sizeof(pipeline_err)) != 0) {
+            live_stop_stream(server, pf->stream_id);
+            pipeline_stop_stream(pf->stream_id);
+            rs_panel_set_stream_running(&server->state, pf->stream_id, false, &ignored);
+            err = live_rc != 0 ? "The live engine could not start." : pipeline_err;
+            rc = live_rc != 0 ? -500 : -400;
+        }
+    }
+    if (rc == 0) {
+        const rs_json *stream = rs_panel_find_stream(&server->state, pf->stream_id);
+        const char *name = stream ? rs_json_obj_str(stream, "name", "") : "";
+        const char *kind = stream ? rs_json_obj_str(stream, "kind", "mpd") : "mpd";
+        const char *src = stream ? stream_source_target(stream) : "";
+        log_recordf(server, pf->stream_id, "info", "streamStart", src, 0, -1,
+                    "START requested by %s — \"%s\" (%s, script-driven)",
+                    pf->client_ip ? pf->client_ip : "?", name, kind);
+        log_recordf(server, "__panel__", "info", "streamStart", src, 0, -1,
+                    "%s (\"%s\") started by %s", pf->stream_id, name,
+                    pf->client_ip ? pf->client_ip : "?");
+    } else {
+        log_recordf(server, "__panel__", "error", "streamStart", NULL, 0, -1,
+                    "START of %s from %s failed: %s", pf->stream_id,
+                    pf->client_ip ? pf->client_ip : "?", err ? err : "unknown error");
+        reply_error(c, -rc, err ? err : "Request failed.");
+        return;
+    }
+
+    if (rs_state_save(&server->state) != 0) { reply_error(c, 500, "Could not save state."); return; }
+    webhook_rebuild_targets(server);
+    rs_json *view = rs_panel_view(&server->state, st->host ? st->host : "");
+    inject_stream_metrics(server, view);
+    reply_json(c, 200, view, NULL);
+}
+
+// Builds the job for a script-driven start and hands it to a worker. Returns
+// true when it has taken the reply over; false means this stream needs nothing
+// from its script and the plain synchronous start should run instead.
+static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
+                                  struct mg_http_message *hm, const char *stream_id,
+                                  const char *ip) {
+    const rs_json *stream = rs_panel_find_stream(&s->state, stream_id);
+    if (!stream) return false;
+    const rs_json *provider = provider_of(&s->state, stream);
+    if (!provider) return false;
+
+    bool want_manifest = rs_json_obj_bool(stream, "sessionManifest", false)
+        && rs_panel_script_action_allowed(provider, stream, "manifest");
+    // Keys typed by hand always win; the script is only asked when the field is
+    // empty, so an operator's own keys are never silently replaced.
+    bool want_cdm = rs_json_obj_bool(stream, "useCdm", false)
+        && rs_panel_script_action_allowed(provider, stream, "cdm")
+        && !rs_json_obj_str(stream, "decryptionKeys", "")[0];
+    if (!want_manifest && !want_cdm) return false;
+
+    const char *script = rs_panel_effective_script_path(provider, stream);
+    if (!script[0]) {
+        const char *ignored = NULL;
+        rs_panel_set_stream_running(&s->state, stream_id, false, &ignored);
+        reply_error(c, 400,
+                    "This stream is set to get its source (or keys) from a script, but neither it "
+                    "nor its provider has a script path set.");
+        return true;
+    }
+
+    rs_stream_start *st = (rs_stream_start *)calloc(1, sizeof(*st));
+    rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
+    char **args = (char **)calloc(RS_SCRIPT_ARG_CAP, sizeof(char *));
+    if (!st || !pf || !args) { free(st); free(pf); free(args); return false; }
+
+    int n = fill_common_script_args(provider, stream, args, 0, RS_SCRIPT_ARG_CAP);
+    if (n < RS_SCRIPT_ARG_CAP) args[n++] = rs_script_arg("id", stream_id, false);
+    int url_arg = -1;
+    if (n < RS_SCRIPT_ARG_CAP) {
+        url_arg = n;
+        args[n++] = rs_script_arg("url", rs_json_obj_str(stream, "url", ""), true);
+    }
+    n = append_script_params(args, n, RS_SCRIPT_ARG_CAP, rs_json_obj_str(stream, "scriptParams", ""));
+
+    st->url_arg = url_arg;
+    st->script_path = rs_strdup(script);
+    st->args = args;
+    st->argc = n;
+    st->kind = rs_strdup(rs_json_obj_str(stream, "kind", "mpd"));
+    st->url = rs_strdup(rs_json_obj_str(stream, "url", ""));
+    st->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    st->headers = effective_headers(provider, stream, "manifestHeaders");
+    st->downloader = rs_strdup(effective_downloader(provider, stream));
+    st->dl_params = rs_strdup(effective_downloader_params(provider, stream));
+    st->rep = rs_strdup(selected_video_rep(stream));
+    st->host = request_host(hm);
+    st->force_ipv6 = rs_json_obj_bool(provider, "forceIpv6", false);
+    st->rotate_proxies = rs_json_obj_bool(provider, "rotateProxies", false);
+    st->want_manifest = want_manifest;
+    st->want_cdm = want_cdm;
+    st->want_pssh_hook = rs_panel_script_action_allowed(provider, stream, "pssh");
+    st->want_initparse = rs_panel_script_action_allowed(provider, stream, "initparse");
+    st->cdm_mode = rs_strdup(rs_json_obj_str(stream, "cdmMode", "external"));
+    st->cdm_type = rs_strdup(rs_json_obj_str(stream, "cdmType", ""));
+
+    pf->kind = RS_PENDING_STREAM_START;
+    pf->stream_id = rs_strdup(stream_id);
+    pf->client_ip = rs_strdup(ip ? ip : "");
+    pf->start = st;
+
+    log_recordf(s, stream_id, "info", "scriptManifest", NULL, 0, -1,
+                "start: running %s%s", want_manifest ? "manifest" : "",
+                want_manifest && want_cdm ? " then cdm" : (want_cdm ? "cdm" : ""));
+    if (!pending_job_dispatch(s, c, pf)) {
+        pending_job_free(pf);
+        return false;
+    }
+    return true;
+}
+
 static void pending_job_finish(restream_server_t *server, struct mg_connection *c, struct mg_str *data) {
     if (!data || data->len != sizeof(rs_pending_job *)) return;
     rs_pending_job *pf;
@@ -3470,6 +4147,7 @@ static void pending_job_finish(restream_server_t *server, struct mg_connection *
     case RS_PENDING_LOGO: pending_job_finish_logo(c, pf); break;
     case RS_PENDING_PROBE: pending_job_finish_probe(c, pf); break;
     case RS_PENDING_SCRIPT: pending_job_finish_script(server, c, pf); break;
+    case RS_PENDING_STREAM_START: pending_job_finish_stream_start(server, c, pf); break;
     }
     pending_job_free(pf);
 }

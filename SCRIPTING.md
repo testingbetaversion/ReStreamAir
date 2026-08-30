@@ -125,7 +125,7 @@ session_file = os.path.join(session_dir, "session.json")
 
 ## Actions
 
-Enable only the actions your script implements. A stream inherits its provider's selection and can override it.
+Enable only the actions your script implements. **An action that isn't ticked is never invoked** — not by playback, and not by the panel's run buttons, which answer `400` and say which box to tick. A stream inherits its provider's selection and can override it; an empty override keeps the script away from that one stream entirely. `downloadinit` and `downloadmedia` can be ticked but are never called yet.
 
 ### Account actions
 
@@ -192,7 +192,7 @@ print(json.dumps({
 }))
 ```
 
-`manifest` is also the recovery hook for an expired source URL. When the current URL and its mirrors fail, ReStreamAir can ask the script for a fresh one and retry.
+`manifest` runs on every start of a stream that has **Session manifest** ticked, before anything reads the stream's source URL. Its `ManifestUrl`, `Cdn` mirrors, `Headers` and `Heartbeat.PeriodMs` are stored on the stream, so the panel shows what the stream is really playing and every pipeline reads the live session URL. A start whose `manifest` action fails is refused rather than begun against a stale URL.
 
 ### Pipeline and key actions
 
@@ -203,6 +203,16 @@ print(json.dumps({
 | `pssh` | `pssh`, `url` | Replacement PSSH or `{"ProcessedPssh":"..."}`. |
 | `initparse` | `url`, base64 `init` | JSON containing any discovered KID/PSSH values. |
 | `cdm` | KIDs, PSSH values, key URI, CDM type | Clear keys as `KID:KEY` lines or JSON. |
+
+`cdm` runs on every start of a stream that has **DRM keys via script** ticked and no keys typed by hand. ReStreamAir fetches the source manifest, scrapes every KID, PSSH box and HLS key URI out of it, and passes them all as `kid=`, `pssh=`, `psshAll=`, `psshWidevine=`, `psshPlayReady=` and `keyUri=`, along with `cdm=external`, the stream's `cdmType=` and its script params. The keys that come back are stored as the stream's decryption keys.
+
+PSSH is looked for in three places, in order:
+
+1. the manifest — `cenc:pssh` in an MPD, a Widevine `EXT-X-KEY` in a playlist;
+2. the initialization segment, fetched when the manifest carried no box, and scanned for `pssh` boxes and `tenc` default KIDs;
+3. built from the KIDs, when the source only ever names one — a version 0 Widevine box whose `WidevinePsshData` carries the key ids, the same box `pywidevine`'s `PSSH.new(key_ids=…)` round-trips.
+
+No `pywidevine` (or any other Python) is involved: the box is assembled in C. ReStreamAir still has no CDM of its own — the script performs the licence exchange and returns clear keys.
 
 Example key output:
 

@@ -279,9 +279,10 @@
                 <label>Script params<span class="field-hint">Auto-filled on channel import. key=value tokens sent to every action, e.g. <code>id=123 streamId=456</code></span><input name="scriptParams" placeholder="id=123 streamId=456"></label>
               </div>
               <div class="actions" style="margin-top: 4px;">
-                <button type="button" class="ghost" id="scriptRunPsshBtn"><span data-icon="play"></span>Run pssh</button>
-                <button type="button" class="ghost" id="scriptRunManifestBtn"><span data-icon="play"></span>Run manifest</button>
-                <button type="button" class="ghost" id="scriptRunMediaBtn"><span data-icon="play"></span>Run media</button>
+                <button type="button" class="ghost" id="scriptRunManifestBtn" title="Run the session-manifest action — the same one Start runs to get a fresh source URL"><span data-icon="play"></span>Run manifest</button>
+                <button type="button" class="ghost" id="scriptRunCdmBtn" title="Ask the script for clear keys, the same way Start does"><span data-icon="play"></span>Run cdm</button>
+                <button type="button" class="ghost" id="scriptRunPsshBtn" title="Run the PSSH post-processing hook"><span data-icon="play"></span>Run pssh</button>
+                <button type="button" class="ghost" id="scriptRunDownloadManifestBtn" title="Run the manifest-download hook, for scripts that fetch the manifest themselves"><span data-icon="play"></span>Run manifest download</button>
               </div>
               <pre id="streamScriptOutputBox" class="script-output hidden"></pre>
               <p class="field-hint" style="margin:2px 2px 0">See the <b>Help</b> tab for the full script protocol.</p>

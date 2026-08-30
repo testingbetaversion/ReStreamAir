@@ -214,6 +214,20 @@ const rs_json *rs_json_arr_at(const rs_json *arr, size_t index) {
     return arr->as.arr.items[index];
 }
 
+size_t rs_json_obj_len(const rs_json *obj) {
+    return (obj && obj->type == RS_JSON_OBJ) ? obj->as.obj.len : 0;
+}
+
+const char *rs_json_obj_key_at(const rs_json *obj, size_t index) {
+    if (!obj || obj->type != RS_JSON_OBJ || index >= obj->as.obj.len) return NULL;
+    return obj->as.obj.members[index].key;
+}
+
+const rs_json *rs_json_obj_value_at(const rs_json *obj, size_t index) {
+    if (!obj || obj->type != RS_JSON_OBJ || index >= obj->as.obj.len) return NULL;
+    return obj->as.obj.members[index].value;
+}
+
 const char *rs_json_as_str(const rs_json *value, const char *fallback) {
     return (value && value->type == RS_JSON_STR) ? value->as.string : fallback;
 }

@@ -516,7 +516,7 @@ int rs_panel_create_provider(rs_state *st, const rs_json *body, const char **err
     rs_json_obj_set_str(p, "scriptWorker", "");
     rs_json_obj_set_str(p, "activeScriptAccountId", "");
     rs_json_obj_set_str(p, "accountSelectionMode", "fixed");
-    rs_json_obj_set(p, "scriptActions", rs_json_new_arr());  // no script yet
+    rs_json_obj_set(p, "scriptActions", rs_panel_default_script_actions());
     rs_json_arr_push(providers_array(st), p);
     (void)err;
     return 0;
@@ -601,6 +601,78 @@ int rs_panel_delete_provider(rs_state *st, const char *id, const char **err) {
     if (!found) { rs_json_free(kept); *err = "Provider not found."; return -404; }
     rs_json_obj_set(st->root, "providers", kept);
     return 0;
+}
+
+// --- script actions --------------------------------------------------------
+//
+// Nothing spawns a provider script without asking here first. An action the
+// provider hasn't declared is never invoked, so a script that only implements
+// `channels` never sees a `downloadmanifest` it would fail on — and the two
+// download hooks, which are storable but not wired to anything yet, are never
+// invoked whatever the configuration says.
+
+static bool action_is(const char *action, const char *name) {
+    return action && strcmp(action, name) == 0;
+}
+
+bool rs_panel_script_action_wired(const char *action) {
+    // Routing every init/segment fetch through a spawned subprocess needs a
+    // persistent worker rather than one process per fetch. The choice is stored
+    // so enabling it later needs no reconfiguration, but it never runs.
+    return !action_is(action, "downloadinit") && !action_is(action, "downloadmedia");
+}
+
+rs_json *rs_panel_default_script_actions(void) {
+    // What a brand-new provider gets: the account and catalogue actions nearly
+    // every script implements. The per-stream playback hooks stay off until
+    // they are asked for.
+    static const char *const defaults[] = {"login", "pair", "channels", "events"};
+    rs_json *arr = rs_json_new_arr();
+    for (size_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]); i++)
+        rs_json_arr_push(arr, rs_json_new_str(defaults[i]));
+    return arr;
+}
+
+// The set in effect for a stream: its own override when it has one, otherwise
+// its provider's.
+//
+// An empty override on a stream really does mean "nothing" — that is what the
+// editor's "untick everything to keep the script away from this stream
+// entirely" offers. An empty (or absent) set on a *provider* means "not
+// configured": providers created before this field was populated stored an
+// empty array, and reading that as "nothing allowed" would silently stop
+// working providers from importing their channels on upgrade. Those fall back
+// to the defaults instead, which is what such a provider has always behaved as.
+static const rs_json *effective_script_actions(const rs_json *provider, const rs_json *stream,
+                                               rs_json **owned) {
+    *owned = NULL;
+    if (stream) {
+        const rs_json *override = rs_json_obj_get(stream, "scriptActionsOverride");
+        if (override && rs_json_type_of(override) == RS_JSON_ARR) return override;
+    }
+    const rs_json *declared = rs_json_obj_get(provider, "scriptActions");
+    if (declared && rs_json_type_of(declared) == RS_JSON_ARR && rs_json_arr_len(declared) > 0)
+        return declared;
+    *owned = rs_panel_default_script_actions();
+    return *owned;
+}
+
+bool rs_panel_script_action_allowed(const rs_json *provider, const rs_json *stream,
+                                    const char *action) {
+    if (!action || !action[0] || !rs_panel_script_action_wired(action)) return false;
+    rs_json *owned = NULL;
+    const rs_json *actions = effective_script_actions(provider, stream, &owned);
+    bool found = false;
+    for (size_t i = 0; i < rs_json_arr_len(actions) && !found; i++)
+        found = strcmp(rs_json_as_str(rs_json_arr_at(actions, i), ""), action) == 0;
+    rs_json_free(owned);
+    return found;
+}
+
+const char *rs_panel_effective_script_path(const rs_json *provider, const rs_json *stream) {
+    const char *override = stream ? rs_json_obj_str(stream, "scriptOverride", "") : "";
+    if (override[0]) return override;
+    return rs_json_obj_str(provider, "scriptPath", "");
 }
 
 // --- stream mutations ------------------------------------------------------
@@ -792,6 +864,44 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
         count++;
     }
     if (imported) *imported = count;
+    return 0;
+}
+
+// Persists what the script's `manifest` action just handed back, so every
+// pipeline — the DASH engine, the m3u8 passthrough, ffmpeg — reads the live
+// session URL rather than the expired one it was started with, and so the panel
+// shows the operator what the stream is actually playing. Empty header text and
+// a zero heartbeat mean "the script didn't say", and leave what was configured
+// alone rather than clearing it.
+int rs_panel_apply_session_manifest(rs_state *st, const char *stream_id, const char *url,
+                                    const rs_json *cdn_urls, const char *manifest_headers,
+                                    const char *media_headers, int heartbeat_seconds,
+                                    const char **err) {
+    rs_json *provider = NULL;
+    rs_json *stream = find_stream(st, stream_id, &provider);
+    if (!stream) { *err = "Stream not found."; return -404; }
+    if (!is_http_url(url)) { *err = "The manifest action returned no usable ManifestUrl."; return -400; }
+    rs_json_obj_set_str(stream, "url", url);
+    rs_json_obj_set(stream, "cdnUrls",
+                    cdn_urls && rs_json_type_of(cdn_urls) == RS_JSON_ARR
+                        ? rs_json_clone(cdn_urls) : rs_json_new_arr());
+    if (manifest_headers && manifest_headers[0])
+        rs_json_obj_set_str(stream, "manifestHeaders", manifest_headers);
+    if (media_headers && media_headers[0])
+        rs_json_obj_set_str(stream, "mediaHeaders", media_headers);
+    if (heartbeat_seconds > 0)
+        rs_json_obj_set_int(stream, "heartbeatSeconds", heartbeat_seconds);
+    return 0;
+}
+
+// Stores the clear keys the `cdm` action returned. Keys typed by hand are never
+// overwritten — the caller only asks for script keys when the field is empty.
+int rs_panel_set_stream_keys(rs_state *st, const char *stream_id, const char *keys,
+                             const char **err) {
+    rs_json *provider = NULL;
+    rs_json *stream = find_stream(st, stream_id, &provider);
+    if (!stream) { *err = "Stream not found."; return -404; }
+    rs_json_obj_set_str(stream, "decryptionKeys", keys ? keys : "");
     return 0;
 }
 

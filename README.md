@@ -146,10 +146,12 @@ Use a provider script only when the source needs custom behavior. Common actions
 | `login` / `pair` | Create a provider session. |
 | `channels` / `events` | Return streams to import. |
 | `epg` | Return guide data. |
-| `manifest` | Return a fresh source URL and headers. |
+| `manifest` | Return a fresh source URL and headers. Runs on every start of a session-manifest stream. |
 | `start` / `stop` / `heartbeat` | Manage a source-side session. |
 | `url`, `downloadmanifest`, `pssh`, `initparse` | Adjust pipeline inputs. |
-| `cdm` | Return clear `KID:KEY` pairs from an external key workflow. |
+| `cdm` | Return clear `KID:KEY` pairs from an external key workflow. Runs on every start, after `manifest`. |
+
+Only the actions ticked for a provider are ever invoked, and `cdm` is given every KID and PSSH box ReStreamAir can find — in the manifest, in the initialization segment, or built from the KIDs when the source names no box at all.
 
 Scripts receive flat `key=value` arguments and print text or JSON. ReStreamAir supplies a durable directory at `runtime/sessions/<provider-id>/`; **Clear session** recursively deletes it.
 

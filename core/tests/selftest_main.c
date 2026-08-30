@@ -20,6 +20,7 @@
 
 #include "rs_aes.h"
 #include "rs_auth.h"
+#include "rs_cdm.h"
 #include "rs_cenc.h"
 #include "rs_crypto.h"
 #include "rs_ffargs.h"
@@ -1044,6 +1045,96 @@ static void test_state_repeated_save(void) {
     remove("rs-selftest-state-save.json.tmp");
 }
 
+static void test_cdm_pssh(void) {
+    // A Widevine box built from a KID: version 0, the Widevine system id, and a
+    // WidevinePsshData payload of one `key_ids` field (tag 0x12, length 0x10).
+    char *kids[1] = {(char *)"11223344556677889900aabbccddeeff"};
+    char *b64 = rs_cdm_pssh_from_kids(kids, 1);
+    check("cdm/pssh-built", b64 != NULL);
+    uint8_t box[128];
+    size_t box_len = 0;
+    check("cdm/pssh-decodes", b64 && rs_base64_decode(b64, box, sizeof(box), &box_len) == 0);
+    check("cdm/pssh-size", box_len == 4 + 4 + 4 + 16 + 4 + 18);
+    check("cdm/pssh-type", box_len > 8 && memcmp(box + 4, "pssh", 4) == 0);
+    check("cdm/pssh-version-0", box_len > 8 && box[8] == 0);
+    static const uint8_t widevine[16] = {0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce,
+                                         0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed};
+    check("cdm/pssh-system-id", box_len >= 28 && memcmp(box + 12, widevine, 16) == 0);
+    static const uint8_t payload[18] = {0x12, 0x10, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                                        0x99, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    check("cdm/pssh-key-ids", box_len == 50 && memcmp(box + 32, payload, 18) == 0);
+
+    // Round-trip: the box we built is recognised as Widevine when it comes back
+    // in a manifest.
+    char xml[512];
+    snprintf(xml, sizeof(xml), "<MPD><cenc:pssh>%s</cenc:pssh></MPD>", b64 ? b64 : "");
+    rs_drm_challenge ch = rs_cdm_challenge_from_mpd(xml);
+    check("cdm/pssh-roundtrip-count", ch.pssh_all_count == 1);
+    check_str("cdm/pssh-roundtrip-widevine", ch.pssh_widevine ? ch.pssh_widevine : "", b64 ? b64 : "x");
+    rs_drm_challenge_free(&ch);
+    rs_free(b64);
+
+    // A KID that isn't 32 hex digits contributes nothing, and a list of only
+    // those produces no box at all rather than an empty one.
+    char *bad[1] = {(char *)"nothex"};
+    check("cdm/pssh-rejects-bad-kid", rs_cdm_pssh_from_kids(bad, 1) == NULL);
+
+    // Synthesis fills the gap only when the source named KIDs but no box.
+    rs_drm_challenge kid_only;
+    memset(&kid_only, 0, sizeof(kid_only));
+    rs_drm_challenge parsed = rs_cdm_challenge_from_mpd(
+        "<MPD><ContentProtection default_KID=\"11223344-5566-7788-9900-aabbccddeeff\"/></MPD>");
+    check("cdm/kid-from-attribute", parsed.kids_count == 1);
+    check("cdm/no-pssh-yet", parsed.pssh_all_count == 0);
+    check("cdm/synthesized", rs_cdm_challenge_synthesize_pssh(&parsed));
+    check("cdm/synthesized-widevine", parsed.pssh_widevine != NULL);
+    check("cdm/synthesize-idempotent", !rs_cdm_challenge_synthesize_pssh(&parsed));
+    rs_drm_challenge_free(&parsed);
+    check("cdm/empty-challenge", rs_drm_challenge_is_empty(&kid_only));
+
+    // Init-segment scan: a `pssh` box and a `tenc` default_KID, wrapped in the
+    // kind of nesting a real initialization segment has.
+    uint8_t init[96];
+    size_t o = 0;
+    memset(init, 0, sizeof(init));
+    // pssh box: 4+4+4+16+4 = 32 bytes, empty payload.
+    init[o++] = 0; init[o++] = 0; init[o++] = 0; init[o++] = 32;
+    memcpy(init + o, "pssh", 4); o += 4;
+    o += 4;                                  // version 0, no flags
+    memcpy(init + o, widevine, 16); o += 16;
+    o += 4;                                  // data size 0
+    // tenc box: 8 header + 8 fixed fields + 16 KID = 32 bytes.
+    init[o++] = 0; init[o++] = 0; init[o++] = 0; init[o++] = 32;
+    memcpy(init + o, "tenc", 4); o += 4;
+    o += 8;                                  // FullBox header + the four bytes before the KID
+    memcpy(init + o, payload + 2, 16); o += 16;
+
+    rs_drm_challenge from_init;
+    memset(&from_init, 0, sizeof(from_init));
+    rs_cdm_challenge_add_from_init(&from_init, init, o);
+    check("cdm/init-pssh", from_init.pssh_all_count == 1);
+    check("cdm/init-widevine", from_init.pssh_widevine != NULL);
+    check("cdm/init-kid-count", from_init.kids_count == 1);
+    check_str("cdm/init-kid", from_init.kids_count ? from_init.kids[0] : "",
+              "11223344556677889900aabbccddeeff");
+    rs_drm_challenge_free(&from_init);
+
+    // Key output: the documented JSON shape and the bare "kid:key" lines.
+    char *pairs = rs_cdm_parse_key_output(
+        "{\"keys\":[{\"kid\":\"c3d43de9ff5b5a45cdc9f4e7f177a1a5\","
+        "\"key\":\"11223344556677889900aabbccddeeff\"}]}");
+    check_str("cdm/keys-json", pairs ? pairs : "",
+              "c3d43de9ff5b5a45cdc9f4e7f177a1a5:11223344556677889900aabbccddeeff");
+    rs_free(pairs);
+    pairs = rs_cdm_parse_key_output("noise\nc3d43de9ff5b5a45cdc9f4e7f177a1a5:11223344556677889900aabbccddeeff\n");
+    check_str("cdm/keys-lines", pairs ? pairs : "",
+              "c3d43de9ff5b5a45cdc9f4e7f177a1a5:11223344556677889900aabbccddeeff");
+    rs_free(pairs);
+    pairs = rs_cdm_parse_key_output("the script printed a traceback");
+    check_str("cdm/keys-none", pairs ? pairs : "x", "");
+    rs_free(pairs);
+}
+
 static void test_panel(void) {
     // Slug: alphanumeric runs joined by single dashes, lowercased.
     char *slug = rs_panel_slugify("My Cool Stream! (HD)");
@@ -1191,6 +1282,88 @@ static void test_panel(void) {
               rs_json_obj_str(rs_json_arr_at(streams, 1), "sourceType", ""), "channel");
     check_str("panel/import-edit-keeps-params",
               rs_json_obj_str(rs_json_arr_at(streams, 1), "scriptParams", ""), "id=202");
+
+    // Script action gating. A brand-new provider declares the account and
+    // catalogue actions, so the playback hooks are refused until ticked.
+    const rs_json *p1 = rs_json_arr_at(providers, 0);
+    check("panel/actions-default-channels", rs_panel_script_action_allowed(p1, NULL, "channels"));
+    check("panel/actions-default-no-manifest", !rs_panel_script_action_allowed(p1, NULL, "manifest"));
+    check("panel/actions-unwired", !rs_panel_script_action_wired("downloadmedia"));
+
+    // A provider whose set is empty predates the field being populated, so it
+    // falls back to the defaults rather than refusing everything on upgrade.
+    rs_json *no_actions = parse_json("{\"name\":\"P1\",\"scriptActions\":[]}");
+    check("panel/actions-clear", rs_panel_update_provider(&st, pid, no_actions, &err) == 0);
+    rs_json_free(no_actions);
+    check("panel/actions-empty-falls-back",
+          rs_panel_script_action_allowed(rs_json_arr_at(providers, 0), NULL, "channels"));
+
+    rs_json *with_actions = parse_json(
+        "{\"name\":\"P1\",\"scriptActions\":[\"login\",\"manifest\",\"cdm\",\"downloadmedia\"]}");
+    check("panel/actions-save", rs_panel_update_provider(&st, pid, with_actions, &err) == 0);
+    rs_json_free(with_actions);
+    p1 = rs_json_arr_at(providers, 0);
+    check("panel/actions-manifest-now-allowed", rs_panel_script_action_allowed(p1, NULL, "manifest"));
+    check("panel/actions-channels-now-refused", !rs_panel_script_action_allowed(p1, NULL, "channels"));
+    // Ticked but not wired to anything is still never invoked.
+    check("panel/actions-unwired-stays-off", !rs_panel_script_action_allowed(p1, NULL, "downloadmedia"));
+
+    // A stream's own override replaces its provider's set entirely.
+    const rs_json *imported_stream = rs_json_arr_at(streams, 1);
+    check("panel/actions-inherited", rs_panel_script_action_allowed(p1, imported_stream, "cdm"));
+    // An empty override on a stream does mean "nothing" — that is what the
+    // editor offers for keeping a script away from one stream.
+    rs_json *silence = parse_json(
+        "{\"name\":\"News\",\"url\":\"https://e.com/n.mpd\",\"scriptActionsOverride\":[]}");
+    check("panel/actions-empty-override-save",
+          rs_panel_update_stream(&st, rs_json_obj_str(imported_stream, "id", ""), silence, &err) == 0);
+    rs_json_free(silence);
+    streams = rs_json_obj_get(rs_json_arr_at(providers, 0), "streams");
+    imported_stream = rs_json_arr_at(streams, 1);
+    check("panel/actions-empty-override-blocks",
+          !rs_panel_script_action_allowed(p1, imported_stream, "cdm"));
+    rs_json *override = parse_json(
+        "{\"name\":\"News\",\"url\":\"https://e.com/n.mpd\",\"scriptActionsOverride\":[\"manifest\"]}");
+    check("panel/actions-override-save",
+          rs_panel_update_stream(&st, rs_json_obj_str(imported_stream, "id", ""), override, &err) == 0);
+    rs_json_free(override);
+    streams = rs_json_obj_get(rs_json_arr_at(providers, 0), "streams");
+    imported_stream = rs_json_arr_at(streams, 1);
+    check("panel/actions-override-keeps-manifest",
+          rs_panel_script_action_allowed(p1, imported_stream, "manifest"));
+    check("panel/actions-override-drops-cdm",
+          !rs_panel_script_action_allowed(p1, imported_stream, "cdm"));
+
+    // The effective script path: the stream's override, else the provider's.
+    check_str("panel/script-path-provider", rs_panel_effective_script_path(p1, imported_stream), "");
+
+    // A session manifest reply lands on the stream, and the engine's source
+    // URL comes from it.
+    const char *sid = rs_json_obj_str(imported_stream, "id", "");
+    rs_json *mirrors = parse_json("[\"https://backup.example/a.mpd\"]");
+    check("panel/session-manifest",
+          rs_panel_apply_session_manifest(&st, sid, "https://cdn.example/live/1.mpd", mirrors,
+                                          "Authorization: Bearer x", "", 300, &err) == 0);
+    rs_json_free(mirrors);
+    imported_stream = rs_json_arr_at(rs_json_obj_get(rs_json_arr_at(providers, 0), "streams"), 1);
+    check_str("panel/session-manifest-url", rs_json_obj_str(imported_stream, "url", ""),
+              "https://cdn.example/live/1.mpd");
+    check("panel/session-manifest-mirrors",
+          rs_json_arr_len(rs_json_obj_get(imported_stream, "cdnUrls")) == 1);
+    check_str("panel/session-manifest-headers",
+              rs_json_obj_str(imported_stream, "manifestHeaders", ""), "Authorization: Bearer x");
+    check("panel/session-manifest-heartbeat",
+          rs_json_obj_int(imported_stream, "heartbeatSeconds", 0) == 300);
+    // An empty header block means "the script didn't say", not "clear it".
+    check_str("panel/session-manifest-keeps-media-headers",
+              rs_json_obj_str(imported_stream, "mediaHeaders", ""), "");
+    check("panel/session-manifest-rejects-bad-url",
+          rs_panel_apply_session_manifest(&st, sid, "ftp://nope", NULL, "", "", 0, &err) == -400);
+
+    check("panel/cdm-keys", rs_panel_set_stream_keys(&st, sid, "aa:bb", &err) == 0);
+    check_str("panel/cdm-keys-stored",
+              rs_json_obj_str(rs_json_arr_at(rs_json_obj_get(rs_json_arr_at(providers, 0), "streams"), 1),
+                              "decryptionKeys", ""), "aa:bb");
 
     // Delete leaves an empty provider list but keeps the unknown top-level key.
     check("panel/delete-provider", rs_panel_delete_provider(&st, pid, &err) == 0);
@@ -2237,6 +2410,7 @@ int main(int argc, char **argv) {
     test_netmatch();
     test_state_repeated_save();
     test_panel();
+    test_cdm_pssh();
     test_cenc_multifragment();
     test_mpegts();
     test_metrics_connections();
