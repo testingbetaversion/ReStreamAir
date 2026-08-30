@@ -198,6 +198,9 @@ print(json.dumps({
 
 `manifest` runs on every start of a stream that has **Session manifest** ticked, before anything reads the stream's source URL. Its `ManifestUrl`, `Cdn` mirrors, `Headers` and `Heartbeat.PeriodMs` are stored on the stream, so the panel shows what the stream is really playing and every pipeline reads the live session URL. A start whose `manifest` action fails is refused rather than begun against a stale URL.
 
+When `ManifestUrl` is empty but `Cdn` contains usable URLs, the first CDN URL
+becomes the primary source and the remaining entries stay available as mirrors.
+
 ### Pipeline and key actions
 
 | Action | Important inputs | Expected output |

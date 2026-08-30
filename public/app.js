@@ -3290,13 +3290,42 @@ async function runStreamScriptAction(action, button) {
   }
 }
 
+// CDM cannot be tested as an isolated script call: it needs the fresh session
+// manifest first, then the KID/PSSH scraped from that manifest. Use the exact
+// Start pipeline so the script receives action=manifest followed by
+// action=cdm (with cdm=external and the discovered DRM arguments), and leave
+// the stream running when it succeeds.
+async function runStreamCdmPipeline(button) {
+  const stream = selectedStream();
+  if (!stream) return;
+  const box = $("#streamScriptOutputBox");
+  if (!box) return;
+  box.classList.remove("hidden");
+  box.textContent = "Running manifest, extracting DRM, then running CDM...";
+  button.disabled = true;
+  try {
+    state = await request(`/api/streams/${stream.id}/start`, { method: "POST", body: "{}" });
+    stateMutationEpoch++;
+    render();
+    const refreshedBox = $("#streamScriptOutputBox");
+    if (refreshedBox) {
+      refreshedBox.classList.remove("hidden");
+      refreshedBox.textContent = "Manifest and CDM completed. The stream is running.";
+    }
+  } catch (err) {
+    box.textContent = `Error: ${err.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 // "Run manifest" is the session-manifest action — the one Start runs to get a
 // fresh source URL — not `downloadmanifest`, which is the separate hook for a
 // script that fetches the manifest document itself. Wiring the button to the
 // latter meant the button people press to test their session URL ran an action
 // most scripts don't implement, with an empty url= into the bargain.
 $("#scriptRunManifestBtn")?.addEventListener("click", (e) => runStreamScriptAction("manifest", e.currentTarget));
-$("#scriptRunCdmBtn")?.addEventListener("click", (e) => runStreamScriptAction("cdm", e.currentTarget));
+$("#scriptRunCdmBtn")?.addEventListener("click", (e) => runStreamCdmPipeline(e.currentTarget));
 $("#scriptRunPsshBtn")?.addEventListener("click", (e) => runStreamScriptAction("pssh", e.currentTarget));
 $("#scriptRunDownloadManifestBtn")?.addEventListener("click", (e) => runStreamScriptAction("downloadmanifest", e.currentTarget));
 

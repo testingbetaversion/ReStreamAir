@@ -892,6 +892,11 @@ int rs_panel_apply_session_manifest(rs_state *st, const char *stream_id, const c
     if (!stream) { *err = "Stream not found."; return -404; }
     if (!is_http_url(url)) { *err = "The manifest action returned no usable ManifestUrl."; return -400; }
     rs_json_obj_set_str(stream, "url", url);
+    // Imported script streams have no URL when they are created and default to
+    // MPD. Once manifest supplies the real source, keep playback in sync with
+    // its actual format.
+    if (strstr(url, ".m3u8")) rs_json_obj_set_str(stream, "kind", "m3u8");
+    else if (strstr(url, ".mpd")) rs_json_obj_set_str(stream, "kind", "mpd");
     rs_json_obj_set(stream, "cdnUrls",
                     cdn_urls && rs_json_type_of(cdn_urls) == RS_JSON_ARR
                         ? rs_json_clone(cdn_urls) : rs_json_new_arr());

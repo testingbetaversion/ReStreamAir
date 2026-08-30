@@ -1615,6 +1615,11 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
         // passes them — otherwise a hook tested from the panel is invoked with
         // different arguments from the one that runs at playback.
         n = append_script_params(args, n, RS_SCRIPT_ARG_CAP, rs_json_obj_str(stream, "scriptParams", ""));
+        // A direct API invocation can still exercise cdm with caller-supplied
+        // DRM arguments. Always identify the panel's script-owned licence
+        // workflow as external, just like the automatic start pipeline does.
+        if (strcmp(action, "cdm") == 0 && n < RS_SCRIPT_ARG_CAP)
+            args[n++] = rs_script_arg("cdm", "external", false);
     }
 
     // Nothing spawns the script for an action the provider hasn't declared.
@@ -3341,7 +3346,24 @@ static const rs_json *header_block(const rs_json *headers, const char *lower, co
 // Runs one action of the stream's script: `action=` first, then the common
 // prefix, then whatever this action adds. Returns the exit code, with stdout in
 // *out (caller frees) — never NULL on success.
-static int stream_start_run(rs_stream_start *st, const char *action,
+static void stream_start_log_text(restream_server_t *server, const char *sid,
+                                  const char *level, const char *event, const char *value) {
+    if (!value) return;
+    const char *line = value;
+    for (const char *p = value;; p++) {
+        if (*p != '\n' && *p != '\r' && *p != '\0') continue;
+        if (p > line) {
+            char *copy = dup_n(line, (size_t)(p - line));
+            if (copy) log_record(server, sid, level, event, NULL, 0, -1, copy);
+            free(copy);
+        }
+        if (*p == '\0') break;
+        line = p + 1;
+    }
+}
+
+static int stream_start_run(restream_server_t *server, const char *sid,
+                            rs_stream_start *st, const char *action,
                             char *const *extra, int extra_n, double timeout, char **out) {
     const char **argv = (const char **)calloc((size_t)st->argc + (size_t)extra_n + 2, sizeof(char *));
     if (!argv) return -1;
@@ -3350,8 +3372,17 @@ static int stream_start_run(rs_stream_start *st, const char *action,
     argv[n++] = action_arg;
     for (int i = 0; i < st->argc; i++) argv[n++] = st->args[i];
     for (int i = 0; i < extra_n; i++) argv[n++] = extra[i];
+    log_record(server, sid, "info", "scriptStart", NULL, 0, -1, action);
+    char *command = script_command_describe(st->script_path, (char **)argv, n);
+    log_record(server, sid, "info", "scriptCommand", NULL, 0, -1,
+               command ? command : st->script_path);
+    free(command);
     char *err_text = NULL;
     int rc = rs_script_run_sync(st->script_path, argv, n, timeout, out, &err_text);
+    stream_start_log_text(server, sid, "info", "scriptOutput", out ? *out : NULL);
+    stream_start_log_text(server, sid, "error", "scriptError", err_text);
+    log_record(server, sid, rc == 0 ? "info" : "error", "scriptEnd", NULL, rc, -1,
+               rc == 0 ? "ok" : "script exited non-zero");
     rs_free(err_text);
     free(action_arg);
     free(argv);
@@ -3365,6 +3396,21 @@ static bool stream_start_parse_manifest(rs_stream_start *st, const char *stdout_
     rs_json *doc = parse_script_document(stdout_text);
     const char *url = doc ? rs_json_obj_str(doc, "ManifestUrl", "") : "";
     if (!url[0] && doc) url = rs_json_obj_str(doc, "manifestUrl", "");
+
+    // Some provider scripts deliberately leave the primary ManifestUrl blank
+    // and return only their ordered Cdn list. The first usable mirror is the
+    // primary in that shape; rejecting the whole successful response kept the
+    // stream stopped and prevented the following CDM action from ever running.
+    const rs_json *cdn = doc ? rs_json_obj_get(doc, "Cdn") : NULL;
+    if (!cdn && doc) cdn = rs_json_obj_get(doc, "cdn");
+    if (!url_is_http(url)) {
+        for (size_t i = 0; i < rs_json_arr_len(cdn); i++) {
+            const rs_json *entry = rs_json_arr_at(cdn, i);
+            const char *mirror = rs_json_obj_str(entry, "ManifestUrl", "");
+            if (!mirror[0]) mirror = rs_json_obj_str(entry, "manifestUrl", "");
+            if (url_is_http(mirror)) { url = mirror; break; }
+        }
+    }
     if (!url_is_http(url)) {
         snprintf(st->err, sizeof(st->err),
                  "The manifest action returned no usable ManifestUrl.");
@@ -3376,8 +3422,6 @@ static bool stream_start_parse_manifest(rs_stream_start *st, const char *stdout_
 
     rs_json_free(st->cdn_urls);
     st->cdn_urls = rs_json_new_arr();
-    const rs_json *cdn = rs_json_obj_get(doc, "Cdn");
-    if (!cdn) cdn = rs_json_obj_get(doc, "cdn");
     for (size_t i = 0; i < rs_json_arr_len(cdn); i++) {
         const rs_json *entry = rs_json_arr_at(cdn, i);
         const char *mirror = rs_json_obj_str(entry, "ManifestUrl", "");
@@ -3392,6 +3436,24 @@ static bool stream_start_parse_manifest(rs_stream_start *st, const char *stdout_
     free(st->media_headers);
     st->manifest_headers = header_object_to_text(header_block(headers, "manifest", "Manifest"));
     st->media_headers = header_object_to_text(header_block(headers, "media", "Media"));
+    // The DRM scrape happens immediately after this function. Use the fresh
+    // session headers for that fetch rather than the stale headers snapshotted
+    // before action=manifest ran.
+    if (st->manifest_headers[0]) {
+        free(st->headers);
+        st->headers = rs_strdup(st->manifest_headers);
+    }
+
+    // Imported entries have no URL at import time, so their default kind is
+    // MPD. Correct it from the session URL before parsing DRM and before the
+    // state is handed to the playback engine.
+    if (strstr(url, ".m3u8")) {
+        free(st->kind);
+        st->kind = rs_strdup("m3u8");
+    } else if (strstr(url, ".mpd")) {
+        free(st->kind);
+        st->kind = rs_strdup("mpd");
+    }
 
     const rs_json *hb = rs_json_obj_get(doc, "Heartbeat");
     if (!hb) hb = rs_json_obj_get(doc, "heartbeat");
@@ -3416,6 +3478,30 @@ static char *stream_start_fetch(rs_stream_start *st, const char *url, size_t *ou
     if (rc != 0 || status < 200 || status >= 300 || !body) { free(body); return NULL; }
     if (out_len) *out_len = len;
     return body;
+}
+
+// A session manifest may be an HLS master playlist; encryption tags live in
+// its media playlists, not necessarily in the master. Return the first video
+// variant so the DRM pass can inspect the document that carries EXT-X-KEY.
+static char *hls_first_variant_url(const char *manifest_url, const char *text) {
+    bool next_uri = false;
+    for (const char *p = text; p && *p;) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char *line = rs_trim_dup(p, len, true);
+        if (line && line[0]) {
+            if (next_uri && line[0] != '#') {
+                char *url = rs_url_resolve(manifest_url, line);
+                free(line);
+                return url;
+            }
+            next_uri = strncmp(line, "#EXT-X-STREAM-INF:", 18) == 0;
+        }
+        free(line);
+        if (!end) break;
+        p = end + 1;
+    }
+    return NULL;
 }
 
 // The third place PSSH can live. A manifest that advertises only a bare
@@ -3496,9 +3582,38 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
 
     rs_drm_challenge ch;
     memset(&ch, 0, sizeof(ch));
+    // Trust the fetched document over the imported stream's initial kind. A
+    // script-only stream has no URL when it is imported and therefore cannot
+    // know whether manifest will return DASH or HLS yet.
+    bool manifest_is_hls = text && (strncmp(text, "#EXTM3U", 7) == 0 || strcmp(st->kind, "m3u8") == 0);
     if (text)
-        ch = strcmp(st->kind, "m3u8") == 0 ? rs_cdm_challenge_from_hls(text)
-                                           : rs_cdm_challenge_from_mpd(text);
+        ch = manifest_is_hls ? rs_cdm_challenge_from_hls(text)
+                             : rs_cdm_challenge_from_mpd(text);
+
+    char *variant_url = NULL;
+    if (manifest_is_hls && text && ch.pssh_all_count == 0 && strstr(text, "#EXT-X-STREAM-INF:")) {
+        variant_url = hls_first_variant_url(manifest_url, text);
+        size_t variant_len = 0;
+        char *variant = variant_url ? stream_start_fetch(st, variant_url, &variant_len) : NULL;
+        if (variant) {
+            rs_drm_challenge media = rs_cdm_challenge_from_hls(variant);
+            for (size_t i = 0; i < ch.kids_count; i++)
+                rs_cdm_challenge_add_kid(&media, ch.kids[i]);
+            for (size_t i = 0; i < ch.pssh_all_count; i++)
+                rs_cdm_challenge_add_pssh(&media, ch.pssh_all[i]);
+            rs_drm_challenge_free(&ch);
+            ch = media;
+            free(text);
+            text = variant;
+            text_len = variant_len;
+            log_record(server, sid, "info", "cdm", variant_url, 0, -1,
+                       "HLS master has no PSSH — inspecting its first media playlist");
+        } else {
+            free(variant_url);
+            variant_url = NULL;
+        }
+    }
+    const char *drm_manifest_url = variant_url ? variant_url : manifest_url;
 
     // PSSH, in the three places it can be: the manifest above, the init
     // segment, or — for a source that only ever names a KID — built from that.
@@ -3506,7 +3621,7 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     // the script has asked to inspect it itself.
     if (text && (ch.pssh_all_count == 0 || st->want_initparse)) {
         size_t init_len = 0;
-        uint8_t *init = stream_start_fetch_init(st, manifest_url, text, &init_len);
+        uint8_t *init = stream_start_fetch_init(st, drm_manifest_url, text, &init_len);
         if (init) {
             size_t before = ch.pssh_all_count;
             rs_cdm_challenge_add_from_init(&ch, init, init_len);
@@ -3523,7 +3638,7 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
                 extra[extra_n++] = rs_script_arg("url", manifest_url, true);
                 extra[extra_n++] = rs_script_arg("init", encoded ? encoded : "", true);
                 char *out = NULL;
-                if (stream_start_run(st, "initparse", extra, extra_n, 30.0, &out) == 0) {
+                if (stream_start_run(server, sid, st, "initparse", extra, extra_n, 30.0, &out) == 0) {
                     rs_json *doc = parse_script_document(out);
                     static const char *const kid_keys[2] = {"Kid", "kid"};
                     for (size_t k = 0; k < 2; k++) {
@@ -3552,8 +3667,14 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
                     (unsigned long)ch.kids_count);
 
     if (rs_drm_challenge_is_empty(&ch)) {
-        log_record(server, sid, "warn", "cdm", manifest_url, 0, -1,
-                   "no KIDs, PSSH or key URIs found — the script gets no DRM to license against");
+        log_record(server, sid, "error", "cdm", manifest_url, 0, -1,
+                   "no KIDs, PSSH or key URIs found — refusing to call CDM without DRM input");
+        snprintf(st->err, sizeof(st->err),
+                 "Could not find a KID or PSSH in the session manifest or its media/init data.");
+        rs_drm_challenge_free(&ch);
+        free(text);
+        free(variant_url);
+        return;
     } else {
         char *kid_list = ch.kids_count ? join_list(ch.kids, ch.kids_count, ", ") : NULL;
         log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
@@ -3575,7 +3696,7 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
         extra[extra_n++] = rs_script_arg("pssh", license_pssh, true);
         extra[extra_n++] = rs_script_arg("url", manifest_url, true);
         char *out = NULL;
-        if (stream_start_run(st, "pssh", extra, extra_n, 30.0, &out) == 0 && out) {
+        if (stream_start_run(server, sid, st, "pssh", extra, extra_n, 30.0, &out) == 0 && out) {
             rs_json *doc = parse_script_document(out);
             const char *replacement = doc ? rs_json_obj_str(doc, "ProcessedPssh", "") : NULL;
             char *trimmed = replacement && replacement[0]
@@ -3624,11 +3745,12 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     }
 
     char *out = NULL;
-    int rc = stream_start_run(st, "cdm", extra, extra_n, 60.0, &out);
+    int rc = stream_start_run(server, sid, st, "cdm", extra, extra_n, 60.0, &out);
     for (int i = 0; i < extra_n; i++) free(extra[i]);
     if (rc != 0) {
         log_record(server, sid, "error", "cdm", NULL, rc, -1,
-                   "the cdm action exited non-zero — playing on without keys");
+                   "the cdm action exited non-zero — the protected stream will remain stopped");
+        snprintf(st->err, sizeof(st->err), "The cdm action exited %d without usable keys.", rc);
     } else {
         char *pairs = rs_cdm_parse_key_output(out);
         if (pairs && pairs[0]) {
@@ -3640,21 +3762,24 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
                         "acquired %lu clear key(s) from the script", (unsigned long)count);
         } else {
             free(pairs);
-            log_record(server, sid, "warn", "cdm", NULL, 0, -1,
+            log_record(server, sid, "error", "cdm", NULL, 0, -1,
                        "the cdm action returned no usable KID:KEY pairs");
+            snprintf(st->err, sizeof(st->err),
+                     "The cdm action returned no usable KID:KEY pairs.");
         }
     }
     rs_free(out);
     free(license_pssh);
     rs_drm_challenge_free(&ch);
     free(text);
+    free(variant_url);
 }
 
 static void stream_start_worker(restream_server_t *server, const char *sid, rs_stream_start *st) {
     const char *source = st->url;
     if (st->want_manifest) {
         char *out = NULL;
-        int rc = stream_start_run(st, "manifest", NULL, 0, 45.0, &out);
+        int rc = stream_start_run(server, sid, st, "manifest", NULL, 0, 45.0, &out);
         if (rc != 0) {
             snprintf(st->err, sizeof(st->err),
                      "The manifest action exited %d — no source URL for this session.", rc);
