@@ -2181,6 +2181,18 @@ function updateScriptOutputToggleLabel() {
   applyIcons($("#toggleScriptOutputBtn"));
 }
 
+async function clearScriptOutput() {
+  const provider = selectedProvider();
+  if (!provider) return;
+  try {
+    const params = new URLSearchParams({ streamId: `script:${provider.id}` });
+    await request(`/api/logs?${params.toString()}`, { method: "DELETE" });
+    $("#scriptOutputBox").textContent = "";
+  } catch (error) {
+    alert(`Couldn't clear the terminal: ${error.message || error}`);
+  }
+}
+
 function closeProviderSettingsDialog() {
   if ($("#providerSettingsDialog").open) $("#providerSettingsDialog").close();
 }
@@ -3228,6 +3240,7 @@ $("#toggleScriptOutputBtn").addEventListener("click", () => {
   $("#scriptOutputBox").classList.toggle("hidden");
   updateScriptOutputToggleLabel();
 });
+$("#clearScriptOutputBtn").addEventListener("click", clearScriptOutput);
 $("#copyBtn").addEventListener("click", async (event) => {
   const link = $("#playLink").value;
   if (!link) return;
