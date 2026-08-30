@@ -3158,20 +3158,52 @@ static bool script_action_imports(const char *action) {
     return action && (strcmp(action, "channels") == 0 || strcmp(action, "events") == 0);
 }
 
-// Parses a catalogue script's stdout. A well-behaved script prints nothing but
-// the JSON document (SCRIPTING.md puts progress on stderr), but plenty print a
-// stray line to stdout too, so fall back to the span between the first `{` and
-// the last `}` rather than dropping the whole import over it.
+// Parses a script's stdout. A well-behaved script prints nothing but one JSON
+// document (SCRIPTING.md puts progress on stderr), but legacy scripts commonly
+// print API response objects and status lines before their final result. Walk
+// every balanced top-level object and keep the last valid one; taking the span
+// from the first `{` to the last `}` would combine several documents into
+// invalid JSON and silently lose the Channels/Events result at the end.
 static rs_json *parse_script_document(const char *stdout_text) {
     if (!stdout_text || !stdout_text[0]) return NULL;
     rs_json *doc = rs_json_parse(stdout_text, strlen(stdout_text));
-    if (!doc) {
-        const char *start = strchr(stdout_text, '{');
-        const char *end = start ? strrchr(start, '}') : NULL;
-        if (end) doc = rs_json_parse(start, (size_t)(end - start) + 1);
+    if (doc) {
+        if (rs_json_type_of(doc) == RS_JSON_OBJ) return doc;
+        rs_json_free(doc);
     }
-    if (doc && rs_json_type_of(doc) != RS_JSON_OBJ) { rs_json_free(doc); return NULL; }
-    return doc;
+
+    rs_json *last = NULL;
+    const char *start = NULL;
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (const char *p = stdout_text; *p; p++) {
+        char ch = *p;
+        if (in_string) {
+            if (escaped) escaped = false;
+            else if (ch == '\\') escaped = true;
+            else if (ch == '"') in_string = false;
+            continue;
+        }
+        if (ch == '"' && depth > 0) { in_string = true; continue; }
+        if (ch == '{') {
+            if (depth == 0) start = p;
+            depth++;
+        } else if (ch == '}' && depth > 0) {
+            depth--;
+            if (depth == 0 && start) {
+                rs_json *candidate = rs_json_parse(start, (size_t)(p - start) + 1);
+                if (candidate && rs_json_type_of(candidate) == RS_JSON_OBJ) {
+                    rs_json_free(last);
+                    last = candidate;
+                } else {
+                    rs_json_free(candidate);
+                }
+                start = NULL;
+            }
+        }
+    }
+    return last;
 }
 
 // Resolves a logo for every distinct entry name in the parsed document, so the

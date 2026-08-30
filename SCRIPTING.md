@@ -159,6 +159,10 @@ print(json.dumps({
 }))
 ```
 
+`ManifestScript` (or `manifestScript`) is accepted as a legacy alias for
+`ScriptParams`. Its `key=value` tokens are saved on the imported stream and
+passed to stream actions such as `manifest` and `cdm`.
+
 Re-running an import matches entries by name and updates them instead of creating duplicates. Imported entries normally need either a source URL entered later or `SessionManifest: true` with a working `manifest` action.
 
 Events use the same basic shape under `Events` and may include `Start`, `End`, and `RecordEvent`.

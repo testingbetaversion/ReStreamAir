@@ -767,6 +767,16 @@ static bool entry_bool(const rs_json *entry, const char *upper, const char *lowe
     return v ? rs_json_as_bool(v, fallback) : fallback;
 }
 
+// Older provider scripts call the manifest hook's argument string
+// `ManifestScript`; the documented protocol calls it `ScriptParams`. They are
+// the same stream field, so accept both without requiring working scripts to
+// be rewritten. Prefer the documented name when both are present.
+static const char *entry_script_params(const rs_json *entry) {
+    const rs_json *v = entry_get(entry, "ScriptParams", "scriptParams");
+    if (v) return rs_json_as_str(v, "");
+    return entry_str(entry, "ManifestScript", "manifestScript");
+}
+
 // Matches an already-imported entry: (name, sourceType) is all the protocol
 // gives us — entries carry no stable id — so that pair is the identity a
 // re-import updates in place.
@@ -839,7 +849,7 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
         rs_json_obj_set_str(stream, "mode", mode[0] ? mode : "live");
         rs_json_obj_set_bool(stream, "sessionManifest",
                              entry_bool(entry, "SessionManifest", "sessionManifest", false));
-        rs_json_obj_set_str(stream, "scriptParams", entry_str(entry, "ScriptParams", "scriptParams"));
+        rs_json_obj_set_str(stream, "scriptParams", entry_script_params(entry));
         rs_json_obj_set_str(stream, "cdmType", entry_str(entry, "CdmType", "cdmType"));
         rs_json_obj_set_bool(stream, "useCdm", entry_bool(entry, "UseCdm", "useCdm", false));
         rs_json_obj_set_str(stream, "scriptVideoSelector", entry_str(entry, "Video", "video"));
