@@ -2,6 +2,7 @@
 #define RS_SCRIPT_H
 
 #include "rs_common.h"
+#include "rs_proc.h"
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -21,9 +22,13 @@ rs_strv rs_script_split_params(const char *text);
 char* rs_script_arg(const char *key, const char *value, bool force);
 
 // Run script synchronously using posix_spawn (or CreateProcess on Windows).
-// For .py files use python3, for .sh use /bin/sh.
+// For .py files use unbuffered python3, for .sh use /bin/sh.
 // Return exit code (0 on success, non-zero on failure). Fill stdout/stderr strings (caller frees with rs_free).
 int rs_script_run_sync(const char *script_path, const char **args, int argc, double timeout, char **out_stdout, char **out_stderr);
+
+int rs_script_run_stream(const char *script_path, const char **args, int argc, double timeout,
+                         char **out_stdout, char **out_stderr,
+                         rs_proc_output_fn output_fn, void *output_ctx);
 
 #ifdef __cplusplus
 }

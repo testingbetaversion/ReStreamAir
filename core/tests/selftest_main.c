@@ -2028,6 +2028,22 @@ static void test_threads(void) {
 // again, and each of these is a case the naive quoting gets wrong.
 #define RS_TRICKY_ARG "a b\"c\\"
 
+typedef struct {
+    char out[512], err[512];
+    size_t out_len, err_len;
+} proc_stream_capture;
+
+static void capture_proc_output(void *opaque, bool is_stderr, const char *bytes, size_t len) {
+    proc_stream_capture *capture = (proc_stream_capture *)opaque;
+    char *dst = is_stderr ? capture->err : capture->out;
+    size_t *used = is_stderr ? &capture->err_len : &capture->out_len;
+    size_t room = sizeof(capture->out) - *used - 1;
+    if (len > room) len = room;
+    memcpy(dst + *used, bytes, len);
+    *used += len;
+    dst[*used] = '\0';
+}
+
 static int run_child_mode(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], RS_CHILD_ECHO) == 0) {
         printf("OUT[%s]", argv[2]);
@@ -2052,13 +2068,17 @@ static void test_proc(const char *self) {
     {
         const char *argv[] = { self, RS_CHILD_ECHO, RS_TRICKY_ARG, NULL };
         rs_run_result res;
-        int rc = rs_proc_run(argv, NULL, 30.0, true, true, NULL, &res, NULL, 0);
+        proc_stream_capture streamed = {{0}, {0}, 0, 0};
+        int rc = rs_proc_run_stream(argv, NULL, 30.0, true, true, NULL, &res, NULL, 0,
+                                    capture_proc_output, &streamed);
         check("proc: the child ran", rc == 0 && res.spawned);
         // The real point of this one: on Windows argv became a single command
         // line and was split again by the child. If the quoting is wrong, this
         // is where it shows up.
         check_str("proc: argv survived the round trip", res.out, expect_out);
         check_str("proc: stderr was captured separately", res.err, expect_err);
+        check_str("proc: stdout was also delivered live", streamed.out, expect_out);
+        check_str("proc: stderr was also delivered live", streamed.err, expect_err);
         check("proc: the exit code came back", res.exit_code == 7);
         check("proc: it was not recorded as a timeout", !res.timed_out);
         rs_run_result_dispose(&res);

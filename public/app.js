@@ -2024,8 +2024,7 @@ async function pollScriptOutput(providerId) {
   const box = $("#scriptOutputBox");
   try {
     const result = await request(`/api/logs?streamId=${encodeURIComponent("script:" + providerId)}&limit=500`);
-    const lines = (result.entries || []).slice().reverse().map((entry) => entry.message || entry.event).join("\n");
-    const text = lines || "(no output yet)";
+    const text = scriptTranscriptText(result.entries || []) || "(no output yet)";
     // Reassigning textContent on every tick — even to the same text — wipes
     // any active selection and yanks scroll position, making it impossible
     // to select/copy a traceback before the next poll undoes it. Skip the
@@ -2090,7 +2089,7 @@ async function pollGridImportStatus(providerId) {
     // Full transcript, oldest→newest, into the terminal — same rendering as
     // the provider dialog's terminal (don't rewrite the DOM when unchanged, so
     // a selection/scroll survives; only auto-scroll if already at the bottom).
-    const text = entries.slice().reverse().map((e) => e.message || e.event).join("\n") || "(no output yet)";
+    const text = scriptTranscriptText(entries) || "(no output yet)";
     if (term.textContent !== text) {
       const wasAtBottom = term.scrollHeight - term.scrollTop - term.clientHeight < 20;
       term.textContent = text;
@@ -2318,42 +2317,82 @@ function openStreamLogs(streamId) {
   switchView("logs");
 }
 
-// Entries come back newest-first, like every other row's timeline — but
-// script output (login/pair/channels/events stdout, one record per line)
-// reads as a paragraph, not a timeline. Left as individual rows, a single
-// traceback becomes dozens of separately-timestamped, ellipsized lines,
-// unreadable and impossible to copy as one block. Bundle consecutive
-// scriptOutput entries into one group, restored to chronological order
-// (they're reverse order coming in) so the block reads top-to-bottom like
-// the terminal output actually printed.
+const scriptTerminalEvents = new Set(["scriptStart", "scriptCommand", "scriptOutput", "scriptError", "scriptEnd"]);
+
+function isScriptTerminalEntry(entry) {
+  return entry.streamId?.startsWith("script:") && scriptTerminalEvents.has(entry.event);
+}
+
+// Text-only transcript used by the smaller terminals in Provider settings and
+// All Streams. The main Logs view uses the richer per-line renderer below.
+function scriptTranscriptText(entries) {
+  return entries.slice().reverse().map((entry) => {
+    if (entry.event === "scriptStart") return `[started ${entry.message || "script"}]`;
+    if (entry.event === "scriptCommand") return `$ ${entry.message || ""}`;
+    if (entry.event === "scriptEnd") return `[process exited with code ${entry.status ?? 0}]`;
+    return entry.message || entry.event;
+  }).join("\n");
+}
+
+// Entries arrive newest-first. Script records can be separated by unrelated
+// stream activity while the command runs, so adjacency is not a reliable run
+// boundary. Build one terminal per stream/run, from scriptEnd back through
+// scriptStart, and leave ordinary log rows in their original timeline order.
 function groupLogEntries(entries) {
   const groups = [];
-  let i = 0;
-  while (i < entries.length) {
-    if (entries[i].event === "scriptOutput") {
-      const chunk = [];
-      while (i < entries.length && entries[i].event === "scriptOutput") {
-        chunk.push(entries[i]);
-        i += 1;
-      }
-      groups.push({ type: "script", entries: chunk.reverse() });
-    } else {
-      groups.push({ type: "single", entry: entries[i] });
-      i += 1;
+  const openRuns = new Map();
+  for (const entry of entries) {
+    if (!isScriptTerminalEntry(entry)) {
+      groups.push({ type: "single", entry });
+      continue;
     }
+    let group = openRuns.get(entry.streamId);
+    if (!group || entry.event === "scriptEnd") {
+      group = { type: "script", streamId: entry.streamId, entries: [] };
+      groups.push(group);
+      openRuns.set(entry.streamId, group);
+    }
+    group.entries.push(entry);
+    if (entry.event === "scriptStart") openRuns.delete(entry.streamId);
   }
   return groups;
 }
 
 function logGroupHtml(group) {
   if (group.type === "single") return logRowHtml(group.entry);
-  const time = new Date(group.entries[0].timestamp).toLocaleTimeString();
-  const text = group.entries.map((entry) => entry.raw || entry.message || "").join("\n");
+  const entries = group.entries.slice().reverse();
+  const providerId = group.streamId.slice("script:".length);
+  const provider = state.providers.find((candidate) => candidate.id === providerId);
+  const end = entries.find((entry) => entry.event === "scriptEnd");
+  const hasError = entries.some((entry) => entry.level === "error");
+  const status = end ? (end.status ?? 0) === 0 ? "Exited 0" : `Exited ${end.status}` : "Running";
+  const lines = entries.map((entry) => {
+    const time = new Date(entry.timestamp).toLocaleTimeString();
+    let content = escapeHtml(entry.message || entry.event);
+    let kind = "output";
+    if (entry.event === "scriptCommand") {
+      kind = "command";
+      content = `<span class="terminal-prompt">$</span> ${content}`;
+    } else if (entry.event === "scriptStart") {
+      kind = "meta";
+      content = `Started <b>${content}</b>`;
+    } else if (entry.event === "scriptEnd") {
+      kind = (entry.status ?? 0) === 0 ? "meta" : "error";
+      content = `Process exited with code ${entry.status ?? 0}`;
+    } else if (entry.event === "scriptError") {
+      kind = "error";
+    }
+    return `<div class="terminal-line terminal-line-${kind}"><span class="terminal-line-time">${time}</span><span class="terminal-line-text">${content}</span></div>`;
+  }).join("");
   return `
-    <div class="log-row log-row-script">
-      <span class="log-time">${time}</span>
-      <pre class="log-detail-script">${escapeHtml(text)}</pre>
-    </div>
+    <section class="script-terminal ${hasError ? "script-terminal-error" : ""}">
+      <header class="script-terminal-head">
+        <span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="script-terminal-title">${escapeHtml(provider?.name || providerId)} · script</span>
+        <span class="script-terminal-status ${end ? "finished" : "running"}">${status}</span>
+      </header>
+      <div class="script-terminal-body">${lines}</div>
+    </section>
   `;
 }
 
@@ -2421,19 +2460,24 @@ async function loadLogs() {
     const result = await request(`/api/logs?${params.toString()}`);
 
     const allEntries = result.entries || [];
-    const entries = logLevelFilter ? allEntries.filter((entry) => entry.level === logLevelFilter) : allEntries;
+    const allGroups = groupLogEntries(allEntries);
+    // An Errors-only terminal still needs its command and surrounding stdout
+    // for context, so filter whole script runs when any line matches.
+    const groups = logLevelFilter ? allGroups.filter((group) => group.type === "script"
+      ? group.entries.some((entry) => entry.level === logLevelFilter)
+      : group.entry.level === logLevelFilter) : allGroups;
     if (!allEntries.length) {
       list.className = "log-list empty-state";
       list.textContent = "No log entries yet — start a stream to see fetch/download activity here.";
       return;
     }
-    if (!entries.length) {
+    if (!groups.length) {
       list.className = "log-list empty-state";
       list.textContent = "No log entries match this filter.";
       return;
     }
     list.className = `log-list ${logMode === "verbose" ? "log-list-verbose" : ""}`;
-    list.innerHTML = groupLogEntries(entries).map(logGroupHtml).join("");
+    list.innerHTML = groups.map(logGroupHtml).join("");
   } catch (error) {
     list.className = "log-list empty-state";
     list.textContent = String(error.message || error);

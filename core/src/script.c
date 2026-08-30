@@ -149,8 +149,9 @@ char* rs_script_arg(const char *key, const char *value, bool force) {
     return res;
 }
 
-int rs_script_run_sync(const char *script_path, const char **args, int argc, double timeout,
-                       char **out_stdout, char **out_stderr) {
+int rs_script_run_stream(const char *script_path, const char **args, int argc, double timeout,
+                         char **out_stdout, char **out_stderr,
+                         rs_proc_output_fn output_fn, void *output_ctx) {
     if (out_stdout) *out_stdout = rs_strdup("");
     if (out_stderr) *out_stderr = rs_strdup("");
     if (!script_path || !script_path[0]) return -1;
@@ -175,8 +176,9 @@ int rs_script_run_sync(const char *script_path, const char **args, int argc, dou
     // runs — a script that writes more than a pipe buffer to stderr while the
     // caller reads stdout would otherwise wedge until the timeout.
     rs_run_result res;
-    int rc = rs_proc_run((const char *const *)spawn_args.items, NULL, timeout,
-                         true, true, NULL, &res, NULL, 0);
+    int rc = rs_proc_run_stream((const char *const *)spawn_args.items, NULL, timeout,
+                                true, true, NULL, &res, NULL, 0,
+                                output_fn, output_ctx);
     rs_strv_dispose(&spawn_args);
 
     // Whatever it managed to say is worth returning even when it was killed: a
@@ -188,4 +190,10 @@ int rs_script_run_sync(const char *script_path, const char **args, int argc, dou
     if (rc != 0) return -1;                            // could not be started
     if (res.timed_out || res.term_signal != 0) return -1;   // killed, not finished
     return res.exit_code;
+}
+
+int rs_script_run_sync(const char *script_path, const char **args, int argc, double timeout,
+                       char **out_stdout, char **out_stderr) {
+    return rs_script_run_stream(script_path, args, argc, timeout, out_stdout, out_stderr,
+                                NULL, NULL);
 }

@@ -161,6 +161,12 @@ typedef struct {
     char *err;          // captured stderr, NUL-terminated; caller frees
 } rs_run_result;
 
+// Optional live output sink for rs_proc_run_stream. Chunks are delivered as
+// soon as they are drained from the child pipe; callers that need lines keep a
+// small partial-line buffer between calls.
+typedef void (*rs_proc_output_fn)(void *ctx, bool is_stderr,
+                                  const char *bytes, size_t len);
+
 // Runs argv to completion. stdout and stderr are captured when the
 // corresponding capture flag is set, discarded otherwise — except that a
 // non-NULL `stderr_path` sends stderr to that file instead (which is what the
@@ -179,6 +185,11 @@ int rs_proc_run(const char *const *argv, const char *const *envp, double timeout
                 bool capture_stdout, bool capture_stderr, const char *stderr_path,
                 rs_run_result *res, char *errbuf, size_t errlen);
 
+int rs_proc_run_stream(const char *const *argv, const char *const *envp, double timeout_s,
+                       bool capture_stdout, bool capture_stderr, const char *stderr_path,
+                       rs_run_result *res, char *errbuf, size_t errlen,
+                       rs_proc_output_fn output_fn, void *output_ctx);
+
 void rs_run_result_dispose(rs_run_result *res);
 
 // Sleeps for `ms` milliseconds. Here because supervising a child means waiting,
@@ -186,8 +197,8 @@ void rs_run_result_dispose(rs_run_result *res);
 void rs_proc_sleep_ms(int ms);
 
 // ---- interpreters ----------------------------------------------------------
-// Given a script path, the argv prefix needed to execute it: "python3" for .py
-// on POSIX and "python" on Windows, a shell for .sh, cmd.exe for .bat/.cmd and
+// Given a script path, the argv prefix needed to execute it: "python3 -u" for .py
+// on POSIX and "python -u" on Windows, a shell for .sh, cmd.exe for .bat/.cmd and
 // PowerShell for .ps1 (both Windows-only), or nothing at all for a file that is
 // directly executable. Writes up to `max` pointers into `prefix` and returns how
 // many; the strings are static literals and must not be freed.

@@ -638,9 +638,10 @@ static bool capture_push(capture *c, const char *bytes, size_t n) {
     return true;
 }
 
-int rs_proc_run(const char *const *argv, const char *const *envp, double timeout_s,
-                bool capture_stdout, bool capture_stderr, const char *stderr_path,
-                rs_run_result *res, char *errbuf, size_t errlen) {
+int rs_proc_run_stream(const char *const *argv, const char *const *envp, double timeout_s,
+                       bool capture_stdout, bool capture_stderr, const char *stderr_path,
+                       rs_run_result *res, char *errbuf, size_t errlen,
+                       rs_proc_output_fn output_fn, void *output_ctx) {
     rs_pipe out_pipe = { RS_FD_INVALID, RS_FD_INVALID };
     rs_pipe err_pipe = { RS_FD_INVALID, RS_FD_INVALID };
     rs_stdio in_io = rs_stdio_null(), out_io, err_io;
@@ -708,6 +709,7 @@ int rs_proc_run(const char *const *argv, const char *const *envp, double timeout
         if (out_open) {
             while ((n = rs_fd_read_nonblocking(out_pipe.read_end, buf, sizeof(buf))) > 0) {
                 capture_push(&out_cap, buf, (size_t)n);
+                if (output_fn) output_fn(output_ctx, false, buf, (size_t)n);
                 moved = true;
             }
             if (n < 0) { rs_fd_close(out_pipe.read_end); out_pipe.read_end = RS_FD_INVALID; out_open = false; }
@@ -715,6 +717,7 @@ int rs_proc_run(const char *const *argv, const char *const *envp, double timeout
         if (err_open) {
             while ((n = rs_fd_read_nonblocking(err_pipe.read_end, buf, sizeof(buf))) > 0) {
                 capture_push(&err_cap, buf, (size_t)n);
+                if (output_fn) output_fn(output_ctx, true, buf, (size_t)n);
                 moved = true;
             }
             if (n < 0) { rs_fd_close(err_pipe.read_end); err_pipe.read_end = RS_FD_INVALID; err_open = false; }
@@ -726,11 +729,15 @@ int rs_proc_run(const char *const *argv, const char *const *envp, double timeout
             // pipe buffer, and dropping them loses the error message that
             // explains the exit code.
             if (out_open)
-                while ((n = rs_fd_read_nonblocking(out_pipe.read_end, buf, sizeof(buf))) > 0)
+                while ((n = rs_fd_read_nonblocking(out_pipe.read_end, buf, sizeof(buf))) > 0) {
                     capture_push(&out_cap, buf, (size_t)n);
+                    if (output_fn) output_fn(output_ctx, false, buf, (size_t)n);
+                }
             if (err_open)
-                while ((n = rs_fd_read_nonblocking(err_pipe.read_end, buf, sizeof(buf))) > 0)
+                while ((n = rs_fd_read_nonblocking(err_pipe.read_end, buf, sizeof(buf))) > 0) {
                     capture_push(&err_cap, buf, (size_t)n);
+                    if (output_fn) output_fn(output_ctx, true, buf, (size_t)n);
+                }
             break;
         }
         if (exited < 0) break;
@@ -756,6 +763,13 @@ int rs_proc_run(const char *const *argv, const char *const *envp, double timeout
     return 0;
 }
 
+int rs_proc_run(const char *const *argv, const char *const *envp, double timeout_s,
+                bool capture_stdout, bool capture_stderr, const char *stderr_path,
+                rs_run_result *res, char *errbuf, size_t errlen) {
+    return rs_proc_run_stream(argv, envp, timeout_s, capture_stdout, capture_stderr,
+                              stderr_path, res, errbuf, errlen, NULL, NULL);
+}
+
 void rs_run_result_dispose(rs_run_result *res) {
     if (!res) return;
     free(res->out);
@@ -775,8 +789,10 @@ size_t rs_proc_interpreter_for(const char *script_path, const char **prefix, siz
     if (_stricmp(ext, "py") == 0) {
         // "python3" is not a thing on Windows outside the Store stub; the
         // real installers put python.exe on PATH.
+        if (max < 2) return 0;
         prefix[0] = "python";
-        return 1;
+        prefix[1] = "-u";  // logs are streamed line-by-line through a pipe
+        return 2;
     }
     if (_stricmp(ext, "bat") == 0 || _stricmp(ext, "cmd") == 0) {
         if (max < 2) return 0;
@@ -800,7 +816,12 @@ size_t rs_proc_interpreter_for(const char *script_path, const char **prefix, siz
         return 1;
     }
 #else
-    if (strcasecmp(ext, "py") == 0) { prefix[0] = "python3"; return 1; }
+    if (strcasecmp(ext, "py") == 0) {
+        if (max < 2) return 0;
+        prefix[0] = "python3";
+        prefix[1] = "-u";  // disable block buffering when stdout is a pipe
+        return 2;
+    }
     if (strcasecmp(ext, "sh") == 0 || strcasecmp(ext, "bash") == 0) { prefix[0] = "/bin/sh"; return 1; }
 #endif
     return 0;   // directly executable

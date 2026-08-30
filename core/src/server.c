@@ -521,7 +521,8 @@ static bool log_always(const char *event) {
         "serverStart", "streamStart", "streamStop", "streamCreate", "streamUpdate",
         "streamDelete", "liveStart", "liveStop", "repStart", "repStop",
         "playlistReady", "renditions", "initReady", "discontinuity",
-        "login", "logout", "loginFailed", "scriptStart", "scriptEnd", "playbackDenied",
+        "login", "logout", "loginFailed", "scriptStart", "scriptCommand", "scriptOutput",
+        "scriptError", "scriptEnd", "playbackDenied",
     };
     if (!event) return false;
     for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); i++)
@@ -1444,9 +1445,52 @@ static rs_json *find_provider_by_id(rs_state *st, const char *id) {
 // Runs a provider's script for one action (login/pair/channels/keys/custom…)
 // on a worker thread, passing the provider config + active account. Always
 // replies to `c` itself — either immediately with an error, or (once
-// dispatched) asynchronously once the run finishes: see the "async jobs"
-// section above and pending_job_finish_script, which records stdout/stderr
-// under "script:<providerId>" so the panel's script output + Logs tab show it.
+// dispatched) asynchronously: see the "async jobs" section below. Its worker
+// records stdout/stderr under "script:<providerId>" as each line arrives so
+// the panel's script output + Logs tab can follow the run live.
+// Builds the command exactly as the process runner will see it, but never puts
+// credentials in the log. The string is for display/copying in the terminal,
+// not for execution, so ordinary shell-style quoting is used on every OS.
+static void script_command_append_token(rs_buf *out, const char *token, bool redact) {
+    const char *shown = redact ? "<redacted>" : (token ? token : "");
+    bool quote = shown[0] == '\0';
+    for (const char *p = shown; *p; p++)
+        if (isspace((unsigned char)*p) || *p == '"' || *p == '\\') quote = true;
+    if (!quote) { rs_buf_append_str(out, shown); return; }
+    rs_buf_append_char(out, '"');
+    for (const char *p = shown; *p; p++) {
+        if (*p == '"' || *p == '\\') rs_buf_append_char(out, '\\');
+        rs_buf_append_char(out, *p);
+    }
+    rs_buf_append_char(out, '"');
+}
+
+static char *script_command_describe(const char *script_path, char **args, int argc) {
+    const char *prefix[8];
+    size_t nprefix = rs_proc_interpreter_for(script_path, prefix, 8);
+    rs_buf out = RS_BUF_INIT;
+    for (size_t i = 0; i < nprefix; i++) {
+        if (out.len) rs_buf_append_char(&out, ' ');
+        script_command_append_token(&out, prefix[i], false);
+    }
+    if (out.len) rs_buf_append_char(&out, ' ');
+    script_command_append_token(&out, script_path, false);
+    for (int i = 0; i < argc; i++) {
+        const char *arg = args[i] ? args[i] : "";
+        const char *eq = strchr(arg, '=');
+        bool redact = (eq && (size_t)(eq - arg) == 8 && strncmp(arg, "password", 8) == 0) ||
+                      (eq && (size_t)(eq - arg) == 5 && strncmp(arg, "proxy", 5) == 0);
+        rs_buf_append_char(&out, ' ');
+        if (redact) {
+            rs_buf_append(&out, arg, (size_t)(eq - arg) + 1);
+            script_command_append_token(&out, "<redacted>", false);
+        } else {
+            script_command_append_token(&out, arg, false);
+        }
+    }
+    return rs_buf_take(&out);
+}
+
 // This is the C port of PanelServer's script-action runner (ScriptRunner).
 static void run_provider_script(restream_server_t *s, struct mg_connection *c,
                                 const rs_json *provider, const char *action,
@@ -1524,6 +1568,10 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     }
 
     log_record(s, sid, "info", "scriptStart", NULL, 0, -1, action);
+    char *command = script_command_describe(script, args, n);
+    log_record(s, sid, "info", "scriptCommand", NULL, 0, -1,
+               command ? command : script);
+    free(command);
     dispatch_script_action(s, c, sid, script, args, n);  // always replies
 }
 
@@ -2971,6 +3019,7 @@ struct rs_pending_job {
     char *content_type;
     char *content_range;
     char *script_stdout, *script_stderr;  // SCRIPT only
+    rs_buf script_stdout_line, script_stderr_line;  // SCRIPT: partial live lines
     char err[256];
 };
 
@@ -2985,7 +3034,31 @@ static void pending_job_free(rs_pending_job *pf) {
     free(pf->script_args);
     free(pf->body); free(pf->content_type); free(pf->content_range);
     free(pf->script_stdout); free(pf->script_stderr);
+    rs_buf_dispose(&pf->script_stdout_line);
+    rs_buf_dispose(&pf->script_stderr_line);
     free(pf);
+}
+
+static void script_log_pending_line(rs_pending_job *pf, bool is_stderr) {
+    rs_buf *pending = is_stderr ? &pf->script_stderr_line : &pf->script_stdout_line;
+    if (!pending->len) return;
+    char *line = rs_buf_take(pending);
+    if (!line) return;
+    log_record(pf->server, pf->stream_id, is_stderr ? "error" : "info",
+               is_stderr ? "scriptError" : "scriptOutput", NULL, 0, -1, line);
+    free(line);
+}
+
+// rs_proc drains arbitrary chunks. Turn them into complete log records here so
+// the browser's one-second poll sees output while the script is still running,
+// with the same line boundaries a real terminal shows.
+static void script_output_chunk(void *ctx, bool is_stderr, const char *bytes, size_t len) {
+    rs_pending_job *pf = (rs_pending_job *)ctx;
+    rs_buf *pending = is_stderr ? &pf->script_stderr_line : &pf->script_stdout_line;
+    for (size_t i = 0; i < len; i++) {
+        if (bytes[i] == '\n' || bytes[i] == '\r') script_log_pending_line(pf, is_stderr);
+        else rs_buf_append_char(pending, bytes[i]);
+    }
 }
 
 static void *pending_job_worker(void *arg) {
@@ -3021,8 +3094,11 @@ static void *pending_job_worker(void *arg) {
         pf->rc = pf->body ? 0 : -1;
         break;
     case RS_PENDING_SCRIPT:
-        pf->rc = rs_script_run_sync(pf->script_path, (const char **)pf->script_args, pf->script_argc,
-                                    30.0, &pf->script_stdout, &pf->script_stderr);
+        pf->rc = rs_script_run_stream(pf->script_path, (const char **)pf->script_args, pf->script_argc,
+                                      30.0, &pf->script_stdout, &pf->script_stderr,
+                                      script_output_chunk, pf);
+        script_log_pending_line(pf, false);
+        script_log_pending_line(pf, true);
         break;
     }
 
@@ -3274,23 +3350,10 @@ static void pending_job_finish_probe(struct mg_connection *c, rs_pending_job *pf
     mg_http_reply(c, 200, headers_out, "%s", pf->body);
 }
 
-// Mirrors run_provider_script's post-run handling exactly — split stdout/
-// stderr into log lines, log the exit, persist state (a script action can
-// change provider fields, e.g. session cookies), then answer with the log
-// tail so the panel's script output shows immediately.
+// Completes the live transcript with the exit status, persists state (a script
+// action can change provider fields, e.g. session cookies), then answers with
+// the log tail. stdout/stderr lines were already recorded by the worker.
 static void pending_job_finish_script(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf) {
-    if (pf->script_stdout && pf->script_stdout[0]) {
-        char *copy = rs_strdup(pf->script_stdout);
-        for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n"))
-            if (line[0]) log_record(server, pf->stream_id, "info", "scriptOutput", NULL, 0, -1, line);
-        free(copy);
-    }
-    if (pf->script_stderr && pf->script_stderr[0]) {
-        char *copy = rs_strdup(pf->script_stderr);
-        for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n"))
-            if (line[0]) log_record(server, pf->stream_id, "error", "scriptError", NULL, 0, -1, line);
-        free(copy);
-    }
     log_record(server, pf->stream_id, pf->rc == 0 ? "info" : "error", "scriptEnd", NULL, pf->rc, -1,
                pf->rc == 0 ? "ok" : "script exited non-zero");
     // A script action can change provider state (session cookies etc.) even on
