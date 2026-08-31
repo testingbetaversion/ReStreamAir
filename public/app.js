@@ -2332,7 +2332,11 @@ function openStreamLogs(streamId) {
 const scriptTerminalEvents = new Set(["scriptStart", "scriptCommand", "scriptOutput", "scriptError", "scriptEnd"]);
 
 function isScriptTerminalEntry(entry) {
-  return entry.streamId?.startsWith("script:") && scriptTerminalEvents.has(entry.event);
+  // Provider actions use script:<providerId>; automatic playback actions use
+  // the real stream id. Both are subprocess transcripts and belong in the
+  // same terminal renderer — restricting this to script: made failed
+  // manifest/CDM runs explode into hundreds of ordinary red log rows.
+  return Boolean(entry.streamId) && scriptTerminalEvents.has(entry.event);
 }
 
 // Text-only transcript used by the smaller terminals in Provider settings and
@@ -2374,8 +2378,14 @@ function groupLogEntries(entries) {
 function logGroupHtml(group) {
   if (group.type === "single") return logRowHtml(group.entry);
   const entries = group.entries.slice().reverse();
-  const providerId = group.streamId.slice("script:".length);
-  const provider = state.providers.find((candidate) => candidate.id === providerId);
+  const providerRun = group.streamId.startsWith("script:");
+  const providerId = providerRun ? group.streamId.slice("script:".length) : null;
+  const provider = providerRun
+    ? state.providers.find((candidate) => candidate.id === providerId)
+    : state.providers.find((candidate) => candidate.streams.some((stream) => stream.id === group.streamId));
+  const stream = providerRun ? null : provider?.streams.find((candidate) => candidate.id === group.streamId);
+  const start = entries.find((entry) => entry.event === "scriptStart");
+  const action = start?.message || "script";
   const end = entries.find((entry) => entry.event === "scriptEnd");
   const hasError = entries.some((entry) => entry.level === "error");
   const status = end ? (end.status ?? 0) === 0 ? "Exited 0" : `Exited ${end.status}` : "Running";
@@ -2401,7 +2411,7 @@ function logGroupHtml(group) {
     <section class="script-terminal ${hasError ? "script-terminal-error" : ""}">
       <header class="script-terminal-head">
         <span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-        <span class="script-terminal-title">${escapeHtml(provider?.name || providerId)} · script</span>
+        <span class="script-terminal-title">${escapeHtml(stream?.name || provider?.name || providerId || group.streamId)} · ${escapeHtml(action)}</span>
         <span class="script-terminal-status ${end ? "finished" : "running"}">${status}</span>
       </header>
       <div class="script-terminal-body">${lines}</div>
@@ -3313,7 +3323,13 @@ async function runStreamCdmPipeline(button) {
       refreshedBox.textContent = "Manifest and CDM completed. The stream is running.";
     }
   } catch (err) {
-    box.textContent = `Error: ${err.message}`;
+    try {
+      const logs = await request(`/api/logs?streamId=${encodeURIComponent(stream.id)}&limit=500`);
+      const transcript = scriptTranscriptText((logs.entries || []).filter(isScriptTerminalEntry));
+      box.textContent = `${transcript || "(no script output was recorded)"}\n\n[failed: ${err.message}]`;
+    } catch (_) {
+      box.textContent = `Error: ${err.message}`;
+    }
   } finally {
     button.disabled = false;
   }

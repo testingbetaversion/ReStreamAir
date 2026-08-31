@@ -1609,7 +1609,7 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     n = fill_common_script_args(provider, stream, args, n, RS_SCRIPT_ARG_CAP);
     if (stream) {
         args[n++] = rs_script_arg("id", stream_id, false);
-        args[n++] = rs_script_arg("url", rs_json_obj_str(stream, "url", ""), true);
+        args[n++] = rs_script_arg("url", rs_json_obj_str(stream, "url", ""), false);
         // Every action a stream can run is parameterised by the tokens the
         // channel/event import stored, exactly as the automatic pipeline
         // passes them — otherwise a hook tested from the panel is invoked with
@@ -3635,8 +3635,8 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
                 char *encoded = rs_base64_encode(init, init_len);
                 char *extra[2];
                 int extra_n = 0;
-                extra[extra_n++] = rs_script_arg("url", manifest_url, true);
-                extra[extra_n++] = rs_script_arg("init", encoded ? encoded : "", true);
+                extra[extra_n++] = rs_script_arg("url", manifest_url, false);
+                extra[extra_n++] = rs_script_arg("init", encoded ? encoded : "", false);
                 char *out = NULL;
                 if (stream_start_run(server, sid, st, "initparse", extra, extra_n, 30.0, &out) == 0) {
                     rs_json *doc = parse_script_document(out);
@@ -3689,12 +3689,19 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     // accepted — a script that prints a traceback, or echoes the argument back
     // still wrapped in the protocol's b64: encoding, must not become the box we
     // ask for keys with.
-    char *license_pssh = ch.pssh_all_count ? rs_strdup(ch.pssh_all[0]) : NULL;
+    const char *selected_pssh = NULL;
+    if (strcasecmp(st->cdm_type, "widevine") == 0 && ch.pssh_widevine)
+        selected_pssh = ch.pssh_widevine;
+    else if (strcasecmp(st->cdm_type, "playready") == 0 && ch.pssh_playready)
+        selected_pssh = ch.pssh_playready;
+    else if (ch.pssh_all_count)
+        selected_pssh = ch.pssh_all[0];
+    char *license_pssh = selected_pssh ? rs_strdup(selected_pssh) : NULL;
     if (st->want_pssh_hook && license_pssh) {
         char *extra[2];
         int extra_n = 0;
-        extra[extra_n++] = rs_script_arg("pssh", license_pssh, true);
-        extra[extra_n++] = rs_script_arg("url", manifest_url, true);
+        extra[extra_n++] = rs_script_arg("pssh", license_pssh, false);
+        extra[extra_n++] = rs_script_arg("url", manifest_url, false);
         char *out = NULL;
         if (stream_start_run(server, sid, st, "pssh", extra, extra_n, 30.0, &out) == 0 && out) {
             rs_json *doc = parse_script_document(out);
@@ -3730,17 +3737,17 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
         extra[extra_n++] = rs_script_arg("kid", j, false);
         free(j);
     }
-    if (license_pssh) extra[extra_n++] = rs_script_arg("pssh", license_pssh, true);
+    if (license_pssh) extra[extra_n++] = rs_script_arg("pssh", license_pssh, false);
     if (ch.pssh_all_count) {
         char *j = join_list(ch.pssh_all, ch.pssh_all_count, ",");
-        extra[extra_n++] = rs_script_arg("psshAll", j, true);
+        extra[extra_n++] = rs_script_arg("psshAll", j, false);
         free(j);
     }
-    if (ch.pssh_widevine) extra[extra_n++] = rs_script_arg("psshWidevine", ch.pssh_widevine, true);
-    if (ch.pssh_playready) extra[extra_n++] = rs_script_arg("psshPlayReady", ch.pssh_playready, true);
+    if (ch.pssh_widevine) extra[extra_n++] = rs_script_arg("psshWidevine", ch.pssh_widevine, false);
+    if (ch.pssh_playready) extra[extra_n++] = rs_script_arg("psshPlayReady", ch.pssh_playready, false);
     if (ch.key_uris_count) {
         char *j = join_list(ch.key_uris, ch.key_uris_count, ",");
-        extra[extra_n++] = rs_script_arg("keyUri", j, true);
+        extra[extra_n++] = rs_script_arg("keyUri", j, false);
         free(j);
     }
 
@@ -3790,7 +3797,7 @@ static void stream_start_worker(restream_server_t *server, const char *sid, rs_s
             // expired one the stream was stored with.
             if (st->url_arg >= 0 && st->url_arg < st->argc) {
                 free(st->args[st->url_arg]);
-                st->args[st->url_arg] = rs_script_arg("url", st->manifest_url, true);
+                st->args[st->url_arg] = rs_script_arg("url", st->manifest_url, false);
             }
             log_recordf(server, sid, "info", "scriptManifest", st->manifest_url, 0, -1,
                         "session manifest: fresh source (%lu CDN mirror(s)%s)",
@@ -4254,7 +4261,7 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
     int url_arg = -1;
     if (n < RS_SCRIPT_ARG_CAP) {
         url_arg = n;
-        args[n++] = rs_script_arg("url", rs_json_obj_str(stream, "url", ""), true);
+        args[n++] = rs_script_arg("url", rs_json_obj_str(stream, "url", ""), false);
     }
     n = append_script_params(args, n, RS_SCRIPT_ARG_CAP, rs_json_obj_str(stream, "scriptParams", ""));
 
