@@ -211,7 +211,7 @@ becomes the primary source and the remaining entries stay available as mirrors.
 | `initparse` | `url`, base64 `init` | JSON containing any discovered KID/PSSH values. |
 | `cdm` | KIDs, PSSH values, key URI, CDM type | Clear keys as `KID:KEY` lines or JSON. |
 
-`cdm` runs on every start of a stream that has **DRM keys via script** ticked and no keys typed by hand. ReStreamAir fetches the source manifest, scrapes every KID, PSSH box and HLS key URI out of it, and passes them all as `kid=`, `pssh=`, `psshAll=`, `psshWidevine=`, `psshPlayReady=` and `keyUri=`, along with `cdm=external`, the stream's `cdmType=` and its script params. The keys that come back are stored as the stream's decryption keys.
+`cdm` runs on every start of a stream that has **DRM keys via script** ticked. ReStreamAir first runs `manifest`, then scrapes every KID, PSSH box and HLS key URI out of the fresh source and passes them all as `kid=`, `pssh=`, `psshAll=`, `psshWidevine=`, `psshPlayReady=` and `keyUri=`, along with `cdm=external`, the stream's `cdmType=` and its script params. The keys that come back replace the stream's active decryption keys for that session. For Widevine/PlayReady HLS, the rewritten playlist removes the DRM key tag and routes its fMP4 init and media fragments through server-side CENC decryption.
 
 PSSH is looked for in three places, in order:
 

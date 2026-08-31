@@ -43,9 +43,10 @@ char *rs_m3u8_rewrite(const char *text, const char *base_url, bool drop_key,
 
 typedef char *(*rs_m3u8_master_transform_fn)(void *userdata, const char *absolute_uri);
 
-// Rewrites a master playlist's variant and audio-track URIs; every other
-// attribute passes through untouched.
-char *rs_m3u8_rewrite_master(const char *text, const char *base_url,
+// Rewrites a master playlist's variant and audio-track URIs. When
+// drop_session_key is set, EXT-X-SESSION-KEY tags are removed because the
+// server is returning already-decrypted media.
+char *rs_m3u8_rewrite_master(const char *text, const char *base_url, bool drop_session_key,
                              rs_m3u8_master_transform_fn transform, void *userdata);
 
 // Absent numeric attributes are -1; absent strings are NULL.

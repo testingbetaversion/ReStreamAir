@@ -203,7 +203,8 @@ static char *effective_proxy(const rs_json *provider, const rs_json *stream, boo
 // Forward declaration: apply_cenc is defined between serve_hls_playlist and
 // serve_restream_item, but pending_job_finish_item (defined just above
 // serve_hls_playlist) needs it too.
-static uint8_t *apply_cenc(const char *decryption_keys, bool is_map, uint8_t *body, size_t body_len, size_t *out_len);
+static uint8_t *apply_cenc(const char *decryption_keys, const char *selected_kid,
+                           bool is_map, uint8_t *body, size_t body_len, size_t *out_len);
 
 // Forward declarations: dispatch_logo_lookup/dispatch_probe/dispatch_script_action
 // are defined alongside pending_job_dispatch (just above serve_hls_playlist),
@@ -2958,6 +2959,8 @@ static void proxy_filename(const char *abs_uri, rs_m3u8_line_kind kind, char *ou
 typedef struct {
     const char *stream_id;
     const char *playback_key;
+    bool decrypt_cenc;
+    const char *cenc_kid;
 } playlist_route_ctx;
 
 static char *media_transform(void *ud, const char *abs_uri, rs_m3u8_line_kind kind, int64_t seq) {
@@ -2968,16 +2971,26 @@ static char *media_transform(void *ud, const char *abs_uri, rs_m3u8_line_kind ki
     proxy_filename(abs_uri, kind, fname, sizeof(fname));
     char *enc = query_encode(abs_uri);
     char *key = (ctx->playback_key && ctx->playback_key[0]) ? query_encode(ctx->playback_key) : NULL;
-    if (!enc) { free(key); return NULL; }
-    size_t need = strlen(stream_id) + strlen(enc) + strlen(fname) + (key ? strlen(key) : 0) + 96;
+    char *kid = (ctx->cenc_kid && ctx->cenc_kid[0]) ? query_encode(ctx->cenc_kid) : NULL;
+    if (!enc) { free(key); free(kid); return NULL; }
+    size_t need = strlen(stream_id) + strlen(enc) + strlen(fname)
+                + (key ? strlen(key) : 0) + (kid ? strlen(kid) : 0) + 128;
     char *out = (char *)malloc(need);
     if (out) {
         snprintf(out, need, "/restream/%s/%s?u=%s&kind=%s", stream_id, fname, enc, kindstr);
         if (seq >= 0) snprintf(out + strlen(out), need - strlen(out), "&seq=%lld", (long long)seq);
+        // Widevine/PlayReady HLS still carries ordinary CENC-encrypted fMP4.
+        // Route maps and media fragments through apply_cenc; key lines are
+        // removed by the playlist rewriter when this flag is set.
+        if (ctx->decrypt_cenc && kind != RS_M3U8_LINE_KEY)
+            snprintf(out + strlen(out), need - strlen(out), "&dec=1");
+        if (ctx->decrypt_cenc && kid && kind != RS_M3U8_LINE_KEY)
+            snprintf(out + strlen(out), need - strlen(out), "&kid=%s", kid);
         if (key) snprintf(out + strlen(out), need - strlen(out), "&key=%s", key);
     }
     free(enc);
     free(key);
+    free(kid);
     return out;
 }
 
@@ -3084,7 +3097,8 @@ struct rs_pending_job {
     bool force_ipv6;               // PLAYLIST/ITEM/PROBE
     bool rotate_proxies;           // PLAYLIST/ITEM/PROBE
     bool decrypt, is_map, is_key;  // ITEM only
-    char *decryption_keys;         // ITEM only, "KID:KEY[,KID:KEY...]"
+    char *decryption_keys;         // PLAYLIST/ITEM, "KID:KEY[,KID:KEY...]"
+    char *cenc_kid;                // ITEM only, KID selected by its media playlist
     char *hls_key, *hls_iv;        // ITEM only
     int seq;                       // ITEM only, for HLS AES-128 IV derivation
     char *user_agent;              // ITEM only, for the metrics/log line
@@ -3119,7 +3133,7 @@ static void pending_job_free(rs_pending_job *pf) {
     if (!pf) return;
     free(pf->stream_id); free(pf->url); free(pf->proxy); free(pf->headers);
     free(pf->range); free(pf->downloader); free(pf->downloader_params);
-    free(pf->decryption_keys); free(pf->hls_key); free(pf->hls_iv);
+    free(pf->decryption_keys); free(pf->cenc_kid); free(pf->hls_key); free(pf->hls_iv);
     free(pf->user_agent); free(pf->playback_key_str); free(pf->client_ip);
     free(pf->script_path);
     free(pf->script_action);
@@ -3996,11 +4010,16 @@ static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job 
         reply_error(c, 502, pf->err[0] ? pf->err : "Could not fetch the playlist.");
         return;
     }
-    playlist_route_ctx ctx = {pf->stream_id, pf->playback_key_str};
-    bool server_decrypts_hls = pf->hls_key && pf->hls_key[0] != '\0';
+    bool decrypts_cenc = pf->decryption_keys && pf->decryption_keys[0] != '\0';
+    rs_drm_challenge drm = {0};
+    if (decrypts_cenc) drm = rs_cdm_challenge_from_hls(pf->body);
+    const char *playlist_kid = drm.kids_count ? drm.kids[0] : NULL;
+    playlist_route_ctx ctx = {pf->stream_id, pf->playback_key_str, decrypts_cenc, playlist_kid};
+    bool server_decrypts_hls = decrypts_cenc || (pf->hls_key && pf->hls_key[0] != '\0');
     char *rewritten;
     if (rs_m3u8_is_master(pf->body)) {
-        rewritten = rs_m3u8_rewrite_master(pf->body, pf->url, master_transform, &ctx);
+        rewritten = rs_m3u8_rewrite_master(pf->body, pf->url, server_decrypts_hls,
+                                           master_transform, &ctx);
     } else {
         // With a configured clear key the server decrypts each segment. Strip
         // EXT-X-KEY so the player does not decrypt the clear bytes a second
@@ -4008,6 +4027,7 @@ static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job 
         rewritten = rs_m3u8_rewrite(pf->body, pf->url, server_decrypts_hls,
                                     media_transform, &ctx);
     }
+    rs_drm_challenge_free(&drm);
     if (!rewritten) { reply_error(c, 500, "Out of memory rewriting the playlist."); return; }
     mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
                           "Cache-Control: no-store\r\n", "%s", rewritten);
@@ -4032,7 +4052,8 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
 
     if (pf->decrypt) {
         size_t new_len = 0;
-        body = apply_cenc(pf->decryption_keys, pf->is_map, body, body_len, &new_len);
+        body = apply_cenc(pf->decryption_keys, pf->cenc_kid,
+                          pf->is_map, body, body_len, &new_len);
         body_len = new_len;
         status = 0; free(pf->content_range); pf->content_range = NULL;  // decrypted body is a fresh whole object
     }
@@ -4234,11 +4255,12 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
 
     bool want_manifest = rs_json_obj_bool(stream, "sessionManifest", false)
         && rs_panel_script_action_allowed(provider, stream, "manifest");
-    // Keys typed by hand always win; the script is only asked when the field is
-    // empty, so an operator's own keys are never silently replaced.
+    // Script-backed DRM is session-scoped: manifests can rotate both their URL
+    // and their keys, so a key acquired during an earlier start must never make
+    // us skip CDM on the next one. If useCdm is enabled, the script owns the
+    // active keys and refreshes them after every manifest action.
     bool want_cdm = rs_json_obj_bool(stream, "useCdm", false)
-        && rs_panel_script_action_allowed(provider, stream, "cdm")
-        && !rs_json_obj_str(stream, "decryptionKeys", "")[0];
+        && rs_panel_script_action_allowed(provider, stream, "cdm");
     if (!want_manifest && !want_cdm) return false;
 
     const char *script = rs_panel_effective_script_path(provider, stream);
@@ -4340,6 +4362,7 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     pf->downloader_params = rs_strdup(effective_downloader_params(provider, stream));
     pf->force_ipv6 = provider && rs_json_obj_bool(provider, "forceIpv6", false);
     pf->rotate_proxies = provider && rs_json_obj_bool(provider, "rotateProxies", false);
+    pf->decryption_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
     pf->hls_key = rs_strdup(rs_json_obj_str(stream, "hlsKey", ""));
     pf->playback_key_str = playback_key(hm);
     free(variant);
@@ -4350,12 +4373,13 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     }
 }
 
-// Applies ClearKey CENC to a fetched DASH item in place: patches the init
+// Applies ClearKey CENC to a fetched DASH/HLS item in place: patches the init
 // segment (kind=map) or AES-CTR-decrypts a media segment using the stream's
 // configured KID:KEY. No-op (returns the input) when no key is set. Takes the
 // raw "KID:KEY" string rather than the stream object itself so it can run on
 // pending_job_worker's copy after the stream JSON may have changed underneath.
-static uint8_t *apply_cenc(const char *decryption_keys, bool is_map, uint8_t *body, size_t body_len, size_t *out_len) {
+static uint8_t *apply_cenc(const char *decryption_keys, const char *selected_kid,
+                           bool is_map, uint8_t *body, size_t body_len, size_t *out_len) {
     *out_len = body_len;
     rs_cenc_keys keys = rs_cenc_parse_keys(decryption_keys ? decryption_keys : "");
     uint8_t *out = NULL;
@@ -4363,7 +4387,16 @@ static uint8_t *apply_cenc(const char *decryption_keys, bool is_map, uint8_t *bo
         // The init needs patching to a clear codec even before any key exists.
         out = rs_cenc_patch_init(body, body_len, out_len, NULL, NULL);
     } else if (keys.count > 0) {
-        out = rs_cenc_decrypt_segment(body, body_len, out_len, keys.keys[0], 8);
+        size_t selected = 0;
+        if (selected_kid && selected_kid[0]) {
+            for (size_t i = 0; i < keys.count; i++) {
+                if (strcasecmp(keys.kids[i], selected_kid) == 0) {
+                    selected = i;
+                    break;
+                }
+            }
+        }
+        out = rs_cenc_decrypt_segment(body, body_len, out_len, keys.keys[selected], 8);
     }
     rs_cenc_keys_free(&keys);
     if (out) { free(body); return out; }
@@ -4484,6 +4517,7 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     const rs_json *provider = provider_of(&server->state, stream);
 
     char *dec = query_var(hm, "dec");
+    char *kid = query_var(hm, "kid");
     char *kindq = query_var(hm, "kind");
     bool decrypt = dec && dec[0] == '1';
     bool is_map = kindq && strcmp(kindq, "map") == 0;
@@ -4491,7 +4525,7 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     free(dec); free(kindq);
 
     rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
-    if (!pf) { free(url); reply_error(c, 500, "Out of memory."); return; }
+    if (!pf) { free(url); free(kid); reply_error(c, 500, "Out of memory."); return; }
     pf->kind = RS_PENDING_ITEM;
     pf->stream_id = rs_strdup(stream_id);
     pf->url = url;  // pf owns it now
@@ -4509,6 +4543,7 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     pf->force_ipv6 = provider && rs_json_obj_bool(provider, "forceIpv6", false);
     pf->rotate_proxies = provider && rs_json_obj_bool(provider, "rotateProxies", false);
     pf->decryption_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
+    pf->cenc_kid = kid;
     pf->hls_key = rs_strdup(rs_json_obj_str(stream, "hlsKey", ""));
     pf->hls_iv = rs_strdup(rs_json_obj_str(stream, "hlsIV", ""));
     char *seq_str = query_var(hm, "seq");

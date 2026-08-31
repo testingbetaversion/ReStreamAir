@@ -909,8 +909,8 @@ int rs_panel_apply_session_manifest(rs_state *st, const char *stream_id, const c
     return 0;
 }
 
-// Stores the clear keys the `cdm` action returned. Keys typed by hand are never
-// overwritten — the caller only asks for script keys when the field is empty.
+// Stores the clear keys the `cdm` action returned. A stream with useCdm enabled
+// treats these as session keys and refreshes them on every start.
 int rs_panel_set_stream_keys(rs_state *st, const char *stream_id, const char *keys,
                              const char **err) {
     rs_json *provider = NULL;

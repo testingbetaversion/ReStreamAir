@@ -237,7 +237,7 @@ static char *master_adapter_call(void *userdata, const char *absolute_uri,
     return adapter->transform(adapter->userdata, absolute_uri);
 }
 
-char *rs_m3u8_rewrite_master(const char *text, const char *base_url,
+char *rs_m3u8_rewrite_master(const char *text, const char *base_url, bool drop_session_key,
                              rs_m3u8_master_transform_fn transform, void *userdata) {
     if (!text || !base_url || !transform) return NULL;
 
@@ -250,6 +250,11 @@ char *rs_m3u8_rewrite_master(const char *text, const char *base_url,
     size_t i = 0;
     while (i < l.count) {
         slice trimmed = slice_trimmed(l.items[i]);
+
+        if (drop_session_key && slice_has_prefix(trimmed, "#EXT-X-SESSION-KEY")) {
+            i++;
+            continue;
+        }
 
         if (slice_has_prefix(trimmed, "#EXT-X-STREAM-INF")) {
             if (!first) rs_buf_append_char(&out, '\n');

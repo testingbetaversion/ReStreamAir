@@ -538,7 +538,8 @@ static void run_golden(const rs_golden *entry) {
     if (strncmp(key, "master:", 7) == 0) {
         const rs_playlist_fixture *fixture = find_playlist(key + 7);
         if (!fixture) { fail(key, "unknown playlist fixture"); return; }
-        char *actual = rs_m3u8_rewrite_master(fixture->text, fixture->base, master_transform, NULL);
+        char *actual = rs_m3u8_rewrite_master(fixture->text, fixture->base, false,
+                                              master_transform, NULL);
         check_str(key, actual, entry->value);
         rs_free(actual);
         return;
