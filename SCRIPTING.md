@@ -58,7 +58,7 @@ ReStreamAir starts the script as a child process:
 
 | File | Command used |
 |---|---|
-| `script.py` | `python3 script.py ...` |
+| `script.py` | `python3 -u script.py ...` |
 | `script.sh` or `script.bash` | `/bin/sh script.sh ...` |
 | Any other file | Executed directly; it needs a shebang and executable permission. |
 
@@ -211,7 +211,7 @@ becomes the primary source and the remaining entries stay available as mirrors.
 | `initparse` | `url`, base64 `init` | JSON containing any discovered KID/PSSH values. |
 | `cdm` | KIDs, PSSH values, key URI, CDM type | Clear keys as `KID:KEY` lines or JSON. |
 
-`cdm` runs on every start of a stream that has **DRM keys via script** ticked. ReStreamAir first runs `manifest`, then scrapes every KID, PSSH box and HLS key URI out of the fresh source and passes them all as `kid=`, `pssh=`, `psshAll=`, `psshWidevine=`, `psshPlayReady=` and `keyUri=`, along with `cdm=external`, the stream's `cdmType=` and its script params. The keys that come back replace the stream's active decryption keys for that session. For Widevine/PlayReady HLS, the rewritten playlist removes the DRM key tag and routes its fMP4 init and media fragments through server-side CENC decryption.
+On every start of a stream that has **DRM keys via script** ticked, ReStreamAir first runs `manifest`, then searches the fresh manifest, its first HLS media playlist and the init segment for every KID, PSSH box and HLS key URI. If the stored clear keys already cover every discovered KID, they are reused and `cdm` is skipped. A missing or changed KID—or DRM input with no identifiable KID—runs `cdm` and passes `kid=`, `pssh=`, `psshAll=`, `psshWidevine=`, `psshPlayReady=` and `keyUri=`, along with `cdm=external`, the stream's `cdmType=` and its script params. The returned pairs replace the active decryption keys. For Widevine/PlayReady HLS, the rewritten playlist removes the DRM key tag and routes its fMP4 init and media fragments through server-side CENC decryption.
 
 PSSH is looked for in three places, in order:
 
@@ -251,7 +251,7 @@ print("Provider rejected the token", file=sys.stderr, flush=True)
 
 The panel combines stdout and stderr for display while structured logs retain their severity.
 
-Pipeline hooks fail soft: an empty, failed, or timed-out hook is logged and ReStreamAir falls back to its built-in behavior where possible.
+Optional `pssh` and `initparse` hooks fail soft and fall back to the built-in parser. A failed `manifest` or `cdm` action stops the start, because an expired source URL or missing clear key cannot produce playable output.
 
 ## Test from a terminal
 

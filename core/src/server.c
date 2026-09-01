@@ -204,7 +204,8 @@ static char *effective_proxy(const rs_json *provider, const rs_json *stream, boo
 // serve_restream_item, but pending_job_finish_item (defined just above
 // serve_hls_playlist) needs it too.
 static uint8_t *apply_cenc(const char *decryption_keys, const char *selected_kid,
-                           bool is_map, uint8_t *body, size_t body_len, size_t *out_len);
+                           bool is_map, uint8_t *body, size_t body_len,
+                           size_t *out_len, bool *transformed);
 
 // Forward declarations: dispatch_logo_lookup/dispatch_probe/dispatch_script_action
 // are defined alongside pending_job_dispatch (just above serve_hls_playlist),
@@ -1621,6 +1622,8 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
         // workflow as external, just like the automatic start pipeline does.
         if (strcmp(action, "cdm") == 0 && n < RS_SCRIPT_ARG_CAP)
             args[n++] = rs_script_arg("cdm", "external", false);
+        if (strcmp(action, "cdm") == 0 && n < RS_SCRIPT_ARG_CAP)
+            args[n++] = rs_script_arg("challenge", "", false);
     }
 
     // Nothing spawns the script for an action the provider hasn't declared.
@@ -3091,6 +3094,8 @@ struct rs_pending_job {
     char *url;                     // PLAYLIST/ITEM: fetch URL. PROBE: source URL. LOGO: channel name to look up.
     char *proxy;                   // PLAYLIST/ITEM/PROBE
     char *headers;                 // PLAYLIST/ITEM/PROBE
+    char *media_proxy;             // PLAYLIST only: init-segment fallback
+    char *media_headers;           // PLAYLIST only: init-segment fallback
     char *range;                   // ITEM only
     char *downloader;               // PLAYLIST/ITEM only
     char *downloader_params;       // PLAYLIST/ITEM only
@@ -3098,7 +3103,7 @@ struct rs_pending_job {
     bool rotate_proxies;           // PLAYLIST/ITEM/PROBE
     bool decrypt, is_map, is_key;  // ITEM only
     char *decryption_keys;         // PLAYLIST/ITEM, "KID:KEY[,KID:KEY...]"
-    char *cenc_kid;                // ITEM only, KID selected by its media playlist
+    char *cenc_kid;                // PLAYLIST/ITEM: KID selected by playlist/init
     char *hls_key, *hls_iv;        // ITEM only
     int seq;                       // ITEM only, for HLS AES-128 IV derivation
     char *user_agent;              // ITEM only, for the metrics/log line
@@ -3132,6 +3137,7 @@ struct rs_pending_job {
 static void pending_job_free(rs_pending_job *pf) {
     if (!pf) return;
     free(pf->stream_id); free(pf->url); free(pf->proxy); free(pf->headers);
+    free(pf->media_proxy); free(pf->media_headers);
     free(pf->range); free(pf->downloader); free(pf->downloader_params);
     free(pf->decryption_keys); free(pf->cenc_kid); free(pf->hls_key); free(pf->hls_iv);
     free(pf->user_agent); free(pf->playback_key_str); free(pf->client_ip);
@@ -3299,10 +3305,11 @@ typedef struct rs_stream_start {
     char *script_path;
     char **args;  // common prefix, no action= (each rs_script_arg-owned)
     int argc;
-    char *kind, *url, *proxy, *headers, *downloader, *dl_params, *rep, *host;
+    char *kind, *url, *proxy, *media_proxy, *headers, *media_fetch_headers, *provider_headers;
+    char *downloader, *dl_params, *rep, *host;
     bool force_ipv6, rotate_proxies;
     bool want_manifest, want_cdm, want_pssh_hook, want_initparse;
-    char *cdm_mode, *cdm_type;
+    char *cdm_mode, *cdm_type, *cached_keys;
     int url_arg;  // index of the url= argument, rewritten once the manifest refreshes it
 
     // Result, filled by the worker.
@@ -3320,9 +3327,10 @@ static void stream_start_free(struct rs_stream_start *st) {
     free(st->script_path);
     for (int i = 0; i < st->argc; i++) free(st->args[i]);
     free(st->args);
-    free(st->kind); free(st->url); free(st->proxy); free(st->headers);
+    free(st->kind); free(st->url); free(st->proxy); free(st->media_proxy); free(st->headers);
+    free(st->media_fetch_headers); free(st->provider_headers);
     free(st->downloader); free(st->dl_params); free(st->rep); free(st->host);
-    free(st->cdm_mode); free(st->cdm_type);
+    free(st->cdm_mode); free(st->cdm_type); free(st->cached_keys);
     free(st->manifest_url); free(st->manifest_headers); free(st->media_headers);
     free(st->keys);
     rs_json_free(st->cdn_urls);
@@ -3357,22 +3365,53 @@ static const rs_json *header_block(const rs_json *headers, const char *lower, co
     return v ? v : rs_json_obj_get(headers, upper);
 }
 
+static char *join_header_text(const char *generic, const char *specific) {
+    generic = generic ? generic : "";
+    specific = specific ? specific : "";
+    size_t need = strlen(generic) + strlen(specific) + 2;
+    char *out = (char *)malloc(need);
+    if (!out) return NULL;
+    out[0] = '\0';
+    if (generic[0]) strcat(out, generic);
+    if (specific[0]) {
+        if (out[0]) strcat(out, "\n");
+        strcat(out, specific);
+    }
+    return out;
+}
+
 // Runs one action of the stream's script: `action=` first, then the common
 // prefix, then whatever this action adds. Returns the exit code, with stdout in
 // *out (caller frees) — never NULL on success.
-static void stream_start_log_text(restream_server_t *server, const char *sid,
-                                  const char *level, const char *event, const char *value) {
-    if (!value) return;
-    const char *line = value;
-    for (const char *p = value;; p++) {
-        if (*p != '\n' && *p != '\r' && *p != '\0') continue;
-        if (p > line) {
-            char *copy = dup_n(line, (size_t)(p - line));
-            if (copy) log_record(server, sid, level, event, NULL, 0, -1, copy);
-            free(copy);
-        }
-        if (*p == '\0') break;
-        line = p + 1;
+typedef struct {
+    restream_server_t *server;
+    const char *sid;
+    rs_buf stdout_line;
+    rs_buf stderr_line;
+} stream_start_log_ctx;
+
+static void stream_start_flush_line(stream_start_log_ctx *ctx, bool is_stderr) {
+    rs_buf *pending = is_stderr ? &ctx->stderr_line : &ctx->stdout_line;
+    if (!pending->len) return;
+    char *line = rs_buf_take(pending);
+    if (!line) return;
+    log_record(ctx->server, ctx->sid, is_stderr ? "error" : "info",
+               is_stderr ? "scriptError" : "scriptOutput", NULL, 0, -1, line);
+    free(line);
+}
+
+// Automatic manifest/pssh/initparse/cdm runs use the same live, line-oriented
+// terminal feed as manually launched provider actions. Keeping this callback
+// active while the child runs is what makes a traceback visible before exit.
+static void stream_start_output_chunk(void *value, bool is_stderr,
+                                      const char *bytes, size_t len) {
+    stream_start_log_ctx *ctx = (stream_start_log_ctx *)value;
+    rs_buf *pending = is_stderr ? &ctx->stderr_line : &ctx->stdout_line;
+    for (size_t i = 0; i < len; i++) {
+        if (bytes[i] == '\n' || bytes[i] == '\r')
+            stream_start_flush_line(ctx, is_stderr);
+        else
+            rs_buf_append_char(pending, bytes[i]);
     }
 }
 
@@ -3392,9 +3431,13 @@ static int stream_start_run(restream_server_t *server, const char *sid,
                command ? command : st->script_path);
     free(command);
     char *err_text = NULL;
-    int rc = rs_script_run_sync(st->script_path, argv, n, timeout, out, &err_text);
-    stream_start_log_text(server, sid, "info", "scriptOutput", out ? *out : NULL);
-    stream_start_log_text(server, sid, "error", "scriptError", err_text);
+    stream_start_log_ctx log_ctx = {server, sid, RS_BUF_INIT, RS_BUF_INIT};
+    int rc = rs_script_run_stream(st->script_path, argv, n, timeout, out, &err_text,
+                                  stream_start_output_chunk, &log_ctx);
+    stream_start_flush_line(&log_ctx, false);
+    stream_start_flush_line(&log_ctx, true);
+    rs_buf_dispose(&log_ctx.stdout_line);
+    rs_buf_dispose(&log_ctx.stderr_line);
     log_record(server, sid, rc == 0 ? "info" : "error", "scriptEnd", NULL, rc, -1,
                rc == 0 ? "ok" : "script exited non-zero");
     rs_free(err_text);
@@ -3455,7 +3498,11 @@ static bool stream_start_parse_manifest(rs_stream_start *st, const char *stdout_
     // before action=manifest ran.
     if (st->manifest_headers[0]) {
         free(st->headers);
-        st->headers = rs_strdup(st->manifest_headers);
+        st->headers = join_header_text(st->provider_headers, st->manifest_headers);
+    }
+    if (st->media_headers[0]) {
+        free(st->media_fetch_headers);
+        st->media_fetch_headers = join_header_text(st->provider_headers, st->media_headers);
     }
 
     // Imported entries have no URL at import time, so their default kind is
@@ -3480,18 +3527,24 @@ static bool stream_start_parse_manifest(rs_stream_start *st, const char *stdout_
 
 // Fetches a URL with the stream's manifest-category settings. Returns the body
 // (caller frees) or NULL.
-static char *stream_start_fetch(rs_stream_start *st, const char *url, size_t *out_len) {
+static char *stream_start_fetch_headers(rs_stream_start *st, const char *url,
+                                        const char *proxy, const char *headers,
+                                        size_t *out_len) {
     if (!g_fetch_handler || !url || !url[0]) return NULL;
     char *body = NULL;
     size_t len = 0;
     long status = 0;
     char err[128] = {0};
-    int rc = g_fetch_handler(url, st->proxy, st->headers, NULL, st->downloader, st->dl_params,
+    int rc = g_fetch_handler(url, proxy, headers, NULL, st->downloader, st->dl_params,
                              st->force_ipv6 ? 1 : 0, st->rotate_proxies ? 1 : 0,
                              &body, &len, &status, NULL, NULL, NULL, err, sizeof(err), 20000, NULL, NULL);
     if (rc != 0 || status < 200 || status >= 300 || !body) { free(body); return NULL; }
     if (out_len) *out_len = len;
     return body;
+}
+
+static char *stream_start_fetch(rs_stream_start *st, const char *url, size_t *out_len) {
+    return stream_start_fetch_headers(st, url, st->proxy, st->headers, out_len);
 }
 
 // A session manifest may be an HLS master playlist; encryption tags live in
@@ -3518,6 +3571,19 @@ static char *hls_first_variant_url(const char *manifest_url, const char *text) {
     return NULL;
 }
 
+static char *hls_init_url(const char *manifest_url, const char *manifest_text) {
+    const char *map = manifest_text ? strstr(manifest_text, "#EXT-X-MAP:") : NULL;
+    const char *uri = map ? strstr(map, "URI=\"") : NULL;
+    if (!uri) return NULL;
+    const char *start = uri + 5;
+    const char *end = strchr(start, '"');
+    if (!end || end <= start) return NULL;
+    char *ref = dup_n(start, (size_t)(end - start));
+    char *resolved = ref ? rs_url_resolve(manifest_url, ref) : NULL;
+    free(ref);
+    return resolved;
+}
+
 // The third place PSSH can live. A manifest that advertises only a bare
 // default_KID (or nothing at all) may still ship real `pssh` boxes in the
 // initialization segment, so when the manifest scrape came up without one, go
@@ -3526,17 +3592,7 @@ static uint8_t *stream_start_fetch_init(rs_stream_start *st, const char *manifes
                                         const char *manifest_text, size_t *out_len) {
     char *init_url = NULL;
     if (strcmp(st->kind, "m3u8") == 0) {
-        const char *map = strstr(manifest_text, "#EXT-X-MAP:");
-        const char *uri = map ? strstr(map, "URI=\"") : NULL;
-        if (uri) {
-            const char *start = uri + 5;
-            const char *end = strchr(start, '"');
-            if (end && end > start) {
-                char *ref = dup_n(start, (size_t)(end - start));
-                init_url = ref ? rs_url_resolve(manifest_url, ref) : NULL;
-                free(ref);
-            }
-        }
+        init_url = hls_init_url(manifest_url, manifest_text);
     } else if (g_dash_handler) {
         // The describe handler resolves the initialization template for one
         // representation; when the stream has no rendition picked yet, its
@@ -3574,11 +3630,102 @@ static uint8_t *stream_start_fetch_init(rs_stream_start *st, const char *manifes
     }
     if (!init_url) return NULL;
     size_t len = 0;
-    char *body = stream_start_fetch(st, init_url, &len);
+    char *body = stream_start_fetch_headers(st, init_url, st->media_proxy,
+                                            st->media_fetch_headers, &len);
     free(init_url);
     if (!body) return NULL;
     if (out_len) *out_len = len;
     return (uint8_t *)body;
+}
+
+static bool stream_start_kid_equal(const char *left, const char *right) {
+    char a[33], b[33];
+    size_t an = 0, bn = 0;
+    for (const char *p = left ? left : ""; *p; p++) {
+        if (*p == '-' || *p == '{' || *p == '}' || isspace((unsigned char)*p)) continue;
+        if (!isxdigit((unsigned char)*p) || an >= 32) return false;
+        a[an++] = (char)tolower((unsigned char)*p);
+    }
+    for (const char *p = right ? right : ""; *p; p++) {
+        if (*p == '-' || *p == '{' || *p == '}' || isspace((unsigned char)*p)) continue;
+        if (!isxdigit((unsigned char)*p) || bn >= 32) return false;
+        b[bn++] = (char)tolower((unsigned char)*p);
+    }
+    return an == 32 && bn == 32 && memcmp(a, b, 32) == 0;
+}
+
+// Cached clear keys are reusable only when the complete discovery pass found
+// at least one KID and every one of those KIDs is represented. A PSSH/key URI
+// without an identifiable KID still goes to CDM: guessing that an old key fits
+// a new session would produce encrypted garbage with no useful error.
+static bool stream_start_cached_keys_cover(const char *cached,
+                                           const rs_drm_challenge *ch) {
+    if (!cached || !cached[0] || !ch || ch->kids_count == 0) return false;
+    rs_cenc_keys keys = rs_cenc_parse_keys(cached);
+    bool covered = keys.count > 0;
+    for (size_t i = 0; covered && i < ch->kids_count; i++) {
+        bool found = false;
+        for (size_t k = 0; k < keys.count; k++) {
+            if (stream_start_kid_equal(ch->kids[i], keys.kids[k])) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) covered = false;
+    }
+    rs_cenc_keys_free(&keys);
+    return covered;
+}
+
+static void stream_start_add_kid_text(rs_drm_challenge *ch, const char *text) {
+    const char *p = text ? text : "";
+    while (*p) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char *value = rs_trim_dup(p, len, true);
+        if (value && value[0]) rs_cdm_challenge_add_kid(ch, value);
+        free(value);
+        if (!end) break;
+        p = end + 1;
+    }
+}
+
+static void stream_start_add_pssh_text(rs_drm_challenge *ch, const char *text) {
+    const char *p = text ? text : "";
+    while (*p) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char *value = rs_trim_dup(p, len, true);
+        if (value && rs_cdm_is_pssh_box(value)) rs_cdm_challenge_add_pssh(ch, value);
+        free(value);
+        if (!end) break;
+        p = end + 1;
+    }
+}
+
+static void stream_start_add_initparse_field(rs_drm_challenge *ch,
+                                             const rs_json *doc,
+                                             const char *name, bool pssh) {
+    const rs_json *value = doc ? rs_json_obj_get(doc, name) : NULL;
+    if (!value) return;
+    if (rs_json_type_of(value) == RS_JSON_STR) {
+        const char *text = rs_json_as_str(value, "");
+        if (pssh) {
+            stream_start_add_pssh_text(ch, text);
+        } else {
+            stream_start_add_kid_text(ch, text);
+        }
+        return;
+    }
+    if (rs_json_type_of(value) != RS_JSON_ARR) return;
+    for (size_t i = 0; i < rs_json_arr_len(value); i++) {
+        const char *text = rs_json_as_str(rs_json_arr_at(value, i), "");
+        if (pssh) {
+            stream_start_add_pssh_text(ch, text);
+        } else {
+            stream_start_add_kid_text(ch, text);
+        }
+    }
 }
 
 // Asks the script for clear keys: scrape the manifest for every scrap of DRM
@@ -3599,29 +3746,45 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     // Trust the fetched document over the imported stream's initial kind. A
     // script-only stream has no URL when it is imported and therefore cannot
     // know whether manifest will return DASH or HLS yet.
-    bool manifest_is_hls = text && (strncmp(text, "#EXTM3U", 7) == 0 || strcmp(st->kind, "m3u8") == 0);
+    const unsigned char *document = (const unsigned char *)text;
+    if (document && text_len >= 3
+        && document[0] == 0xef && document[1] == 0xbb && document[2] == 0xbf)
+        document += 3;
+    while (document && *document && isspace(*document)) document++;
+    bool content_is_hls = document && strncmp((const char *)document, "#EXTM3U", 7) == 0;
+    bool content_is_mpd = document && strstr((const char *)document, "<MPD") != NULL;
+    bool manifest_is_hls = text && (content_is_hls
+                                    || (!content_is_mpd && strcmp(st->kind, "m3u8") == 0));
+    if (text && manifest_is_hls && strcmp(st->kind, "m3u8") != 0) {
+        free(st->kind);
+        st->kind = rs_strdup("m3u8");
+    } else if (text && content_is_mpd && strcmp(st->kind, "mpd") != 0) {
+        free(st->kind);
+        st->kind = rs_strdup("mpd");
+    }
     if (text)
         ch = manifest_is_hls ? rs_cdm_challenge_from_hls(text)
                              : rs_cdm_challenge_from_mpd(text);
 
     char *variant_url = NULL;
-    if (manifest_is_hls && text && ch.pssh_all_count == 0 && strstr(text, "#EXT-X-STREAM-INF:")) {
+    if (manifest_is_hls && text && (ch.pssh_all_count == 0 || ch.kids_count == 0)
+        && strstr(text, "#EXT-X-STREAM-INF:")) {
         variant_url = hls_first_variant_url(manifest_url, text);
         size_t variant_len = 0;
         char *variant = variant_url ? stream_start_fetch(st, variant_url, &variant_len) : NULL;
         if (variant) {
             rs_drm_challenge media = rs_cdm_challenge_from_hls(variant);
-            for (size_t i = 0; i < ch.kids_count; i++)
-                rs_cdm_challenge_add_kid(&media, ch.kids[i]);
-            for (size_t i = 0; i < ch.pssh_all_count; i++)
-                rs_cdm_challenge_add_pssh(&media, ch.pssh_all[i]);
+            // Session keys and media keys can be split across the two files.
+            // Preserve every field from the master, including key URIs, rather
+            // than replacing it with only what the first variant advertised.
+            rs_cdm_challenge_merge(&media, &ch);
             rs_drm_challenge_free(&ch);
             ch = media;
             free(text);
             text = variant;
             text_len = variant_len;
             log_record(server, sid, "info", "cdm", variant_url, 0, -1,
-                       "HLS master has no PSSH — inspecting its first media playlist");
+                       "HLS master lacks complete DRM data — inspecting its first media playlist");
         } else {
             free(variant_url);
             variant_url = NULL;
@@ -3633,7 +3796,7 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     // segment, or — for a source that only ever names a KID — built from that.
     // The init is only fetched when the manifest didn't carry a box, or when
     // the script has asked to inspect it itself.
-    if (text && (ch.pssh_all_count == 0 || st->want_initparse)) {
+    if (text && (ch.pssh_all_count == 0 || ch.kids_count == 0 || st->want_initparse)) {
         size_t init_len = 0;
         uint8_t *init = stream_start_fetch_init(st, drm_manifest_url, text, &init_len);
         if (init) {
@@ -3654,18 +3817,14 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
                 char *out = NULL;
                 if (stream_start_run(server, sid, st, "initparse", extra, extra_n, 30.0, &out) == 0) {
                     rs_json *doc = parse_script_document(out);
-                    static const char *const kid_keys[2] = {"Kid", "kid"};
-                    for (size_t k = 0; k < 2; k++) {
-                        const char *found = rs_json_obj_str(doc, kid_keys[k], "");
-                        if (found[0]) rs_cdm_challenge_add_kid(&ch, found);
-                    }
-                    static const char *const box_keys[6] = {"Pssh", "pssh", "PsshWidevine",
-                                                            "psshWidevine", "PsshPlayReady",
-                                                            "psshPlayReady"};
-                    for (size_t k = 0; k < 6; k++) {
-                        const char *found = rs_json_obj_str(doc, box_keys[k], "");
-                        if (rs_cdm_is_pssh_box(found)) rs_cdm_challenge_add_pssh(&ch, found);
-                    }
+                    static const char *const kid_keys[] = {"Kid", "kid", "Kids", "kids"};
+                    static const char *const box_keys[] = {"Pssh", "pssh", "PsshAll", "psshAll",
+                                                            "PsshWidevine", "psshWidevine",
+                                                            "PsshPlayReady", "psshPlayReady"};
+                    for (size_t k = 0; k < sizeof(kid_keys) / sizeof(kid_keys[0]); k++)
+                        stream_start_add_initparse_field(&ch, doc, kid_keys[k], false);
+                    for (size_t k = 0; k < sizeof(box_keys) / sizeof(box_keys[0]); k++)
+                        stream_start_add_initparse_field(&ch, doc, box_keys[k], true);
                     rs_json_free(doc);
                 }
                 rs_free(out);
@@ -3698,6 +3857,21 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
         free(kid_list);
     }
 
+    // This check deliberately happens after manifest, HLS variant and init
+    // parsing. Sources that advertise no DRM in the playlist but put their
+    // tenc/PSSH in the init segment therefore participate in the same cache
+    // decision. Only unchanged, fully covered KIDs skip the licence exchange.
+    if (stream_start_cached_keys_cover(st->cached_keys, &ch)) {
+        st->keys = rs_strdup(st->cached_keys);
+        log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
+                    "reusing cached clear keys — all %lu discovered KID(s) are already covered",
+                    (unsigned long)ch.kids_count);
+        rs_drm_challenge_free(&ch);
+        free(text);
+        free(variant_url);
+        return;
+    }
+
     // `pssh` hook: the script gets first refusal on the box we extracted and may
     // hand back a different one to license against. Only a real `pssh` box is
     // accepted — a script that prints a traceback, or echoes the argument back
@@ -3711,6 +3885,8 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     else if (ch.pssh_all_count)
         selected_pssh = ch.pssh_all[0];
     char *license_pssh = selected_pssh ? rs_strdup(selected_pssh) : NULL;
+    bool selected_widevine = selected_pssh && selected_pssh == ch.pssh_widevine;
+    bool selected_playready = selected_pssh && selected_pssh == ch.pssh_playready;
     if (st->want_pssh_hook && license_pssh) {
         char *extra[2];
         int extra_n = 0;
@@ -3724,6 +3900,17 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
                 ? rs_strdup(replacement) : rs_trim_dup(out, strlen(out), true);
             if (trimmed && strcmp(trimmed, license_pssh) != 0 && rs_cdm_is_pssh_box(trimmed)) {
                 rs_cdm_challenge_add_pssh(&ch, trimmed);
+                // Keep the system-specific argument aligned with the generic
+                // pssh= argument. Many scripts prefer psshWidevine= or
+                // psshPlayReady=; leaving the original there would silently
+                // bypass the hook they just enabled.
+                if (selected_widevine) {
+                    free(ch.pssh_widevine);
+                    ch.pssh_widevine = rs_strdup(trimmed);
+                } else if (selected_playready) {
+                    free(ch.pssh_playready);
+                    ch.pssh_playready = rs_strdup(trimmed);
+                }
                 free(license_pssh);
                 license_pssh = trimmed;
                 trimmed = NULL;
@@ -3745,6 +3932,7 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     char *extra[10];
     int extra_n = 0;
     extra[extra_n++] = rs_script_arg("cdm", st->cdm_mode[0] ? st->cdm_mode : "external", false);
+    extra[extra_n++] = rs_script_arg("challenge", "", false);
     if (st->cdm_type[0]) extra[extra_n++] = rs_script_arg("cdmType", st->cdm_type, false);
     if (ch.kids_count) {
         char *j = join_list(ch.kids, ch.kids_count, ",");
@@ -3774,7 +3962,17 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
         snprintf(st->err, sizeof(st->err), "The cdm action exited %d without usable keys.", rc);
     } else {
         char *pairs = rs_cdm_parse_key_output(out);
-        if (pairs && pairs[0]) {
+        if (pairs && pairs[0] && ch.kids_count > 0
+            && !stream_start_cached_keys_cover(pairs, &ch)) {
+            rs_cenc_keys returned = rs_cenc_parse_keys(pairs);
+            log_recordf(server, sid, "error", "cdm", NULL, 0, -1,
+                        "the cdm action returned %lu usable key(s), but they do not cover all %lu discovered KID(s)",
+                        (unsigned long)returned.count, (unsigned long)ch.kids_count);
+            rs_cenc_keys_free(&returned);
+            free(pairs);
+            snprintf(st->err, sizeof(st->err),
+                     "The cdm action did not return a key for every discovered KID.");
+        } else if (pairs && pairs[0]) {
             free(st->keys);
             st->keys = pairs;
             size_t count = 1;
@@ -3840,6 +4038,40 @@ static void *pending_job_worker(void *arg) {
                                  &pf->body, &pf->body_len, &pf->status,
                                  &pf->content_type, &pf->content_range, NULL,
                                  pf->err, sizeof(pf->err), 30000, NULL, NULL);
+        if (pf->kind == RS_PENDING_PLAYLIST && pf->rc == 0 && pf->body
+            && pf->decryption_keys && pf->decryption_keys[0]
+            && !rs_m3u8_is_master(pf->body)) {
+            rs_drm_challenge playlist_drm = rs_cdm_challenge_from_hls(pf->body);
+            if (playlist_drm.kids_count == 0) {
+                char *init_url = hls_init_url(pf->url, pf->body);
+                if (init_url) {
+                    char *init_body = NULL;
+                    size_t init_len = 0;
+                    long init_status = 0;
+                    char init_err[128] = {0};
+                    int init_rc = g_fetch_handler(init_url, pf->media_proxy, pf->media_headers,
+                                                  NULL, pf->downloader, pf->downloader_params,
+                                                  pf->force_ipv6, pf->rotate_proxies,
+                                                  &init_body, &init_len, &init_status,
+                                                  NULL, NULL, NULL, init_err, sizeof(init_err),
+                                                  20000, NULL, NULL);
+                    if (init_rc == 0 && init_status >= 200 && init_status < 300 && init_body) {
+                        rs_cdm_challenge_add_from_init(&playlist_drm,
+                                                       (const uint8_t *)init_body, init_len);
+                        if (playlist_drm.kids_count == 1) {
+                            pf->cenc_kid = rs_strdup(playlist_drm.kids[0]);
+                            log_recordf(server, pf->stream_id, "info", "cdm", init_url,
+                                        init_status, (long long)init_len,
+                                        "selected HLS KID %s from the init segment",
+                                        playlist_drm.kids[0]);
+                        }
+                    }
+                    free(init_body);
+                    free(init_url);
+                }
+            }
+            rs_drm_challenge_free(&playlist_drm);
+        }
         break;
     case RS_PENDING_LOGO:
         // The cache itself isn't thread-safe (a plain cJSON tree, no locking —
@@ -4010,10 +4242,16 @@ static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job 
         reply_error(c, 502, pf->err[0] ? pf->err : "Could not fetch the playlist.");
         return;
     }
-    bool decrypts_cenc = pf->decryption_keys && pf->decryption_keys[0] != '\0';
+    bool has_clear_keys = pf->decryption_keys && pf->decryption_keys[0] != '\0';
     rs_drm_challenge drm = {0};
-    if (decrypts_cenc) drm = rs_cdm_challenge_from_hls(pf->body);
-    const char *playlist_kid = drm.kids_count ? drm.kids[0] : NULL;
+    if (has_clear_keys) drm = rs_cdm_challenge_from_hls(pf->body);
+    const char *playlist_kid = drm.kids_count ? drm.kids[0] : pf->cenc_kid;
+    bool advertises_cenc = playlist_kid || drm.pssh_all_count > 0
+        || drm.pssh_widevine || drm.pssh_playready
+        || strstr(pf->body, "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
+        || strstr(pf->body, "urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95")
+        || strstr(pf->body, "METHOD=SAMPLE-AES-CTR");
+    bool decrypts_cenc = has_clear_keys && advertises_cenc;
     playlist_route_ctx ctx = {pf->stream_id, pf->playback_key_str, decrypts_cenc, playlist_kid};
     bool server_decrypts_hls = decrypts_cenc || (pf->hls_key && pf->hls_key[0] != '\0');
     char *rewritten;
@@ -4052,8 +4290,23 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
 
     if (pf->decrypt) {
         size_t new_len = 0;
+        bool transformed = false;
         body = apply_cenc(pf->decryption_keys, pf->cenc_kid,
-                          pf->is_map, body, body_len, &new_len);
+                          pf->is_map, body, body_len, &new_len, &transformed);
+        if (!transformed) {
+            if (pf->cenc_kid && pf->cenc_kid[0])
+                log_recordf(server, pf->stream_id, "error", "decryptSegment",
+                            pf->url, 0, -1,
+                            "no usable clear key matches HLS KID %s", pf->cenc_kid);
+            else
+                log_record(server, pf->stream_id, "error", "decryptSegment",
+                           pf->url, 0, -1,
+                           "could not select a unique clear key for this encrypted HLS item");
+            free(body);
+            pf->body = NULL;
+            reply_error(c, 502, "CENC decryption could not select the required clear key.");
+            return;
+        }
         body_len = new_len;
         status = 0; free(pf->content_range); pf->content_range = NULL;  // decrypted body is a fresh whole object
     }
@@ -4255,10 +4508,10 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
 
     bool want_manifest = rs_json_obj_bool(stream, "sessionManifest", false)
         && rs_panel_script_action_allowed(provider, stream, "manifest");
-    // Script-backed DRM is session-scoped: manifests can rotate both their URL
-    // and their keys, so a key acquired during an earlier start must never make
-    // us skip CDM on the next one. If useCdm is enabled, the script owns the
-    // active keys and refreshes them after every manifest action.
+    // Script-backed DRM enters discovery on every start because manifests can
+    // rotate their URL and KIDs. The worker inspects the manifest/media/init
+    // data first and reuses stored keys when every discovered KID is covered;
+    // only a missing or changed KID actually launches the CDM action.
     bool want_cdm = rs_json_obj_bool(stream, "useCdm", false)
         && rs_panel_script_action_allowed(provider, stream, "cdm");
     if (!want_manifest && !want_cdm) return false;
@@ -4294,7 +4547,10 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
     st->kind = rs_strdup(rs_json_obj_str(stream, "kind", "mpd"));
     st->url = rs_strdup(rs_json_obj_str(stream, "url", ""));
     st->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    st->media_proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
     st->headers = effective_headers(provider, stream, "manifestHeaders");
+    st->media_fetch_headers = effective_headers(provider, stream, "mediaHeaders");
+    st->provider_headers = rs_strdup(rs_json_obj_str(provider, "headers", ""));
     st->downloader = rs_strdup(effective_downloader(provider, stream));
     st->dl_params = rs_strdup(effective_downloader_params(provider, stream));
     st->rep = rs_strdup(selected_video_rep(stream));
@@ -4307,15 +4563,18 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
     st->want_initparse = rs_panel_script_action_allowed(provider, stream, "initparse");
     st->cdm_mode = rs_strdup(rs_json_obj_str(stream, "cdmMode", "external"));
     st->cdm_type = rs_strdup(rs_json_obj_str(stream, "cdmType", ""));
+    st->cached_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
 
     pf->kind = RS_PENDING_STREAM_START;
     pf->stream_id = rs_strdup(stream_id);
     pf->client_ip = rs_strdup(ip ? ip : "");
     pf->start = st;
 
-    log_recordf(s, stream_id, "info", "scriptManifest", NULL, 0, -1,
-                "start: running %s%s", want_manifest ? "manifest" : "",
-                want_manifest && want_cdm ? " then cdm" : (want_cdm ? "cdm" : ""));
+    const char *start_plan = want_manifest && want_cdm
+        ? "start: running manifest then DRM discovery (CDM only if cached keys do not cover the KIDs)"
+        : (want_manifest ? "start: running manifest"
+                         : "start: running DRM discovery (CDM only if cached keys do not cover the KIDs)");
+    log_record(s, stream_id, "info", "scriptManifest", NULL, 0, -1, start_plan);
     if (!pending_job_dispatch(s, c, pf)) {
         pending_job_free(pf);
         return false;
@@ -4358,6 +4617,8 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     pf->url = rs_strdup(manifest_url);
     pf->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
     pf->headers = effective_headers(provider, stream, "manifestHeaders");
+    pf->media_proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
+    pf->media_headers = effective_headers(provider, stream, "mediaHeaders");
     pf->downloader = rs_strdup(effective_downloader(provider, stream));
     pf->downloader_params = rs_strdup(effective_downloader_params(provider, stream));
     pf->force_ipv6 = provider && rs_json_obj_bool(provider, "forceIpv6", false);
@@ -4379,27 +4640,35 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
 // raw "KID:KEY" string rather than the stream object itself so it can run on
 // pending_job_worker's copy after the stream JSON may have changed underneath.
 static uint8_t *apply_cenc(const char *decryption_keys, const char *selected_kid,
-                           bool is_map, uint8_t *body, size_t body_len, size_t *out_len) {
+                           bool is_map, uint8_t *body, size_t body_len,
+                           size_t *out_len, bool *transformed) {
     *out_len = body_len;
+    if (transformed) *transformed = false;
     rs_cenc_keys keys = rs_cenc_parse_keys(decryption_keys ? decryption_keys : "");
     uint8_t *out = NULL;
     if (is_map) {
         // The init needs patching to a clear codec even before any key exists.
         out = rs_cenc_patch_init(body, body_len, out_len, NULL, NULL);
     } else if (keys.count > 0) {
-        size_t selected = 0;
+        size_t selected = keys.count == 1 && (!selected_kid || !selected_kid[0])
+                            ? 0 : keys.count;
         if (selected_kid && selected_kid[0]) {
             for (size_t i = 0; i < keys.count; i++) {
-                if (strcasecmp(keys.kids[i], selected_kid) == 0) {
+                if (stream_start_kid_equal(keys.kids[i], selected_kid)) {
                     selected = i;
                     break;
                 }
             }
         }
-        out = rs_cenc_decrypt_segment(body, body_len, out_len, keys.keys[selected], 8);
+        if (selected < keys.count)
+            out = rs_cenc_decrypt_segment(body, body_len, out_len, keys.keys[selected], 8);
     }
     rs_cenc_keys_free(&keys);
-    if (out) { free(body); return out; }
+    if (out) {
+        if (transformed) *transformed = true;
+        free(body);
+        return out;
+    }
     *out_len = body_len;
     return body;
 }

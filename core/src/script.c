@@ -176,8 +176,9 @@ int rs_script_run_stream(const char *script_path, const char **args, int argc, d
     // runs — a script that writes more than a pipe buffer to stderr while the
     // caller reads stdout would otherwise wedge until the timeout.
     rs_run_result res;
+    char run_error[256] = {0};
     int rc = rs_proc_run_stream((const char *const *)spawn_args.items, NULL, timeout,
-                                true, true, NULL, &res, NULL, 0,
+                                true, true, NULL, &res, run_error, sizeof(run_error),
                                 output_fn, output_ctx);
     rs_strv_dispose(&spawn_args);
 
@@ -185,6 +186,17 @@ int rs_script_run_stream(const char *script_path, const char **args, int argc, d
     // script that times out has usually already printed the reason.
     if (out_stdout && res.out) { rs_free(*out_stdout); *out_stdout = res.out; res.out = NULL; }
     if (out_stderr && res.err) { rs_free(*out_stderr); *out_stderr = res.err; res.err = NULL; }
+    if (out_stderr && (!*out_stderr || !(*out_stderr)[0])) {
+        char reason[320] = {0};
+        if (run_error[0]) snprintf(reason, sizeof(reason), "%s", run_error);
+        else if (res.timed_out) snprintf(reason, sizeof(reason), "script timed out after %.0f seconds", timeout);
+        else if (res.term_signal) snprintf(reason, sizeof(reason), "script was terminated by signal %d", res.term_signal);
+        if (reason[0]) {
+            rs_free(*out_stderr);
+            *out_stderr = rs_strdup(reason);
+            if (output_fn) output_fn(output_ctx, true, reason, strlen(reason));
+        }
+    }
     rs_run_result_dispose(&res);
 
     if (rc != 0) return -1;                            // could not be started

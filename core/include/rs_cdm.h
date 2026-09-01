@@ -38,6 +38,11 @@ void rs_cdm_challenge_add_kid(rs_drm_challenge *ch, const char *hex);
 // anything that isn't a well-formed `pssh` box.
 void rs_cdm_challenge_add_pssh(rs_drm_challenge *ch, const char *b64);
 
+// Adds every unique KID, PSSH and HLS key URI from `source` to `destination`.
+// This is used when DRM is split between an HLS master and its media playlist.
+void rs_cdm_challenge_merge(rs_drm_challenge *destination,
+                            const rs_drm_challenge *source);
+
 // Scans an ISO-BMFF init segment for the DRM the manifest didn't carry: every
 // `pssh` box, and the `default_KID` of every `tenc`. Some sources advertise a
 // bare `default_KID` (or nothing) in the manifest and only ship the real boxes

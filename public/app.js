@@ -2047,25 +2047,31 @@ async function runProviderScript(action) {
   $("#scriptOutputBox").classList.remove("hidden");
   $("#scriptOutputBox").textContent = "Saving…";
   updateScriptOutputToggleLabel();
+  const alsoRefreshState = action === "channels" || action === "events";
   try {
     await saveProviderSettings();
     $("#scriptOutputBox").textContent = "Starting…";
-    await request(`/api/providers/${provider.id}/script/${action}`, { method: "POST", body: "{}" });
-  } catch (error) {
-    $("#scriptOutputBox").textContent = `Couldn't start ${action}: ${error.message || error}`;
-    return;
-  }
-  stopScriptOutputPoll();
-  pollScriptOutput(provider.id);
-  // channels/events write new streams straight to disk in the background
-  // (see importScriptEntries) — piggyback a refresh() on the same tick so
-  // they show up in the provider/grid views without waiting for the
-  // separate 4s background poll or a manual reload.
-  const alsoRefreshState = action === "channels" || action === "events";
-  scriptOutputPollTimer = setInterval(() => {
+    // The request remains open until the child exits. Start polling before
+    // awaiting it so stdout/stderr appears as the server drains each line.
+    stopScriptOutputPoll();
+    const run = request(`/api/providers/${provider.id}/script/${action}`, { method: "POST", body: "{}" });
     pollScriptOutput(provider.id);
-    if (alsoRefreshState) refresh();
-  }, 1000);
+    scriptOutputPollTimer = setInterval(() => {
+      pollScriptOutput(provider.id);
+      if (alsoRefreshState) refresh();
+    }, 1000);
+    await run;
+    await pollScriptOutput(provider.id);
+    if (alsoRefreshState) await refresh();
+  } catch (error) {
+    await pollScriptOutput(provider.id);
+    const box = $("#scriptOutputBox");
+    const prior = box.textContent && box.textContent !== "Starting…" ? `${box.textContent}\n\n` : "";
+    box.textContent = `${prior}[failed: ${error.message || error}]`;
+    return;
+  } finally {
+    stopScriptOutputPoll();
+  }
 }
 
 // Import Channels/Events from the All Streams bulk bar — same backend action
@@ -2098,14 +2104,6 @@ async function pollGridImportStatus(providerId) {
       status.textContent = latest.message || latest.event;
       status.classList.remove("hidden");
     }
-    // scriptEnd is the process exiting; scriptImport, which the server logs
-    // straight after it for channels/events, is the last word on how many
-    // streams the run actually produced.
-    if (latest && (latest.event === "scriptEnd" || latest.event === "scriptImport")) {
-      clearInterval(gridImportPollTimer);
-      gridImportPollTimer = null;
-      refresh();
-    }
   } catch (error) {
     status.textContent = `Couldn't check import status: ${error.message || error}`;
     status.classList.remove("hidden");
@@ -2123,18 +2121,27 @@ async function runProviderScriptForGrid(action) {
   term.classList.remove("hidden");
   term.textContent = "Starting…";
   try {
-    await request(`/api/providers/${provider.id}/script/${action}`, { method: "POST", body: "{}" });
+    // Keep the terminal moving while the long-running request is in flight.
+    // Waiting first made even line-streamed server logs appear only at exit.
+    clearInterval(gridImportPollTimer);
+    const run = request(`/api/providers/${provider.id}/script/${action}`, { method: "POST", body: "{}" });
+    pollGridImportStatus(provider.id);
+    gridImportPollTimer = setInterval(() => {
+      pollGridImportStatus(provider.id);
+      refresh();
+    }, 1000);
+    await run;
+    await pollGridImportStatus(provider.id);
+    await refresh();
   } catch (error) {
     status.textContent = `Couldn't start ${action}: ${error.message || error}`;
-    term.textContent = `Couldn't start ${action}: ${error.message || error}`;
+    const prior = term.textContent && term.textContent !== "Starting…" ? `${term.textContent}\n\n` : "";
+    term.textContent = `${prior}[failed: ${error.message || error}]`;
     return;
+  } finally {
+    clearInterval(gridImportPollTimer);
+    gridImportPollTimer = null;
   }
-  clearInterval(gridImportPollTimer);
-  pollGridImportStatus(provider.id);
-  gridImportPollTimer = setInterval(() => {
-    pollGridImportStatus(provider.id);
-    refresh();
-  }, 1000);
 }
 
 function openProviderSettingsDialog() {
@@ -3277,6 +3284,19 @@ $("#audioTrackSelect").addEventListener("change", (event) => {
 document.querySelectorAll(".tab").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));
 document.querySelectorAll(".nav-btn").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
 
+async function pollLatestScriptRun(logStreamId) {
+  const result = await request(`/api/logs?streamId=${encodeURIComponent(logStreamId)}&limit=500`);
+  const group = groupLogEntries(result.entries || []).find((candidate) => candidate.type === "script");
+  const text = group ? scriptTranscriptText(group.entries) : "";
+  const box = $("#streamScriptOutputBox");
+  if (box && text && box.textContent !== text) {
+    const wasAtBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 20;
+    box.textContent = text;
+    if (wasAtBottom) box.scrollTop = box.scrollHeight;
+  }
+  return text;
+}
+
 async function runStreamScriptAction(action, button) {
   const stream = selectedStream();
   if (!stream) return;
@@ -3287,40 +3307,50 @@ async function runStreamScriptAction(action, button) {
   box.classList.remove("hidden");
   box.textContent = "Running...";
   button.disabled = true;
+  let pollTimer = null;
   try {
-    const result = await request(`/api/providers/${provider.id}/script/run`, {
+    const run = request(`/api/providers/${provider.id}/script/run`, {
       method: "POST",
       body: JSON.stringify({ action, streamId: stream.id })
     });
-    box.textContent = result.output || "No output";
+    pollTimer = setInterval(() => pollLatestScriptRun(`script:${provider.id}`).catch(() => {}), 750);
+    const result = await run;
+    const transcript = await pollLatestScriptRun(`script:${provider.id}`);
+    box.textContent = transcript || result.output || "No output";
   } catch (err) {
-    box.textContent = `Error: ${err.message}`;
+    let transcript = "";
+    try { transcript = await pollLatestScriptRun(`script:${provider.id}`); } catch (_) {}
+    box.textContent = `${transcript ? `${transcript}\n\n` : ""}[failed: ${err.message}]`;
   } finally {
+    clearInterval(pollTimer);
     button.disabled = false;
   }
 }
 
-// CDM cannot be tested as an isolated script call: it needs the fresh session
-// manifest first, then the KID/PSSH scraped from that manifest. Use the exact
-// Start pipeline so the script receives action=manifest followed by
-// action=cdm (with cdm=external and the discovered DRM arguments), and leave
-// the stream running when it succeeds.
+// DRM cannot be tested as an isolated script call: discovery needs the fresh
+// session manifest, its media playlist and sometimes its init segment. Use the
+// exact Start pipeline so matching cached keys can be reused; action=cdm runs
+// only when a discovered KID is missing or changed.
 async function runStreamCdmPipeline(button) {
   const stream = selectedStream();
   if (!stream) return;
   const box = $("#streamScriptOutputBox");
   if (!box) return;
   box.classList.remove("hidden");
-  box.textContent = "Running manifest, extracting DRM, then running CDM...";
+  box.textContent = "Running manifest, discovering DRM, then checking cached keys...";
   button.disabled = true;
+  let pollTimer = null;
   try {
-    state = await request(`/api/streams/${stream.id}/start`, { method: "POST", body: "{}" });
+    const run = request(`/api/streams/${stream.id}/start`, { method: "POST", body: "{}" });
+    pollTimer = setInterval(() => pollLatestScriptRun(stream.id).catch(() => {}), 750);
+    state = await run;
+    const transcript = await pollLatestScriptRun(stream.id);
     stateMutationEpoch++;
     render();
     const refreshedBox = $("#streamScriptOutputBox");
     if (refreshedBox) {
       refreshedBox.classList.remove("hidden");
-      refreshedBox.textContent = "Manifest and CDM completed. The stream is running.";
+      refreshedBox.textContent = `${transcript ? `${transcript}\n\n` : ""}[manifest and DRM check completed; stream is running]`;
     }
   } catch (err) {
     try {
@@ -3331,6 +3361,7 @@ async function runStreamCdmPipeline(button) {
       box.textContent = `Error: ${err.message}`;
     }
   } finally {
+    clearInterval(pollTimer);
     button.disabled = false;
   }
 }

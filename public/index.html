@@ -280,7 +280,7 @@
               </div>
               <div class="actions" style="margin-top: 4px;">
                 <button type="button" class="ghost" id="scriptRunManifestBtn" title="Run the session-manifest action — the same one Start runs to get a fresh source URL"><span data-icon="play"></span>Run manifest</button>
-                <button type="button" class="ghost" id="scriptRunCdmBtn" title="Run manifest, extract KID/PSSH, run CDM, and start the stream"><span data-icon="play"></span>Run manifest + CDM</button>
+                <button type="button" class="ghost" id="scriptRunCdmBtn" title="Run manifest, discover DRM in the playlist/init, reuse matching keys or run CDM, and start the stream"><span data-icon="play"></span>Run manifest + DRM</button>
                 <button type="button" class="ghost" id="scriptRunPsshBtn" title="Run the PSSH post-processing hook"><span data-icon="play"></span>Run pssh</button>
                 <button type="button" class="ghost" id="scriptRunDownloadManifestBtn" title="Run the manifest-download hook, for scripts that fetch the manifest themselves"><span data-icon="play"></span>Run manifest download</button>
               </div>
@@ -669,7 +669,7 @@
                 <p class="help-callout">ReStreamAir is an IPTV restreamer, <b>not a DRM client</b> — it never runs a real Widevine/PlayReady/FairPlay CDM. For protected streams a script returns <b>clear keys</b> and the remuxer decrypts with them.</p>
                 <ul>
                   <li><b>Manual keys</b> — paste <code>KID:KEY</code> hex pairs (one per line) in the stream editor's decryption box. Leave <b>CDM keys</b> unticked to keep using them unchanged.</li>
-                  <li><b>Get keys via script</b> — tick <b>CDM keys</b> in the stream's Script actions. On every start ReStreamAir runs <code>manifest</code>, parses the fresh source for every DRM detail (all KIDs, Widevine + PlayReady PSSH, HLS key URIs), then hands them to <code>cdm</code> for fresh clear <code>KID:KEY</code> pairs. For protected HLS, the panel removes the DRM tags and decrypts the fMP4 init and media fragments before serving them. The script always runs the license exchange itself — ReStreamAir has no embedded CDM, so <code>challenge=</code> is passed empty.</li>
+                  <li><b>Get keys via script</b> — tick <b>CDM keys</b> in the stream's Script actions. On every start ReStreamAir runs <code>manifest</code> and searches the fresh manifest, HLS media playlist and init segment for DRM. Stored keys are reused when they cover every discovered KID; <code>cdm</code> runs only for a missing or changed KID, or when DRM is present but no KID can be identified. For protected HLS, the panel removes the DRM tags and decrypts the fMP4 init and media fragments before serving them. The script always runs the license exchange itself — ReStreamAir has no embedded CDM, so <code>challenge=</code> is passed empty.</li>
                   <li><b>Refine what's sent</b> — the optional <b>PSSH parsing</b> and <b>Init parsing</b> actions let the script rewrite the PSSH or pull extra KIDs/PSSH out of the init segment before the <code>cdm</code> call.</li>
                 </ul>
                 <p>Key output formats accepted: bare <code>KID:KEY</code> lines, <code>--&gt; KID:KEY</code>, or JSON <code>{"keys":[{"kid","key"}]}</code>. This decrypts <code>cenc</code> (AES-CTR) directly; <code>cbcs</code> pattern encryption isn't supported.</p>

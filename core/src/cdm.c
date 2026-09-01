@@ -56,6 +56,18 @@ static const char *scan_kid_key_pair(const char *s, char kid_out[33], char key_o
     return NULL;
 }
 
+static bool normalize_hex32(const char *value, bool allow_dashes, char out[33]) {
+    size_t n = 0;
+    if (!value) return false;
+    for (const char *p = value; *p; p++) {
+        if (allow_dashes && (*p == '-' || *p == '{' || *p == '}')) continue;
+        if (!isxdigit((unsigned char)*p) || n >= 32) return false;
+        out[n++] = (char)tolower((unsigned char)*p);
+    }
+    out[n] = '\0';
+    return n == 32;
+}
+
 // default_KID[ \t]*=[ \t]*["']<hex and dashes>["'] — case-sensitive on the
 // name, as the pattern was. On a match, *out is the KID and the return value is
 // just past the closing quote.
@@ -191,6 +203,18 @@ static void add_pssh(rs_drm_challenge *ch, const char *b64) {
     classify_pssh(ch, b64);
 }
 
+static void add_key_uri(rs_drm_challenge *ch, const char *uri) {
+    if (!ch || !uri || !uri[0]) return;
+    for (size_t i = 0; i < ch->key_uris_count; i++)
+        if (strcmp(ch->key_uris[i], uri) == 0) return;
+    char **grown = realloc(ch->key_uris,
+                           (ch->key_uris_count + 1) * sizeof(char *));
+    if (!grown) return;
+    ch->key_uris = grown;
+    ch->key_uris[ch->key_uris_count] = rs_strdup(uri);
+    if (ch->key_uris[ch->key_uris_count]) ch->key_uris_count++;
+}
+
 void rs_cdm_challenge_add_kid(rs_drm_challenge *ch, const char *hex) {
     if (ch && hex) add_kid(ch, hex);
 }
@@ -209,6 +233,19 @@ bool rs_cdm_is_pssh_box(const char *b64) {
 
 void rs_cdm_challenge_add_pssh(rs_drm_challenge *ch, const char *b64) {
     if (ch) add_pssh(ch, b64);
+}
+
+void rs_cdm_challenge_merge(rs_drm_challenge *destination,
+                            const rs_drm_challenge *source) {
+    if (!destination || !source || destination == source) return;
+    for (size_t i = 0; i < source->kids_count; i++)
+        add_kid(destination, source->kids[i]);
+    for (size_t i = 0; i < source->pssh_all_count; i++)
+        add_pssh(destination, source->pssh_all[i]);
+    for (size_t i = 0; i < source->key_uris_count; i++)
+        add_key_uri(destination, source->key_uris[i]);
+    if (!destination->pssh_fairplay && source->pssh_fairplay)
+        destination->pssh_fairplay = rs_strdup(source->pssh_fairplay);
 }
 
 bool rs_drm_challenge_is_empty(const rs_drm_challenge *ch) {
@@ -345,7 +382,11 @@ rs_drm_challenge rs_cdm_challenge_from_mpd(const char *xml) {
             char *b64 = rs_buf_take(&b);
             if (b64 && b64[0]) add_pssh(&ch, b64);
             rs_free(b64);
-            p = end + 2;
+            // Continue after the closing tag. Restarting inside
+            // `</cenc:pssh>` makes its own trailing "pssh>" look like another
+            // opening tag and can collect unrelated XML as a bogus box.
+            const char *close = strchr(end, '>');
+            p = close ? close + 1 : end + 2;
         } else {
             break;
         }
@@ -415,20 +456,7 @@ rs_drm_challenge rs_cdm_challenge_from_hls(const char *playlist) {
                     if (uri && uri[0]) {
                         char *kf = get_attr(attrs, "KEYFORMAT");
                         
-                        bool has_uri = false;
-                        for (size_t i = 0; i < ch.key_uris_count; i++) {
-                            if (strcmp(ch.key_uris[i], uri) == 0) {
-                                has_uri = true;
-                                break;
-                            }
-                        }
-                        if (!has_uri) {
-                            char **new_uris = realloc(ch.key_uris, (ch.key_uris_count + 1) * sizeof(char*));
-                            if (new_uris) {
-                                ch.key_uris = new_uris;
-                                ch.key_uris[ch.key_uris_count++] = rs_strdup(uri);
-                            }
-                        }
+                        add_key_uri(&ch, uri);
                         
                         if (kf && strstr(kf, "streamingkeydelivery") && !ch.pssh_fairplay) {
                             ch.pssh_fairplay = rs_strdup(uri);
@@ -528,27 +556,49 @@ char *rs_cdm_parse_key_output(const char *out_stdout) {
     rs_strv pairs = RS_STRV_INIT;
     if (!out_stdout) return rs_strdup("");
 
-    // JSON parsing
-    cJSON *json = cJSON_Parse(out_stdout);
-    bool parsed_json = false;
-    if (json) {
-        cJSON *keys = cJSON_GetObjectItem(json, "keys");
+    // JSON parsing. Provider scripts often print progress before their final
+    // document, so trying only cJSON_Parse(stdout) loses otherwise valid keys.
+    // Examine every possible object/array start and keep the candidate with the
+    // most valid pairs (the outer document beats each nested key object).
+    for (const char *start = out_stdout; *start; start++) {
+        if (*start != '{' && *start != '[') continue;
+        const char *end = NULL;
+        cJSON *json = cJSON_ParseWithOpts(start, &end, 0);
+        if (!json) continue;
+        cJSON *keys = cJSON_GetObjectItemCaseSensitive(json, "keys");
         if (!keys && cJSON_IsArray(json)) keys = json;
+        rs_strv candidate = RS_STRV_INIT;
         if (cJSON_IsArray(keys)) {
             cJSON *item;
             cJSON_ArrayForEach(item, keys) {
-                cJSON *kid = cJSON_GetObjectItem(item, "kid");
-                cJSON *key = cJSON_GetObjectItem(item, "key");
-                if (cJSON_IsString(kid) && cJSON_IsString(key)) {
-                    rs_strv_pushf(&pairs, "%s:%s", kid->valuestring, key->valuestring);
-                    parsed_json = true;
-                }
+                cJSON *kid = cJSON_GetObjectItemCaseSensitive(item, "kid");
+                cJSON *key = cJSON_GetObjectItemCaseSensitive(item, "key");
+                char kid_hex[33], key_hex[33];
+                if (cJSON_IsString(kid) && cJSON_IsString(key)
+                    && normalize_hex32(kid->valuestring, true, kid_hex)
+                    && normalize_hex32(key->valuestring, false, key_hex))
+                    rs_strv_pushf(&candidate, "%s:%s", kid_hex, key_hex);
             }
+        } else if (cJSON_IsObject(json)) {
+            cJSON *kid = cJSON_GetObjectItemCaseSensitive(json, "kid");
+            cJSON *key = cJSON_GetObjectItemCaseSensitive(json, "key");
+            char kid_hex[33], key_hex[33];
+            if (cJSON_IsString(kid) && cJSON_IsString(key)
+                && normalize_hex32(kid->valuestring, true, kid_hex)
+                && normalize_hex32(key->valuestring, false, key_hex))
+                rs_strv_pushf(&candidate, "%s:%s", kid_hex, key_hex);
         }
         cJSON_Delete(json);
+        if (candidate.len >= pairs.len && candidate.len > 0) {
+            rs_strv_dispose(&pairs);
+            pairs = candidate;
+        } else {
+            rs_strv_dispose(&candidate);
+        }
+        if (end && end > start) start = end - 1;
     }
     
-    if (!parsed_json) {
+    if (pairs.len == 0) {
         // Line-based parsing: every "<kid>:<key>" pair in the output.
         char kid_val[33], key_val[33];
         for (const char *search = out_stdout; search && *search;) {

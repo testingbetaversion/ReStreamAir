@@ -910,7 +910,7 @@ int rs_panel_apply_session_manifest(rs_state *st, const char *stream_id, const c
 }
 
 // Stores the clear keys the `cdm` action returned. A stream with useCdm enabled
-// treats these as session keys and refreshes them on every start.
+// reuses them while the manifest/media/init discovery reports the same KIDs.
 int rs_panel_set_stream_keys(rs_state *st, const char *stream_id, const char *keys,
                              const char **err) {
     rs_json *provider = NULL;
