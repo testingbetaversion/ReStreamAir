@@ -27,6 +27,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <sys/stat.h>
 // live.c spawns threads unconditionally (director/rep/prefetch workers), so the
 // same primitives are needed here for the log ring those workers write into.
@@ -155,6 +156,41 @@ struct restream_server {
 // A live Server-Sent Events subscriber is marked in mongoose's per-connection
 // scratch space, so the broadcast timer can find them.
 #define RS_SSE_MARKER 'S'
+
+// Copied into Mongoose's scratch bytes (which need not be aligned).
+typedef struct {
+    char marker;
+    bool override_interval;
+    uint32_t interval_ms;
+    uint64_t last_frame_ms;
+    uint64_t last_write_ms;
+} rs_sse_state;
+_Static_assert(sizeof(rs_sse_state) <= MG_DATA_SIZE, "SSE state exceeds connection scratch space");
+
+#define RS_REFRESH_MIN_MS 100
+#define RS_REFRESH_MAX_MS 3600000
+static const struct { const char *name; uint32_t fallback; } refresh_fields[] = {
+    {"eventsIntervalMs", 1000}, {"stateRefreshMs", 4000},
+    {"logsRefreshMs", 2000}, {"activityRefreshMs", 1000},
+};
+
+static bool valid_refresh_ms(double value) {
+    return isfinite(value) && (value == 0 ||
+        (value >= RS_REFRESH_MIN_MS && value <= RS_REFRESH_MAX_MS && (double)(uint32_t)value == value));
+}
+
+static uint32_t refresh_ms(restream_server_t *s, size_t field) {
+    const rs_json *settings = rs_json_obj_get(s->state.root, "settings");
+    double value = rs_json_obj_num(settings, refresh_fields[field].name, refresh_fields[field].fallback);
+    return valid_refresh_ms(value) ? (uint32_t)value : refresh_fields[field].fallback;
+}
+
+static rs_json *refresh_view(restream_server_t *s) {
+    rs_json *out = rs_json_new_obj();
+    for (size_t i = 0; i < sizeof(refresh_fields) / sizeof(refresh_fields[0]); i++)
+        rs_json_obj_set_int(out, refresh_fields[i].name, refresh_ms(s, i));
+    return out;
+}
 
 // The probe/fetch handlers are registered by the C++ app; the core only calls
 // through them, so libcurl/libxml2 never reach a core-only build. Declared here so
@@ -766,7 +802,11 @@ static void log_clear(restream_server_t *s, const char *sid) {
 
 // --- small response helpers ------------------------------------------------
 
-static const char *JSON_HEADERS = "Content-Type: application/json\r\n";
+// All origins may use explicit Basic/Bearer authorization. Ambient cookies
+// remain same-origin: wildcard CORS intentionally does not allow credentials.
+#define RS_CORS_HEADERS "Access-Control-Allow-Origin: *\r\n" \
+    "Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Retry-After, Content-Disposition, Location, X-Accel-Buffering\r\n"
+static const char *JSON_HEADERS = RS_CORS_HEADERS "Content-Type: application/json\r\n";
 
 // Security headers for the request currently being handled. Whether HSTS
 // belongs on a response depends on how *that* request reached us, and threading
@@ -778,7 +818,7 @@ static char g_request_security[192] = "";
 
 // A JSON error body the panel's fetch layer reads as `payload.error`.
 static void reply_error(struct mg_connection *c, int status, const char *message) {
-    char headers[320];
+    char headers[320 + sizeof(RS_CORS_HEADERS)];
     snprintf(headers, sizeof(headers), "%s%s", JSON_HEADERS, g_request_security);
     mg_http_reply(c, status, headers, "{\"error\":%m}", MG_ESC(message));
 }
@@ -786,7 +826,7 @@ static void reply_error(struct mg_connection *c, int status, const char *message
 // The same, with extra headers — a 429 has to carry Retry-After to be useful.
 static void reply_error_headers(struct mg_connection *c, int status, const char *message,
                                 const char *extra_headers) {
-    char headers[512];
+    char headers[512 + sizeof(RS_CORS_HEADERS)];
     snprintf(headers, sizeof(headers), "%s%s%s", JSON_HEADERS, g_request_security,
              extra_headers ? extra_headers : "");
     mg_http_reply(c, status, headers, "{\"error\":%m}", MG_ESC(message));
@@ -801,7 +841,7 @@ static void reply_json(struct mg_connection *c, int status, rs_json *value,
         reply_error(c, 500, "Out of memory building the response.");
         return;
     }
-    char headers[640];
+    char headers[640 + sizeof(RS_CORS_HEADERS)];
     snprintf(headers, sizeof(headers), "%sCache-Control: no-store\r\n%s%s",
              JSON_HEADERS, g_request_security, extra_headers ? extra_headers : "");
     mg_http_reply(c, status, headers, "%s", body);
@@ -889,7 +929,39 @@ static void security_headers(restream_server_t *s, struct mg_connection *c,
 // --- auth helpers ----------------------------------------------------------
 
 // The username of the caller's live session, or NULL. Caller frees.
-static char *current_user(restream_server_t *s, struct mg_http_message *hm) {
+static rs_json *admin_by_username(rs_state *st, const char *username);
+
+static char *current_user(restream_server_t *s, struct mg_connection *c,
+                          struct mg_http_message *hm, int *retry_after) {
+    if (retry_after) *retry_after = 0;
+    char *authorization = header_dup(hm, "Authorization");
+    if (authorization) {
+        char *username = NULL, *password = NULL;
+        int parsed = rs_auth_parse_basic(authorization, &username, &password);
+        free(authorization);
+        if (parsed != 0) return NULL;
+        char *ip = client_ip(s, c, hm);
+        char identity[320];
+        snprintf(identity, sizeof(identity), "%s|%s", username, ip ? ip : "");
+        rs_free(ip);
+        int delay = rs_auth_throttle_delay(s->auth, identity);
+        const rs_json *account = admin_by_username(&s->state, username);
+        bool ok = delay == 0 && account && rs_auth_verify_password(password,
+            rs_json_obj_str(account, "passwordHash", ""), rs_json_obj_str(account, "salt", ""));
+        free(password);
+        if (ok) {
+            rs_auth_throttle_reset(s->auth, identity);
+            return username;
+        }
+        if (delay == 0) {
+            rs_auth_throttle_record_failure(s->auth, identity);
+            log_record(s, "__panel__", "error", "loginFailed", NULL, 0, -1,
+                       "Invalid HTTP Basic credentials.");
+        }
+        if (retry_after) *retry_after = delay;
+        free(username);
+        return NULL;
+    }
     char *cookie = header_dup(hm, "Cookie");
     if (!cookie) return NULL;
     char *token = rs_auth_cookie_token(cookie);
@@ -921,7 +993,7 @@ static char *body_str(rs_json *body, const char *key) {
 static void handle_auth_status(restream_server_t *s, struct mg_connection *c,
                                struct mg_http_message *hm) {
     const rs_json *users = rs_json_obj_get(s->state.root, "adminUsers");
-    char *user = current_user(s, hm);
+    char *user = current_user(s, c, hm, NULL);
     rs_json *out = rs_json_new_obj();
     rs_json_obj_set(out, "needsSetup", rs_json_new_bool(rs_json_arr_len(users) == 0));
     rs_json_obj_set(out, "authenticated", rs_json_new_bool(user != NULL));
@@ -1116,6 +1188,7 @@ static char *request_host(struct mg_http_message *hm) {
 // all-time bytes) onto each stream in a freshly-built /api/state view. Kept out
 // of rs_panel_view (core, no metrics) — the server owns the monitor.
 static void inject_stream_metrics(restream_server_t *s, rs_json *view) {
+    rs_json_obj_set(view, "refresh", refresh_view(s));
     rs_json *providers = (rs_json *)rs_json_obj_get(view, "providers");
     for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
         rs_json *streams = (rs_json *)rs_json_obj_get(rs_json_arr_at(providers, i), "streams");
@@ -1192,7 +1265,7 @@ static rs_json *parse_body(struct mg_http_message *hm) {
 
 static rs_json *settings_view(restream_server_t *s) {
     const rs_json *settings = rs_json_obj_get(s->state.root, "settings");
-    rs_json *out = rs_json_new_obj();
+    rs_json *out = refresh_view(s);
     // The port actually bound, not the stored preference. Reporting the stored
     // value meant the Settings page showed 8787 (the default nobody had ever
     // changed) while the operator was connected on the real port — the field
@@ -1215,8 +1288,39 @@ static void handle_settings(restream_server_t *s, struct mg_connection *c) {
 
 static void handle_settings_update(restream_server_t *s, struct mg_connection *c,
                                    struct mg_http_message *hm) {
-    rs_json *body = parse_body(hm);
-    rs_json *settings = rs_state_settings(&s->state);
+    rs_json *body = hm->body.len ? rs_json_parse(hm->body.buf, hm->body.len) : rs_json_new_obj();
+    if (!body || rs_json_type_of(body) != RS_JSON_OBJ) {
+        rs_json_free(body);
+        reply_error(c, 400, "Settings body must be a JSON object.");
+        return;
+    }
+    // Validate everything before modifying the saved or live configuration.
+    for (size_t i = 0; i < sizeof(refresh_fields) / sizeof(refresh_fields[0]); i++) {
+        const rs_json *value = rs_json_obj_get(body, refresh_fields[i].name);
+        if (value && (rs_json_type_of(value) != RS_JSON_NUM ||
+                      !valid_refresh_ms(rs_json_as_num(value, -1)))) {
+            char message[160];
+            snprintf(message, sizeof(message), "%s must be 0 (paused) or an integer from 100 to 3600000 milliseconds.",
+                     refresh_fields[i].name);
+            rs_json_free(body);
+            reply_error(c, 400, message);
+            return;
+        }
+    }
+    const rs_json *trusted_input = rs_json_obj_get(body, "trustedProxies");
+    char bad[80];
+    if (trusted_input && (rs_json_type_of(trusted_input) != RS_JSON_STR ||
+        !rs_ip_list_valid(rs_json_as_str(trusted_input, ""), bad, sizeof(bad)))) {
+        rs_json_free(body);
+        reply_error(c, 400, "trustedProxies must contain addresses, CIDR blocks, loopback, private or any.");
+        return;
+    }
+    rs_json *settings = rs_json_clone(rs_state_settings(&s->state));
+    if (!settings) { rs_json_free(body); reply_error(c, 500, "Out of memory."); return; }
+    for (size_t i = 0; i < sizeof(refresh_fields) / sizeof(refresh_fields[0]); i++) {
+        const rs_json *value = rs_json_obj_get(body, refresh_fields[i].name);
+        if (value) rs_json_obj_set_int(settings, refresh_fields[i].name, (long long)rs_json_as_num(value, 0));
+    }
 
     double port = rs_json_as_num(rs_json_obj_get(body, "port"), 0);
     if (port > 0 && port <= 65535) rs_json_obj_set_int(settings, "port", (long long)port);
@@ -1234,28 +1338,21 @@ static void handle_settings_update(restream_server_t *s, struct mg_connection *c
         }
     }
 
-    // The trusted-proxy list is validated on the way in: a typo here does not
-    // fail loudly at request time, it just silently stops matching, and the
-    // operator is left believing their proxy is trusted when it is not.
-    const rs_json *trusted = rs_json_obj_get(body, "trustedProxies");
-    if (trusted && rs_json_type_of(trusted) == RS_JSON_STR) {
-        const char *value = rs_json_as_str(trusted, "");
-        char bad[80];
-        if (!rs_ip_list_valid(value, bad, sizeof(bad))) {
-            rs_json_free(body);
-            char msg[192];
-            snprintf(msg, sizeof(msg),
-                     "'%s' is not an address, CIDR block, 'loopback', 'private' or 'any'.", bad);
-            reply_error(c, 400, msg);
-            return;
-        }
-        rs_json_obj_set_str(settings, "trustedProxies", value);
-    }
+    if (trusted_input) rs_json_obj_set_str(settings, "trustedProxies", rs_json_as_str(trusted_input, ""));
 
     rs_json_free(body);
-    if (rs_state_save(&s->state) != 0) { reply_error(c, 500, "Could not save state."); return; }
+    // Roll back the live settings too if persistence fails.
+    rs_json *previous = rs_json_clone(rs_state_settings(&s->state));
+    if (!previous) { rs_json_free(settings); reply_error(c, 500, "Out of memory."); return; }
+    rs_json_obj_set(s->state.root, "settings", settings);
+    if (rs_state_save(&s->state) != 0) {
+        rs_json_obj_set(s->state.root, "settings", previous);
+        reply_error(c, 500, "Could not save state.");
+        return;
+    }
+    rs_json_free(previous);
     rs_json *out = settings_view(s);
-    rs_json_obj_set_str(out, "note", "Takes effect after restart.");
+    rs_json_obj_set_str(out, "note", "Refresh intervals and trusted proxies apply immediately; port and bind address apply after restart.");
     reply_json(c, 200, out, NULL);
 }
 
@@ -1311,6 +1408,8 @@ static void append_metrics_connection(void *opaque, const char *stream_id,
 // Builds the metrics payload the SSE stream and the Monitoring view consume.
 static rs_json *build_metrics(restream_server_t *s) {
     rs_json *out = rs_json_new_obj();
+    rs_json_obj_set(out, "timestamp", rs_json_new_num(now_ms()));
+    rs_json_obj_set(out, "refresh", refresh_view(s));
     rs_json *streams = rs_json_new_obj();
     double global_bps = 0; long long global_total = 0; int global_clients = 0;
     double global_in_bps = 0; long long global_in_total = 0;
@@ -1360,21 +1459,69 @@ static rs_json *build_metrics(restream_server_t *s) {
     return out;
 }
 
-static void handle_events(restream_server_t *s, struct mg_connection *c) {
-    // SSE: send the headers, mark the connection, and push one frame right away
-    // so the panel populates without waiting for the first tick.
-    mg_printf(c, "HTTP/1.1 200 OK\r\n"
+static void handle_events(restream_server_t *s, struct mg_connection *c, struct mg_http_message *hm) {
+    rs_sse_state sub = {0};
+    sub.marker = RS_SSE_MARKER;
+    char interval[32];
+    int length = mg_http_get_var(&hm->query, "intervalMs", interval, sizeof(interval));
+    if (length != -1 && length != -4) {  // absent vs empty/malformed
+        char *end = NULL;
+        unsigned long value = 0;
+        bool digits = length > 0;
+        for (int i = 0; i < length; i++)
+            if (interval[i] < '0' || interval[i] > '9') digits = false;
+        if (digits) { errno = 0; value = strtoul(interval, &end, 10); }
+        if (!digits || errno == ERANGE || !end || *end || !valid_refresh_ms((double)value)) {
+            reply_error(c, 400, "intervalMs must be 0 (paused) or an integer from 100 to 3600000 milliseconds.");
+            return;
+        }
+        sub.override_interval = true;
+        sub.interval_ms = (uint32_t)value;
+    }
+    // Unnamed SSE messages preserve existing EventSource.onmessage clients.
+    mg_printf(c, "HTTP/1.1 200 OK\r\n" RS_CORS_HEADERS
                  "Content-Type: text/event-stream\r\n"
-                 "Cache-Control: no-cache\r\n"
-                 "Connection: keep-alive\r\n\r\n");
-    c->data[0] = RS_SSE_MARKER;
+                 "Cache-Control: no-cache, no-transform\r\n"
+                 "X-Accel-Buffering: no\r\n"
+                 "Connection: keep-alive\r\n\r\n"
+                 "retry: 3000\n\n");
+    sub.last_frame_ms = sub.last_write_ms = mg_millis();
+    memcpy(c->data, &sub, sizeof(sub));
     rs_json *metrics = build_metrics(s);
     char *body = rs_json_serialize(metrics, false);
     rs_json_free(metrics);
-    if (body) {
-        mg_printf(c, "data: %s\n\n", body);
-        rs_free(body);
+    if (body) { mg_printf(c, "data: %s\n\n", body); rs_free(body); }
+}
+
+// Snapshot delivery is independent of the one-second maintenance timer.
+static void broadcast_metrics(void *arg) {
+    restream_server_t *s = (restream_server_t *)arg;
+    uint64_t now = mg_millis();
+    char *body = NULL;
+    for (struct mg_connection *c = s->mgr.conns; c; c = c->next) {
+        if (c->data[0] != RS_SSE_MARKER || c->is_closing || c->is_draining) continue;
+        // A stalled reader must not accumulate an unbounded send buffer.
+        if (c->send.len > 1024 * 1024) { c->is_closing = 1; continue; }
+        rs_sse_state sub;
+        memcpy(&sub, c->data, sizeof(sub));
+        uint32_t interval = sub.override_interval ? sub.interval_ms : refresh_ms(s, 0);
+        if (interval && now - sub.last_frame_ms >= interval) {
+            if (!body) {
+                rs_json *metrics = build_metrics(s);
+                body = rs_json_serialize(metrics, false);
+                rs_json_free(metrics);
+            }
+            if (body) {
+                mg_printf(c, "data: %s\n\n", body);
+                sub.last_frame_ms = sub.last_write_ms = now;
+            }
+        } else if (now - sub.last_write_ms >= 15000) {
+            mg_printf(c, ": keepalive\n\n");
+            sub.last_write_ms = now;
+        }
+        memcpy(c->data, &sub, sizeof(sub));
     }
+    rs_free(body);
 }
 
 // Folds what each live engine has pulled from the origin since the last tick
@@ -1396,8 +1543,8 @@ static void collect_ingest(restream_server_t *s) {
     }
 }
 
-// The 1s timer: push a fresh metrics frame to every SSE subscriber.
-static void broadcast_metrics(void *arg) {
+// Maintenance always runs once a second, even with snapshots paused.
+static void maintenance_tick(void *arg) {
     restream_server_t *s = (restream_server_t *)arg;
     // A restart asked for from Settings. Deferred to here so the HTTP reply has
     // been flushed — systemd stops this process the moment it accepts.
@@ -1414,20 +1561,6 @@ static void broadcast_metrics(void *arg) {
     // Doing it here rather than in the stop handler is what makes Stop return
     // instantly instead of waiting for an in-flight segment download.
     rs_live_reap(s->live);
-    // Snapshot once, reuse for every subscriber.
-    bool any = false;
-    for (struct mg_connection *c = s->mgr.conns; c != NULL; c = c->next) {
-        if (c->data[0] == RS_SSE_MARKER) { any = true; break; }
-    }
-    if (!any) return;  // don't sample the host with nobody watching
-    rs_json *metrics = build_metrics(s);
-    char *body = rs_json_serialize(metrics, false);
-    rs_json_free(metrics);
-    if (!body) return;
-    for (struct mg_connection *c = s->mgr.conns; c != NULL; c = c->next) {
-        if (c->data[0] == RS_SSE_MARKER) mg_printf(c, "data: %s\n\n", body);
-    }
-    rs_free(body);
 }
 
 // The Logs view. Everything the server does lands in the ring buffer — panel
@@ -1780,9 +1913,9 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
     if (!text) { reply_error(c, 500, "Out of memory."); return; }
 
     char *safe = rs_panel_slugify(filename);
-    char headers[256];
+    char headers[256 + sizeof(RS_CORS_HEADERS)];
     snprintf(headers, sizeof(headers),
-             "Content-Type: audio/x-mpegurl\r\nCache-Control: no-store\r\n"
+             RS_CORS_HEADERS "Content-Type: audio/x-mpegurl\r\nCache-Control: no-store\r\n"
              "Content-Disposition: attachment; filename=\"%s.m3u8\"\r\n",
              safe && safe[0] ? safe : "playlist");
     mg_http_reply(c, 200, headers, "%s", text);
@@ -1916,7 +2049,7 @@ static void serve_provider_epg(struct mg_connection *c, const char *provider_id)
     // handler does rather than forcing one content type on both.
     const char *type = (len > 0 && data[0] == '<') ? "application/xml; charset=utf-8"
                                                    : "application/json; charset=utf-8";
-    mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
+    mg_printf(c, "HTTP/1.1 200 OK\r\n" RS_CORS_HEADERS "Content-Type: %s\r\nContent-Length: %lu\r\n"
                  "Cache-Control: no-store\r\n\r\n", type, (unsigned long)len);
     mg_send(c, data, len);
     free(data);
@@ -1937,8 +2070,16 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     }
 
     // Everything past here needs a signed-in account.
-    char *user = current_user(s, hm);
-    if (!user) { reply_error(c, 401, "Not signed in."); return true; }
+    int retry_after = 0;
+    char *user = current_user(s, c, hm, &retry_after);
+    if (!user) {
+        if (retry_after > 0) {
+            char headers[80];
+            snprintf(headers, sizeof(headers), "Retry-After: %d\r\n", retry_after);
+            reply_error_headers(c, 429, "Too many failed sign-ins. Retry later.", headers);
+        } else reply_error(c, 401, "Not signed in.");
+        return true;
+    }
 
     // A viewer may read the panel but not change it. Enforcing on the method
     // rather than on a list of routes means a route added later is read-only
@@ -1961,7 +2102,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         handle_settings_update(s, c, hm); return true;
     }
     if (mg_match(hm->uri, mg_str("/api/events"), NULL) && method_is(hm, "GET")) {
-        handle_events(s, c); return true;
+        handle_events(s, c, hm); return true;
     }
     if (mg_match(hm->uri, mg_str("/api/logs"), NULL) && method_is(hm, "GET")) {
         handle_logs(s, c, hm); return true;
@@ -2088,7 +2229,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         bool queued = webhook_enqueue_test(s, id);
         free(id);
         if (!queued) reply_error(c, 400, "Provider has no valid error webhook, or the delivery queue is full.");
-        else mg_http_reply(c, 202, "Content-Type: application/json\r\nCache-Control: no-store\r\n",
+        else mg_http_reply(c, 202, RS_CORS_HEADERS "Content-Type: application/json\r\nCache-Control: no-store\r\n",
                            "{\"ok\":true,\"queued\":true}");
         return true;
     }
@@ -2136,6 +2277,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         return true;
     }
     if (mg_match(hm->uri, mg_str("/api/providers/*/export"), NULL) && method_is(hm, "GET")) {
+        if (is_viewer) { reply_error(c, 403, "Provider export requires an admin account."); return true; }
         char *provider_id = capture(hm, "/api/providers/*/export");
         serve_provider_export(s, c, provider_id);
         free(provider_id);
@@ -2712,7 +2854,7 @@ static void xc_reply_xmltv(restream_server_t *s, struct mg_connection *c) {
     rs_buf_append_str(&body, "</tv>\n");
     char *text = rs_buf_take(&body);
     if (!text) { reply_error(c, 500, "Out of memory building XMLTV."); return; }
-    mg_http_reply(c, 200, "Content-Type: application/xml; charset=utf-8\r\nCache-Control: no-store\r\n", "%s", text);
+    mg_http_reply(c, 200, RS_CORS_HEADERS "Content-Type: application/xml; charset=utf-8\r\nCache-Control: no-store\r\n", "%s", text);
     rs_free(text);
 }
 
@@ -2748,7 +2890,7 @@ static bool handle_xtream(restream_server_t *s, struct mg_connection *c,
         snprintf(location, sizeof(location), "/play/%s/index.m3u8?key=%s",
                  rs_json_obj_str(stream, "id", ""), encoded_key ? encoded_key : "");
         free(encoded_key); free(username); free(password); free(filename);
-        mg_printf(c, "HTTP/1.1 302 Found\r\nLocation: %s\r\nCache-Control: no-store\r\nContent-Length: 0\r\n\r\n", location);
+        mg_printf(c, "HTTP/1.1 302 Found\r\n" RS_CORS_HEADERS "Location: %s\r\nCache-Control: no-store\r\nContent-Length: 0\r\n\r\n", location);
         c->is_resp = 0;
         return true;
     }
@@ -2799,7 +2941,7 @@ static bool handle_xtream(restream_server_t *s, struct mg_connection *c,
         char *text = rs_buf_take(&body);
         if (!text) reply_error(c, 500, "Out of memory building playlist.");
         else {
-            mg_http_reply(c, 200, "Content-Type: audio/x-mpegurl\r\nCache-Control: no-store\r\n", "%s", text);
+            mg_http_reply(c, 200, RS_CORS_HEADERS "Content-Type: audio/x-mpegurl\r\nCache-Control: no-store\r\n", "%s", text);
             rs_free(text);
         }
         free(output); free(eu); free(ep); free(host);
@@ -3041,7 +3183,7 @@ static char *playlist_with_playback_key(const char *playlist, const char *playba
 }
 
 static void send_redirect(struct mg_connection *c, const char *location) {
-    mg_printf(c, "HTTP/1.1 302 Found\r\nLocation: %s\r\nCache-Control: no-store\r\n"
+    mg_printf(c, "HTTP/1.1 302 Found\r\n" RS_CORS_HEADERS "Location: %s\r\nCache-Control: no-store\r\n"
                  "Content-Length: 0\r\n\r\n", location);
     // mg_http_reply clears this itself; a raw mg_printf response has to do it
     // by hand or mongoose leaves the connection marked mid-response forever —
@@ -4267,7 +4409,7 @@ static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job 
     }
     rs_drm_challenge_free(&drm);
     if (!rewritten) { reply_error(c, 500, "Out of memory rewriting the playlist."); return; }
-    mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
+    mg_http_reply(c, 200, RS_CORS_HEADERS "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
                           "Cache-Control: no-store\r\n", "%s", rewritten);
     rs_free(rewritten);
 }
@@ -4344,14 +4486,14 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
     // Relay the upstream's 206 + Content-Range so the player's byte-range
     // request is answered as a partial response, not a 200 of the wrong length.
     if (status == 206 && pf->content_range && pf->content_range[0]) {
-        mg_printf(c, "HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\nContent-Range: %s\r\n"
+        mg_printf(c, "HTTP/1.1 206 Partial Content\r\n" RS_CORS_HEADERS "Content-Type: %s\r\nContent-Range: %s\r\n"
                      "Content-Length: %lu\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\n"
-                     "Access-Control-Allow-Origin: *\r\n\r\n",
+                     "\r\n",
                   type, pf->content_range, (unsigned long)body_len);
     } else {
-        mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
+        mg_printf(c, "HTTP/1.1 200 OK\r\n" RS_CORS_HEADERS "Content-Type: %s\r\nContent-Length: %lu\r\n"
                      "Accept-Ranges: bytes\r\nCache-Control: no-store\r\n"
-                     "Access-Control-Allow-Origin: *\r\n\r\n",
+                     "\r\n",
                   type, (unsigned long)body_len);
     }
     mg_send(c, body, body_len);
@@ -4379,7 +4521,7 @@ static void pending_job_finish_logo(struct mg_connection *c, rs_pending_job *pf)
 
 static void pending_job_finish_probe(struct mg_connection *c, rs_pending_job *pf) {
     if (!pf->body) { reply_error(c, 400, pf->err[0] ? pf->err : "Could not probe the source."); return; }
-    char headers_out[128];
+    char headers_out[128 + sizeof(RS_CORS_HEADERS)];
     snprintf(headers_out, sizeof(headers_out), "%sCache-Control: no-store\r\n", JSON_HEADERS);
     mg_http_reply(c, 200, headers_out, "%s", pf->body);
 }
@@ -4745,9 +4887,9 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
             const char *fext = strrchr(fname, '.');
             const char *ctype = (fext && strcmp(fext, ".vtt") == 0)
                                     ? "text/vtt; charset=utf-8" : "video/mp4";
-            mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
+            mg_printf(c, "HTTP/1.1 200 OK\r\n" RS_CORS_HEADERS "Content-Type: %s\r\nContent-Length: %lu\r\n"
                          "Accept-Ranges: bytes\r\nCache-Control: no-store\r\n"
-                         "Access-Control-Allow-Origin: *\r\n\r\n", ctype, (unsigned long)clen);
+                         "\r\n", ctype, (unsigned long)clen);
             mg_send(c, cached, clen);
             // Without this, mongoose leaves the connection marked as still
             // generating a response (mg_http_reply would have cleared it) and
@@ -4769,8 +4911,8 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
                     live_init ? "cacheMissInit" : "cacheMissSegment", NULL, 404, -1,
                     "rep %d %s outside the live window — 404 so %s reseeks "
                     "(raise keepSegments if this repeats)", rep_index, fname, cip);
-        mg_http_reply(c, 404, "Content-Type: text/plain\r\nCache-Control: no-store\r\n"
-                              "Access-Control-Allow-Origin: *\r\n",
+        mg_http_reply(c, 404, RS_CORS_HEADERS "Content-Type: text/plain\r\nCache-Control: no-store\r\n"
+                              "",
                       "Segment is outside the live window.\n");
         rs_free(cip);
         return;
@@ -5214,8 +5356,8 @@ static void serve_dash_master(restream_server_t *server, struct mg_connection *c
         log_record(server, stream_id, "error", "master", NULL, 503, -1,
                    status ? status : "engine not ready yet");
         rs_free(status);
-        mg_http_reply(c, 503, "Content-Type: text/plain\r\nRetry-After: 2\r\n"
-                              "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
+        mg_http_reply(c, 503, RS_CORS_HEADERS "Content-Type: text/plain\r\nRetry-After: 2\r\n"
+                              "Cache-Control: no-store\r\n",
                       "The stream is still starting up. Retry shortly.\n");
         return;
     }
@@ -5227,8 +5369,8 @@ static void serve_dash_master(restream_server_t *server, struct mg_connection *c
     if (!routed) { reply_error(c, 500, "Out of memory rewriting the master playlist."); return; }
     log_record(server, stream_id, "info", "master", NULL, 200,
                (long long)strlen(routed), "master playlist served");
-    mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
-                          "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
+    mg_http_reply(c, 200, RS_CORS_HEADERS "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
+                          "Cache-Control: no-store\r\n",
                   "%s", routed);
     rs_free(routed);
 }
@@ -5251,8 +5393,8 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
         log_recordf(server, stream_id, "error", "playlist", NULL, 503, -1,
                     "%s: no window yet (%s)", rep, status ? status : "engine not running");
         rs_free(status);
-        mg_http_reply(c, 503, "Content-Type: text/plain\r\nRetry-After: 1\r\n"
-                              "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
+        mg_http_reply(c, 503, RS_CORS_HEADERS "Content-Type: text/plain\r\nRetry-After: 1\r\n"
+                              "Cache-Control: no-store\r\n",
                       "The stream is still starting up. Retry shortly.\n");
         return;
     }
@@ -5264,8 +5406,8 @@ static void serve_dash_media(restream_server_t *server, struct mg_connection *c,
     if (!routed) { reply_error(c, 500, "Out of memory rewriting the media playlist."); return; }
     log_recordf(server, stream_id, "info", "playlist", NULL, 200, (long long)strlen(routed),
                 "%s: media playlist served", rep);
-    mg_http_reply(c, 200, "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
-                          "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
+    mg_http_reply(c, 200, RS_CORS_HEADERS "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
+                          "Cache-Control: no-store\r\n",
                   "%s", routed);
     rs_free(routed);
 }
@@ -5899,8 +6041,8 @@ static void serve_direct(restream_server_t *server, struct mg_connection *c,
 
     // Framed by the connection closing, not by a length — the same contract the
     // shape every player that takes a raw URL expects.
-    mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n"
-                 "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n"
+    mg_printf(c, "HTTP/1.1 200 OK\r\n" RS_CORS_HEADERS "Content-Type: video/mp4\r\n"
+                 "Cache-Control: no-store\r\n"
                  "Connection: close\r\n\r\n");
     c->data[0] = RS_DIRECT_MARKER;
     d->next = server->direct_head;
@@ -5927,8 +6069,8 @@ static void serve_direct_ts(restream_server_t *server, struct mg_connection *c,
     t->identity = (key && key[0]) ? key : rs_strdup(t->ip);
     if (key && !key[0]) free(key);
 
-    mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n"
-                 "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n"
+    mg_printf(c, "HTTP/1.1 200 OK\r\n" RS_CORS_HEADERS "Content-Type: video/mp2t\r\n"
+                 "Cache-Control: no-store\r\n"
                  "Connection: close\r\n\r\n");
     c->data[0] = RS_TSMUX_MARKER;
     t->next = server->ts_head;
@@ -6003,9 +6145,9 @@ static void serve_download(restream_server_t *server, struct mg_connection *c,
     log_recordf(server, stream_id, "info", "download", NULL, 200, (long long)len,
                 "rendition %d downloaded by %s", rep_index, ip);
     rs_free(ip);
-    mg_printf(c, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: %lu\r\n"
+    mg_printf(c, "HTTP/1.1 200 OK\r\n" RS_CORS_HEADERS "Content-Type: video/mp4\r\nContent-Length: %lu\r\n"
                  "Content-Disposition: attachment; filename=\"%s.mp4\"\r\n"
-                 "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                 "Cache-Control: no-store\r\n\r\n",
               (unsigned long)len, filename);
     mg_send(c, body, len);
     c->is_resp = 0;
@@ -6066,13 +6208,13 @@ static bool serve_pipeline_hls(restream_server_t *server, struct mg_connection *
 
     FILE *test = fopen(path, "rb");
     if (!test) {
-        mg_http_reply(c, 503, "Content-Type: application/json\r\nRetry-After: 1\r\n",
+        mg_http_reply(c, 503, RS_CORS_HEADERS "Content-Type: application/json\r\nRetry-After: 1\r\n",
                       "{\"error\":\"FFmpeg output is warming up.\"}");
         return true;
     }
     fclose(test);
     struct mg_http_serve_opts opts = {0};
-    opts.extra_headers = "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n";
+    opts.extra_headers = RS_CORS_HEADERS "Cache-Control: no-store\r\n";
     mg_http_serve_file(c, hm, path, &opts);
     return true;
 }
@@ -6277,6 +6419,34 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     if (server) security_headers(server, c, hm, g_request_security, sizeof(g_request_security));
     else g_request_security[0] = '\0';
 
+    // Preflight is capability discovery, before authentication and all routes.
+    // Echo only valid header-name tokens; never reflect arbitrary header text.
+    if (method_is(hm, "OPTIONS")) {
+        struct mg_str *requested = mg_http_get_header(hm, "Access-Control-Request-Headers");
+        if (requested) {
+            for (size_t i = 0; i < requested->len; i++) {
+                unsigned char ch = (unsigned char)requested->buf[i];
+                if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9') ||
+                      (ch != 0 && strchr("!#$%&'*+-.^_`|~, \t", ch)))) {
+                    reply_error(c, 400, "Invalid preflight header names.");
+                    return;
+                }
+            }
+        }
+        char *headers = mg_mprintf(RS_CORS_HEADERS
+            "Access-Control-Allow-Methods: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Authorization, Content-Type, Range, Accept, Last-Event-ID%.*s%.*s\r\n"
+            "Access-Control-Max-Age: 86400\r\n"
+            "Vary: Access-Control-Request-Headers\r\n",
+            requested && requested->len ? 2 : 0, ", ",
+            requested ? (int)requested->len : 0, requested ? requested->buf : "");
+        if (!headers) { reply_error(c, 500, "Out of memory."); return; }
+        mg_http_reply(c, 204, headers, "");
+        free(headers);
+        return;
+    }
+
     // Liveness probe. Carries the binary's build time so it's trivial to tell,
     // from an unauthenticated curl, whether a rebuilt server was actually
     // restarted (a stale process reports the old stamp).
@@ -6328,7 +6498,9 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     if (server && server->web_root) {
         struct mg_http_serve_opts opts = {0};
         opts.root_dir = server->web_root;
-        opts.extra_headers = g_request_security;
+        char static_headers[sizeof(g_request_security) + sizeof(RS_CORS_HEADERS)];
+        snprintf(static_headers, sizeof(static_headers), "%s%s", RS_CORS_HEADERS, g_request_security);
+        opts.extra_headers = static_headers;
         // The panel is a single page that gives every view its own address, so
         // each of those addresses has to return index.html and let the
         // front-end router pick the view up from the path. A fixed list, not a
@@ -6346,7 +6518,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     }
 
     // No web root: explain, rather than a bare 404.
-    mg_http_reply(c, 404, "Content-Type: text/plain\r\n",
+    mg_http_reply(c, 404, RS_CORS_HEADERS "Content-Type: text/plain\r\n",
                   "restreamair-server: this is the C core. It answers /ping, the panel API "
                   "(auth, management, monitoring), live DASH and HLS playback, and — with "
                   "--root pointing at public/ — the panel's static files. ffmpeg input "
@@ -6495,9 +6667,9 @@ bool restream_server_start(restream_server_t* server, uint16_t port, const char*
     if (server->c == NULL) {
         return false;
     }
-    // Push a metrics frame to SSE subscribers once a second, and reap any live
-    // engines that have finished winding down.
-    mg_timer_add(&server->mgr, 1000, MG_TIMER_REPEAT, broadcast_metrics, server);
+    // Maintenance cadence stays independent of each subscriber's refresh rate.
+    mg_timer_add(&server->mgr, 1000, MG_TIMER_REPEAT, maintenance_tick, server);
+    mg_timer_add(&server->mgr, RS_REFRESH_MIN_MS, MG_TIMER_REPEAT, broadcast_metrics, server);
     // Direct links run on their own faster timer: a second of added latency on
     // every segment is the very cost they exist to avoid.
     mg_timer_add(&server->mgr, RS_DIRECT_PUMP_MS, MG_TIMER_REPEAT, pump_direct_links, server);

@@ -63,6 +63,53 @@ let decryptionKeysManuallyShown = false;
 
 const $ = (selector) => document.querySelector(selector);
 
+const refreshSettings = {
+  eventsIntervalMs: 1000, stateRefreshMs: 4000,
+  logsRefreshMs: 2000, activityRefreshMs: 1000,
+};
+const refreshPolls = new Set();
+
+function armRefreshPoll(poll) {
+  clearInterval(poll.timer);
+  poll.timer = null;
+  const delay = refreshSettings[poll.key];
+  if (!delay) return;
+  poll.timer = setInterval(async () => {
+    if (poll.busy || !authenticated) return;
+    poll.busy = true;
+    try { await poll.callback(); } catch (_) { /* request handles sign-in failures */ }
+    finally { poll.busy = false; }
+  }, delay);
+}
+
+function startRefreshPoll(callback, key) {
+  const poll = { callback, key, timer: null, busy: false };
+  refreshPolls.add(poll);
+  armRefreshPoll(poll);
+  return poll;
+}
+
+function stopRefreshPoll(poll) {
+  if (!poll) return;
+  clearInterval(poll.timer);
+  refreshPolls.delete(poll);
+}
+
+function applyRefreshSettings(settings) {
+  if (!settings) return;
+  const changed = new Set();
+  for (const key of Object.keys(refreshSettings)) {
+    const value = settings[key];
+    if (Number.isInteger(value) && (value === 0 || (value >= 100 && value <= 3600000)) && value !== refreshSettings[key]) {
+      refreshSettings[key] = value;
+      changed.add(key);
+    }
+  }
+  for (const poll of refreshPolls) if (changed.has(poll.key)) armRefreshPoll(poll);
+  if (authenticated) $("#monitorStatus").textContent = refreshSettings.eventsIntervalMs ? "Live" : "Auto-refresh paused";
+}
+
+
 async function request(path, options = {}) {
   const response = await fetch(path, {
     ...options,
@@ -92,6 +139,7 @@ async function refreshOnce() {
   // a successful broadcast visibly "drop" until another refresh.
   if (epoch !== stateMutationEpoch) return;
   state = fresh;
+  applyRefreshSettings(state.refresh);
   if (!selectedProviderId && state.providers[0]) selectedProviderId = state.providers[0].id;
   const provider = selectedProvider();
   if (!provider) selectedProviderId = null;
@@ -299,11 +347,11 @@ function switchView(view, { history: historyMode = "push" } = {}) {
     if (view === "settings") loadSettingsView();
     // Logs auto-refresh only while the tab is actually open, same reasoning
     // as the existing "no overhead when closed" comment on loadLogs itself.
-    clearInterval(logsPollTimer);
+    stopRefreshPoll(logsPollTimer);
     logsPollTimer = null;
     if (view === "logs") {
       loadLogs();
-      if (!logsPaused) logsPollTimer = setInterval(loadLogs, 2000);
+      if (!logsPaused) logsPollTimer = startRefreshPoll(loadLogs, "logsRefreshMs");
     }
   };
   if (document.startViewTransition) {
@@ -828,7 +876,7 @@ function renderEditor() {
 
   // Only (re)populate the editable fields + representation picker when the
   // selected stream actually changes. Otherwise the periodic background
-  // refresh() (every 4s) would wipe out in-progress edits — including
+  // refresh() (every 4s by default) would wipe out in-progress edits — including
   // freshly detected representations that haven't been saved yet.
   if (stream.id === lastEditorStreamId) {
     renderRepresentationPicker();
@@ -863,7 +911,7 @@ function renderEditor() {
   form.elements.downloadAhead.value = stream.downloadAhead ?? 20;
   form.elements.parallelDownloads.value = stream.parallelDownloads ?? 6;
   form.elements.prioritizeOldest.checked = stream.prioritizeOldest ?? false;
-  form.elements.pollInterval.value = stream.pollInterval || 2;
+  form.elements.pollInterval.value = stream.pollInterval ?? 0;
   form.elements.audioDelayMs.value = stream.audioDelayMs || 0;
   form.elements.tvgId.value = stream.tvgId || "";
   form.elements.forceOffline.checked = Boolean(stream.forceOffline);
@@ -1630,7 +1678,7 @@ function updatePipelineFieldVisibility() {
 let ffmpegInstallPollTimer = null;
 
 function stopFfmpegInstallPoll() {
-  clearInterval(ffmpegInstallPollTimer);
+  stopRefreshPoll(ffmpegInstallPollTimer);
   ffmpegInstallPollTimer = null;
 }
 
@@ -1662,7 +1710,7 @@ async function startFfmpegInstall(output) {
     await request("/api/ffmpeg-install", { method: "POST", body: "{}" });
     stopFfmpegInstallPoll();
     pollFfmpegInstallOutput(output);
-    ffmpegInstallPollTimer = setInterval(() => pollFfmpegInstallOutput(output), 1000);
+    ffmpegInstallPollTimer = startRefreshPoll(() => pollFfmpegInstallOutput(output), "activityRefreshMs");
   } catch (error) {
     output.textContent = `Couldn't start install: ${error.message || error}`;
   }
@@ -1675,7 +1723,7 @@ $("#ffmpegInstallBtn").addEventListener("click", () => {
 let nm3u8dlreInstallPollTimer = null;
 
 function stopNm3u8dlreInstallPoll() {
-  clearInterval(nm3u8dlreInstallPollTimer);
+  stopRefreshPoll(nm3u8dlreInstallPollTimer);
   nm3u8dlreInstallPollTimer = null;
 }
 
@@ -1711,7 +1759,7 @@ $("#nm3u8dlreInstallBtn")?.addEventListener("click", async () => {
   }
   stopNm3u8dlreInstallPoll();
   pollNm3u8dlreInstallOutput();
-  nm3u8dlreInstallPollTimer = setInterval(pollNm3u8dlreInstallOutput, 1000);
+  nm3u8dlreInstallPollTimer = startRefreshPoll(pollNm3u8dlreInstallOutput, "activityRefreshMs");
 });
 
 $("#streamForm").elements.inputMode.addEventListener("change", updatePipelineFieldVisibility);
@@ -2013,7 +2061,7 @@ function renderScriptAccountsList() {
 }
 
 function stopScriptOutputPoll() {
-  clearInterval(scriptOutputPollTimer);
+  stopRefreshPoll(scriptOutputPollTimer);
   scriptOutputPollTimer = null;
 }
 
@@ -2056,10 +2104,10 @@ async function runProviderScript(action) {
     stopScriptOutputPoll();
     const run = request(`/api/providers/${provider.id}/script/${action}`, { method: "POST", body: "{}" });
     pollScriptOutput(provider.id);
-    scriptOutputPollTimer = setInterval(() => {
-      pollScriptOutput(provider.id);
-      if (alsoRefreshState) refresh();
-    }, 1000);
+    scriptOutputPollTimer = startRefreshPoll(async () => {
+      await pollScriptOutput(provider.id);
+      if (alsoRefreshState) await refresh();
+    }, "activityRefreshMs");
     await run;
     await pollScriptOutput(provider.id);
     if (alsoRefreshState) await refresh();
@@ -2123,13 +2171,13 @@ async function runProviderScriptForGrid(action) {
   try {
     // Keep the terminal moving while the long-running request is in flight.
     // Waiting first made even line-streamed server logs appear only at exit.
-    clearInterval(gridImportPollTimer);
+    stopRefreshPoll(gridImportPollTimer);
     const run = request(`/api/providers/${provider.id}/script/${action}`, { method: "POST", body: "{}" });
     pollGridImportStatus(provider.id);
-    gridImportPollTimer = setInterval(() => {
-      pollGridImportStatus(provider.id);
-      refresh();
-    }, 1000);
+    gridImportPollTimer = startRefreshPoll(async () => {
+      await pollGridImportStatus(provider.id);
+      await refresh();
+    }, "activityRefreshMs");
     await run;
     await pollGridImportStatus(provider.id);
     await refresh();
@@ -2139,7 +2187,7 @@ async function runProviderScriptForGrid(action) {
     term.textContent = `${prior}[failed: ${error.message || error}]`;
     return;
   } finally {
-    clearInterval(gridImportPollTimer);
+    stopRefreshPoll(gridImportPollTimer);
     gridImportPollTimer = null;
   }
 }
@@ -2554,11 +2602,11 @@ $("#pauseLogsBtn").addEventListener("click", (event) => {
   button.classList.toggle("active", logsPaused);
   applyIcons(button);
   // Restart or stop the poll to match.
-  clearInterval(logsPollTimer);
+  stopRefreshPoll(logsPollTimer);
   logsPollTimer = null;
   if (!logsPaused && currentView === "logs") {
     loadLogs();
-    logsPollTimer = setInterval(loadLogs, 2000);
+    logsPollTimer = startRefreshPoll(loadLogs, "logsRefreshMs");
   }
 });
 $("#clearLogsBtn").addEventListener("click", async () => {
@@ -2664,6 +2712,8 @@ document.querySelectorAll(".log-mode-btn").forEach((button) => {
 async function loadSettingsView() {
   try {
     const settings = await request("/api/settings");
+    applyRefreshSettings(settings);
+    for (const key of Object.keys(refreshSettings)) $("#refreshForm").elements[key].value = refreshSettings[key];
     // `port` is the port actually bound; `storedPort` is the saved preference.
     // Show the saved value (it is what this form edits) but say so when the
     // running server is on a different one, which is exactly the state that
@@ -2831,6 +2881,21 @@ $("#portForm").addEventListener("submit", async (event) => {
   $("#viewMeta").textContent = "Saved — restart the server for it to take effect.";
 });
 
+$("#refreshForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const body = {};
+  for (const key of Object.keys(refreshSettings)) body[key] = Number(form.elements[key].value);
+  const status = $("#refreshSettingsStatus");
+  try {
+    const settings = await request("/api/settings", { method: "POST", body: JSON.stringify(body) });
+    applyRefreshSettings(settings);
+    status.textContent = "Saved — refresh intervals applied.";
+  } catch (error) {
+    status.textContent = `Could not save: ${error.message}`;
+  }
+});
+
 $("#userForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -2874,8 +2939,9 @@ let connectionsSearchQuery = "";
 let lastMetricsPayload = null;
 
 function applyMetrics(payload) {
+  applyRefreshSettings(payload.refresh);
   // Everything below paints into the monitor view, which is display:none on
-  // every other tab. An SSE metrics frame arrives every second regardless of
+  // every other tab. SSE metrics frames arrive at the configured interval regardless of
   // which tab is open, so rebuilding all these tiles' and the connections
   // table's innerHTML while they're hidden is pure wasted DOM work. Cache the
   // frame and skip the repaint unless the monitor view is actually visible;
@@ -2983,7 +3049,7 @@ function formatUptime(seconds) {
 function connectEvents() {
   if (eventSource) return;
   eventSource = new EventSource("/api/events");
-  eventSource.onopen = () => { $("#monitorStatus").textContent = "Live"; };
+  eventSource.onopen = () => { $("#monitorStatus").textContent = refreshSettings.eventsIntervalMs ? "Live" : "Auto-refresh paused"; };
   eventSource.onerror = () => { $("#monitorStatus").textContent = "Reconnecting…"; };
   eventSource.onmessage = (event) => {
     try {
@@ -3313,7 +3379,7 @@ async function runStreamScriptAction(action, button) {
       method: "POST",
       body: JSON.stringify({ action, streamId: stream.id })
     });
-    pollTimer = setInterval(() => pollLatestScriptRun(`script:${provider.id}`).catch(() => {}), 750);
+    pollTimer = startRefreshPoll(() => pollLatestScriptRun(`script:${provider.id}`), "activityRefreshMs");
     const result = await run;
     const transcript = await pollLatestScriptRun(`script:${provider.id}`);
     box.textContent = transcript || result.output || "No output";
@@ -3322,7 +3388,7 @@ async function runStreamScriptAction(action, button) {
     try { transcript = await pollLatestScriptRun(`script:${provider.id}`); } catch (_) {}
     box.textContent = `${transcript ? `${transcript}\n\n` : ""}[failed: ${err.message}]`;
   } finally {
-    clearInterval(pollTimer);
+    stopRefreshPoll(pollTimer);
     button.disabled = false;
   }
 }
@@ -3342,7 +3408,7 @@ async function runStreamCdmPipeline(button) {
   let pollTimer = null;
   try {
     const run = request(`/api/streams/${stream.id}/start`, { method: "POST", body: "{}" });
-    pollTimer = setInterval(() => pollLatestScriptRun(stream.id).catch(() => {}), 750);
+    pollTimer = startRefreshPoll(() => pollLatestScriptRun(stream.id), "activityRefreshMs");
     state = await run;
     const transcript = await pollLatestScriptRun(stream.id);
     stateMutationEpoch++;
@@ -3361,7 +3427,7 @@ async function runStreamCdmPipeline(button) {
       box.textContent = `Error: ${err.message}`;
     }
   } finally {
-    clearInterval(pollTimer);
+    stopRefreshPoll(pollTimer);
     button.disabled = false;
   }
 }
@@ -3399,7 +3465,7 @@ async function boot() {
     if (!bootStarted) {
       bootStarted = true;
       document.querySelectorAll(".stream-form label, #providerChips").forEach((el) => el.classList.add("skeleton"));
-      setInterval(() => refresh().catch(() => {}), 4000);
+      startRefreshPoll(() => authenticated ? refresh() : undefined, "stateRefreshMs");
     }
 
     try {

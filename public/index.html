@@ -494,6 +494,16 @@
                 <label>Trusted proxies<span class="field-hint">Blank = trust nothing. Set to <code>loopback</code> when a reverse proxy in front of ReStreamAir terminates HTTPS, so the real client address and https:// scheme are honoured. Accepts addresses, CIDR blocks, <code>loopback</code>, <code>private</code> or <code>any</code>.</span><input name="trustedProxies" placeholder="loopback"></label>
                 <div class="actions"><button type="submit">Save</button></div>
               </form>
+              <h3>Refresh intervals</h3>
+              <p class="field-hint">Applies immediately and survives restart. Enter milliseconds: 0 pauses automatic updates; 100–3600000 sets the interval (1000 = 1 second). Manual actions still work. Source manifest polling is configured separately in each stream.</p>
+              <form id="refreshForm" class="form-row">
+                <label>Monitoring events (ms)<input name="eventsIntervalMs" type="number" min="0" max="3600000" step="1" value="1000" required></label>
+                <label>Panel state (ms)<input name="stateRefreshMs" type="number" min="0" max="3600000" step="1" value="4000" required></label>
+                <label>Logs (ms)<input name="logsRefreshMs" type="number" min="0" max="3600000" step="1" value="2000" required></label>
+                <label>Script and installer progress (ms)<input name="activityRefreshMs" type="number" min="0" max="3600000" step="1" value="1000" required></label>
+                <div class="actions"><button type="submit">Save refresh intervals</button></div>
+              </form>
+              <p id="refreshSettingsStatus" class="field-hint" role="status"></p>
               <div id="servicePanel" class="hidden">
                 <h3>Service</h3>
                 <div id="serviceStatus" class="field-hint"></div>
@@ -691,7 +701,7 @@
               <article id="help-logs" class="help-card">
                 <h3>Monitoring &amp; logs</h3>
                 <p>The <b>Server</b> view streams live over SSE: input vs output bandwidth (per stream and all-time), active viewers per stream, host CPU/memory/disk, and one searchable row per playback connection.</p>
-                <p>The <b>Logs</b> view shows what each worker is doing, <b>newest first</b>, polled every 2s only while it's open. Filter by stream, level or run date, toggle Verbose for raw JSON, or jump straight to one stream's logs from the icon on its card. Script runs stay in terminal form in either mode, with the complete command and live stdout/stderr shown one line at a time. Per-stream <b>Clear</b> hides everything logged so far for that stream while leaving new activity visible.</p>
+                <p>The <b>Logs</b> view shows what each worker is doing, <b>newest first</b>, polled at the configured Logs interval (2s by default) only while it's open. Filter by stream, level or run date, toggle Verbose for raw JSON, or jump straight to one stream's logs from the icon on its card. Script runs stay in terminal form in either mode, with the complete command and live stdout/stderr shown one line at a time. Per-stream <b>Clear</b> hides everything logged so far for that stream while leaving new activity visible.</p>
                 <table class="help-table">
                   <tr><th>Event</th><th>Means</th></tr>
                   <tr><td><code>manifest</code></td><td>A manifest poll, with the URL that answered it.</td></tr>
@@ -749,6 +759,8 @@ cd restreamair-vX-linux-x86_64
                 <h3>HTTP API, keys &amp; CLI</h3>
                 <ul>
                   <li><b>Every server action in this panel uses the public HTTP API.</b> Scripts can use HTTP Basic auth with a panel admin account: <code>curl --user 'admin:password' http://host:8787/api/state</code>. Provider/stream CRUD, start/stop, probe, imports/exports, script actions, logs, users, keys, settings, service control and installers all live under <code>/api/</code>; the repository's <code>API.md</code> is the complete route reference.</li>
+                  <li><b>External websites:</b> CORS accepts every origin. Send an explicit Basic Authorization header with <code>fetch</code> and <code>credentials: "omit"</code>. For live monitoring, stream <code>GET /api/events?intervalMs=1000</code> using fetch; native EventSource cannot set authorization headers. See <code>API.md</code> for a complete browser example.</li>
+                  <li><b>Refresh intervals:</b> Settings controls event snapshots, state, logs and script/install progress independently. External SSE clients can override their own interval with <code>intervalMs</code>; 0 pauses periodic data while retaining connection keepalives.</li>
                   <li><b>Common automation routes:</b> <code>POST /api/streams/&lt;id&gt;/start</code> and <code>/stop</code>, <code>POST /api/providers/&lt;id&gt;/script/&lt;action&gt;</code>, and <code>GET /api/logs?streamId=&lt;id&gt;</code>. Mutations return fresh state JSON. Viewer accounts can read but receive <code>403</code> on writes.</li>
                   <li><b>API Keys</b> view — generate keys to require auth on playback; add <code>?key=…</code> to the play URL, or send <code>Authorization: Bearer &lt;key&gt;</code>. For an Xtream Codes client, enter this server's base URL, use the key label as its username, and the generated key as its password. The gate covers every playback route (<code>/play/</code>, <code>/restream/</code>, <code>/proxy/</code>, <code>/direct/</code>, <code>/download/</code>, <code>/source/</code>). <b>With no keys defined, playback is open to anyone who can reach the port.</b></li>
                   <li><b>Panel logins</b> are separate — an API key never gets you into <code>/api/*</code>, and an admin account is not a playback key.</li>

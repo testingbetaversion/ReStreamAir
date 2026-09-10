@@ -94,7 +94,7 @@ Other useful routes:
 
 | Route | Use |
 |---|---|
-| `/play/<id>/index.mpd` | Generated live DASH view for a DASH stream. |
+| `/restream/<id>/<generated-filename>` | Internal media URLs emitted by playlists. |
 | `/direct/<id>` | Never-ending raw fMP4 tail. |
 | `/direct/<id>.ts` | Never-ending muxed MPEG-TS tail. |
 | `/download/<id>/<representation>` | Download the media currently buffered in memory. |
@@ -135,7 +135,11 @@ curl --fail-with-body --user "$auth" -X POST \
 
 Viewer accounts can read management data but receive `403` for writes. Playback API keys cannot access `/api/*`.
 
-See [API.md](API.md) for provider/stream CRUD, probing, imports/exports, logs, users, keys, settings, services, installers, and script actions.
+See [API.md](API.md) for request/response fields, authentication, browser examples, provider/stream CRUD, probing, imports/exports, accounts, settings, service tools, and playback. [EVENTS.md](EVENTS.md) covers live SSE payloads, reconnecting browser clients, log events, scheduled provider events, and outgoing webhooks.
+
+CORS allows every website origin. External browser clients send explicit Basic authentication with `credentials: "omit"`; playback uses separate keys. Use streaming `fetch` for cross-origin SSE because native EventSource cannot set an Authorization header.
+
+**Settings → Refresh intervals** controls monitoring snapshots, panel state, logs, and script/install progress independently. Values are milliseconds: `100`–`3600000`, or `0` to pause automatic updates. Settings persist across restarts and apply without restarting. An external subscriber can choose its own rate with `/api/events?intervalMs=1500`. Source manifest `pollInterval` remains a separate seconds-based setting.
 
 ## Provider scripts
 

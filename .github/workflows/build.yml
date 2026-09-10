@@ -148,7 +148,7 @@ jobs:
           mkdir -p "$STAGE"
           cp build/restreamair-server "$STAGE/restreamair"
           cp -R public "$STAGE/public"
-          cp README.md SCRIPTING.md API.md "$STAGE/"
+          cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
           tar -czf "$STAGE.tar.gz" "$STAGE"
 
       - name: Upload build artifact (Unix)
@@ -170,7 +170,7 @@ jobs:
           mkdir -p "$STAGE"
           cp build/Release/restreamair-server.exe "$STAGE/restreamair.exe"
           cp -R public "$STAGE/public"
-          cp README.md SCRIPTING.md API.md "$STAGE/"
+          cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
           7z a "$STAGE.zip" "$STAGE" >/dev/null
 
       - name: Upload build artifact (Windows)

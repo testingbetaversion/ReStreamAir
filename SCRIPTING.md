@@ -165,7 +165,7 @@ passed to stream actions such as `manifest` and `cdm`.
 
 Re-running an import matches entries by name and updates them instead of creating duplicates. Imported entries normally need either a source URL entered later or `SessionManifest: true` with a working `manifest` action.
 
-Events use the same basic shape under `Events` and may include `Start`, `End`, and `RecordEvent`.
+Events use the same basic shape under `Events` and may include `Start`, `End`, and `RecordEvent`. Start/End are Unix epoch seconds. Matching uses name plus source type within the provider; event and channel entries of the same name remain distinct. These are imported metadata, not an automatic start/stop or recording schedule. See [EVENTS.md](EVENTS.md#scheduled-provider-events) for every field and an external scheduler workflow.
 
 ### Session and lifecycle actions
 
@@ -200,6 +200,8 @@ print(json.dumps({
 
 When `ManifestUrl` is empty but `Cdn` contains usable URLs, the first CDN URL
 becomes the primary source and the remaining entries stay available as mirrors.
+
+The C server stores heartbeat settings but does not run a periodic heartbeat scheduler. Call declared `start`, `stop`, or `heartbeat` actions explicitly through the script API when your integration needs them. These are independent of the monitoring SSE keepalive.
 
 ### Pipeline and key actions
 

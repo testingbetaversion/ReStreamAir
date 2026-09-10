@@ -18,6 +18,8 @@ Standard library only, so CI needs nothing installed.
 """
 
 import argparse
+import base64
+import queue
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -101,7 +103,7 @@ class Server:
             # --no-download: the scratch directory has no public/, and this
             # test has no business reaching out to GitHub for one.
             [self.binary, "--port", str(self.port), "--bind", "127.0.0.1",
-             "--no-download"],
+             "--no-download", "--root", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "public"))],
             cwd=self.workdir,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
@@ -225,6 +227,146 @@ class WebhookSink:
         self.httpd.shutdown()
         self.httpd.server_close()
         self.thread.join(timeout=5)
+
+
+def basic_auth(username=ADMIN_USER, password=ADMIN_PASS):
+    return "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+
+
+class EventStream:
+    """Read SSE in a background thread so pause/cadence tests have deadlines."""
+    def __init__(self, port, query="", authorization=None):
+        self.frames = queue.Queue()
+        self.comments = queue.Queue()
+        self.conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+        self.conn.request("GET", "/api/events" + query, headers={
+            "Origin": "https://external.example", "Authorization": authorization or basic_auth(),
+        })
+        self.sock = self.conn.sock
+        self.response = self.conn.getresponse()
+        self.headers = dict(self.response.getheaders())
+        self.thread = threading.Thread(target=self.read, daemon=True)
+        self.thread.start()
+
+    def read(self):
+        try:
+            while line := self.response.readline():
+                if line.startswith(b"data: "):
+                    self.frames.put((time.monotonic(), json.loads(line[6:])))
+                elif line.startswith(b":"):
+                    self.comments.put(line.decode().strip())
+        except (OSError, ValueError):
+            pass
+
+    def frame(self, timeout=3):
+        try:
+            return self.frames.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.thread.join(timeout=2)
+        self.response.close()
+        self.conn.close()
+
+
+def test_external_access(client, viewer):
+    print("cross-origin APIs, explicit authentication, and preflight")
+    for route in ["/api/state", "/api/events", "/api/providers", "/api/settings",
+                  "/play/missing/index.m3u8", "/restream/missing/live.m3u8",
+                  "/direct/missing", "/download/missing.mp4", "/source/missing",
+                  "/player_api.php", "/missing"]:
+        status, body, headers = client.request("OPTIONS", route, cookie=False, headers={
+            "Origin": "https://external.example", "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "authorization, content-type, x-custom-client, range",
+        })
+        check(f"preflight before auth: {route}", status == 204 and not body and
+              headers.get("Access-Control-Allow-Origin") == "*" and
+              "x-custom-client" in headers.get("Access-Control-Allow-Headers", "") and
+              "PUT" in headers.get("Access-Control-Allow-Methods", ""), str(headers))
+    for route, expected in [("/api/state", 401), ("/api/events", 401), ("/ping", 200),
+                            ("/app.js", 200), ("/missing", 404), ("/play/missing/index.m3u8", 404)]:
+        status, _, headers = client.request("GET", route, cookie=False,
+                                            headers={"Origin": "https://another.example"})
+        check(f"CORS on success/error: {route}", status == expected and
+              headers.get("Access-Control-Allow-Origin") == "*", f"{status} {headers}")
+        check(f"wildcard does not grant ambient credentials: {route}",
+              "Access-Control-Allow-Credentials" not in headers)
+    status, raw, headers = client.request("GET", "/api/state", cookie=False, headers={
+        "Authorization": basic_auth(), "Origin": "https://external.example"})
+    check("Basic auth reads state without cookies", status == 200 and "providers" in json.loads(raw))
+    check("Basic auth does not issue a cookie", "Set-Cookie" not in headers)
+    status, _, headers = client.request("POST", "/api/settings", body={"logsRefreshMs": 2100}, cookie=False,
+                                       headers={"Authorization": basic_auth()})
+    check("Basic admin can mutate settings", status == 200)
+    status, _, headers = client.request("POST", "/api/settings", body={"logsRefreshMs": 2000}, cookie=False,
+                                       headers={"Authorization": basic_auth(VIEWER_USER, VIEWER_PASS)})
+    check("Basic viewer mutations return readable 403", status == 403 and
+          headers.get("Access-Control-Allow-Origin") == "*")
+    for _ in range(7):
+        status, _, headers = client.request("GET", "/api/state", cookie=False,
+            headers={"Authorization": basic_auth("unknown-external", "incorrect")})
+    check("Basic failures are throttled", status == 429 and int(headers.get("Retry-After", 0)) > 0)
+    check("retry information is exposed to browsers", "Retry-After" in headers.get("Access-Control-Expose-Headers", ""))
+    status, _, _ = client.request("GET", "/api/state", headers={"Authorization": "Bearer playback-key"})
+    check("explicit playback authorization cannot fall back to admin cookies", status == 401)
+
+
+def test_refresh_and_events(client, viewer):
+    print("refresh settings and live SSE cadence")
+    defaults = {"eventsIntervalMs": 1000, "stateRefreshMs": 4000,
+                "logsRefreshMs": 2000, "activityRefreshMs": 1000}
+    client.request("POST", "/api/settings", body=defaults)
+    status, settings, _ = client.json("GET", "/api/settings")
+    check("all refresh defaults are visible", status == 200 and all(settings.get(k) == v for k, v in defaults.items()))
+    for key in defaults:
+        for value in [-1, 1, 99, 100.5, 3600001, "1000", None, True]:
+            status, _, _ = client.request("POST", "/api/settings", body={key: value, "stateRefreshMs": value if key == "stateRefreshMs" else 999})
+            check(f"invalid refresh rejected: {key}={value!r}", status == 400)
+    status, after, _ = client.json("GET", "/api/settings")
+    check("invalid settings cannot partially mutate live state", all(after.get(k) == v for k, v in defaults.items()))
+    check("invalid settings body is rejected", client.request("POST", "/api/settings", body=[])[0] == 400)
+    for value in ["", "-1", "99", "1.5", "3600001", "abc", "100ms", "%00", "%zz", "9" * 70]:
+        status, _, headers = client.request("GET", "/api/events?intervalMs=" + value)
+        check(f"invalid subscriber interval rejected: {value[:12]!r}", status == 400 and headers.get("Access-Control-Allow-Origin") == "*")
+    status, _, _ = viewer.request("POST", "/api/settings", body={"eventsIntervalMs": 0})
+    check("viewer cannot pause global events", status == 403)
+    client.request("POST", "/api/settings", body={"eventsIntervalMs": 0})
+    with EventStream(client.port, "?unrelated=1") as inherited, EventStream(client.port, "?intervalMs=200",
+            basic_auth(VIEWER_USER, VIEWER_PASS)) as custom, EventStream(client.port, "?intervalMs=0") as paused:
+        initial = inherited.frame()
+        check("paused default still sends initial metrics snapshot", initial is not None and
+              all(k in initial[1] for k in ["timestamp", "refresh", "streams", "global", "globalInput", "system", "connections"]))
+        check("SSE headers disable buffering and enable CORS", inherited.headers.get("Content-Type") == "text/event-stream" and
+              inherited.headers.get("X-Accel-Buffering") == "no" and inherited.headers.get("Access-Control-Allow-Origin") == "*")
+        check("explicit pause sends initial snapshot", paused.frame() is not None)
+        first, second, third = custom.frame(), custom.frame(), custom.frame()
+        check("subscriber override delivers periodic frames to viewers", first and second and third and
+              0.10 <= third[0] - second[0] <= 1.2, str((first and first[0], second and second[0], third and third[0])))
+        check("default pause suppresses periodic snapshots", inherited.frame(timeout=0.4) is None)
+        client.request("POST", "/api/settings", body={"eventsIntervalMs": 100})
+        check("changing saved interval resumes existing subscribers", inherited.frame() is not None)
+        check("explicit zero stays paused after default changes", paused.frame(timeout=0.4) is None)
+        client.request("POST", "/api/settings", body={"eventsIntervalMs": 3600000})
+        check("independent override survives global interval change", custom.frame() is not None)
+        # Paused and long-interval streams still keep reverse proxies alive.
+        try:
+            heartbeat = paused.comments.get(timeout=16)
+        except queue.Empty:
+            heartbeat = None
+        check("paused streams keep connection alive with comments", heartbeat == ": keepalive")
+    saved = {"eventsIntervalMs": 1250, "stateRefreshMs": 5000, "logsRefreshMs": 0, "activityRefreshMs": 750}
+    status, settings, _ = client.json("POST", "/api/settings", body=saved)
+    check("custom refresh settings accepted", status == 200 and all(settings.get(k) == v for k, v in saved.items()))
+    status, state, _ = client.json("GET", "/api/state")
+    check("state advertises effective refresh intervals", state.get("refresh") == saved)
 
 
 def test_health_and_gate(client):
@@ -414,8 +556,12 @@ def test_session_persistence(server, admin, viewer):
     saved_admin, saved_viewer = admin.cookie, viewer.cookie
     check("there is a session cookie to test with", bool(saved_admin))
 
+    _, saved_settings, _ = admin.json("GET", "/api/settings")
     server.stop()
     server.start()
+    _, restored_settings, _ = admin.json("GET", "/api/settings")
+    check("refresh settings survive restart", all(saved_settings[k] == restored_settings[k] for k in
+          ["eventsIntervalMs", "stateRefreshMs", "logsRefreshMs", "activityRefreshMs"]))
 
     status, body, _ = admin.json("GET", "/api/state")
     check("the admin is still signed in after a restart", status == 200 and "providers" in body, f"got {status}")
@@ -684,7 +830,8 @@ def test_hls_playback_routes(client, origin):
     if not key:
         return
 
-    status, payload, _ = client.request("GET", f"/play/{stream['id']}/index.m3u8?key={key}")
+    status, payload, cors_headers = client.request("GET", f"/play/{stream['id']}/index.m3u8?key={key}", headers={"Origin": "https://external.example"})
+    check("async playlist responses carry CORS", cors_headers.get("Access-Control-Allow-Origin") == "*")
     master = payload.decode(errors="replace")
     child = next((line for line in master.splitlines() if line and not line.startswith("#")), "")
     check("authenticated HLS master is served", status == 200 and child.startswith("/play/"), f"{status} {master}")
@@ -782,9 +929,11 @@ def main():
                 test_setup_and_cookie(admin)
                 test_state_permissions(workdir)
                 test_legacy_account_upgrade(workdir, admin)
-                test_login_throttle(port)
                 test_proxy_headers(admin)
                 viewer = test_viewer_role(admin, port)
+                test_external_access(admin, viewer)
+                test_refresh_and_events(admin, viewer)
+                test_login_throttle(port)
                 test_provider_routes(admin)
                 test_script_action_api(workdir, admin)
                 test_provider_webhooks(admin, webhook_sink)

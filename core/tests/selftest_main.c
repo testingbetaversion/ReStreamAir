@@ -605,12 +605,21 @@ static void test_ffargs_helpers(void) {
     size_t count = 0;
     check("ffargs/tokenize", rs_ffargs_tokenize("-f flv 'a b' \"c d\" e", &tokens, &count) == 0);
     check("ffargs/tokenize-count", count == 5);
+    check("ffargs/tokenize-argv-terminator", tokens && tokens[count] == NULL);
     if (count == 5) {
         check_str("ffargs/tokenize-0", tokens[0], "-f");
         check_str("ffargs/tokenize-2", tokens[2], "a b");
         check_str("ffargs/tokenize-3", tokens[3], "c d");
         check_str("ffargs/tokenize-4", tokens[4], "e");
     }
+    rs_free_strv(tokens, count);
+
+    tokens = NULL; count = 0;
+    check("ffargs/tokenize-long-command",
+          rs_ffargs_tokenize("program a b c d e f g h i j k l m n o p q r s",
+                            &tokens, &count) == 0);
+    check("ffargs/tokenize-long-command-count", count == 20);
+    check("ffargs/tokenize-long-command-terminator", tokens && tokens[count] == NULL);
     rs_free_strv(tokens, count);
 
     tokens = NULL; count = 0;

@@ -1,4 +1,4 @@
-const CACHE_NAME = "restreamair-shell-v47";
+const CACHE_NAME = "restreamair-shell-v48";
 const SHELL_FILES = [
   "/",
   "/app.js",
