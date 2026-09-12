@@ -115,7 +115,7 @@
             <label>Proxies<span class="field-hint">Default for every stream. Up to 16 HTTP or SOCKS5 proxies, one per line in fallback order.</span><textarea name="proxy" rows="3" placeholder="http://127.0.0.1:8888&#10;socks5h://127.0.0.1:1080"></textarea></label>
             <label>Error webhook<span class="field-hint">Optional Discord webhook URL. Errors from this provider's streams and scripts are sent with source URLs redacted.</span><input name="errorWebhookUrl" type="url" placeholder="https://discord.com/api/webhooks/…"></label>
             <div class="actions"><button id="testProviderWebhookBtn" type="button" class="ghost"><span data-icon="play"></span>Send test notification</button></div>
-            <label>Generic headers<span class="field-hint">Applied to all requests for all streams, one "Name: value" per line</span><textarea name="headers" placeholder="Authorization: Bearer TOKEN"></textarea></label>
+            <label>Additional HTTP headers (one per line)<span class="field-hint">Applied to this provider's manifest, media and key requests. Enter Name: value.</span><textarea name="headers" placeholder="Authorization: Bearer TOKEN"></textarea></label>
             <div class="form-row">
               <label>Downloader<span class="field-hint">Tool used to fetch this provider's manifests &amp; segments</span>
                 <select name="downloader">
@@ -129,8 +129,14 @@
             </div>
             <label class="check"><input name="forceIpv6" type="checkbox"> Force IPv6 for this provider's manifest and media requests<span class="field-hint">Fails instead of falling back to IPv4 when the origin or network has no working IPv6 path.</span></label>
             <label class="check"><input name="rotateProxies" type="checkbox"> Rotate healthy proxies<span class="field-hint">Checks every configured proxy through normal traffic, round-robins healthy entries, temporarily omits failures, and retries them automatically.</span></label>
-            <label class="check"><input name="inheritUrlParams" type="checkbox"> Append each stream's own Source URL query params to its segments</label>
+            <label class="check"><input name="inheritUrlParams" type="checkbox"> Use manifest URL params for segments<span class="field-hint">Append each stream's manifest query parameters to its segments, including parameters added by redirects.</span></label>
             <label id="segmentUrlParamsField">Segment URL params<span class="field-hint">Fixed fallback appended to every media/init segment URL when the option above is off, e.g. token=abc&amp;region=us</span><input name="segmentUrlParams" placeholder="token=abc&region=us"></label>
+
+            <details class="provider-options" id="providerOptionsSection">
+              <summary>Streaming options <span class="field-hint">Behaviour, requests, output and events</span></summary>
+              <p class="field-hint">These options apply only to this provider. Output overrides use 0 to keep each stream's settings. Restart running streams after changing playback options. Each option describes its supported pipeline and required inputs.</p>
+              <div id="providerOptionsFields"></div>
+            </details>
 
             <div class="field-group">
               <div class="field-group-title">Script provider <span class="field-hint">optional — a script handles login/session/manifest/keys instead of a fixed URL</span></div>
@@ -205,6 +211,7 @@
               <div id="cdnMirrorList" class="cdn-mirror-list"></div>
               <button type="button" id="addCdnMirrorBtn" class="ghost add-cdn-btn"><span data-icon="plus"></span>Add CDN mirror</button>
             </div>
+            <label class="check"><input name="autostart" type="checkbox"> Include in provider autostart<span class="field-hint">Eligible for the provider’s sequential or random start schedule, within the event’s start/end window.</span></label>
             <label class="check"><input name="directSource" type="checkbox"> Direct source — the play link 302-redirects players straight to the source URL (or its current CDN mirror) instead of proxying through the panel</label>
             <div id="representationPicker" class="representation-picker hidden"></div>
             <div class="form-row">
@@ -334,7 +341,7 @@
                 </label>
               </div>
               <label id="nm3u8dlreParamsField" class="hidden">N_m3u8DL-RE Params<span class="field-hint">Command-line arguments appended to the N_m3u8DL-RE execution</span><input name="nm3u8dlreParams"></label>
-              <label id="pipeCommandField" class="hidden">Program command<span class="field-hint">Executable plus quoted arguments. Its stdout is the media input. No shell is implied; use <code>/bin/sh -c '…'</code> explicitly for shell pipelines.</span><input name="pipeCommand" placeholder="streamlink --stdout https://example/live best"></label>
+              <label id="pipeCommandField" class="hidden">Program command<span class="field-hint">Executable plus quoted arguments. Blank uses the provider Pipe command. Its stdout is the media input. No shell is implied; use <code>/bin/sh -c '…'</code> explicitly for shell pipelines.</span><input name="pipeCommand" placeholder="streamlink --stdout https://example/live best"></label>
               <label id="outputTargetField" class="hidden">Output target<span class="field-hint" id="outputTargetHint"></span><input name="outputTarget"></label>
               <div id="ffmpegNotice" class="field-hint hidden"></div>
               <div id="ffmpegCapsNotice" class="field-hint warn hidden"></div>

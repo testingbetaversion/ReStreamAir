@@ -1,3 +1,4 @@
+#include "rs_source_policy.h"
 #ifndef RESTREAM_H
 #define RESTREAM_H
 
@@ -40,7 +41,7 @@ typedef int (*restream_pipeline_start_fn)(const char *stream_id,
                                           const char *const *producer_argv,
                                           const char *const *env_keys,
                                           const char *const *env_values,
-                                          size_t env_count);
+                                          size_t env_count, const rs_source_policy *policy);
 typedef void (*restream_pipeline_stop_fn)(const char *stream_id);
 typedef bool (*restream_pipeline_running_fn)(const char *stream_id);
 typedef void (*restream_pipeline_poll_fn)(void);
@@ -50,7 +51,7 @@ void restream_server_set_pipeline_handler(restream_pipeline_start_fn start,
                                           restream_pipeline_poll_fn poll);
 
 // Lets the app-owned process supervisor put diagnostics in the same per-stream
-// log ring as the internal live engine.
+// log ring as the internal live engine. Call on the server event-loop thread.
 void restream_server_log_external(restream_server_t *server, const char *stream_id,
                                   const char *level, const char *event,
                                   const char *message);
@@ -68,6 +69,9 @@ const char* restream_server_stored_bind(const restream_server_t* server);
 // false, the default once main sets it) or restores the full trace (true).
 void restream_server_set_verbose(bool verbose);
 
+typedef char *(*restream_epg_fn)(const char *xml, size_t len, int offset_minutes, char *err, size_t errlen);
+void restream_server_set_epg_handler(restream_epg_fn handler);
+
 // A source-probe handler: given a source URL (with optional proxy and
 // newline-separated "Name: value" headers), it fetches and inspects the source
 // and returns a malloc'd JSON string (freed with rs_free) describing its
@@ -78,7 +82,7 @@ void restream_server_set_verbose(bool verbose);
 // libraries. When no handler is registered, /api/probe returns 501.
 typedef char *(*restream_probe_fn)(const char *url, const char *proxy, const char *headers,
                                    int force_ipv6, int rotate_proxies,
-                                   char *errbuf, size_t errbuf_len);
+                                   char *errbuf, size_t errbuf_len, const rs_source_policy *policy);
 void restream_server_set_probe_handler(restream_probe_fn handler);
 
 // A URL fetch handler, used by the playback routes to pull remote playlists and
@@ -107,7 +111,7 @@ typedef int (*restream_fetch_fn)(const char *url, const char *proxy, const char 
                                  char **out, size_t *out_len,
                                  long *status, char **content_type, char **content_range,
                                  char **effective_url, char *errbuf, size_t errbuf_len,
-                                 long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx);
+                                 long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx, const rs_source_policy *policy);
 void restream_server_set_fetch_handler(restream_fetch_fn handler);
 
 // JSON POST handler used by provider error webhooks. Delivery is performed on
@@ -135,7 +139,7 @@ typedef char *(*restream_dash_fn)(const char *url, const char *proxy, const char
                                   int force_ipv6, int rotate_proxies,
                                   const char *rep, int want,
                                   const char *segment_url_params, int inherit_url_params,
-                                  char *errbuf, size_t errbuf_len);
+                                  char *errbuf, size_t errbuf_len, const rs_source_policy *policy);
 void restream_server_set_dash_handler(restream_dash_fn handler);
 
 // Start the server. Non-blocking: the caller drives it with

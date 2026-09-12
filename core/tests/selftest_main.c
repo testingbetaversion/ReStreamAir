@@ -31,6 +31,7 @@
 #include "rs_metrics.h"
 #include "rs_netmatch.h"
 #include "rs_panel.h"
+#include "rs_provider_options.h"
 #include "rs_proc.h"
 #include "rs_state.h"
 #include "rs_thread.h"
@@ -1143,6 +1144,93 @@ static void test_cdm_pssh(void) {
     pairs = rs_cdm_parse_key_output("the script printed a traceback");
     check_str("cdm/keys-none", pairs ? pairs : "x", "");
     rs_free(pairs);
+}
+
+static void test_provider_options(void) {
+    const char *err = NULL;
+    rs_state st = {0};
+    st.root = parse_json("{\"providers\":[]}");
+    rs_json *body = parse_json("{\"name\":\"Options\",\"options\":{\"userAgent\":\"Test/2\",\"xForwardedFor\":\"192.0.2.4\",\"maxStreamsConcurrency\":1,\"maxEventsCount\":1,\"hlsFragmentDurationSeconds\":4,\"hlsPlaylistDurationSeconds\":15}}");
+    check("options/create", rs_panel_create_provider(&st, body, &err) == 0);
+    rs_json_free(body);
+    const rs_json *provider = rs_json_arr_at(rs_json_obj_get(st.root, "providers"), 0);
+    const char *pid = rs_json_obj_str(provider, "id", "");
+    rs_json *stream = parse_json("{\"playlistSegments\":6,\"hlsSegmentSeconds\":10}");
+    check("options/duration-rounds-up", rs_provider_playlist_segments(provider, stream) == 4);
+    check("options/fragment-override", rs_provider_segment_seconds(provider, stream) == 4);
+    check("options/legacy-playlist", rs_provider_playlist_segments(NULL, stream) == 6);
+    check("options/legacy-fragments", rs_provider_segment_seconds(NULL, stream) == 10);
+    char *headers = rs_provider_headers(provider);
+    check("options/dedicated-headers", strstr(headers, "User-Agent: Test/2") && strstr(headers, "X-Forwarded-For: 192.0.2.4"));
+    free(headers);
+
+    body = parse_json("{\"name\":\"Options\",\"headers\":\"user-agent: Custom/3\",\"options\":{\"outputFragmentsCount\":8}}");
+    check("options/partial-save", rs_panel_update_provider(&st, pid, body, &err) == 0);
+    rs_json_free(body);
+    check("options/count-precedes-duration", rs_provider_playlist_segments(provider, stream) == 8);
+    check_str("options/omitted-preserved", rs_provider_option_str(provider, "userAgent"), "Test/2");
+    headers = rs_provider_headers(provider);
+    check("options/generic-header-precedence", strstr(headers, "user-agent: Custom/3") && !strstr(headers, "Test/2"));
+    free(headers);
+    rs_json_free(stream);
+
+    rs_json *view = rs_panel_view(&st, "localhost");
+    const rs_json *schema = rs_json_obj_get(view, "providerOptionFields");
+    check("options/screenshot-fields", rs_json_arr_len(schema) == 41);
+    rs_json *defaults = rs_provider_options_merge(NULL, NULL);
+    check("options/defaults-valid", rs_provider_options_valid(defaults, &err));
+    rs_json_free(defaults);
+    rs_json_free(view);
+    const char *invalid[] = {"[]", "null", "{\"scriptTimeoutSeconds\":0}", "{\"playbackDelaySeconds\":121}",
+        "{\"outputFragmentsCount\":2}", "{\"maxStreamsConcurrency\":-1}", "{\"scriptTimeoutSeconds\":1.5}",
+        "{\"noRestartOnError\":1}", "{\"userAgent\":\"bad\\r\\nInjected: yes\"}"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        rs_json *v = parse_json(invalid[i]);
+        check("options/reject-invalid", !rs_provider_options_valid(v, &err));
+        rs_json_free(v);
+    }
+    body = parse_json("{\"name\":\"Should not change\",\"options\":{\"outputFragmentsCount\":2}}");
+    check("options/reject-before-mutation", rs_panel_update_provider(&st, pid, body, &err) == -400);
+    check_str("options/name-not-mutated", rs_json_obj_str(provider, "name", ""), "Options");
+    rs_json_free(body);
+
+    rs_json *exported = rs_panel_export_provider(&st, pid);
+    char *imported_id = NULL;
+    check("options/export-import", rs_panel_import_provider(&st, exported, "", &imported_id, &err) == 0);
+    const rs_json *copy = rs_json_arr_at(rs_json_obj_get(st.root, "providers"), 1);
+    check_str("options/exported-agent", rs_provider_option_str(copy, "userAgent"), "Test/2");
+    check("options/exported-count", rs_provider_option_int(copy, "outputFragmentsCount") == 8);
+    free(imported_id);
+    rs_json_free(exported);
+
+    const char *sid[2];
+    for (int i = 0; i < 2; i++) {
+        body = parse_json("{\"name\":\"Channel\",\"kind\":\"m3u8\",\"url\":\"http://example.test/live.m3u8\"}");
+        check("options/add-stream", rs_panel_create_stream(&st, pid, body, &err) == 0);
+        rs_json_free(body);
+        sid[i] = rs_json_obj_str(rs_json_arr_at(rs_json_obj_get(provider, "streams"), (size_t)i), "id", "");
+    }
+    check("options/first-start", rs_panel_set_stream_running(&st, sid[0], true, &err) == 0);
+    check("options/idempotent-start", rs_panel_set_stream_running(&st, sid[0], true, &err) == 0);
+    check("options/limit-enforced", rs_panel_set_stream_running(&st, sid[1], true, &err) == -409);
+    check("options/stop-releases-slot", rs_panel_set_stream_running(&st, sid[0], false, &err) == 0 &&
+          rs_panel_set_stream_running(&st, sid[1], true, &err) == 0);
+    body = parse_json("{\"Events\":[{}, {\"Name\":\"Event one\"}, {\"Name\":\"Event two\"}]}");
+    int count = 0;
+    check("options/event-cap", rs_panel_import_script_entries(&st, pid, "events", body, NULL, &count, &err) == 0 && count == 1);
+    check("options/reimport-preserves-id", rs_panel_import_script_entries(&st, pid, "events", body, NULL, &count, &err) == 0 &&
+          rs_json_arr_len(rs_json_obj_get(provider, "streams")) == 3);
+    rs_json_free(body);
+    body = parse_json("{\"name\":\"Options\",\"options\":{\"pipeCommand\":\"cat\"}}");
+    check("options/provider-pipe-save", rs_panel_update_provider(&st, pid, body, &err) == 0);
+    rs_json_free(body);
+    body = parse_json("{\"name\":\"Provider pipe\",\"inputMode\":\"pipe\",\"pipeCommand\":\"\"}");
+    check("options/provider-pipe-create", rs_panel_create_stream(&st, pid, body, &err) == 0);
+    const rs_json *pipe_stream = rs_json_arr_at(rs_json_obj_get(provider, "streams"), 3);
+    char *pipe_id = rs_strdup(rs_json_obj_str(pipe_stream, "id", ""));
+    check("options/provider-pipe-update", rs_panel_update_stream(&st, pipe_id, body, &err) == 0);
+    free(pipe_id); rs_json_free(body);
+    rs_json_free(st.root);
 }
 
 static void test_panel(void) {
@@ -2420,6 +2508,7 @@ int main(int argc, char **argv) {
     test_netmatch();
     test_state_repeated_save();
     test_panel();
+    test_provider_options();
     test_cdm_pssh();
     test_cenc_multifragment();
     test_mpegts();

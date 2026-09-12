@@ -282,7 +282,7 @@ static bool path_ends_with(const char *url, const char *suffix) {
 
 char *rs_probe_source(const char *url, const char *proxy, const char *headers,
                       int force_ipv6, int rotate_proxies,
-                      char *errbuf, size_t errbuf_len) {
+                      char *errbuf, size_t errbuf_len, const rs_source_policy *policy) {
     if (!url || !url[0]) { snprintf(errbuf, errbuf_len, "A source URL is required."); return NULL; }
     if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
         snprintf(errbuf, errbuf_len, "The source URL must be http or https.");
@@ -292,7 +292,7 @@ char *rs_probe_source(const char *url, const char *proxy, const char *headers,
     char *data = NULL;
     size_t len = 0;
     if (rs_fetch_url(url, proxy, headers, NULL, NULL, NULL, force_ipv6, rotate_proxies, &data, &len,
-                     NULL, NULL, NULL, NULL, errbuf, errbuf_len, 30000, NULL, NULL) != 0)
+                     NULL, NULL, NULL, NULL, errbuf, errbuf_len, 30000, NULL, NULL, policy) != 0)
         return NULL;
 
     char *result = NULL;

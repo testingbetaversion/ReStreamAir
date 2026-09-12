@@ -279,7 +279,7 @@ level, text and date filtering are client-side. See [log schema](EVENTS.md#logs)
 
 Provider PUT requires `name`. Most omitted fields reset to these defaults;
 merge your edits into the provider object from state to retain other settings.
-`logo` and `scriptActions` are preserved when omitted. `streams` and computed
+`logo` and `scriptActions` are preserved when omitted. The nested `options` object merges supplied fields and preserves omitted fields. `streams` and computed
 `scriptSessionDir` are not writable through provider PUT.
 
 | Editable fields | Type / default / purpose |
@@ -296,6 +296,64 @@ merge your edits into the provider object from state to retain other settings.
 | `activeScriptAccountId` | String `""`. Unknown ID falls back to first account ID. |
 | `accountSelectionMode` | `fixed` (default), `rotate`, `random`. |
 | `scriptActions` | String array. New providers default to `login`, `pair`, `channels`, `events`. Empty/absent provider action lists use those legacy defaults. |
+
+Provider **Streaming options** are saved in `options` on create/PUT and included
+in provider export/import. `GET /api/state` also returns `providerOptionFields`,
+with each field's label, group, type, default, bounds, hint and `inactive` reason.
+Invalid types, out-of-range or fractional numbers, and multiline text return
+`400` before changing the provider. Single-line text is limited to 4096 characters.
+Restart running streams after changing playback options. Request headers and
+script timeouts apply to subsequent requests/actions.
+
+| Active option | Behaviour |
+|---|---|
+| `userAgent`, `xForwardedFor` | Dedicated upstream headers; blank uses downloader defaults. Matching generic `headers` entries take precedence. |
+| `scriptTimeoutSeconds` | Each manual or playback script action, 1–3600 seconds; default 30. |
+| `pipeCommand` | Fallback when a Program pipe stream has no command of its own. |
+| `hlsFragmentDurationSeconds` | Internal DASH / FFmpeg HLS output target, 1–30 seconds; 0 keeps stream settings. |
+| `hlsPlaylistDurationSeconds` | Converts target duration to output fragment count, rounded up and bounded to 3–240; 0 keeps stream settings. |
+| `outputFragmentsCount` | Output window of 3–240 fragments; nonzero overrides playlist duration. 0 uses duration or stream settings. |
+| `playbackDelaySeconds` | Internal DASH playout delay, 1–120 seconds; 0 keeps stream settings. |
+| `dontWaitForFullPlaylist` | Internal DASH can publish after one complete, released segment. Default false. |
+| `maxStreamsConcurrency` | Maximum streams marked running under this provider; excess starts return `409`. 0 = unlimited. Existing running streams are retained when lowering the cap. |
+| `maxEventsCount` | Maximum valid events processed per Load events import. 0 = unlimited; existing events beyond the cap are retained. |
+
+HLS output overrides apply to generated output. All provider controls have
+backend behavior; pipeline-specific controls identify their scope in the schema.
+
+| Additional option | Behaviour |
+|---|---|
+| `alwaysResetSession` | Clears an idle provider's stored session before login or its first stream start. Concurrent streams retain their shared active session. |
+| `useSessionCookies` | Uses the provider script cookie jar for upstream requests, with serialized built-in HTTP requests to protect the jar. |
+| `httpGetTimeoutSeconds`, `httpGetAttempts` | Per-attempt timeout and attempt limit for manifest/media/probe downloaders. Permanent 4xx responses are not retried, except 408/429. FFmpeg receives the socket timeout and uses its own reconnect policy. |
+| `maxDownloadConcurrency` | Shared provider budget for manifest/media/probe downloaders; FFmpeg owns its internal connections. |
+| `detectJsonRedirect` | Follows recognized HTTP(S) JSON URL fields at the root or under `data`, at most five hops. Relative playlist paths resolve against the final URL. |
+| `defaultCdn` | Selects `Name`/`name` from the manifest script's `Cdn` list. An unmatched configured name fails visibly. |
+| `defaultVideo`, `defaultAudio` | Internal DASH ordered comma-separated preferences: `best`, `worst`, `id=ID`, `lang=ur`, `codec=avc`, `height<=720`, `bandwidth<=2000000`. Explicit stream selections win. |
+| `legacyDashParser` | Internal DASH XML recovery mode; default parsing is strict. |
+| `useDashDelay` | Honors MPD `suggestedPresentationDelay`, bounded to 120s, taking the larger of the source delay and stream/provider buffer. |
+| `ignoreDashStaticFlag` | Continues polling a static MPD. Otherwise a drained static source publishes ENDLIST. |
+| `noRestartOnError`, `restartFinishedBroadcast` | Controls DASH/FFmpeg recovery after an error or completion. Finished DASH buffers drain before restarting. Finished FFmpeg output remains available. |
+| `noRestartOnTrackChange` | Switches discovered DASH tracks in place. When false, changing selected IDs schedules a clean restart. |
+| `stalledStreamTimeoutSeconds` | DASH/FFmpeg recovery when new media/output timestamps stop advancing. |
+| `restartDelaySeconds`, `coolDownAutoRestart` | Base restart delay; optional exponential cooldown for repeated failures, capped at 300s or the configured delay when larger. Healthy operation clears the failure count. |
+| `retryNewManifestCount` | Additional fresh DASH reads per failed poll. Every configured CDN mirror still gets a chance. |
+| `offAirFallback`, `offAirFallbackUrl` | Internal DASH switches to a configured clear, publicly reachable fallback MPD on failure/completion. Source headers, cookies, keys and track selections are not sent to the fallback. Manual/timed restart returns to the primary. Enabling fallback requires its URL. |
+| `autoRefreshEvents`, `eventsRefreshSeconds` | Background events-script imports on the server timer, waiting while other provider script jobs are active. Requires a script and declared events action. |
+| `autoRemoveMissingChannels` | Successful imports stop/delete missing imported channels; manually added streams remain. |
+| `autoRemoveFinishedEvents` | Stops/deletes imported events at their epoch `End`; no end means retain. |
+| `reuseEventIndex` | Reuses an ended, stopped event's public ID for a new event, clearing its old source and keys. Matching names retain identity. |
+| `autoRestartPeriodSeconds` | Periodically restarts running streams, with the configured restart delay. Zero disables. |
+| `sequentialAutostartPeriodSeconds`, `randomAutostartPeriodSeconds` | Starts one eligible stopped stream each interval in provider order or randomly. Requires stream `autostart: true`, respects event windows and provider concurrency. Zero disables. |
+| `epgTimezone` | Re-expresses full XMLTV programme start/stop timestamps in UTC or fixed offsets such as `UTC+05:00`. Blank preserves input, partial timestamps remain unchanged. IANA names are rejected. |
+
+Schedules run without an open panel. Explicit Stop cancels a pending delayed
+restart or script start. Timed autostart can select the stream again if its
+`autostart` flag remains enabled. Provider settings apply on the next stream start;
+request-driven HLS and probes snapshot the latest request policy. Include
+`providerId` in `/api/probe` to apply that provider's policy.
+
+Existing `headers` and `inheritUrlParams` remain separate provider fields.
 
 Export is `{"restreamairExport":1,"provider":{…},"streams":[…],"scriptFile":{…}}`.
 `scriptFile` is optional and has `filename` and `contentBase64`; it is included

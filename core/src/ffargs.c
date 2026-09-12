@@ -140,6 +140,9 @@ int rs_ffargs_tokenize(const char *text, char ***tokens, size_t *count) {
         rs_strv_dispose(&out);
         return -1;
     }
+    // Program-pipe startup passes this array to the process supervisor as
+    // argv. rs_strv reserves the terminator slot but does not initialise it.
+    if (out.items) out.items[out.len] = NULL;
     *tokens = out.items;
     *count = out.len;
     return 0;
@@ -260,23 +263,30 @@ int rs_ffargs_build(const rs_ffargs_inputs *in, rs_ffargs_command *out) {
     rs_strv_push(&args, "warning");
     rs_strv_push(&args, "-nostdin");
     rs_strv_push(&args, "-y");
+    if (in->report_progress) {
+        rs_strv_push(&args, "-progress");
+        rs_strv_push(&args, "pipe:2");
+        rs_strv_push(&args, "-nostats");
+    }
 
     // Input options, which must precede -i.
     const char *source = or_empty(in->source_url);
     bool pipe_input = str_equal(in->input_mode, "pipe");
     if (!pipe_input && strncmp(source, "http", 4) == 0) {
         // Survive routine live-edge network blips instead of exiting.
-        rs_strv_push(&args, "-reconnect");
-        rs_strv_push(&args, "1");
-        rs_strv_push(&args, "-reconnect_streamed");
-        rs_strv_push(&args, "1");
-        rs_strv_push(&args, "-reconnect_on_network_error");
-        rs_strv_push(&args, "1");
-        rs_strv_push(&args, "-reconnect_delay_max");
-        rs_strv_push(&args, "2");
+        if (!in->no_reconnect) {
+            rs_strv_push(&args, "-reconnect");
+            rs_strv_push(&args, "1");
+            rs_strv_push(&args, "-reconnect_streamed");
+            rs_strv_push(&args, "1");
+            rs_strv_push(&args, "-reconnect_on_network_error");
+            rs_strv_push(&args, "1");
+            rs_strv_push(&args, "-reconnect_delay_max");
+            rs_strv_push(&args, "2");
+        }
         // Microseconds; guards a wedged socket at the live edge.
         rs_strv_push(&args, "-rw_timeout");
-        rs_strv_push(&args, "15000000");
+        rs_strv_pushf(&args, "%lld", (long long)(in->http_timeout_seconds > 0 ? in->http_timeout_seconds : 15) * 1000000);
     }
     char *block = pipe_input ? NULL : rs_ffargs_header_block(in->headers);
     if (block) {

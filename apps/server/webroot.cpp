@@ -208,7 +208,7 @@ bool fetch(const std::string &url, const char *accept, size_t limit,
     std::string headers = accept ? std::string("Accept: ") + accept : std::string();
     int rc = rs_fetch_url(url.c_str(), nullptr, headers.empty() ? nullptr : headers.c_str(),
                           nullptr, nullptr, nullptr, 0, 0, &out, &len, &status, nullptr, nullptr,
-                          nullptr, errbuf, sizeof(errbuf), kTimeoutMs, nullptr, nullptr);
+                          nullptr, errbuf, sizeof(errbuf), kTimeoutMs, nullptr, nullptr, nullptr);
     if (rc != 0) {
         err = errbuf[0] ? errbuf : "request failed";
         std::free(out);

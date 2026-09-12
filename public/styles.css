@@ -1707,3 +1707,23 @@ pre {
 
 /* Settings note shown when the saved port differs from the one in use. */
 .field-hint.warn { color: #d98b3a; }
+
+
+/* Provider streaming options keep their explanations readable in the dialog. */
+#providerSettingsForm, #providerSettingsForm > .field-group { min-width: 0; grid-template-columns: minmax(0, 1fr); }
+.provider-options { min-width: 0; border: 1px solid var(--line-strong); border-radius: var(--radius-md); padding: 16px; }
+.provider-options > summary { cursor: pointer; font-weight: 600; }
+.provider-options > summary .field-hint { display: inline; margin-left: 8px; font-weight: 400; }
+.provider-options > p { margin: 14px 0; }
+.provider-options-group { min-width: 0; margin: 16px 0 0; padding: 14px 0 0; border: 0; border-top: 1px solid var(--line-strong); }
+.provider-options-group legend { padding: 0 10px 0 0; font-weight: 600; }
+.provider-options-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 24px; }
+.provider-options-grid label { min-width: 0; align-content: start; }
+.provider-options-grid input:not([type="checkbox"]) { width: 100%; min-width: 0; }
+.provider-options-grid .check { flex-wrap: wrap; align-items: flex-start; }
+.provider-options-grid .check .field-hint { flex-basis: 100%; margin-left: 24px; }
+.provider-option-inactive .inactive-badge { align-self: flex-start; justify-self: start; }
+@media (max-width: 620px) {
+  .provider-options-grid { grid-template-columns: minmax(0, 1fr); }
+  .provider-options > summary .field-hint { display: block; margin: 4px 0 0; }
+}

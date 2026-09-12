@@ -1,3 +1,4 @@
+#include "rs_source_policy.h"
 #ifndef RS_LIVE_H
 #define RS_LIVE_H
 
@@ -82,14 +83,14 @@ typedef int (*rs_live_fetch_fn)(const char *url, const char *proxy, const char *
                                 char **out, size_t *out_len, long *status,
                                 char **content_type, char **content_range,
                                 char **effective_url, char *errbuf, size_t errbuf_len,
-                                long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx);
+                                long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx, const rs_source_policy *policy);
 
 typedef char *(*rs_live_dash_fn)(const char *url, const char *proxy, const char *headers,
                                  const char *downloader, const char *dl_params,
                                  int force_ipv6, int rotate_proxies,
                                  const char *rep, int want,
                                  const char *segment_url_params, int inherit_url_params,
-                                 char *errbuf, size_t errbuf_len);
+                                 char *errbuf, size_t errbuf_len, const rs_source_policy *policy);
 
 // Log sink. Called from worker threads, so the implementation must be
 // thread-safe. `url`/`message` may be NULL; status 0 and bytes -1 mean absent.
@@ -100,6 +101,7 @@ typedef void (*rs_live_log_fn)(void *ctx, const char *stream_id, const char *lev
 // A snapshot of one stream's playback settings. Strings are copied; NULL is
 // treated as "". One of these is built per stream from its stored settings.
 typedef struct {
+    rs_source_policy source_policy;
     const char *mpd_url;
     // Fallback sources carrying the same content on other CDNs, tried in order
     // when the primary manifest stops answering. The panel has always collected
@@ -132,6 +134,7 @@ typedef struct {
     // is one manifest reader per stream, so this is about request rate, not
     // concurrency.
     int reduced_manifest_polling;
+    int dont_wait_for_full_playlist; // publish after one complete segment
     int playlist_segments;          // advertised window (default 6)
     int hls_segment_seconds;        // output fragment group duration (default 10)
     int keep_segments;              // segments held in memory (default 60)
@@ -250,6 +253,9 @@ void rs_live_stop(rs_live *live, const char *stream_id);
 
 // True while an engine for `stream_id` exists and has not been asked to stop.
 bool rs_live_is_running(rs_live *live, const char *stream_id);
+
+// Lifecycle observation: 0 healthy, 1 error/stall, 2 finished and drained, 3 tracks changed.
+int rs_live_condition(rs_live *live, const char *stream_id);
 
 // Joins and frees engines whose threads have exited. Cheap; call it from the
 // server's one-second timer.

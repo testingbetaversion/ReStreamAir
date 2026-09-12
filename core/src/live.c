@@ -393,6 +393,7 @@ typedef struct {
     int index;             // slot in owner->reps, used as the public URL token
 
     // No poller thread: manifest reads are the director's, once per stream.
+    bool selected;         // referenced by the current master
     bool broken;           // its writer never started; skip it everywhere
 
     // --- the pending queue --------------------------------------------------
@@ -515,6 +516,8 @@ typedef struct live_stream {
     size_t ndl;
     size_t dl_cursor;      // round-robin start point, so no rendition starves
     int prioritize_oldest;
+    rs_source_policy source_policy;
+    int dont_wait_for_full_playlist;
     int playback_delay_seconds, audio_delay_ms;
     double poll_interval;
 
@@ -524,6 +527,11 @@ typedef struct live_stream {
     // catch-up policy still shows up as bandwidth spent — it was. Guarded by
     // `mu`; the download threads add to it as they finish.
     long long ingest_bytes;
+    double last_media_progress, finished_at;
+    int terminal; // 1 error, 2 finished broadcast, 3 track change
+    bool static_complete;
+    int dash_delay;
+    char *last_video, *last_audio;
 
     pthread_t dir_thread;
     bool dir_started, dir_finished;
@@ -562,6 +570,8 @@ typedef struct {
     int playlist_segments, hls_segment_seconds, keep_segments, download_ahead;
     int parallel_downloads;
     int prioritize_oldest;
+    rs_source_policy source_policy;
+    int dont_wait_for_full_playlist;
     int playback_delay_seconds, audio_delay_ms;
     double poll_interval;
 } cfg_snap;
@@ -624,6 +634,8 @@ static void cfg_snapshot_locked(const live_stream *st, cfg_snap *out) {
     out->download_ahead = st->download_ahead;
     out->parallel_downloads = st->parallel_downloads;
     out->prioritize_oldest = st->prioritize_oldest;
+    out->source_policy = st->source_policy;
+    out->dont_wait_for_full_playlist = st->dont_wait_for_full_playlist;
     out->playback_delay_seconds = st->playback_delay_seconds;
     out->audio_delay_ms = st->audio_delay_ms;
     out->poll_interval = st->poll_interval;
@@ -959,7 +971,7 @@ static void *download_main(void *arg) {
             int rc = st->mgr->fetch(url, cfg.media_proxy, cfg.media_headers, NULL,
                                     cfg.downloader, cfg.dl_params, cfg.force_ipv6, cfg.rotate_proxies,
                                     &body, &blen, &status, NULL, NULL, NULL, err, sizeof(err),
-                                    media_timeout_ms(duration), download_should_cancel, &cancel);
+                                    media_timeout_ms(duration), download_should_cancel, &cancel, &cfg.source_policy);
             free(url);
             attempts = attempt + 1;
             // Every attempt that put bytes on the wire counts, including the
@@ -1151,7 +1163,7 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
     int rc = st->mgr->fetch(init_url, cfg->media_proxy, cfg->media_headers, NULL,
                             cfg->downloader, cfg->dl_params, cfg->force_ipv6, cfg->rotate_proxies,
                             &body, &len, &status, NULL, NULL, NULL, err, sizeof(err),
-                            30000, NULL, NULL);
+                            30000, NULL, NULL, &cfg->source_policy);
     ingest_record(st, len);
     if (rc != 0 || !body) {
         free(body);
@@ -1260,7 +1272,7 @@ static char *manifest_fetch(live_stream *st, const cfg_snap *cfg, const char *re
 
     // Enough attempts to retry a flaky source and still give every mirror a
     // turn, so a dead primary cannot hide a working mirror behind the retries.
-    size_t tries = RS_LIVE_MANIFEST_TRIES;
+    size_t tries = (size_t)cfg->source_policy.manifest_retries + 1;
     if (cfg->nsources > tries) tries = cfg->nsources;
 
     for (size_t attempt = 0; attempt < tries; attempt++) {
@@ -1271,7 +1283,7 @@ static char *manifest_fetch(live_stream *st, const cfg_snap *cfg, const char *re
                                    cfg->downloader, cfg->dl_params,
                                    cfg->force_ipv6, cfg->rotate_proxies, rep_id, want,
                                    cfg->segment_url_params, cfg->inherit_url_params,
-                                   err, errlen);
+                                   err, errlen, &cfg->source_policy);
         if (json) {
             // Stick to whatever answered, and say so when it is not the primary.
             pthread_mutex_lock(&st->mu);
@@ -1664,6 +1676,7 @@ static void commit_one(live_rep *rep, const cfg_snap *cfg, pend_item *it,
     }
 
     pthread_mutex_lock(&st->mu);
+    st->last_media_progress = now_seconds();
     bool was_disc = false;
     double gap = 0;
     rep_append_locked(rep, cfg, it->url, data, len,
@@ -1994,7 +2007,7 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
     // With a clocked cushion, the first finished segment is already safely
     // behind live and can be advertised immediately; waiting for three full
     // ten-second groups on top of the cushion made Start look like a failure.
-    int startup_segments = cfg->playback_delay_seconds > 0
+    int startup_segments = rep->owner->static_complete || cfg->dont_wait_for_full_playlist || cfg->playback_delay_seconds > 0
                                ? 1 : (cfg->playlist_segments < 3 ? cfg->playlist_segments : 3);
     if (released < startup_segments) return NULL;
 
@@ -2081,6 +2094,7 @@ static char *rep_render_locked(live_rep *rep, const cfg_snap *cfg) {
         sb_addf(&b, "#EXTINF:%.3f,\n/restream/%s/%d_%lld.%s\n",
                 s->duration, rep->owner->id, rep->index, s->seq, ext);
     }
+    if (rep->owner->static_complete && released == complete) sb_add(&b, "#EXT-X-ENDLIST\n");
     return b.p;
 }
 
@@ -2140,12 +2154,14 @@ static live_rep *rep_find_locked(live_stream *st, const char *rep_id) {
 // Caller holds st->mu.
 static void rep_ensure_locked(live_stream *st, const char *rep_id, const char *kind) {
     if (!rep_id || !rep_id[0]) return;
-    if (rep_find_locked(st, rep_id)) return;
+    live_rep *existing = rep_find_locked(st, rep_id);
+    if (existing) { existing->selected = true; return; }
     if (st->nreps >= RS_LIVE_MAX_REPS) return;
 
     live_rep *rep = (live_rep *)calloc(1, sizeof(*rep));
     if (!rep) return;
     rep->owner = st;
+    rep->selected = true;
     rep->rep_id = rs_strdup(rep_id);
     rep->kind = rs_strdup(kind && kind[0] ? kind : "video");
     rep->iv_size = 8;
@@ -2221,6 +2237,10 @@ static void *director_main(void *arg) {
 
     for (;;) {
         if (live_stopping(st)) break;
+        pthread_mutex_lock(&st->mu);
+        bool complete = st->static_complete || st->terminal;
+        pthread_mutex_unlock(&st->mu);
+        if (complete) { if (!live_wait(st, 1.0)) break; continue; }
         double cycle_start = now_seconds();
 
         cfg_snap cfg;
@@ -2245,7 +2265,7 @@ static void *director_main(void *arg) {
         size_t npolled = 0;
         pthread_mutex_lock(&st->mu);
         for (size_t r = 0; r < st->nreps; r++)
-            if (!st->reps[r]->broken) polled[npolled++] = st->reps[r];
+            if (st->reps[r]->selected && !st->reps[r]->broken) polled[npolled++] = st->reps[r];
         size_t reps_before = st->nreps;
         pthread_mutex_unlock(&st->mu);
 
@@ -2270,6 +2290,7 @@ static void *director_main(void *arg) {
         char err[256] = {0};
         char *json = manifest_fetch(st, &cfg, ids, want, err, sizeof(err));
         if (!json) {
+            pthread_mutex_lock(&st->mu); st->terminal = 1; pthread_mutex_unlock(&st->mu);
             fails++;
             throttled = rs_live_status_is_throttle(status_from_error(err)) != 0;
             double wait = director_retry_delay(fails, throttled);
@@ -2284,6 +2305,7 @@ static void *director_main(void *arg) {
         rs_json *root = rs_json_parse(json, strlen(json));
         free(json);
         if (!root) {
+            pthread_mutex_lock(&st->mu); st->terminal = 1; pthread_mutex_unlock(&st->mu);
             fails++;
             throttled = false;
             double wait = director_retry_delay(fails, throttled);
@@ -2305,7 +2327,19 @@ static void *director_main(void *arg) {
         bool have_audio = audio && rs_json_type_of(audio) == RS_JSON_OBJ;
         bool have_text = text && rs_json_type_of(text) == RS_JSON_OBJ;
         size_t ncc = (cc && rs_json_type_of(cc) == RS_JSON_ARR) ? rs_json_arr_len(cc) : 0;
-        bool dynamic = rs_json_as_bool(rs_json_obj_get(root, "dynamic"), true);
+        bool dynamic = cfg.source_policy.ignore_static || rs_json_as_bool(rs_json_obj_get(root, "dynamic"), true);
+        if (cfg.source_policy.use_dash_delay) {
+            double delay = rs_json_obj_num(root, "suggestedDelay", 0);
+            int seconds = delay <= 0 ? 0 : delay >= 120 ? 120 : (int)(delay + 0.999);
+            pthread_mutex_lock(&st->mu);
+            st->dash_delay = seconds;
+            if (st->playback_delay_seconds < seconds) st->playback_delay_seconds = seconds;
+            cfg.playback_delay_seconds = st->playback_delay_seconds;
+            int retain = st->playlist_segments + (st->playback_delay_seconds + st->hls_segment_seconds - 1) / st->hls_segment_seconds + 8;
+            if (retain > st->keep_segments) st->keep_segments = retain > 240 ? 240 : retain;
+            cfg.keep_segments = st->keep_segments;
+            pthread_mutex_unlock(&st->mu);
+        }
 
         // A pinned representation overrides the auto-selected video rendition;
         // the audio and subtitle renditions are still picked up so the master
@@ -2337,12 +2371,24 @@ static void *director_main(void *arg) {
         }
 
         if (!vid[0]) {
-            lg(st, "error", "renditions", cfg.mpd_url, 0, -1, "no video representation in the MPD");
+            pthread_mutex_lock(&st->mu); st->terminal = 1; pthread_mutex_unlock(&st->mu);
+            lg(st, "error", "renditions", cfg.mpd_url, 0, -1, "no video representation matches the configured selection");
             rs_json_free(root);
             free(pinned);
             cfg_snap_dispose(&cfg);
             if (!live_wait(st, 5.0)) break;
             continue;
+        }
+
+        pthread_mutex_lock(&st->mu);
+        bool changed_tracks = st->last_video && (strcmp(st->last_video, vid) || strcmp(st->last_audio, aid));
+        if (changed_tracks && !cfg.source_policy.no_restart_track) st->terminal = 3;
+        free(st->last_video); free(st->last_audio);
+        st->last_video = rs_strdup(vid); st->last_audio = rs_strdup(aid);
+        pthread_mutex_unlock(&st->mu);
+        if (changed_tracks && !cfg.source_policy.no_restart_track) {
+            lg(st, "info", "trackChanged", NULL, 0, -1, "selected tracks changed; requesting a clean pipeline restart");
+            rs_json_free(root); free(pinned); cfg_snap_dispose(&cfg); continue;
         }
 
         // Render the master playlist.
@@ -2406,6 +2452,7 @@ static void *director_main(void *arg) {
 
         pthread_mutex_lock(&st->mu);
         bool first = st->master == NULL;
+        for (size_t r = 0; r < st->nreps; r++) st->reps[r]->selected = false;
         free(st->master);
         st->master = b.p;  // ownership moves to the stream
         if (video_choice_count) {
@@ -2450,6 +2497,7 @@ static void *director_main(void *arg) {
         const rs_json *plans = rs_json_obj_get(root, "plans");
         size_t nplans = (plans && rs_json_type_of(plans) == RS_JSON_ARR) ? rs_json_arr_len(plans) : 0;
         for (size_t r = 0; r < npolled; r++) {
+            if (!polled[r]->selected) continue;
             const rs_json *mine = NULL;
             for (size_t i = 0; i < nplans && !mine; i++) {
                 const rs_json *pj = rs_json_arr_at(plans, i);
@@ -2469,6 +2517,29 @@ static void *director_main(void *arg) {
 
         pthread_mutex_lock(&st->mu);
         bool discovered = st->nreps > reps_before;
+        bool drained = !dynamic && !discovered && npolled > 0 && nplans >= npolled;
+        for (size_t r = 0; r < st->nreps; r++) {
+            live_rep *rep = st->reps[r];
+            if (!rep->selected || !strcmp(rep->kind, "text")) continue;
+            if (rep->pend_count || rep->active_downloads || !rep->nsegs) drained = false;
+        }
+        // Wait for the writer to finish committing the last popped item.
+        if (drained && now_seconds() - st->last_media_progress >= 1.0) {
+            st->static_complete = true;
+            st->terminal = 2;
+            double drain = 0;
+            for (size_t r = 0; r < st->nreps; r++) {
+                live_rep *rep = st->reps[r];
+                if (!rep->selected) continue;
+                rep_finish_last_locked(rep, &cfg);
+                char *rendered = rep_render_locked(rep, &cfg);
+                if (rendered) { free(rep->playlist); rep->playlist = rendered; rep->ready = true; }
+                double duration = 0;
+                for (size_t k = 0; k < rep->nsegs; k++) duration += rep->segs[k].duration;
+                if (duration > drain) drain = duration;
+            }
+            st->finished_at = now_seconds() + drain + cfg.playback_delay_seconds;
+        }
         double seg_dur = 2.0;
         for (size_t r = 0; r < st->nreps; r++)
             if (st->reps[r]->seg_duration > seg_dur) seg_dur = st->reps[r]->seg_duration;
@@ -2569,6 +2640,7 @@ static void stream_dispose(live_stream *st) {
     // Normally released by stream_stop_pool; a pool that never got a thread
     // started (the director bails out immediately) still owns the array.
     free(st->dl_threads);
+    free(st->last_video); free(st->last_audio);
     free(st->id);
     for (size_t i = 0; i < st->representation_count; i++) {
         free((char *)st->representations[i].id); free((char *)st->representations[i].type);
@@ -2668,6 +2740,8 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     st->parallel_downloads = cfg->parallel_downloads;
     st->prioritize_oldest = cfg->prioritize_oldest;
     int previous_buffer_seconds = st->playback_delay_seconds;
+    st->source_policy = cfg->source_policy;
+    st->dont_wait_for_full_playlist = cfg->dont_wait_for_full_playlist;
     st->playback_delay_seconds = cfg->playback_delay_seconds > 0 ? cfg->playback_delay_seconds : 0;
     st->audio_delay_ms = cfg->audio_delay_ms;
     st->poll_interval = cfg->poll_interval;
@@ -2690,6 +2764,9 @@ static void stream_apply_config_locked(live_stream *st, const rs_live_config *cf
     // hold-back. Segment duration is not known until media arrives; two seconds
     // is the common DASH duration and the 64MB per-rendition ceiling remains
     // the final memory guard for unusually large/short segments.
+    if (st->source_policy.use_dash_delay && st->playback_delay_seconds < st->dash_delay)
+        st->playback_delay_seconds = st->dash_delay;
+
     int buffer_segments = (st->playback_delay_seconds + st->hls_segment_seconds - 1)
                             / st->hls_segment_seconds;
     int need = st->playlist_segments + hold + buffer_segments + 8;
@@ -2781,6 +2858,7 @@ int rs_live_start(rs_live *live, const char *stream_id, const rs_live_config *cf
     pthread_cond_init(&st->cv, NULL);
     stream_apply_config_locked(st, cfg);
     st->worker_parallel_downloads = effective_parallel_downloads(cfg->parallel_downloads);
+    st->last_media_progress = now_seconds();
     live->streams[live->nstreams++] = st;
     pthread_mutex_unlock(&live->mu);
 
@@ -2882,7 +2960,7 @@ static bool stream_ready_locked(const live_stream *st) {
     if (!st->master || st->nreps == 0) return false;
     bool any_media = false;
     for (size_t i = 0; i < st->nreps; i++) {
-        if (strcmp(st->reps[i]->kind, "text") == 0) continue;
+        if (!st->reps[i]->selected || strcmp(st->reps[i]->kind, "text") == 0) continue;
         if (!st->reps[i]->ready) return false;
         any_media = true;
     }
@@ -3083,4 +3161,21 @@ long long rs_live_drain_ingest(rs_live *live, const char *stream_id) {
     }
     pthread_mutex_unlock(&live->mu);
     return bytes;
+}
+
+int rs_live_condition(rs_live *live, const char *stream_id) {
+    if (!live || !stream_id) return 0;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    int result = 0;
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        result = st->terminal;
+        if (result == 2 && now_seconds() < st->finished_at) result = 0;
+        if (!result && !st->static_complete && st->source_policy.stalled_seconds > 0 &&
+            now_seconds() - st->last_media_progress >= st->source_policy.stalled_seconds) result = 1;
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    return result;
 }

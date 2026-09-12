@@ -47,7 +47,9 @@ typedef struct {
     int restarts;
     int consecutive_failures;
     double retry_at;    // 0 = eligible now
-    bool stopping;
+    bool stopping, halted;
+    rs_source_policy policy;
+    double last_progress, media_time;
 
     char line[RS_FFRUN_LINE_MAX];
     size_t line_len;
@@ -217,6 +219,8 @@ static int spawn_pipeline(rs_ffrun *r, ffrun_entry *e) {
 
     e->stderr_fd = err_pipe.read_end;
     e->started_at = now_seconds();
+    e->last_progress = e->started_at;
+    e->media_time = -1;
     e->line_len = 0;
 
     char *desc = argv_describe(e->argv);
@@ -266,6 +270,11 @@ static void kill_pipeline(ffrun_entry *e) {
 static bool line_is_interesting(const char *s) {
     while (*s == ' ' || *s == '\t') s++;
     if (!*s) return false;
+    if (strncmp(s, "out_time", 8) == 0 || strncmp(s, "progress=", 9) == 0 ||
+        strncmp(s, "fps=", 4) == 0 || strncmp(s, "speed=", 6) == 0 ||
+        strncmp(s, "total_size=", 11) == 0 || strncmp(s, "bitrate=", 8) == 0 ||
+        strncmp(s, "dup_frames=", 11) == 0 || strncmp(s, "drop_frames=", 12) == 0 ||
+        strncmp(s, "stream_", 7) == 0) return false;
     if (strncmp(s, "frame=", 6) == 0) return false;
     if (strncmp(s, "size=", 5) == 0) return false;
     if (strstr(s, "bitrate=") && strstr(s, "time=")) return false;
@@ -284,6 +293,10 @@ static void drain_stderr(rs_ffrun *r, ffrun_entry *e) {
             // with '\n'; both end a line for our purposes.
             if (c == '\n' || c == '\r') {
                 e->line[e->line_len] = '\0';
+                if (!strncmp(e->line, "out_time_us=", 12)) {
+                    double media = strtod(e->line + 12, NULL);
+                    if (media > e->media_time) { e->media_time = media; e->last_progress = now_seconds(); }
+                }
                 if (e->line_len && line_is_interesting(e->line)) {
                     bool bad = strstr(e->line, "Error") || strstr(e->line, "error") ||
                                strstr(e->line, "Invalid") || strstr(e->line, "failed") ||
@@ -336,7 +349,7 @@ void rs_ffrun_destroy(rs_ffrun *r) {
 int rs_ffrun_start(rs_ffrun *r, const char *stream_id,
                    const char *const *argv, const char *const *feeder_argv,
                    const char *const *env_keys, const char *const *env_values,
-                   size_t env_count) {
+                   size_t env_count, const rs_source_policy *policy) {
     if (!r || !stream_id || !argv || !argv[0]) return -1;
 
     // Replacing a running pipeline: the argument list is what a config edit
@@ -361,6 +374,8 @@ int rs_ffrun_start(rs_ffrun *r, const char *stream_id,
     e->env_keys = strv_copy_n(env_keys, env_count);
     e->env_values = strv_copy_n(env_values, env_count);
     e->env_count = env_count;
+    if (policy) e->policy = *policy;
+    else { e->policy.restart_finished = 1; e->policy.restart_delay = 1; }
     if (!e->stream_id || !e->argv || (env_count && (!e->env_keys || !e->env_values))) {
         entry_release(e);
         return -1;
@@ -370,8 +385,9 @@ int rs_ffrun_start(rs_ffrun *r, const char *stream_id,
         // Keep the entry so the supervisor retries with backoff rather than
         // failing the operator's Start click outright — a source that is not up
         // yet is the common case, not an error.
+        if (e->policy.no_restart_error) { entry_release(e); return -1; }
         e->consecutive_failures = 1;
-        e->retry_at = now_seconds() + RS_FFRUN_BACKOFF_BASE;
+        e->retry_at = now_seconds() + e->policy.restart_delay;
         return -1;
     }
     return 0;
@@ -392,62 +408,63 @@ bool rs_ffrun_is_running(const rs_ffrun *r, const char *stream_id) {
     return e && !e->stopping;
 }
 
+static void retry_pipeline(rs_ffrun *r, ffrun_entry *e, double now, bool error) {
+    if ((error && e->policy.no_restart_error) || (!error && !e->policy.restart_finished)) {
+        e->halted = true;
+        lg(r, e->stream_id, error ? "error" : "info", "ffmpegHalted",
+           error ? "automatic restart disabled after error" : "broadcast finished; output remains available");
+        return;
+    }
+    double wait = e->policy.restart_delay;
+    if (wait < 0) wait = 0;
+    if (error) e->consecutive_failures++;
+    else e->consecutive_failures = 0;
+    if (e->policy.cooldown && error) {
+        if (wait < 1) wait = 1;
+        double ceiling = wait > 300 ? wait : 300;
+        for (int k = 1; k < e->consecutive_failures && wait < ceiling; k++) wait *= 2;
+        if (wait > ceiling) wait = ceiling;
+    }
+    e->retry_at = now + wait;
+    lgf(r, e->stream_id, "info", "ffmpegBackoff", "restarting in %.0fs", wait);
+}
+
 void rs_ffrun_poll(rs_ffrun *r) {
     if (!r) return;
     double now = now_seconds();
     for (size_t i = 0; i < RS_FFRUN_MAX_STREAMS; i++) {
         ffrun_entry *e = &r->entries[i];
-        if (!e->used || e->stopping) continue;
-
+        if (!e->used || e->stopping || e->halted) continue;
         drain_stderr(r, e);
-
-        // A dead feeder with a live ffmpeg is a stalled pipeline: ffmpeg will sit
-        // on an stdin that will never produce another byte. Treat the pair as one
-        // unit and restart both.
-        if (rs_proc_valid(&e->feeder) && rs_proc_try_wait(&e->feeder, NULL, NULL) == 1) {
-            lg(r, e->stream_id, "error", "ffmpegExit", "the input command exited — restarting the pipeline");
-            kill_pipeline(e);
+        bool died = false, error = false;
+        if (rs_proc_valid(&e->feeder)) {
+            int status = 0, sig = 0;
+            if (rs_proc_try_wait(&e->feeder, &status, &sig) == 1) {
+                rs_proc_release(&e->feeder);
+                if (status || sig) { died = true; error = true; }
+                // A clean producer EOF lets ffmpeg drain its buffered input.
+            }
         }
-
-        if (rs_proc_valid(&e->proc)) {
+        if (!died && rs_proc_valid(&e->proc)) {
             int status = 0, sig = 0;
             if (rs_proc_try_wait(&e->proc, &status, &sig) == 1) {
-                double uptime = now - e->started_at;
-                drain_stderr(r, e);   // whatever it said on the way out
-                if (sig)
-                    lgf(r, e->stream_id, "error", "ffmpegExit",
-                        "killed by signal %d after %.0fs", sig, uptime);
-                else
-                    lgf(r, e->stream_id, "error", "ffmpegExit",
-                        "exited with status %d after %.0fs", status, uptime);
-                kill_pipeline(e);
-                if (uptime >= RS_FFRUN_HEALTHY_AFTER) {
-                    e->consecutive_failures = 0;   // it ran; this is a blip
-                    e->retry_at = 0;
-                } else {
-                    e->consecutive_failures++;
-                    double wait = RS_FFRUN_BACKOFF_BASE;
-                    for (int k = 1; k < e->consecutive_failures && wait < RS_FFRUN_BACKOFF_MAX; k++)
-                        wait *= 2;
-                    if (wait > RS_FFRUN_BACKOFF_MAX) wait = RS_FFRUN_BACKOFF_MAX;
-                    e->retry_at = now + wait;
-                    lgf(r, e->stream_id, "error", "ffmpegBackoff",
-                        "%d starts in a row ended early — waiting %.0fs before the next",
-                        e->consecutive_failures, wait);
-                }
+                drain_stderr(r, e);
+                died = true; error = status != 0 || sig != 0;
+                lgf(r, e->stream_id, error ? "error" : "info", "ffmpegExit",
+                    "exited with status %d, signal %d after %.0fs", status, sig, now - e->started_at);
+            } else if (e->policy.stalled_seconds > 0 && now - e->last_progress >= e->policy.stalled_seconds) {
+                died = error = true;
+                lg(r, e->stream_id, "error", "ffmpegStalled", "no output timestamp progress within provider stall timeout");
             }
         }
-
-        if (!rs_proc_valid(&e->proc) && (e->retry_at == 0 || now >= e->retry_at)) {
-            e->retry_at = 0;
-            if (spawn_pipeline(r, e) == 0) {
-                e->restarts++;
-            } else {
-                e->consecutive_failures++;
-                double wait = RS_FFRUN_BACKOFF_BASE * (double)e->consecutive_failures;
-                if (wait > RS_FFRUN_BACKOFF_MAX) wait = RS_FFRUN_BACKOFF_MAX;
-                e->retry_at = now + wait;
-            }
+        if (died) {
+            if (now - e->started_at >= RS_FFRUN_HEALTHY_AFTER) e->consecutive_failures = 0;
+            kill_pipeline(e);
+            retry_pipeline(r, e, now, error);
+        }
+        if (!e->halted && !rs_proc_valid(&e->proc) && now >= e->retry_at) {
+            if (spawn_pipeline(r, e) == 0) e->restarts++;
+            else retry_pipeline(r, e, now, true);
         }
     }
 }
@@ -457,7 +474,9 @@ char *rs_ffrun_status_line(const rs_ffrun *r, const char *stream_id) {
     ffrun_entry *e = find((rs_ffrun *)r, stream_id);
     if (!e) return NULL;
     char buf[256];
-    if (rs_proc_valid(&e->proc))
+    if (e->halted)
+        snprintf(buf, sizeof(buf), "ffmpeg stopped by provider policy; output remains available");
+    else if (rs_proc_valid(&e->proc))
         snprintf(buf, sizeof(buf), "ffmpeg pid %ld, up %.0fs, %d restart%s",
                  rs_proc_id(&e->proc), now_seconds() - e->started_at, e->restarts,
                  e->restarts == 1 ? "" : "s");

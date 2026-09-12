@@ -10,6 +10,18 @@
 
 #include "rs_common.h"
 #include "rs_proc.h"
+#include "rs_json.h"
+#include "rs_url.h"
+#include "rs_thread.h"
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define POLICY_MKDIR(p) _mkdir(p)
+static __declspec(thread) const rs_source_policy *active_policy;
+#else
+#define POLICY_MKDIR(p) mkdir(p, 0700)
+static _Thread_local const rs_source_policy *active_policy;
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -263,6 +275,18 @@ static int transfer_progress(void *opaque, curl_off_t dltotal, curl_off_t dlnow,
     return cancel && cancel->should_cancel && cancel->should_cancel(cancel->ctx, downloaded) ? 1 : 0;
 }
 
+// Request-local tokenization; strtok's shared cursor corrupts concurrent
+// provider headers and downloader arguments.
+static char *net_token(char **cursor, const char *delimiters) {
+    if (!*cursor) return NULL;
+    char *start = *cursor + strspn(*cursor, delimiters);
+    if (!*start) { *cursor = NULL; return NULL; }
+    char *end = start + strcspn(start, delimiters);
+    *cursor = *end ? end + 1 : NULL;
+    if (*end) *end = 0;
+    return start;
+}
+
 // One transfer on the calling thread's handle. `force_http11` is set by the
 // caller when retrying after an HTTP/2 framing error.
 static int fetch_once(CURL *curl, const char *url, const char *proxy, const char *headers,
@@ -275,7 +299,8 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     struct curl_slist *header_list = NULL;
     if (headers && headers[0]) {
         char *copy = rs_strdup(headers);
-        for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+        char *cursor = copy;
+        for (char *line = net_token(&cursor, "\r\n"); line; line = net_token(&cursor, "\r\n")) {
             while (*line == ' ' || *line == '\t') line++;
             if (*line) header_list = curl_slist_append(header_list, line);
         }
@@ -321,6 +346,12 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
     CURLSH *dns = shared_dns_cache();
     if (dns) curl_easy_setopt(curl, CURLOPT_SHARE, dns);
+    curl_easy_setopt(curl, CURLOPT_COOKIELIST, "ALL");
+    if (active_policy && active_policy->use_cookies) {
+        curl_easy_setopt(curl, CURLOPT_COOKIEFILE, active_policy->cookie_file);
+        curl_easy_setopt(curl, CURLOPT_COOKIEJAR, active_policy->cookie_file);
+        curl_easy_setopt(curl, CURLOPT_COOKIELIST, "RELOAD");
+    }
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "ReStreamAir/1.0");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     if (proxy && proxy[0]) curl_easy_setopt(curl, CURLOPT_PROXY, proxy);
@@ -337,6 +368,13 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     }
 
     CURLcode rc = curl_easy_perform(curl);
+    if (active_policy && active_policy->use_cookies) {
+        curl_easy_setopt(curl, CURLOPT_COOKIELIST, "FLUSH");
+        curl_easy_setopt(curl, CURLOPT_COOKIEJAR, NULL);
+#ifndef _WIN32
+        chmod(active_policy->cookie_file, 0600);
+#endif
+    }
     *out_rc = rc;
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
@@ -392,9 +430,10 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     if (effective_url) *effective_url = NULL;
     if (status) *status = 0;
 
-    CURL *curl = thread_handle();
+    bool session_client = active_policy && active_policy->use_cookies;
+    CURL *curl = session_client ? curl_easy_init() : thread_handle();
     if (!curl) { snprintf(errbuf, errbuf_len, "Could not initialise HTTP client."); return -1; }
-    bool borrowed = thread_handle_is_owned();  // false: this handle is ours to free
+    bool borrowed = !session_client && thread_handle_is_owned();  // false: this handle is ours to free
 
     char host[256];
     url_host(url, host, sizeof(host));
@@ -502,7 +541,8 @@ static int make_temp_file(const char *dir, const char *prefix, char *path, size_
 static void push_headers(argv_b *a, const char *headers, bool curl_style) {
     if (!headers || !headers[0]) return;
     char *copy = rs_strdup(headers);
-    for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+    char *cursor = copy;
+    for (char *line = net_token(&cursor, "\r\n"); line; line = net_token(&cursor, "\r\n")) {
         while (*line == ' ' || *line == '\t') line++;
         if (!*line) continue;
         if (curl_style) { ab_push(a, "-H"); ab_push(a, line); }
@@ -515,7 +555,8 @@ static void push_headers(argv_b *a, const char *headers, bool curl_style) {
 static void push_extra_params(argv_b *a, const char *params) {
     if (!params || !params[0]) return;
     char *copy = rs_strdup(params);
-    for (char *tok = strtok(copy, " \t\r\n"); tok; tok = strtok(NULL, " \t\r\n"))
+    char *cursor = copy;
+    for (char *tok = net_token(&cursor, " \t\r\n"); tok; tok = net_token(&cursor, " \t\r\n"))
         if (*tok) ab_push(a, tok);
     free(copy);
 }
@@ -525,7 +566,8 @@ static void push_extra_params(argv_b *a, const char *params) {
 // the Content-Range / Content-Type of that response.
 static void parse_meta(const char *meta, long *status, char **content_type, char **content_range) {
     char *copy = rs_strdup(meta ? meta : "");
-    for (char *line = strtok(copy, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+    char *cursor = copy;
+    for (char *line = net_token(&cursor, "\r\n"); line; line = net_token(&cursor, "\r\n")) {
         while (*line == ' ' || *line == '\t') line++;
         if (strncasecmp(line, "HTTP/", 5) == 0) {
             const char *sp = strchr(line, ' ');
@@ -548,7 +590,7 @@ static int spawn_wait(const char *const argv[], const char *err_path) {
     rs_run_result res;
     // 180s: a whole segment over a slow link is legitimately slow, but a tool
     // that wedges must not pin this thread for the life of the process.
-    int rc = rs_proc_run(argv, NULL, 180.0, false, false, err_path, &res, NULL, 0);
+    int rc = rs_proc_run(argv, NULL, active_policy ? (double)active_policy->timeout_seconds : 180.0, false, false, err_path, &res, NULL, 0);
     int code;
     if (rc != 0) {
         // ENOENT is the one failure the caller can recover from: it means the
@@ -589,6 +631,9 @@ static int fetch_external(const char *tool, const char *dl_params,
     const char *range_spec = range && range[0]
         ? (strncasecmp(range, "bytes=", 6) == 0 ? range + 6 : range) : NULL;
 
+    char timeout_arg[32], timeout_flag[48];
+    snprintf(timeout_arg, sizeof(timeout_arg), "%d", active_policy ? active_policy->timeout_seconds : 60);
+    snprintf(timeout_flag, sizeof(timeout_flag), "--timeout=%s", timeout_arg);
     argv_b a = {0};
     bool is_wget = strcasecmp(tool, "wget") == 0;
     bool is_aria = strcasecmp(tool, "aria2c") == 0 || strcasecmp(tool, "aria2") == 0 || strcasecmp(tool, "aria") == 0;
@@ -597,7 +642,7 @@ static int fetch_external(const char *tool, const char *dl_params,
     if (is_wget) {
         ab_push(&a, "wget"); ab_push(&a, "--server-response"); ab_push(&a, "-O"); ab_push(&a, body_tmpl);
         if (force_ipv6) ab_push(&a, "-6");
-        ab_push(&a, "--timeout=60"); ab_push(&a, "--tries=2"); ab_push(&a, "-U"); ab_push(&a, "ReStreamAir/1.0");
+        ab_push(&a, timeout_flag); ab_push(&a, "--tries=1"); ab_push(&a, "-U"); ab_push(&a, "ReStreamAir/1.0");
         if (proxy && proxy[0]) {
             char e[1200];
             ab_push(&a, "-e"); ab_push(&a, "use_proxy=yes");
@@ -618,8 +663,8 @@ static int fetch_external(const char *tool, const char *dl_params,
 #endif
         base = base ? base + 1 : basebuf;
         ab_push(&a, "aria2c"); ab_push(&a, "--quiet=true"); ab_push(&a, "--allow-overwrite=true");
-        ab_push(&a, "--auto-file-renaming=false"); ab_push(&a, "-x1"); ab_push(&a, "-s1");
-        ab_push(&a, "--connect-timeout=10"); ab_push(&a, "--timeout=60"); ab_push(&a, "-U"); ab_push(&a, "ReStreamAir/1.0");
+        ab_push(&a, "--max-tries=1"); ab_push(&a, "--auto-file-renaming=false"); ab_push(&a, "-x1"); ab_push(&a, "-s1");
+        ab_push(&a, "--connect-timeout=10"); ab_push(&a, timeout_flag); ab_push(&a, "-U"); ab_push(&a, "ReStreamAir/1.0");
         ab_push(&a, "-d"); ab_push(&a, tmpdir); ab_push(&a, "-o"); ab_push(&a, base);
         if (proxy && proxy[0]) { char p[1200]; snprintf(p, sizeof(p), "--all-proxy=%s", proxy); ab_push(&a, p); }
         push_headers(&a, headers, false);
@@ -627,7 +672,7 @@ static int fetch_external(const char *tool, const char *dl_params,
         push_extra_params(&a, dl_params);
         ab_push(&a, url);
     } else {  // curl (default)
-        ab_push(&a, "curl"); ab_push(&a, "-sS"); ab_push(&a, "-L"); ab_push(&a, "--max-time"); ab_push(&a, "60");
+        ab_push(&a, "curl"); ab_push(&a, "-sS"); ab_push(&a, "-L"); ab_push(&a, "--max-time"); ab_push(&a, timeout_arg);
         if (force_ipv6) ab_push(&a, "-6");
         ab_push(&a, "--connect-timeout"); ab_push(&a, "10"); ab_push(&a, "-A"); ab_push(&a, "ReStreamAir/1.0");
         ab_push(&a, "-o"); ab_push(&a, body_tmpl); ab_push(&a, "-D"); ab_push(&a, meta_tmpl);
@@ -712,6 +757,7 @@ static int fetch_through_one_proxy(const char *url, const char *proxy,
                        strcasecmp(downloader ? downloader : "", "aria2") == 0 ||
                        strcasecmp(downloader ? downloader : "", "aria") == 0))
         internal = true;
+    if (active_policy && active_policy->use_cookies) internal = true;
     if (!internal) {
         int rc = fetch_external(downloader, dl_params, url, proxy, headers, range, force_ipv6,
                                 out, out_len, status, content_type, content_range, effective_url, errbuf, errbuf_len);
@@ -866,7 +912,7 @@ static void proxy_release(const char *list, size_t count, size_t index,
     pthread_mutex_unlock(&g_proxy_pool_mu);
 }
 
-int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
+static int fetch_with_proxies(const char *url, const char *proxy, const char *headers, const char *range,
                  const char *downloader, const char *dl_params, int force_ipv6, int rotate_proxies,
                  char **out, size_t *out_len, long *status, char **content_type,
                  char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
@@ -921,6 +967,154 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
         if (used + strlen(suffix) + 1 < errbuf_len) strcat(errbuf, suffix);
     }
     free(copy);
+    return rc;
+}
+
+
+// A provider budget includes all of its concurrent upstream requests. Entries
+// are reference counted while waiting/running, so deleting a provider cannot
+// leave a worker holding a freed limiter. Cookie-jar requests serialize to
+// avoid concurrent writes to the script's session file.
+typedef struct provider_budget {
+    char id[128];
+    int active, users;
+    struct provider_budget *next;
+} provider_budget;
+static provider_budget *budgets;
+static pthread_mutex_t budget_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t budget_cv = PTHREAD_COND_INITIALIZER;
+
+static double net_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+static void budget_drop_locked(provider_budget *b) {
+    if (--b->users != 0) return;
+    provider_budget **link = &budgets;
+    while (*link && *link != b) link = &(*link)->next;
+    if (*link) *link = b->next;
+    free(b);
+}
+static provider_budget *budget_enter(const rs_source_policy *policy,
+                                     int (*cancel)(void *, size_t), void *ctx) {
+    if (!policy || !policy->provider_id[0]) return NULL;
+    int limit = policy->use_cookies ? 1 : policy->max_downloads;
+    if (limit < 1) limit = 1;
+    double deadline = net_now() + policy->timeout_seconds;
+    pthread_mutex_lock(&budget_mu);
+    provider_budget *b = budgets;
+    while (b && strcmp(b->id, policy->provider_id) != 0) b = b->next;
+    if (!b) {
+        b = (provider_budget *)calloc(1, sizeof(*b));
+        if (!b) { pthread_mutex_unlock(&budget_mu); return NULL; }
+        snprintf(b->id, sizeof(b->id), "%s", policy->provider_id);
+        b->next = budgets; budgets = b;
+    }
+    b->users++;
+    while (b->active >= limit) {
+        pthread_mutex_unlock(&budget_mu);
+        bool expired = net_now() >= deadline || (cancel && cancel(ctx, 0));
+        pthread_mutex_lock(&budget_mu);
+        if (expired) { budget_drop_locked(b); pthread_mutex_unlock(&budget_mu); return NULL; }
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 100000000;
+        if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&budget_cv, &budget_mu, &until);
+    }
+    b->active++;
+    pthread_mutex_unlock(&budget_mu);
+    return b;
+}
+static void budget_leave(provider_budget *b) {
+    if (!b) return;
+    pthread_mutex_lock(&budget_mu);
+    b->active--;
+    budget_drop_locked(b);
+    pthread_cond_broadcast(&budget_cv);
+    pthread_mutex_unlock(&budget_mu);
+}
+
+static char *json_redirect_target(const char *data, size_t len, const char *base) {
+    if (!data || len > 1024 * 1024) return NULL;
+    rs_json *doc = rs_json_parse(data, len);
+    if (!doc) return NULL;
+    const rs_json *objects[2] = {doc, rs_json_obj_get(doc, "data")};
+    static const char *keys[] = {"ManifestUrl", "manifestUrl", "url", "redirect", "location", "redirectUrl"};
+    char *result = NULL;
+    for (size_t i = 0; i < 2 && !result; i++) {
+        for (size_t j = 0; j < sizeof(keys) / sizeof(keys[0]); j++) {
+            const char *u = rs_json_as_str(rs_json_obj_get(objects[i], keys[j]), "");
+            if (!u[0]) continue;
+            result = rs_url_resolve(base, u);
+            if (result && strncmp(result, "https://", 8) && strncmp(result, "http://", 7)) {
+                free(result); result = NULL;
+            }
+            if (result) break;
+        }
+    }
+    rs_json_free(doc);
+    return result;
+}
+
+int rs_fetch_url(const char *url, const char *proxy, const char *headers, const char *range,
+                 const char *downloader, const char *dl_params, int force_ipv6, int rotate_proxies,
+                 char **out, size_t *out_len, long *status, char **content_type,
+                 char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
+                 long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx,
+                 const rs_source_policy *policy) {
+    // A zero-initialized policy belongs to a standalone probe, not a provider.
+    if (policy && !policy->provider_id[0]) policy = NULL;
+    *out = NULL; *out_len = 0;
+    long local_status = 0;
+    long *result_status = status ? status : &local_status;
+    *result_status = 0;
+    if (content_type) *content_type = NULL;
+    if (content_range) *content_range = NULL;
+    if (effective_url) *effective_url = NULL;
+    provider_budget *budget = budget_enter(policy, should_cancel, cancel_ctx);
+    if (policy && !budget) { snprintf(errbuf, errbuf_len, "Provider request budget wait cancelled or timed out."); return -1; }
+    const rs_source_policy *previous = active_policy;
+    active_policy = policy;
+    if (policy) timeout_ms = (long)policy->timeout_seconds * 1000;
+    if (policy && policy->use_cookies) {
+        char dir[256];
+        POLICY_MKDIR("runtime"); POLICY_MKDIR("runtime/sessions");
+        snprintf(dir, sizeof(dir), "runtime/sessions/%s", policy->provider_id);
+        POLICY_MKDIR(dir);
+    }
+    int tries = policy ? policy->attempts : 1;
+    if (tries < 1) tries = 1;
+    int rc = -1;
+    char *current = rs_strdup(url);
+    for (int redirects = 0; current && redirects <= 5; redirects++) {
+        for (int attempt = 0; attempt < tries; attempt++) {
+            if (should_cancel && should_cancel(cancel_ctx, 0)) break;
+            rc = fetch_with_proxies(current, proxy, headers, range, downloader, dl_params,
+                                    force_ipv6, rotate_proxies, out, out_len, result_status,
+                                    content_type, content_range, effective_url, errbuf, errbuf_len,
+                                    timeout_ms, should_cancel, cancel_ctx);
+            if (rc == 0) break;
+            if (*result_status >= 400 && *result_status < 500 && *result_status != 408 && *result_status != 429) break;
+        }
+        if (rc != 0 || !policy || !policy->detect_json_redirect) break;
+        const char *base = effective_url && *effective_url ? *effective_url : current;
+        char *next = json_redirect_target(*out, *out_len, base);
+        if (!next) break;
+        free(*out); *out = NULL; *out_len = 0;
+        if (content_type) { free(*content_type); *content_type = NULL; }
+        if (content_range) { free(*content_range); *content_range = NULL; }
+        if (effective_url) { free(*effective_url); *effective_url = NULL; }
+        if (redirects == 5 || strcmp(next, current) == 0) {
+            free(next); rc = -1;
+            snprintf(errbuf, errbuf_len, "JSON redirect loop or limit reached."); break;
+        }
+        free(current); current = next;
+    }
+    free(current);
+    active_policy = previous;
+    budget_leave(budget);
     return rc;
 }
 

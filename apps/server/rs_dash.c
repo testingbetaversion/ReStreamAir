@@ -609,9 +609,43 @@ static void scan_cc_descriptors(xmlNode *node, rendition_set *out) {
 // Picks the default renditions: the highest-bandwidth video Representation, the
 // first audio one, and the first timed-text one, with their codecs — plus any
 // in-band closed captions the video AdaptationSet declares.
-static void pick_default_reps(xmlNode *root, rendition_set *out) {
+static int rendition_rank(const char *filters, const char *id, const char *lang,
+                          const char *codecs, long long bandwidth, long long height,
+                          bool *worst) {
+    *worst = false;
+    if (!filters || !filters[0]) return 0;
+    char *copy = rs_strdup(filters);
+    if (!copy) return -1;
+    int rank = 0, result = -1;
+    char *token = copy;
+    while (token && *token) {
+        char *next = strchr(token, ',');
+        if (next) *next++ = '\0';
+        char *v = dup_trimmed(token, strlen(token));
+        bool match = false;
+        if (v) {
+            if (!strcmp(v, "best") || !strcmp(v, "worst")) {
+                match = true; *worst = !strcmp(v, "worst");
+            } else if (!strncmp(v, "id=", 3)) match = !strcmp(v + 3, id);
+            else if (!strncmp(v, "lang=", 5)) match = lang && !strcmp(v + 5, lang);
+            else if (!strncmp(v, "codec=", 6)) match = codecs && strstr(codecs, v + 6);
+            else if (!strncmp(v, "height<=", 8)) match = height > 0 && height <= strtoll(v + 8, NULL, 10);
+            else if (!strncmp(v, "bandwidth<=", 11)) match = bandwidth > 0 && bandwidth <= strtoll(v + 11, NULL, 10);
+            else match = !strcmp(v, id) || (lang && !strcmp(v, lang));
+        }
+        free(v);
+        if (match) { result = rank; break; }
+        rank++; token = next;
+    }
+    free(copy);
+    return result;
+}
+
+static void pick_default_reps(xmlNode *root, rendition_set *out, const rs_source_policy *policy) {
     memset(out, 0, sizeof(*out));
     out->video_bw = -1;
+    int video_rank = 1000000, audio_rank = 1000000;
+    long long audio_bw = -1;
     for (xmlNode *period = root->children; period; period = period->next) {
         if (!node_is(period, "Period")) continue;
         for (xmlNode *adap = period->children; adap; adap = adap->next) {
@@ -630,15 +664,25 @@ static void pick_default_reps(xmlNode *root, rendition_set *out) {
                 if (!codecs && adap_codecs) codecs = rs_strdup(adap_codecs);
                 char *bw = attr(rep, "bandwidth");
                 long long bwv = bw ? strtoll(bw, NULL, 10) : 0;
+                char *height_text = attr(rep, "height");
+                long long height = height_text ? strtoll(height_text, NULL, 10) : 0;
+                free(height_text);
+                bool worst = false;
+                const char *filter = !policy ? "" : strcmp(type, "audio") == 0 ? policy->audio_filter : policy->video_filter;
+                int rank = rendition_rank(filter, rid, lang, codecs, bwv, height, &worst);
                 if (strcmp(type, "video") == 0) {
                     scan_cc_descriptors(rep, out);
-                    if (bwv > out->video_bw) {
+                    if (rank >= 0 && (rank < video_rank || (rank == video_rank && (worst ? bwv < out->video_bw : bwv > out->video_bw)))) {
+                        video_rank = rank;
                         free(out->video_id); free(out->video_codecs);
                         out->video_id = rs_strdup(rid);
                         out->video_codecs = codecs ? rs_strdup(codecs) : NULL;
                         out->video_bw = bwv;
                     }
-                } else if (strcmp(type, "audio") == 0 && !out->audio_id) {
+                } else if (strcmp(type, "audio") == 0 && rank >= 0 &&
+                           (!out->audio_id || rank < audio_rank || (filter[0] && rank == audio_rank && (worst ? bwv < audio_bw : bwv > audio_bw)))) {
+                    audio_rank = rank; audio_bw = bwv;
+                    free(out->audio_id); free(out->audio_codecs); free(out->audio_lang);
                     out->audio_id = rs_strdup(rid);
                     out->audio_codecs = codecs ? rs_strdup(codecs) : NULL;
                     out->audio_lang = lang ? rs_strdup(lang) : NULL;
@@ -708,7 +752,7 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
                        int force_ipv6, int rotate_proxies,
                        const char *rep, int want,
                        const char *segment_url_params, int inherit_url_params,
-                       char *errbuf, size_t errbuf_len) {
+                       char *errbuf, size_t errbuf_len, const rs_source_policy *policy) {
     // Fetch the MPD via libcurl (downloader forced internal so we get the final
     // URL after any redirect — segment URLs must resolve against it).
     (void)downloader; (void)dl_params;
@@ -724,7 +768,7 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         int force_ipv6;
         time_t time;
         bool fetching;
-        bool failed;
+        bool failed, private_response;
         char error[256];
         pthread_cond_t cv;
     } dash_cache_entry;
@@ -766,7 +810,7 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
 
     while (entry->fetching) pthread_cond_wait(&entry->cv, &g_dash_mu);
 
-    bool match = entry->force_ipv6 == force_ipv6 &&
+    bool match = !policy && !entry->private_response && entry->force_ipv6 == force_ipv6 &&
                  ((!proxy && !entry->proxy) || (proxy && entry->proxy && strcmp(proxy, entry->proxy) == 0)) &&
                  ((!headers && !entry->headers) || (headers && entry->headers && strcmp(headers, entry->headers) == 0));
     
@@ -783,12 +827,13 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         pthread_mutex_unlock(&g_dash_mu);
     } else {
         entry->fetching = true;
+        entry->private_response = policy != NULL;
         pthread_mutex_unlock(&g_dash_mu);
 
         int rc = rs_fetch_url(url, proxy, headers, NULL, NULL, NULL,
                               force_ipv6, rotate_proxies, &xml, &len,
                               NULL, NULL, NULL, &effurl, errbuf, errbuf_len,
-                              30000, NULL, NULL);
+                              30000, NULL, NULL, policy);
 
         pthread_mutex_lock(&g_dash_mu);
         entry->fetching = false;
@@ -837,7 +882,8 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         : ((segment_url_params && segment_url_params[0]) ? segment_url_params : NULL);
 
     xmlDoc *doc = xmlReadMemory(xml, (int)len, "mpd.xml", NULL,
-                                XML_PARSE_NOERROR | XML_PARSE_NOWARNING | XML_PARSE_RECOVER);
+                                XML_PARSE_NOERROR | XML_PARSE_NOWARNING | XML_PARSE_NONET |
+                                (policy && policy->legacy_dash ? XML_PARSE_RECOVER : 0));
     if (!doc) { free(xml); free(effurl); free(inherited_params); snprintf(errbuf, errbuf_len, "Could not parse the MPD."); return NULL; }
     xmlNode *root = xmlDocGetRootElement(doc);
     if (!root || !node_is(root, "MPD")) { xmlFreeDoc(doc); free(xml); free(effurl); free(inherited_params); snprintf(errbuf, errbuf_len, "Not an MPD."); return NULL; }
@@ -849,8 +895,15 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
     char *mup = attr(root, "minimumUpdatePeriod"); rs_json_obj_set(obj, "mup", rs_json_new_num(parse_duration(mup))); free(mup);
     char *tsb = attr(root, "timeShiftBufferDepth"); rs_json_obj_set(obj, "tsb", rs_json_new_num(parse_duration(tsb))); free(tsb);
 
+    char *delay = attr(root, "suggestedPresentationDelay");
+    rs_json_obj_set(obj, "suggestedDelay", rs_json_new_num(parse_duration(delay))); free(delay);
     rendition_set reps;
-    pick_default_reps(root, &reps);
+    pick_default_reps(root, &reps, policy);
+    if (policy && ((policy->video_filter[0] && !reps.video_id) || (policy->audio_filter[0] && !reps.audio_id))) {
+        snprintf(errbuf, errbuf_len, "No DASH rendition matches the provider video/audio filters.");
+        rendition_set_dispose(&reps); rs_json_free(obj); xmlFreeDoc(doc);
+        free(xml); free(effurl); free(inherited_params); return NULL;
+    }
     if (reps.video_id) {
         rs_json *v = rs_json_new_obj();
         rs_json_obj_set_str(v, "id", reps.video_id);

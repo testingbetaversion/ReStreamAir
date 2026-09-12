@@ -15,6 +15,7 @@
 #include "rs_netmatch.h"
 #include "rs_nm3u8dlre.h"
 #include "rs_panel.h"
+#include "rs_provider_options.h"
 #include "rs_script.h"
 #include "rs_state.h"
 #include "rs_internal.h"
@@ -121,9 +122,10 @@ struct restream_server {
     rs_auth *auth;          // admin accounts + sessions
     rs_sysstats *sysstats;  // live host stats for the monitoring view
     rs_metrics *metrics;    // per-stream client/bytes network monitor
-    rs_pending_job *pending_head; // in-flight async jobs (playback fetches, probe, logo lookup, script actions)
-    pthread_mutex_t pending_mu;     // guards pending_head and each entry's `cancelled` flag
-    pthread_cond_t pending_cv;      // signalled whenever a job unlinks itself; wakes restream_server_destroy's drain
+    rs_pending_job *pending_head; // async jobs waiting on a worker or on event-loop delivery
+    unsigned pending_workers;       // worker threads that may still touch the server/mgr
+    pthread_mutex_t pending_mu;     // guards pending_head, pending_workers, and per-job lifecycle flags
+    pthread_cond_t pending_cv;      // signalled whenever pending job ownership changes
     bool ffmpeg_install_running;    // guarded by pending_mu; installer thread holds the server alive
     pthread_mutex_t logo_mu;        // serialises RS_PENDING_LOGO workers' access to logo_cache (not itself thread-safe)
     uint16_t listen_port;   // the port actually bound, which is what /api/state must report
@@ -132,6 +134,8 @@ struct restream_server {
     // browser. The one-second timer performs it instead, by which point mongoose
     // has flushed the response and the operator has seen it succeed.
     bool restart_pending;
+    unsigned long long next_start_token;
+    rs_json *provider_timers; // event-loop-owned scheduling state, never persisted
     rs_live *live;          // background DASH->HLS engines, one per running stream
     rs_direct_client *direct_head;  // open fMP4 byte-tail viewers
     rs_ts_client *ts_head;          // open muxed-MPEG-TS viewers
@@ -197,6 +201,7 @@ static rs_json *refresh_view(restream_server_t *s) {
 // everything below (including the logo fetcher and the live engine) can
 // reference them before their setters are defined.
 static restream_probe_fn g_probe_handler = NULL;
+static restream_epg_fn g_epg_handler = NULL;
 static restream_fetch_fn g_fetch_handler = NULL;
 static restream_webhook_fn g_webhook_handler = NULL;
 static restream_dash_fn g_dash_handler = NULL;
@@ -216,6 +221,12 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
                                 char *errbuf, size_t errbuf_len);
 static void pipeline_stop_stream(const char *stream_id);
 static void live_sync_all(restream_server_t *s);
+static void provider_maintenance(restream_server_t *s);
+static int clear_provider_session(const char *provider_id);
+static bool provider_job_busy(restream_server_t *s, const rs_json *provider);
+static rs_json *provider_timer(restream_server_t *s, const char *id);
+static bool reset_idle_provider_session(restream_server_t *s, const rs_json *provider);
+static const rs_json *provider_of(rs_state *st, const rs_json *stream);
 static const char *stream_source_target(const rs_json *stream);
 
 // Forward declaration: query helpers are defined with the routing code below,
@@ -251,10 +262,10 @@ static uint8_t *apply_cenc(const char *decryption_keys, const char *selected_kid
 static void dispatch_logo_lookup(restream_server_t *server, struct mg_connection *c, const char *name);
 static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
                            char *url, char *proxy, char *headers,
-                           bool force_ipv6, bool rotate_proxies);
+                           bool force_ipv6, bool rotate_proxies, const rs_json *provider);
 static void dispatch_script_action(restream_server_t *server, struct mg_connection *c,
                                    const char *sid, const char *action, const char *script_path,
-                                   char **args, int argc);
+                                   char **args, int argc, double timeout);
 static bool dispatch_stream_start(restream_server_t *server, struct mg_connection *c,
                                   struct mg_http_message *hm, const char *stream_id,
                                   const char *ip);
@@ -267,7 +278,7 @@ static char *logo_fetch_wrapper(const char *url, void *ctx) {
     long status = 0;
     char err[128] = {0};
     int rc = g_fetch_handler(url, NULL, NULL, NULL, NULL, NULL, 0, 0, &body, &body_len, &status,
-                             NULL, NULL, NULL, err, sizeof(err), 30000, NULL, NULL);
+                             NULL, NULL, NULL, err, sizeof(err), 30000, NULL, NULL, NULL);
     if (rc == 0 && status == 200 && body) return body;
     free(body);
     return NULL;
@@ -818,6 +829,7 @@ static char g_request_security[192] = "";
 
 // A JSON error body the panel's fetch layer reads as `payload.error`.
 static void reply_error(struct mg_connection *c, int status, const char *message) {
+    if (!c) return; // background actions report through the log
     char headers[320 + sizeof(RS_CORS_HEADERS)];
     snprintf(headers, sizeof(headers), "%s%s", JSON_HEADERS, g_request_security);
     mg_http_reply(c, status, headers, "{\"error\":%m}", MG_ESC(message));
@@ -835,6 +847,7 @@ static void reply_error_headers(struct mg_connection *c, int status, const char 
 // Serializes and sends a JSON DOM, then frees it. `extra_headers` may be NULL.
 static void reply_json(struct mg_connection *c, int status, rs_json *value,
                        const char *extra_headers) {
+    if (!c) { rs_json_free(value); return; }
     char *body = rs_json_serialize(value, false);
     rs_json_free(value);
     if (!body) {
@@ -1557,6 +1570,7 @@ static void maintenance_tick(void *arg) {
     }
     rs_metrics_prune(s->metrics);  // expire stale clients/rate windows every tick
     collect_ingest(s);
+    provider_maintenance(s);
     // Join and free any engine that finished winding down since the last tick.
     // Doing it here rather than in the stop handler is what makes Stop return
     // instantly instead of waiting for an in-flight segment download.
@@ -1717,6 +1731,9 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     // call — the stack array would be gone by the time the worker ran.
     char **args = (char **)malloc(RS_SCRIPT_ARG_CAP * sizeof(char *));
     if (!args) { reply_error(c, 500, "Out of memory."); return; }
+    if (!strcmp(action, "login") && !reset_idle_provider_session(s, provider)) {
+        free(args); reply_error(c, 500, "Could not reset provider session."); return;
+    }
     int n = 0;
     args[n++] = rs_script_arg("action", action, false);
 
@@ -1784,7 +1801,7 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     log_record(s, sid, "info", "scriptCommand", NULL, 0, -1,
                command ? command : script);
     free(command);
-    dispatch_script_action(s, c, sid, action, script, args, n);  // always replies
+    dispatch_script_action(s, c, sid, action, script, args, n, (double)rs_provider_option_int(provider, "scriptTimeoutSeconds"));  // always replies
 }
 
 // Removes a provider-owned script session recursively without invoking a shell.
@@ -1839,6 +1856,19 @@ static int clear_provider_session(const char *provider_id) {
     // used by the C runner, but an operator may have put script state there.
     snprintf(path, sizeof(path), "runtime/scripts/%s", provider_id);
     return remove_tree(path);
+}
+
+static bool reset_idle_provider_session(restream_server_t *s, const rs_json *provider) {
+    if (!provider || !rs_provider_option_bool(provider, "alwaysResetSession")) return true;
+    const rs_json *streams = rs_json_obj_get(provider, "streams");
+    for (size_t i = 0; i < rs_json_arr_len(streams); i++)
+        if (!strcmp(rs_json_obj_str(rs_json_arr_at(streams, i), "status", ""), "running")) return true;
+    if (provider_job_busy(s, provider)) return true;
+    const char *id = rs_json_obj_str(provider, "id", "");
+    int rc = clear_provider_session(id);
+    log_record(s, "__panel__", rc ? "error" : "info", "clearSession", NULL, 0, -1,
+               rc ? "provider session reset failed" : "idle provider session reset before login/start");
+    return rc == 0;
 }
 
 // --- M3U export, provider export/import, EPG --------------------------------
@@ -2035,7 +2065,7 @@ static void handle_provider_import(restream_server_t *s, struct mg_connection *c
     reply_after_mutation(s, c, hm, rc, err);
 }
 
-static void serve_provider_epg(struct mg_connection *c, const char *provider_id) {
+static void serve_provider_epg(restream_server_t *s, struct mg_connection *c, const char *provider_id) {
     // Stored by the script's `epg` action under the provider's session dir.
     char path[512];
     snprintf(path, sizeof(path), "runtime/sessions/%s/epg.xml", provider_id);
@@ -2044,6 +2074,15 @@ static void serve_provider_epg(struct mg_connection *c, const char *provider_id)
     if (!data) {
         reply_error(c, 404, "No EPG stored for this provider yet — run the epg action first.");
         return;
+    }
+    const char *zone = rs_provider_option_str(find_provider_by_id(&s->state, provider_id), "epgTimezone");
+    if (zone[0]) {
+        int minutes = 0; char err[256] = {0};
+        char *converted = rs_provider_timezone_offset(zone, &minutes) && g_epg_handler
+            ? g_epg_handler((const char *)data, len, minutes, err, sizeof(err)) : NULL;
+        free(data);
+        if (!converted) { reply_error(c, 400, err[0] ? err : "EPG timezone conversion unavailable."); return; }
+        data = (uint8_t *)converted; len = strlen(converted);
     }
     // The script may return XMLTV or JSON; sniff it the same way the panel
     // handler does rather than forcing one content type on both.
@@ -2181,8 +2220,15 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         char *headers = body_str(body, "headers");
         bool force_ipv6 = rs_json_obj_bool(body, "forceIpv6", false);
         bool rotate_proxies = rs_json_obj_bool(body, "rotateProxies", false);
+        const rs_json *provider = find_provider_by_id(&s->state, rs_json_obj_str(body, "providerId", ""));
+        if (provider) {
+            if (!rs_json_obj_get(body, "headers")) { free(headers); headers = rs_provider_headers(provider); }
+            if (!rs_json_obj_get(body, "proxy")) { free(proxy); proxy = rs_strdup(rs_json_obj_str(provider, "proxy", "")); }
+            if (!rs_json_obj_get(body, "forceIpv6")) force_ipv6 = rs_json_obj_bool(provider, "forceIpv6", false);
+            if (!rs_json_obj_get(body, "rotateProxies")) rotate_proxies = rs_json_obj_bool(provider, "rotateProxies", false);
+        }
         rs_json_free(body);
-        dispatch_probe(s, c, url, proxy, headers, force_ipv6, rotate_proxies);  // takes ownership
+        dispatch_probe(s, c, url, proxy, headers, force_ipv6, rotate_proxies, provider);  // takes ownership
         return true;
     }
 
@@ -2289,7 +2335,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     }
     if (mg_match(hm->uri, mg_str("/api/providers/*/epg"), NULL) && method_is(hm, "GET")) {
         char *provider_id = capture(hm, "/api/providers/*/epg");
-        serve_provider_epg(c, provider_id);
+        serve_provider_epg(s, c, provider_id);
         free(provider_id);
         return true;
     }
@@ -2317,6 +2363,10 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     // fetch the single-threaded event loop happened to be blocked on.
     if (mg_match(hm->uri, mg_str("/api/streams/*/start"), NULL) && method_is(hm, "POST")) {
         char *id = capture(hm, "/api/streams/*/start");
+        rs_json_obj_remove(s->provider_timers, id);
+        if (!reset_idle_provider_session(s, provider_of(&s->state, rs_panel_find_stream(&s->state, id)))) {
+            free(id); reply_error(c, 500, "Could not reset provider session."); return true;
+        }
         char *ip = client_ip(s, c, hm);
         const char *err = NULL;
         // A stream whose source URL (or keys) comes from its provider script
@@ -2361,6 +2411,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     }
     if (mg_match(hm->uri, mg_str("/api/streams/*/stop"), NULL) && method_is(hm, "POST")) {
         char *id = capture(hm, "/api/streams/*/stop");
+        rs_json_obj_remove(s->provider_timers, id);
         char *ip = client_ip(s, c, hm);
         const char *err = NULL;
         // Flag the engine before the status flip so the log reads in the order
@@ -3015,14 +3066,16 @@ static char *primary_proxy(const char *list) {
 
 // Provider generic headers plus the stream's category headers, newline-joined.
 static char *effective_headers(const rs_json *provider, const rs_json *stream, const char *stream_field) {
-    const char *generic = rs_json_obj_str(provider, "headers", "");
+    char *generic = rs_provider_headers(provider);
+    if (!generic) return NULL;
     const char *specific = rs_json_obj_str(stream, stream_field, "");
     size_t need = strlen(generic) + strlen(specific) + 2;
     char *out = (char *)malloc(need);
-    if (!out) return NULL;
+    if (!out) { free(generic); return NULL; }
     out[0] = '\0';
     if (generic[0]) { strcat(out, generic); }
     if (specific[0]) { if (out[0]) strcat(out, "\n"); strcat(out, specific); }
+    free(generic);
     return out;
 }
 
@@ -3228,6 +3281,7 @@ struct rs_pending_job {
     unsigned long conn_id;
     rs_pending_kind kind;
     bool cancelled;  // connection closed while the job was in flight; guarded by server->pending_mu
+    bool done;       // worker finished; guarded by server->pending_mu
 
     // Request, copied up front: hm/stream (and the POST body) are only valid
     // for this one mongoose event, and a stream/provider JSON node can be
@@ -3253,9 +3307,11 @@ struct rs_pending_job {
     char *client_ip;               // ITEM only — resolved at dispatch, since the
                                    // request (and any X-Forwarded-For) is gone
                                    // by the time the worker reports back
+    rs_source_policy source_policy;
     char *script_path;             // SCRIPT only
     char *script_action;           // SCRIPT only, e.g. "login" / "channels"
     char **script_args;            // SCRIPT only, each rs_script_arg-owned
+    double script_timeout;
     int script_argc;               // SCRIPT only
 
     // Result, filled by pending_job_worker.
@@ -3295,6 +3351,24 @@ static void pending_job_free(rs_pending_job *pf) {
     rs_buf_dispose(&pf->script_stdout_line);
     rs_buf_dispose(&pf->script_stderr_line);
     free(pf);
+}
+
+static bool pending_job_unlink_locked(restream_server_t *server, rs_pending_job *pf) {
+    rs_pending_job **link = &server->pending_head;
+    while (*link && *link != pf) link = &(*link)->next;
+    if (*link != pf) return false;
+    *link = pf->next;
+    pf->next = NULL;
+    return true;
+}
+
+static void pending_job_free_list(rs_pending_job *head) {
+    while (head) {
+        rs_pending_job *next = head->next;
+        head->next = NULL;
+        pending_job_free(head);
+        head = next;
+    }
 }
 
 static void script_log_pending_line(rs_pending_job *pf, bool is_stderr) {
@@ -3449,9 +3523,13 @@ typedef struct rs_stream_start {
     int argc;
     char *kind, *url, *proxy, *media_proxy, *headers, *media_fetch_headers, *provider_headers;
     char *downloader, *dl_params, *rep, *host;
+    char *default_cdn;
+    rs_source_policy source_policy;
     bool force_ipv6, rotate_proxies;
     bool want_manifest, want_cdm, want_pssh_hook, want_initparse;
     char *cdm_mode, *cdm_type, *cached_keys;
+    double script_timeout;
+    unsigned long long token;
     int url_arg;  // index of the url= argument, rewritten once the manifest refreshes it
 
     // Result, filled by the worker.
@@ -3466,7 +3544,7 @@ typedef struct rs_stream_start {
 
 static void stream_start_free(struct rs_stream_start *st) {
     if (!st) return;
-    free(st->script_path);
+    free(st->script_path); free(st->default_cdn);
     for (int i = 0; i < st->argc; i++) free(st->args[i]);
     free(st->args);
     free(st->kind); free(st->url); free(st->proxy); free(st->media_proxy); free(st->headers);
@@ -3560,6 +3638,7 @@ static void stream_start_output_chunk(void *value, bool is_stderr,
 static int stream_start_run(restream_server_t *server, const char *sid,
                             rs_stream_start *st, const char *action,
                             char *const *extra, int extra_n, double timeout, char **out) {
+    timeout = st->script_timeout;
     const char **argv = (const char **)calloc((size_t)st->argc + (size_t)extra_n + 2, sizeof(char *));
     if (!argv) return -1;
     int n = 0;
@@ -3602,6 +3681,21 @@ static bool stream_start_parse_manifest(rs_stream_start *st, const char *stdout_
     // stream stopped and prevented the following CDM action from ever running.
     const rs_json *cdn = doc ? rs_json_obj_get(doc, "Cdn") : NULL;
     if (!cdn && doc) cdn = rs_json_obj_get(doc, "cdn");
+    if (st->default_cdn && st->default_cdn[0]) {
+        const char *chosen = NULL;
+        for (size_t i = 0; i < rs_json_arr_len(cdn); i++) {
+            const rs_json *entry = rs_json_arr_at(cdn, i);
+            const char *name = rs_json_obj_str(entry, "Name", rs_json_obj_str(entry, "name", ""));
+            if (strcmp(name, st->default_cdn)) continue;
+            const char *mirror = rs_json_obj_str(entry, "ManifestUrl", rs_json_obj_str(entry, "manifestUrl", ""));
+            if (url_is_http(mirror)) { chosen = mirror; break; }
+        }
+        if (!chosen) {
+            snprintf(st->err, sizeof(st->err), "Configured default CDN was not returned by the manifest script.");
+            rs_json_free(doc); return false;
+        }
+        url = chosen;
+    }
     if (!url_is_http(url)) {
         for (size_t i = 0; i < rs_json_arr_len(cdn); i++) {
             const rs_json *entry = rs_json_arr_at(cdn, i);
@@ -3679,7 +3773,7 @@ static char *stream_start_fetch_headers(rs_stream_start *st, const char *url,
     char err[128] = {0};
     int rc = g_fetch_handler(url, proxy, headers, NULL, st->downloader, st->dl_params,
                              st->force_ipv6 ? 1 : 0, st->rotate_proxies ? 1 : 0,
-                             &body, &len, &status, NULL, NULL, NULL, err, sizeof(err), 20000, NULL, NULL);
+                             &body, &len, &status, NULL, NULL, NULL, err, sizeof(err), 20000, NULL, NULL, &st->source_policy);
     if (rc != 0 || status < 200 || status >= 300 || !body) { free(body); return NULL; }
     if (out_len) *out_len = len;
     return body;
@@ -3746,7 +3840,7 @@ static uint8_t *stream_start_fetch_init(rs_stream_start *st, const char *manifes
             char *desc = g_dash_handler(manifest_url, st->proxy, st->headers, st->downloader,
                                         st->dl_params, st->force_ipv6 ? 1 : 0,
                                         st->rotate_proxies ? 1 : 0, NULL, 0, NULL, 0,
-                                        derr, sizeof(derr));
+                                        derr, sizeof(derr), &st->source_policy);
             if (desc) {
                 rs_json *doc = rs_json_parse(desc, strlen(desc));
                 chosen = rs_strdup(rs_json_obj_str(rs_json_obj_get(doc, "video"), "id", ""));
@@ -3759,7 +3853,7 @@ static uint8_t *stream_start_fetch_init(rs_stream_start *st, const char *manifes
             char *desc = g_dash_handler(manifest_url, st->proxy, st->headers, st->downloader,
                                         st->dl_params, st->force_ipv6 ? 1 : 0,
                                         st->rotate_proxies ? 1 : 0, rep, 0, NULL, 0,
-                                        derr, sizeof(derr));
+                                        derr, sizeof(derr), &st->source_policy);
             if (desc) {
                 rs_json *doc = rs_json_parse(desc, strlen(desc));
                 const char *found = rs_json_obj_str(rs_json_obj_get(doc, "plan"), "initUrl", "");
@@ -4173,13 +4267,16 @@ static void *pending_job_worker(void *arg) {
 
     switch (pf->kind) {
     case RS_PENDING_PLAYLIST:
-    case RS_PENDING_ITEM:
+    case RS_PENDING_ITEM: {
+        char *effective = NULL;
         pf->rc = g_fetch_handler(pf->url, pf->proxy, pf->headers, pf->range,
                                  pf->downloader, pf->downloader_params,
                                  pf->force_ipv6, pf->rotate_proxies,
                                  &pf->body, &pf->body_len, &pf->status,
-                                 &pf->content_type, &pf->content_range, NULL,
-                                 pf->err, sizeof(pf->err), 30000, NULL, NULL);
+                                 &pf->content_type, &pf->content_range, &effective,
+                                 pf->err, sizeof(pf->err), 30000, NULL, NULL, &pf->source_policy);
+        if (pf->rc == 0 && effective && effective[0]) { free(pf->url); pf->url = effective; }
+        else free(effective);
         if (pf->kind == RS_PENDING_PLAYLIST && pf->rc == 0 && pf->body
             && pf->decryption_keys && pf->decryption_keys[0]
             && !rs_m3u8_is_master(pf->body)) {
@@ -4196,7 +4293,7 @@ static void *pending_job_worker(void *arg) {
                                                   pf->force_ipv6, pf->rotate_proxies,
                                                   &init_body, &init_len, &init_status,
                                                   NULL, NULL, NULL, init_err, sizeof(init_err),
-                                                  20000, NULL, NULL);
+                                                  20000, NULL, NULL, &pf->source_policy);
                     if (init_rc == 0 && init_status >= 200 && init_status < 300 && init_body) {
                         rs_cdm_challenge_add_from_init(&playlist_drm,
                                                        (const uint8_t *)init_body, init_len);
@@ -4215,6 +4312,7 @@ static void *pending_job_worker(void *arg) {
             rs_drm_challenge_free(&playlist_drm);
         }
         break;
+    }
     case RS_PENDING_LOGO:
         // The cache itself isn't thread-safe (a plain cJSON tree, no locking —
         // see logo.c), and lazily creates server->logo_cache on first use, so
@@ -4230,12 +4328,12 @@ static void *pending_job_worker(void *arg) {
     case RS_PENDING_PROBE:
         pf->body = g_probe_handler(pf->url, pf->proxy, pf->headers,
                                    pf->force_ipv6, pf->rotate_proxies,
-                                   pf->err, sizeof(pf->err));
+                                   pf->err, sizeof(pf->err), &pf->source_policy);
         pf->rc = pf->body ? 0 : -1;
         break;
     case RS_PENDING_SCRIPT:
         pf->rc = rs_script_run_stream(pf->script_path, (const char **)pf->script_args, pf->script_argc,
-                                      30.0, &pf->script_stdout, &pf->script_stderr,
+                                      pf->script_timeout, &pf->script_stdout, &pf->script_stderr,
                                       script_output_chunk, pf);
         script_log_pending_line(pf, false);
         script_log_pending_line(pf, true);
@@ -4250,46 +4348,50 @@ static void *pending_job_worker(void *arg) {
     }
 
     pthread_mutex_lock(&server->pending_mu);
-    // Unlink before reading `cancelled`, under the same lock the close handler
-    // uses to set it — once unlinked nothing else can find pf, so everything
-    // after unlock is safe to touch without the lock.
-    rs_pending_job **link = &server->pending_head;
-    while (*link && *link != pf) link = &(*link)->next;
-    if (*link == pf) *link = pf->next;
-    bool cancelled = pf->cancelled;
-    pthread_cond_broadcast(&server->pending_cv);  // wakes restream_server_destroy's drain
+    pf->done = true;
+
+    // Keep pf linked until the poll thread consumes it. If the client already
+    // left, or if the wakeup pipe is unavailable, no one can build
+    // a reply, so the worker drops the result itself. The lock deliberately
+    // covers mg_wakeup(): MG_EV_CLOSE and shutdown cannot free pf while the
+    // worker is still handing its pointer to mongoose.
+    bool drop = pf->cancelled || (pf->conn_id && !mg_wakeup(&server->mgr, pf->conn_id, &pf, sizeof(pf)));
+    if (server->pending_workers > 0) server->pending_workers--;
+    if (drop) pending_job_unlink_locked(server, pf);
+    pthread_cond_broadcast(&server->pending_cv);
     pthread_mutex_unlock(&server->pending_mu);
 
-    // Either the player gave up and nobody is listening any more, or mg_wakeup
-    // could not queue the message (pipe not initialised) — either way there is
-    // no reply to build, so free the job here instead of leaking it.
-    if (cancelled || !mg_wakeup(&server->mgr, pf->conn_id, &pf, sizeof(pf))) {
+    if (drop) {
         pending_job_free(pf);
     }
     return NULL;
 }
 
-// Hands `pf` off to a worker thread. Always consumes pf: on success the worker
-// frees it once the reply is built; on failure the caller must free it. Fills
-// pf->server/conn_id, so callers only need everything else set.
+// Hands `pf` off to a worker thread. On success pf stays in pending_head until
+// the event loop builds the reply, the client closes, or shutdown drops it. On
+// failure the caller must free it. Fills pf->server/conn_id, so callers only
+// need everything else set.
 static bool pending_job_dispatch(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf) {
     // Without a working wakeup pipe a worker could still fetch, but could never
     // hand the result back — the connection would hang forever instead of
     // erroring. Fail the dispatch up front so callers reply with a clean 500.
     if (!server->wakeup_ok) return false;
     pf->server = server;
-    pf->conn_id = c->id;
+    pf->conn_id = c ? c->id : 0;
     pthread_mutex_lock(&server->pending_mu);
     pf->next = server->pending_head;
+    pf->cancelled = false;
+    pf->done = false;
     server->pending_head = pf;
+    server->pending_workers++;
     pthread_mutex_unlock(&server->pending_mu);
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, pending_job_worker, pf) != 0) {
         pthread_mutex_lock(&server->pending_mu);
-        rs_pending_job **link = &server->pending_head;
-        while (*link && *link != pf) link = &(*link)->next;
-        if (*link == pf) *link = pf->next;
+        pending_job_unlink_locked(server, pf);
+        if (server->pending_workers > 0) server->pending_workers--;
+        pthread_cond_broadcast(&server->pending_cv);
         pthread_mutex_unlock(&server->pending_mu);
         return false;
     }
@@ -4315,7 +4417,7 @@ static void dispatch_logo_lookup(restream_server_t *server, struct mg_connection
 // replies to `c`.
 static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
                            char *url, char *proxy, char *headers,
-                           bool force_ipv6, bool rotate_proxies) {
+                           bool force_ipv6, bool rotate_proxies, const rs_json *provider) {
     rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
     if (!pf) {
         free(url); free(proxy); free(headers);
@@ -4323,6 +4425,7 @@ static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
         return;
     }
     pf->kind = RS_PENDING_PROBE;
+    rs_provider_source_policy(provider, &pf->source_policy);
     pf->url = url;
     pf->proxy = proxy;
     pf->headers = headers;  // pf owns all three now
@@ -4339,7 +4442,7 @@ static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
 // array itself). Always replies to `c`.
 static void dispatch_script_action(restream_server_t *server, struct mg_connection *c,
                                    const char *sid, const char *action, const char *script_path,
-                                   char **args, int argc) {
+                                   char **args, int argc, double timeout) {
     rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
     if (!pf) {
         for (int i = 0; i < argc; i++) free(args[i]);
@@ -4353,6 +4456,7 @@ static void dispatch_script_action(restream_server_t *server, struct mg_connecti
     pf->script_path = rs_strdup(script_path);
     pf->script_args = args;  // pf owns it now
     pf->script_argc = argc;
+    pf->script_timeout = timeout;
     if (!pending_job_dispatch(server, c, pf)) {
         pending_job_free(pf);
         reply_error(c, 500, "Could not start the script.");
@@ -4360,23 +4464,45 @@ static void dispatch_script_action(restream_server_t *server, struct mg_connecti
 }
 
 static void pending_job_cancel(restream_server_t *s, unsigned long conn_id) {
+    rs_pending_job *to_free = NULL;
     pthread_mutex_lock(&s->pending_mu);
-    for (rs_pending_job *pf = s->pending_head; pf; pf = pf->next)
-        if (pf->conn_id == conn_id) pf->cancelled = true;
+    rs_pending_job **link = &s->pending_head;
+    while (*link) {
+        rs_pending_job *pf = *link;
+        if (pf->conn_id != conn_id) {
+            link = &pf->next;
+            continue;
+        }
+        pf->cancelled = true;
+        if (pf->done) {
+            *link = pf->next;
+            pf->next = to_free;
+            to_free = pf;
+            continue;
+        }
+        link = &pf->next;
+    }
+    if (to_free) pthread_cond_broadcast(&s->pending_cv);
     pthread_mutex_unlock(&s->pending_mu);
+    pending_job_free_list(to_free);
 }
 
-// Blocks until every dispatched job has finished and freed itself. Bounded by
-// libcurl's own connect/transfer timeouts (net.c) or the script runner's 30s
-// timeout (script.c), so this cannot hang forever even against an origin or
-// script that never returns. Must run before mg_mgr_free and before
-// pending_mu/pending_cv are destroyed — a worker mid-flight touches all three
-// when it finishes.
+// Blocks until every worker has made its final access to server/mgr, then drops
+// any completions the event loop did not consume. Bounded by libcurl's own
+// connect/transfer timeouts (net.c) or the script runner's 30s timeout
+// (script.c), so this cannot hang forever even against an origin or script that
+// never returns. Must run before mg_mgr_free and before pending_mu/pending_cv
+// are destroyed.
 static void pending_job_wait_idle(restream_server_t *s) {
+    rs_pending_job *to_free = NULL;
     pthread_mutex_lock(&s->pending_mu);
-    while (s->pending_head != NULL || s->ffmpeg_install_running)
+    for (rs_pending_job *pf = s->pending_head; pf; pf = pf->next) pf->cancelled = true;
+    while (s->pending_workers != 0 || s->ffmpeg_install_running)
         pthread_cond_wait(&s->pending_cv, &s->pending_mu);
+    to_free = s->pending_head;
+    s->pending_head = NULL;
     pthread_mutex_unlock(&s->pending_mu);
+    pending_job_free_list(to_free);
 }
 
 static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job *pf) {
@@ -4539,6 +4665,7 @@ static void pending_job_finish_script(restream_server_t *server, struct mg_conne
     if (script_action_imports(pf->script_action) && pf->rc == 0) {
         const char *provider_id = strchr(pf->stream_id, ':');
         provider_id = provider_id ? provider_id + 1 : pf->stream_id;
+        rs_json *before = rs_json_clone(rs_json_obj_get(find_provider_by_id(&server->state, provider_id), "streams"));
         int count = 0;
         const char *err = NULL;
         if (!pf->script_import) {
@@ -4552,12 +4679,23 @@ static void pending_job_finish_script(restream_server_t *server, struct mg_conne
             log_recordf(server, pf->stream_id, "info", "scriptImport", NULL, 0, -1,
                         "imported %d %s", count, pf->script_action);
         }
+        for (size_t i = 0; i < rs_json_arr_len(before); i++) {
+            const char *id = rs_json_obj_str(rs_json_arr_at(before, i), "id", "");
+            if (!rs_panel_find_stream(&server->state, id)) {
+                live_stop_stream(server, id);
+                pipeline_stop_stream(id);
+                log_record(server, id, "info", "channelRemoved", NULL, 0, -1, "channel absent from latest provider import");
+            }
+        }
+        rs_json_free(before);
+        webhook_rebuild_targets(server);
     }
     // A script action can change provider state (session cookies etc.) even on
     // a nonzero exit, so persist regardless. A nonzero exit is reported through
     // the log, not as an HTTP error — matches the original synchronous handler,
     // and the panel surfaces it via the script output/Logs tab either way.
     rs_state_save(&server->state);
+    if (!c) return;
     rs_json *result = log_view(server, pf->stream_id, 150);
     rs_buf output = RS_BUF_INIT;
     if (pf->script_stdout && pf->script_stdout[0]) rs_buf_append_str(&output, pf->script_stdout);
@@ -4578,6 +4716,10 @@ static void pending_job_finish_script(restream_server_t *server, struct mg_conne
 static void pending_job_finish_stream_start(restream_server_t *server, struct mg_connection *c,
                                             rs_pending_job *pf) {
     rs_stream_start *st = pf->start;
+    if ((unsigned long long)rs_json_obj_int(rs_json_obj_get(server->provider_timers, pf->stream_id), "startToken", 0) != st->token ||
+        !rs_panel_find_stream(&server->state, pf->stream_id)) {
+        reply_error(c, 409, "This start was superseded by a stop, deletion or newer start."); return;
+    }
     const char *ignored = NULL;
     if (st->err[0]) {
         // A session URL we could not refresh is fatal: there is nothing to
@@ -4682,8 +4824,13 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
     }
     n = append_script_params(args, n, RS_SCRIPT_ARG_CAP, rs_json_obj_str(stream, "scriptParams", ""));
 
+    rs_provider_source_policy(provider, &st->source_policy);
+    st->token = ++s->next_start_token;
+    rs_json_obj_set_int(provider_timer(s, stream_id), "startToken", (long long)st->token);
+    st->script_timeout = (double)rs_provider_option_int(provider, "scriptTimeoutSeconds");
     st->url_arg = url_arg;
     st->script_path = rs_strdup(script);
+    st->default_cdn = rs_strdup(rs_provider_option_str(provider, "defaultCdn"));
     st->args = args;
     st->argc = n;
     st->kind = rs_strdup(rs_json_obj_str(stream, "kind", "mpd"));
@@ -4692,11 +4839,12 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
     st->media_proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
     st->headers = effective_headers(provider, stream, "manifestHeaders");
     st->media_fetch_headers = effective_headers(provider, stream, "mediaHeaders");
-    st->provider_headers = rs_strdup(rs_json_obj_str(provider, "headers", ""));
+    st->provider_headers = rs_provider_headers(provider);
     st->downloader = rs_strdup(effective_downloader(provider, stream));
     st->dl_params = rs_strdup(effective_downloader_params(provider, stream));
     st->rep = rs_strdup(selected_video_rep(stream));
-    st->host = request_host(hm);
+    if (st->rep[0]) st->source_policy.video_filter[0] = 0;
+    st->host = hm ? request_host(hm) : rs_strdup("");
     st->force_ipv6 = rs_json_obj_bool(provider, "forceIpv6", false);
     st->rotate_proxies = rs_json_obj_bool(provider, "rotateProxies", false);
     st->want_manifest = want_manifest;
@@ -4728,6 +4876,20 @@ static void pending_job_finish(restream_server_t *server, struct mg_connection *
     if (!data || data->len != sizeof(rs_pending_job *)) return;
     rs_pending_job *pf;
     memcpy(&pf, data->buf, sizeof(pf));
+
+    bool found = false, consume = false;
+    pthread_mutex_lock(&server->pending_mu);
+    if (pending_job_unlink_locked(server, pf)) {
+        found = true;
+        consume = !pf->cancelled;
+        pthread_cond_broadcast(&server->pending_cv);
+    }
+    pthread_mutex_unlock(&server->pending_mu);
+    if (!consume) {
+        if (found) pending_job_free(pf);
+        return;
+    }
+
     switch (pf->kind) {
     case RS_PENDING_PLAYLIST: pending_job_finish_playlist(c, pf); break;
     case RS_PENDING_ITEM: pending_job_finish_item(server, c, pf); break;
@@ -4758,6 +4920,7 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     pf->stream_id = rs_strdup(stream_id);
     pf->url = rs_strdup(manifest_url);
     pf->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    rs_provider_source_policy(provider, &pf->source_policy);
     pf->headers = effective_headers(provider, stream, "manifestHeaders");
     pf->media_proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
     pf->media_headers = effective_headers(provider, stream, "mediaHeaders");
@@ -4948,6 +5111,7 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     // whole segment, so a ranged fetch would corrupt it.
     pf->range = decrypt ? NULL : header_dup(hm, "Range");
     pf->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
+    rs_provider_source_policy(provider, &pf->source_policy);
     pf->headers = effective_headers(provider, stream, is_key ? "hlsKeyHeaders" : "mediaHeaders");
     pf->downloader = rs_strdup(effective_downloader(provider, stream));
     pf->downloader_params = rs_strdup(effective_downloader_params(provider, stream));
@@ -5012,7 +5176,8 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
         snprintf(errbuf, errbuf_len, "The selected output mode requires an output target.");
         return -1;
     }
-    if (strcmp(input, "pipe") == 0 && !rs_json_obj_str(stream, "pipeCommand", "")[0]) {
+    if (strcmp(input, "pipe") == 0 && !rs_json_obj_str(stream, "pipeCommand", "")[0] &&
+        !rs_provider_option_str(provider_of(&s->state, stream), "pipeCommand")[0]) {
         snprintf(errbuf, errbuf_len, "Program pipe command is required.");
         return -1;
     }
@@ -5098,8 +5263,11 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
     in.rep_type_count = used;
     in.temp_dir = out_dir;
     in.output_playlist = playlist;
-    in.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
-    in.segment_seconds = (int)rs_json_obj_int(stream, "hlsSegmentSeconds", 10);
+    in.playlist_segments = rs_provider_playlist_segments(provider, stream);
+    in.segment_seconds = rs_provider_segment_seconds(provider, stream);
+    in.http_timeout_seconds = (int)rs_provider_option_int(provider, "httpGetTimeoutSeconds");
+    in.no_reconnect = rs_provider_option_bool(provider, "noRestartOnError");
+    in.report_progress = true;
 
     rs_ffargs_command cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -5107,7 +5275,9 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
     size_t producer_count = 0;
     int rc = rs_ffargs_build(&in, &cmd);
     if (rc == 0 && strcmp(input, "pipe") == 0)
-        rc = rs_ffargs_tokenize(rs_json_obj_str(stream, "pipeCommand", ""),
+        rc = rs_ffargs_tokenize(rs_json_obj_str(stream, "pipeCommand", "")[0]
+                                ? rs_json_obj_str(stream, "pipeCommand", "")
+                                : rs_provider_option_str(provider, "pipeCommand"),
                                 &producer, &producer_count);
     if (rc == 0 && strcmp(input, "pipe") == 0 && producer_count == 0) rc = -1;
 
@@ -5119,9 +5289,10 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
     if (rc == 0) {
         argv[0] = ffmpeg;
         for (size_t i = 0; i < cmd.argc; i++) argv[i + 1] = cmd.argv[i];
+        rs_source_policy policy; rs_provider_source_policy(provider, &policy);
         rc = g_pipeline_start(stream_id, argv, (const char *const *)producer,
                               (const char *const *)cmd.env_keys,
-                              (const char *const *)cmd.env_values, cmd.env_count);
+                              (const char *const *)cmd.env_values, cmd.env_count, &policy);
         // A failed initial spawn remains registered for supervised retry.
         if (rc != 0 && g_pipeline_running && g_pipeline_running(stream_id)) rc = 0;
     }
@@ -5173,6 +5344,8 @@ static int live_sync_stream(restream_server_t *s, const char *stream_id) {
     }
 
     const rs_json *provider = provider_of(&s->state, stream);
+    bool fallback = rs_json_obj_bool(rs_json_obj_get(s->provider_timers, stream_id), "fallback", false);
+    if (fallback) src = rs_provider_option_str(provider, "offAirFallbackUrl");
     char *mproxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
     char *dproxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
     char *mheaders = effective_headers(provider, stream, "manifestHeaders");
@@ -5194,6 +5367,7 @@ static int live_sync_stream(restream_server_t *s, const char *stream_id) {
 
     rs_live_config cfg;
     memset(&cfg, 0, sizeof(cfg));
+    rs_provider_source_policy(provider, &cfg.source_policy);
     cfg.mpd_url = src;
     cfg.cdn_urls = mirror_urls;
     cfg.cdn_url_count = mirror_used;
@@ -5219,6 +5393,11 @@ static int live_sync_stream(restream_server_t *s, const char *stream_id) {
     }
     cfg.representations = live_reps;
     cfg.representation_count = live_rep_count;
+    if (cfg.representation && cfg.representation[0]) cfg.source_policy.video_filter[0] = 0;
+    for (size_t i = 0; i < live_rep_count; i++) {
+        if (!strcmp(live_reps[i].type, "audio")) cfg.source_policy.audio_filter[0] = 0;
+        else cfg.source_policy.video_filter[0] = 0;
+    }
     cfg.manifest_proxy = mproxy;
     cfg.media_proxy = dproxy;
     cfg.manifest_headers = mheaders;
@@ -5239,17 +5418,31 @@ static int live_sync_stream(restream_server_t *s, const char *stream_id) {
     // token low enough that the director's own periodic re-poll (a 3rd fetch
     // alongside the video and audio workers) trips it by itself. See rs_live.h.
     cfg.reduced_manifest_polling = rs_json_obj_bool(stream, "reducedManifestPolling", false);
-    cfg.playlist_segments = (int)rs_json_obj_int(stream, "playlistSegments", 6);
-    cfg.hls_segment_seconds = (int)rs_json_obj_int(stream, "hlsSegmentSeconds", 10);
+    cfg.playlist_segments = rs_provider_playlist_segments(provider, stream);
+    cfg.hls_segment_seconds = rs_provider_segment_seconds(provider, stream);
     cfg.keep_segments = (int)rs_json_obj_int(stream, "keepSegments", 10);
     cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 20);
     cfg.parallel_downloads = (int)rs_json_obj_int(stream, "parallelDownloads", 6);
     cfg.prioritize_oldest = rs_json_obj_bool(stream, "prioritizeOldest", false) ? 1 : 0;
     cfg.playback_delay_seconds = (int)rs_json_obj_int(stream, "playbackDelaySeconds", 0);
+    if (rs_provider_option_int(provider, "playbackDelaySeconds") > 0)
+        cfg.playback_delay_seconds = (int)rs_provider_option_int(provider, "playbackDelaySeconds");
+    cfg.dont_wait_for_full_playlist = rs_provider_option_bool(provider, "dontWaitForFullPlaylist");
     cfg.audio_delay_ms = (int)rs_json_obj_int(stream, "audioDelayMs", 0);
     cfg.poll_interval = rs_json_obj_num(stream, "pollInterval", 0);
 
     bool already = rs_live_is_running(s->live, stream_id);
+    if (fallback) {
+        cfg.manifest_headers = cfg.media_headers = "";
+        cfg.manifest_proxy = cfg.media_proxy = "";
+        cfg.decryption_keys = "";
+        cfg.segment_url_params = ""; cfg.inherit_url_params = 0;
+        cfg.source_policy.use_cookies = 0;
+        cfg.source_policy.video_filter[0] = cfg.source_policy.audio_filter[0] = 0;
+        cfg.source_policy.use_dash_delay = 0;
+        cfg.cdn_url_count = 0;
+        cfg.representation = ""; cfg.representation_count = 0;
+    }
     int rc = rs_live_start(s->live, stream_id, &cfg);
     free(live_reps);
     if (rc != 0) {
@@ -5314,6 +5507,207 @@ static void live_sync_all(restream_server_t *s) {
         log_recordf(s, "__panel__", "info", "serverStart", NULL, 0, -1,
                     "resuming %d stream%s that were running before the restart",
                     started, started == 1 ? "" : "s");
+}
+
+// The event loop owns timers and consumes detached script results. A browser
+// connection is optional: closing Settings does not cancel scheduled work.
+static bool provider_job_busy(restream_server_t *s, const rs_json *provider) {
+    const char *pid = rs_json_obj_str(provider, "id", "");
+    bool busy = false;
+    pthread_mutex_lock(&s->pending_mu);
+    for (rs_pending_job *pf = s->pending_head; pf && !busy; pf = pf->next) {
+        if (pf->cancelled || !pf->stream_id) continue;
+        if (pf->kind == RS_PENDING_SCRIPT)
+            busy = !strncmp(pf->stream_id, "script:", 7) && !strcmp(pf->stream_id + 7, pid);
+        if (pf->kind == RS_PENDING_STREAM_START) {
+            const rs_json *streams = rs_json_obj_get(provider, "streams");
+            for (size_t i = 0; i < rs_json_arr_len(streams) && !busy; i++)
+                busy = !strcmp(rs_json_obj_str(rs_json_arr_at(streams, i), "id", ""), pf->stream_id);
+        }
+    }
+    pthread_mutex_unlock(&s->pending_mu);
+    return busy;
+}
+
+static rs_json *provider_timer(restream_server_t *s, const char *id) {
+    if (!s->provider_timers) s->provider_timers = rs_json_new_obj();
+    rs_json *timer = (rs_json *)rs_json_obj_get(s->provider_timers, id);
+    if (!timer) {
+        rs_json_obj_set(s->provider_timers, id, rs_json_new_obj());
+        timer = (rs_json *)rs_json_obj_get(s->provider_timers, id);
+    }
+    return timer;
+}
+
+static bool provider_timer_due(rs_json *timer, const char *name, long long period, double now) {
+    char pkey[96]; snprintf(pkey, sizeof(pkey), "%sPeriod", name);
+    double deadline = rs_json_obj_num(timer, name, 0);
+    if (period <= 0) { rs_json_obj_remove(timer, name); rs_json_obj_remove(timer, pkey); return false; }
+    if (deadline <= 0 || rs_json_obj_int(timer, pkey, 0) != period) {
+        rs_json_obj_set_int(timer, pkey, period);
+        rs_json_obj_set(timer, name, rs_json_new_num(now + (double)period));
+        return false;
+    }
+    if (now < deadline) return false;
+    rs_json_obj_set(timer, name, rs_json_new_num(now + (double)period));
+    return true;
+}
+
+static bool scheduled_stream_eligible(const rs_json *stream, double now) {
+    if (!rs_json_obj_bool(stream, "autostart", false) ||
+        !strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) return false;
+    double start = rs_json_obj_num(stream, "scriptStart", 0), end = rs_json_obj_num(stream, "scriptEnd", 0);
+    return (start <= 0 || start <= now) && (end <= 0 || end > now);
+}
+
+static void scheduled_stream_start(restream_server_t *s, const char *id, const char *reason) {
+    if (!reset_idle_provider_session(s, provider_of(&s->state, rs_panel_find_stream(&s->state, id)))) return;
+    if (dispatch_stream_start(s, NULL, NULL, id, "scheduler")) return;
+    const char *err = NULL;
+    char pipeline_err[256] = {0};
+    int rc = rs_panel_set_stream_running(&s->state, id, true, &err);
+    if (rc == 0 && (live_sync_stream(s, id) != 0 ||
+                   pipeline_sync_stream(s, id, pipeline_err, sizeof(pipeline_err)) != 0)) {
+        live_stop_stream(s, id); pipeline_stop_stream(id);
+        rs_panel_set_stream_running(&s->state, id, false, &err);
+        rc = -1; err = pipeline_err[0] ? pipeline_err : "Could not start scheduled stream.";
+    }
+    log_record(s, id, rc == 0 ? "info" : "error", "scheduledStart", NULL, 0, -1, rc == 0 ? reason : err);
+    rs_state_save(&s->state);
+}
+
+static void provider_maintenance(restream_server_t *s) {
+    // Unlink finished background work under the lifecycle lock, then apply its
+    // results without the lock. Workers never touch the state DOM.
+    rs_pending_job *completed = NULL;
+    pthread_mutex_lock(&s->pending_mu);
+    rs_pending_job **link = &s->pending_head;
+    while (*link) {
+        rs_pending_job *pf = *link;
+        if (pf->conn_id == 0 && pf->done) { *link = pf->next; pf->next = completed; completed = pf; }
+        else link = &pf->next;
+    }
+    pthread_mutex_unlock(&s->pending_mu);
+    while (completed) {
+        rs_pending_job *pf = completed; completed = pf->next;
+        if (!pf->cancelled) {
+            if (pf->kind == RS_PENDING_SCRIPT) pending_job_finish_script(s, NULL, pf);
+            if (pf->kind == RS_PENDING_STREAM_START) pending_job_finish_stream_start(s, NULL, pf);
+        }
+        pending_job_free(pf);
+    }
+
+    double now = now_ms() / 1000.0;
+    const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
+    bool changed = false;
+    for (size_t p = 0; p < rs_json_arr_len(providers); p++) {
+        rs_json *provider = (rs_json *)rs_json_arr_at(providers, p);
+        const char *pid = rs_json_obj_str(provider, "id", "");
+        rs_json *timer = provider_timer(s, pid);
+        if (rs_provider_option_bool(provider, "autoRemoveFinishedEvents")) {
+            const rs_json *streams = rs_json_obj_get(provider, "streams");
+            for (size_t j = rs_json_arr_len(streams); j > 0; j--) {
+                const rs_json *stream = rs_json_arr_at(streams, j - 1);
+                double end = rs_json_obj_num(stream, "scriptEnd", 0);
+                if (strcmp(rs_json_obj_str(stream, "sourceType", ""), "event") || end <= 0 || end > now) continue;
+                char *id = rs_strdup(rs_json_obj_str(stream, "id", ""));
+                live_stop_stream(s, id); pipeline_stop_stream(id);
+                const char *err = NULL;
+                rs_panel_delete_stream(&s->state, id, &err);
+                log_record(s, id, "info", "eventRemoved", NULL, 0, -1, "event reached its scheduled end");
+                rs_json_obj_remove(s->provider_timers, id);
+                free(id); changed = true;
+                streams = rs_json_obj_get(provider, "streams");
+            }
+        }
+        long long refresh = rs_provider_option_bool(provider, "autoRefreshEvents") &&
+            rs_panel_script_action_allowed(provider, NULL, "events") && rs_json_obj_str(provider, "scriptPath", "")[0]
+            ? rs_provider_option_int(provider, "eventsRefreshSeconds") : 0;
+        if (!provider_job_busy(s, provider) && provider_timer_due(timer, "events", refresh, now))
+            run_provider_script(s, NULL, provider, "events", NULL);
+
+        const rs_json *streams = rs_json_obj_get(provider, "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+            const rs_json *stream = rs_json_arr_at(streams, j);
+            const char *id = rs_json_obj_str(stream, "id", "");
+            rs_json *stimer = provider_timer(s, id);
+            bool running = !strcmp(rs_json_obj_str(stream, "status", "stopped"), "running");
+            if (!running && g_pipeline_running && g_pipeline_running(id)) pipeline_stop_stream(id);
+            int condition = running ? rs_live_condition(s->live, id) : 0;
+            double healthy_since = rs_json_obj_num(stimer, "healthySince", 0);
+            if (!running || condition) rs_json_obj_remove(stimer, "healthySince");
+            else if (healthy_since <= 0) rs_json_obj_set(stimer, "healthySince", rs_json_new_num(now));
+            else if (now - healthy_since >= 10) rs_json_obj_remove(stimer, "failures");
+            bool fallback_active = rs_json_obj_bool(stimer, "fallback", false);
+            if (running && (condition == 1 || condition == 2) && !fallback_active &&
+                rs_provider_option_bool(provider, "offAirFallback") &&
+                rs_provider_option_str(provider, "offAirFallbackUrl")[0]) {
+                live_stop_stream(s, id);
+                rs_json_obj_set_bool(stimer, "fallback", true);
+                live_sync_stream(s, id);
+                log_record(s, id, "info", "offAirFallback", NULL, 0, -1, "primary unavailable; switched to the provider fallback MPD");
+                condition = 0;
+            }
+            bool restart = condition == 1 ? !rs_provider_option_bool(provider, "noRestartOnError") :
+                           condition == 2 ? rs_provider_option_bool(provider, "restartFinishedBroadcast") : condition == 3;
+            if (fallback_active && condition) restart = true;
+            if (condition && (restart || condition == 1)) {
+                live_stop_stream(s, id); pipeline_stop_stream(id);
+                const char *err = NULL;
+                rs_panel_set_stream_running(&s->state, id, false, &err);
+                running = false; changed = true;
+                double delay = (double)rs_provider_option_int(provider, "restartDelaySeconds");
+                if (condition == 1 && rs_provider_option_bool(provider, "coolDownAutoRestart")) {
+                    int failures = (int)rs_json_obj_int(stimer, "failures", 0) + 1;
+                    rs_json_obj_set_int(stimer, "failures", failures < 20 ? failures : 20);
+                    if (delay < 1) delay = 1;
+                    double cap = delay > 300 ? delay : 300;
+                    for (int k = 1; k < failures && delay < cap; k++) delay *= 2;
+                    if (delay > cap) delay = cap;
+                }
+                if (restart) rs_json_obj_set(stimer, "restartAt", rs_json_new_num(now + delay));
+                log_record(s, id, condition == 1 ? "error" : "info", "providerRestart", NULL, 0, -1,
+                    restart ? "pipeline restart scheduled by provider policy" : "pipeline stopped; no restart on error is enabled");
+            }
+            double restart_at = rs_json_obj_num(stimer, "restartAt", 0);
+            if (restart_at > 0 && restart_at <= now && !provider_job_busy(s, provider)) {
+                rs_json_obj_remove(stimer, "restartAt");
+                scheduled_stream_start(s, id, "provider restart timer");
+            } else if (provider_timer_due(stimer, "restart", running ? rs_provider_option_int(provider, "autoRestartPeriodSeconds") : 0, now)) {
+                live_stop_stream(s, id); pipeline_stop_stream(id);
+                const char *err = NULL;
+                rs_panel_set_stream_running(&s->state, id, false, &err);
+                rs_json_obj_set(stimer, "restartAt", rs_json_new_num(now + (double)rs_provider_option_int(provider, "restartDelaySeconds")));
+                rs_json_obj_remove(stimer, "fallback");
+                log_record(s, id, "info", "scheduledRestart", NULL, 0, -1, "provider autorestart period elapsed");
+                changed = true;
+            }
+        }
+        static const char *options[] = {"sequentialAutostartPeriodSeconds", "randomAutostartPeriodSeconds"};
+        for (size_t mode = 0; mode < 2; mode++) {
+            if (provider_job_busy(s, provider) || !provider_timer_due(timer, options[mode], rs_provider_option_int(provider, options[mode]), now)) continue;
+            size_t n = rs_json_arr_len(streams), chosen = n, eligible = 0;
+            size_t cursor = n ? (size_t)rs_json_obj_int(timer, "cursor", 0) % n : 0;
+            for (size_t j = 0; j < n; j++) {
+                size_t index = mode ? j : (cursor + j) % n;
+                if (!scheduled_stream_eligible(rs_json_arr_at(streams, index), now)) continue;
+                if (!mode) { chosen = index; break; }
+                if ((size_t)rand() % ++eligible == 0) chosen = index;
+            }
+            if (chosen < n) {
+                const char *id = rs_json_obj_str(rs_json_arr_at(streams, chosen), "id", "");
+                scheduled_stream_start(s, id, mode ? "random provider autostart" : "sequential provider autostart");
+                rs_json_obj_set_int(timer, "cursor", (long long)(chosen + 1));
+            }
+        }
+    }
+    // Discard timers for deleted providers/streams to keep memory bounded.
+    for (size_t i = rs_json_obj_len(s->provider_timers); i > 0; i--) {
+        const char *id = rs_json_obj_key_at(s->provider_timers, i - 1);
+        if (!find_provider_by_id(&s->state, id) && !rs_panel_find_stream(&s->state, id))
+            rs_json_obj_remove(s->provider_timers, id);
+    }
+    if (changed) { rs_state_save(&s->state); webhook_rebuild_targets(s); }
 }
 
 // Serves the DASH master playlist. The engine renders it in the background and
@@ -6542,6 +6936,7 @@ restream_server_t* restream_server_create(void) {
     server->sysstats = rs_sysstats_create();
     server->metrics = rs_metrics_create();
     server->pending_head = NULL;
+    server->pending_workers = 0;
     pthread_mutex_init(&server->pending_mu, NULL);
     pthread_cond_init(&server->pending_cv, NULL);
     pthread_mutex_init(&server->logo_mu, NULL);
@@ -6560,6 +6955,7 @@ restream_server_t* restream_server_create(void) {
         rs_sysstats_destroy(server->sysstats);
         rs_metrics_destroy(server->metrics);
         rs_live_destroy(server->live);
+        rs_json_free(server->provider_timers);
         rs_state_dispose(&server->state);
         mg_mgr_free(&server->mgr);
         pthread_mutex_destroy(&server->pending_mu);
@@ -6607,6 +7003,14 @@ void restream_server_log_external(restream_server_t *server, const char *stream_
     log_record(server, stream_id && stream_id[0] ? stream_id : "__panel__",
                level && level[0] ? level : "info",
                event && event[0] ? event : "external", NULL, 0, -1, message);
+    // The app supervisor calls this on the event-loop thread. A terminal
+    // failure releases the provider's concurrency slot; cleanup runs next tick
+    // after the supervisor has finished accessing its current entry.
+    if (stream_id && event && level && !strcmp(event, "ffmpegHalted") && !strcmp(level, "error")) {
+        const char *err = NULL;
+        if (rs_panel_set_stream_running(&server->state, stream_id, false, &err) == 0)
+            rs_state_save(&server->state);
+    }
 }
 
 void restream_server_set_web_root(restream_server_t* server, const char* path) {
@@ -6618,6 +7022,8 @@ void restream_server_set_web_root(restream_server_t* server, const char* path) {
 void restream_server_set_verbose(bool verbose) {
     mg_log_set(verbose ? MG_LL_DEBUG : MG_LL_ERROR);
 }
+
+void restream_server_set_epg_handler(restream_epg_fn handler) { g_epg_handler = handler; }
 
 void restream_server_set_probe_handler(restream_probe_fn handler) {
     g_probe_handler = handler;
@@ -6696,12 +7102,9 @@ void restream_server_stop(restream_server_t* server) {
 
 void restream_server_destroy(restream_server_t* server) {
     if (server) {
-        // Detached pending-job worker threads (see pending_job_dispatch) call
-        // mg_wakeup() on this server's mgr and read/write the pending list on
-        // their own time; both become use-after-free the moment
-        // mg_mgr_free/pthread_mutex_destroy below run. Block until none are
-        // left in flight — bounded by each job's own timeout, so this cannot
-        // hang forever.
+        // Detached pending-job workers (see pending_job_dispatch) may still be
+        // fetching, logging, or queueing mg_wakeup() against this server. Drain
+        // them before freeing the mongoose manager and lifecycle locks.
         pending_job_wait_idle(server);
         mg_mgr_free(&server->mgr);
         // Direct-link viewers and their muxes hold no threads, but they do hold
@@ -6746,6 +7149,7 @@ void restream_server_destroy(restream_server_t* server) {
             server->webhook_head = job->next;
             webhook_job_free(job);
         }
+        rs_json_free(server->provider_timers);
         rs_state_dispose(&server->state);
         free(server->web_root);
         free(server);

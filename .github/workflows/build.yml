@@ -81,6 +81,8 @@ jobs:
           BIN=build/restreamair-server
           [ -f "$BIN" ] || BIN=build/Release/restreamair-server.exe
           python3 scripts/api-smoke.py --binary "$BIN"
+          python3 scripts/provider-options-smoke.py --binary "$BIN"
+          python3 scripts/provider-engine-smoke.py --binary "$BIN"
 
       - name: Smoke test the panel binary (Unix)
         if: runner.os != 'Windows'
@@ -208,7 +210,10 @@ jobs:
           # unaffected.
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: python3 scripts/api-smoke.py --binary build-asan/restreamair-server
+        run: |
+          python3 scripts/api-smoke.py --binary build-asan/restreamair-server
+          python3 scripts/provider-options-smoke.py --binary build-asan/restreamair-server
+          python3 scripts/provider-engine-smoke.py --binary build-asan/restreamair-server
 
   # A MinGW cross-build, which catches a POSIX-ism reaching a Windows path in a
   # couple of minutes on a Linux runner — and keeps the core honest about being

@@ -24,6 +24,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "rs_source_policy.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,7 +50,7 @@ void rs_ffrun_destroy(rs_ffrun *r);
 int rs_ffrun_start(rs_ffrun *r, const char *stream_id,
                    const char *const *argv, const char *const *feeder_argv,
                    const char *const *env_keys, const char *const *env_values,
-                   size_t env_count);
+                   size_t env_count, const rs_source_policy *policy);
 
 // Signals the pipeline to stop (SIGTERM, then SIGKILL if it ignores that) and
 // forgets it. Safe to call for a stream that is not running.

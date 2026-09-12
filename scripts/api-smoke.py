@@ -145,6 +145,12 @@ class HLSOrigin:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path.startswith("/master.m3u8"):
+                if self.server.pause_playlists.is_set():
+                    release = threading.Event()
+                    self.server.blocked_requests.put(release)
+                    if not release.wait(timeout=10):
+                        self.send_error(504)
+                        return
                 body = ("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\n"
                         "media.m3u8\n").encode()
                 content_type = "application/vnd.apple.mpegurl"
@@ -172,6 +178,8 @@ class HLSOrigin:
     def __init__(self):
         self.port = free_port()
         self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self.Handler)
+        self.httpd.pause_playlists = threading.Event()
+        self.httpd.blocked_requests = queue.Queue()
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
 
     def __enter__(self):
@@ -887,6 +895,74 @@ def test_hls_playback_routes(client, origin):
         if status == 200:
             client.request("POST", f"/api/streams/{ff['id']}/stop", body={})
 
+    return stream, key
+
+
+def test_async_hls_cleanup(server, client, origin, stream, key):
+    """Hold real origin replies until clients have closed or shutdown starts."""
+    print("async HLS disconnect and shutdown cleanup")
+    held = []
+    origin.httpd.pause_playlists.set()
+
+    def begin_request():
+        sock = socket.create_connection(("127.0.0.1", client.port), timeout=5)
+        try:
+            path = f"/play/{stream['id']}/index.m3u8?key={key}"
+            sock.sendall((f"GET {path} HTTP/1.1\r\nHost: localhost\r\n"
+                          "Connection: close\r\n\r\n").encode())
+            # The worker must have reached the origin before we disconnect;
+            # sending then immediately closing alone may never dispatch a job.
+            release = origin.httpd.blocked_requests.get(timeout=5)
+        except BaseException:
+            sock.close()
+            raise
+        held.append((sock, release))
+        return sock, release
+
+    try:
+        for _ in range(24):
+            sock, _ = begin_request()
+            sock.close()
+        check("panel responds while disconnected fetches are pending",
+              client.request("GET", "/ping")[0] == 200)
+        for _, release in held:
+            release.set()
+
+        sock, release = begin_request()
+        release.set()
+        with http.client.HTTPResponse(sock) as response:
+            response.begin()
+            payload = response.read()
+            check("HLS still serves after aborted requests",
+                  response.status == 200 and payload.startswith(b"#EXTM3U"))
+        sock.close()
+
+        # Popen.terminate uses TerminateProcess on Windows, which cannot test
+        # graceful signal-driven draining of in-flight workers.
+        if os.name != "nt":
+            _, release = begin_request()
+            server.process.terminate()
+            try:
+                server.process.wait(timeout=0.25)
+                waiting = False
+            except subprocess.TimeoutExpired:
+                waiting = True
+            check("shutdown waits for an in-flight origin fetch", waiting)
+            release.set()
+            server.stop()
+            check("shutdown with a pending fetch exits cleanly",
+                  server.process.returncode == 0, f"exit {server.process.returncode}")
+            server.start()
+            check("panel returns after restart with pending work drained",
+                  client.request("GET", "/api/state")[0] == 200)
+    finally:
+        origin.httpd.pause_playlists.clear()
+        for sock, release in held:
+            release.set()
+            sock.close()
+        while not origin.httpd.blocked_requests.empty():
+            origin.httpd.blocked_requests.get_nowait().set()
+
 
 def test_sessions_are_hashed_at_rest(workdir, admin):
     print("session storage")
@@ -937,7 +1013,9 @@ def main():
                 test_provider_routes(admin)
                 test_script_action_api(workdir, admin)
                 test_provider_webhooks(admin, webhook_sink)
-                test_hls_playback_routes(admin, origin)
+                playback = test_hls_playback_routes(admin, origin)
+                if playback:
+                    test_async_hls_cleanup(server, admin, origin, *playback)
                 test_sessions_are_hashed_at_rest(workdir, admin)
                 test_session_persistence(server, admin, viewer)
                 test_logout(admin)

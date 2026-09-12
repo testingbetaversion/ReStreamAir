@@ -44,6 +44,9 @@ typedef struct {
     const char *output_playlist;  // filesystem path, <temp_dir>/live.m3u8
     int playlist_segments;
     int segment_seconds;
+    int http_timeout_seconds; // 0 keeps the legacy 15s default
+    bool no_reconnect;
+    bool report_progress;
 } rs_ffargs_inputs;
 
 typedef struct {
@@ -68,8 +71,9 @@ char *rs_ffargs_first_clear_key(const char *keys);
 char *rs_ffargs_header_block(const char *headers);
 
 // Whitespace tokenizer that honours single and double quotes, so a custom
-// output string can contain quoted arguments. Returns 0 on success; release
-// with rs_free_strv(*tokens, *count).
+// output string can contain quoted arguments. Returns 0 on success; a nonempty
+// result has (*tokens)[*count] == NULL for use as argv. Release with
+// rs_free_strv(*tokens, *count).
 int rs_ffargs_tokenize(const char *text, char ***tokens, size_t *count);
 
 // Locate ffmpeg on PATH and standard locations (returns malloc'd path or NULL).

@@ -868,6 +868,7 @@ function renderEditor() {
     activeClients: stream.activeClients,
     playUrl: stream.playUrl,
     directUrl: stream.directUrl,
+    autostart: Boolean(stream.autostart),
     directSource: Boolean(stream.directSource),
     sourceUrl: stream.sourceUrl,
     directStreamUrls: stream.directStreamUrls || {},
@@ -916,6 +917,7 @@ function renderEditor() {
   form.elements.tvgId.value = stream.tvgId || "";
   form.elements.forceOffline.checked = Boolean(stream.forceOffline);
   form.elements.reducedManifestPolling.checked = Boolean(stream.reducedManifestPolling);
+  form.elements.autostart.checked = Boolean(stream.autostart);
   form.elements.directSource.checked = Boolean(stream.directSource);
   form.elements.manifestHeaders.value = stream.manifestHeaders || "";
   form.elements.mediaHeaders.value = stream.mediaHeaders || "";
@@ -984,7 +986,7 @@ async function enlistQualitiesForEditor(stream) {
   try {
     const result = await request("/api/probe", {
       method: "POST",
-      body: JSON.stringify({ url, proxy: stream.proxy || selectedProvider()?.proxy || "", headers: stream.manifestHeaders || "", forceIpv6: Boolean(selectedProvider()?.forceIpv6), rotateProxies: Boolean(selectedProvider()?.rotateProxies) }),
+      body: JSON.stringify({ providerId: selectedProvider()?.id || "", url, proxy: stream.proxy || selectedProvider()?.proxy || "", headers: providerProbeHeaders(stream.manifestHeaders), forceIpv6: Boolean(selectedProvider()?.forceIpv6), rotateProxies: Boolean(selectedProvider()?.rotateProxies) }),
     });
     // The user may have switched to another stream (or started editing the
     // URL, which triggers its own detect) while the probe was in flight.
@@ -1048,6 +1050,7 @@ function streamPayload() {
     tvgId: form.elements.tvgId.value.trim(),
     forceOffline: form.elements.forceOffline.checked,
     reducedManifestPolling: form.elements.reducedManifestPolling.checked,
+    autostart: form.elements.autostart.checked,
     directSource: form.elements.directSource.checked,
     manifestHeaders: form.elements.manifestHeaders.value,
     mediaHeaders: form.elements.mediaHeaders.value,
@@ -1188,7 +1191,6 @@ const INACTIVE_FIELDS = {
   period: "the engine reads every DASH period; selection isn't implemented",
   forceOffline: "not implemented in this build",
   onDemand: "not implemented in this build",
-  autostart: "streams marked running resume on restart regardless",
   speedUp: "not implemented in this build",
   recordEvent: "not implemented in this build",
   nm3u8dlreParams: "the N_m3u8DL-RE input mode isn't in this build",
@@ -1616,7 +1618,7 @@ function updatePipelineFieldVisibility() {
   if (nmParamsField) nmParamsField.classList.toggle("hidden", inputMode !== "nm3u8dlre");
   const pipeCommandField = $("#pipeCommandField");
   if (pipeCommandField) pipeCommandField.classList.toggle("hidden", inputMode !== "pipe");
-  if (form.elements.pipeCommand) form.elements.pipeCommand.required = inputMode === "pipe";
+  if (form.elements.pipeCommand) form.elements.pipeCommand.required = inputMode === "pipe" && !selectedProvider()?.options?.pipeCommand?.trim();
   if (form.elements.url) form.elements.url.required = inputMode !== "pipe";
 
   const needsFfmpeg = (inputMode !== "internal" && inputMode !== "nm3u8dlre") || outputMode !== "hls";
@@ -1910,7 +1912,7 @@ async function detectSource() {
     const proxy = form.elements.proxy.value || selectedProvider()?.proxy || "";
     const result = await request("/api/probe", {
       method: "POST",
-      body: JSON.stringify({ url, proxy, headers: form.elements.manifestHeaders.value, forceIpv6: Boolean(selectedProvider()?.forceIpv6), rotateProxies: Boolean(selectedProvider()?.rotateProxies) }),
+      body: JSON.stringify({ providerId: selectedProvider()?.id || "", url, proxy, headers: providerProbeHeaders(form.elements.manifestHeaders.value), forceIpv6: Boolean(selectedProvider()?.forceIpv6), rotateProxies: Boolean(selectedProvider()?.rotateProxies) }),
     });
     probeResult = result;
     selectedRepIds = new Set();
@@ -2192,10 +2194,91 @@ async function runProviderScriptForGrid(action) {
   }
 }
 
+// The server supplies labels, bounds and support status from the same schema
+// that validates saved values. Rebuild only when opening, never during polling,
+// so a background state refresh cannot overwrite an in-progress edit.
+function renderProviderOptions(provider) {
+  const container = $("#providerOptionsFields");
+  container.replaceChildren();
+  const groups = new Map();
+  for (const field of state.providerOptionFields || []) {
+    if (!groups.has(field.group)) {
+      const group = document.createElement("fieldset");
+      group.className = "provider-options-group";
+      const legend = document.createElement("legend");
+      legend.textContent = field.group;
+      const grid = document.createElement("div");
+      grid.className = "provider-options-grid";
+      group.append(legend, grid);
+      container.append(group);
+      groups.set(field.group, grid);
+    }
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.name = `providerOption_${field.name}`;
+    input.dataset.providerOption = field.name;
+    input.type = field.type;
+    const value = provider.options?.[field.name] ?? field.default;
+    if (field.type === "checkbox") {
+      label.className = "check";
+      input.checked = Boolean(value);
+      label.append(input, document.createTextNode(field.label));
+    } else {
+      label.append(document.createTextNode(field.label), input);
+      input.value = value;
+      if (field.type === "number") {
+        input.min = field.min;
+        input.max = field.max;
+        input.step = "1";
+        input.required = true;
+        if (field.name === "outputFragmentsCount") {
+          input.addEventListener("input", () => {
+            input.setCustomValidity([1, 2].includes(Number(input.value)) ? "Use 0 or a whole number from 3 to 240." : "");
+          });
+        }
+      } else {
+        input.maxLength = field.max;
+        input.autocomplete = "off";
+        input.spellcheck = false;
+      }
+    }
+    if (field.inactive) {
+      label.classList.add("provider-option-inactive");
+      const badge = document.createElement("span");
+      badge.className = "inactive-badge";
+      badge.textContent = "inactive";
+      label.append(badge);
+    }
+    const hint = document.createElement("span");
+    hint.className = "field-hint";
+    hint.id = `providerOptionHint_${field.name}`;
+    hint.textContent = [field.hint, field.inactive].filter(Boolean).join(" ");
+    input.setAttribute("aria-describedby", hint.id);
+    label.append(hint);
+    groups.get(field.group).append(label);
+  }
+}
+
+function readProviderOptions() {
+  return Object.fromEntries(Array.from($("#providerOptionsFields").querySelectorAll("[data-provider-option]"), (input) => [
+    input.dataset.providerOption,
+    input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) : input.value.trim(),
+  ]));
+}
+
+function providerProbeHeaders(specific) {
+  const provider = selectedProvider();
+  const headers = [provider?.headers || "", specific || ""].filter(Boolean).join("\n");
+  const dedicated = [["User-Agent", provider?.options?.userAgent], ["X-Forwarded-For", provider?.options?.xForwardedFor]];
+  return [...dedicated.filter(([name, value]) => value && !headers.split(/\r?\n/).some((line) => line.split(":", 1)[0].trim().toLowerCase() === name.toLowerCase()))
+    .map(([name, value]) => `${name}: ${value}`), headers].filter(Boolean).join("\n");
+}
+
 function openProviderSettingsDialog() {
   const form = $("#providerSettingsForm");
   const provider = selectedProvider();
   if (!provider) return;
+  renderProviderOptions(provider);
   form.elements.name.value = provider.name || "";
   form.elements.proxy.value = provider.proxy || "";
   form.elements.errorWebhookUrl.value = provider.errorWebhookUrl || "";
@@ -2280,6 +2363,7 @@ async function saveProviderSettings() {
   const provider = selectedProvider();
   if (!provider) throw new Error("No provider selected.");
   const form = $("#providerSettingsForm");
+  if (!form.reportValidity()) throw new Error("Check the highlighted provider settings.");
   state = await request(`/api/providers/${provider.id}`, {
     method: "PUT",
     body: JSON.stringify({
@@ -2295,6 +2379,7 @@ async function saveProviderSettings() {
       scriptAccounts: scriptAccountsDraft, activeScriptAccountId: activeScriptAccountIdDraft,
       accountSelectionMode: form.elements.accountSelectionMode.value,
       scriptActions: readScriptActions($("#providerScriptActions")),
+      options: readProviderOptions(),
     }),
   });
 }

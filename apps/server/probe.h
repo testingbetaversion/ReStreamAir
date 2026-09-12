@@ -1,3 +1,4 @@
+#include "rs_source_policy.h"
 #ifndef RS_PROBE_H
 #define RS_PROBE_H
 
@@ -15,7 +16,7 @@ extern "C" {
 // why it lives in the server app rather than the core.
 char *rs_probe_source(const char *url, const char *proxy, const char *headers,
                       int force_ipv6, int rotate_proxies,
-                      char *errbuf, size_t errbuf_len);
+                      char *errbuf, size_t errbuf_len, const rs_source_policy *policy);
 
 #ifdef __cplusplus
 }

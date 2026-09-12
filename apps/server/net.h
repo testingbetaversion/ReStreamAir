@@ -1,3 +1,4 @@
+#include "rs_source_policy.h"
 #ifndef RS_NET_H
 #define RS_NET_H
 
@@ -44,7 +45,7 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
                  const char *downloader, const char *dl_params, int force_ipv6, int rotate_proxies,
                  char **out, size_t *out_len, long *status, char **content_type,
                  char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
-                 long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx);
+                 long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx, const rs_source_policy *policy);
 
 // POSTs a JSON document to an HTTP(S) endpoint. Used by the provider error
 // webhook worker; deliberately separate from rs_fetch_url so a configured

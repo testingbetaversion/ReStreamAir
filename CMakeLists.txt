@@ -54,6 +54,7 @@ add_library(restream_base STATIC
     core/src/state.c
     core/src/auth.c
     core/src/panel.c
+    core/src/provider_options.c
     core/src/sysstats.c
     core/src/cenc.c
     core/src/mpegts.c
@@ -138,6 +139,7 @@ add_executable(restreamair-server
     apps/server/webroot.cpp
     apps/server/net.c
     apps/server/probe.c
+    apps/server/epg.c
     apps/server/rs_dash.c
     apps/server/ffrun.c
     apps/server/service.c
@@ -146,3 +148,10 @@ target_link_libraries(restreamair-server PRIVATE restream_core CURL::libcurl Lib
 target_include_directories(restreamair-server PRIVATE apps/server)
 target_compile_options(restreamair-server PRIVATE ${RS_WARNINGS})
 set_source_files_properties(apps/server/webroot.cpp apps/server/probe.c apps/server/net.c apps/server/rs_dash.c apps/server/ffrun.c apps/server/service.c PROPERTIES COMPILE_OPTIONS "${RS_WARNINGS}")
+
+add_executable(restream_provider_runtime_test
+    core/tests/provider_runtime_main.c apps/server/ffrun.c apps/server/epg.c)
+target_link_libraries(restream_provider_runtime_test PRIVATE restream_base LibXml2::LibXml2 Threads::Threads)
+target_include_directories(restream_provider_runtime_test PRIVATE apps/server)
+target_compile_options(restream_provider_runtime_test PRIVATE ${RS_WARNINGS})
+add_test(NAME provider_runtime COMMAND restream_provider_runtime_test)

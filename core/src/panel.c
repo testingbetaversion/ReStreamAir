@@ -1,4 +1,5 @@
 #include "rs_panel.h"
+#include "rs_provider_options.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -248,7 +249,7 @@ static rs_json *stream_build(const rs_json *body, const char *id) {
     rs_json_obj_set_str(s, "scriptAudioSelector", "");
     rs_json_obj_set_bool(s, "onDemand", false);
     rs_json_obj_set_bool(s, "speedUp", false);
-    rs_json_obj_set_bool(s, "autostart", false);
+    rs_json_obj_set_bool(s, "autostart", rs_json_obj_bool(body, "autostart", false));
     rs_json_obj_set(s, "scriptStart", rs_json_new_null());
     rs_json_obj_set(s, "scriptEnd", rs_json_new_null());
     rs_json_obj_set_bool(s, "recordEvent", false);
@@ -257,7 +258,7 @@ static rs_json *stream_build(const rs_json *body, const char *id) {
 
 // Builds a stream object from a request body, applying the same defaults,
 // clamps and validation as streamFromBody. `err` is set on failure.
-static rs_json *stream_from_body(const rs_json *body, const char *id, const char **err) {
+static rs_json *stream_from_body(const rs_json *body, const char *id, const rs_json *provider, const char **err) {
     const char *name = rs_json_obj_str(body, "name", "");
     const char *url = rs_json_obj_str(body, "url", "");
     const char *input_mode = rs_json_obj_str(body, "inputMode", "internal");
@@ -268,7 +269,8 @@ static rs_json *stream_from_body(const rs_json *body, const char *id, const char
         *err = "Stream URL must be http or https.";
         return NULL;
     }
-    if (strcmp(input_mode, "pipe") == 0 && !rs_json_obj_str(body, "pipeCommand", "")[0]) {
+    if (strcmp(input_mode, "pipe") == 0 && !rs_json_obj_str(body, "pipeCommand", "")[0] &&
+        !rs_provider_option_str(provider, "pipeCommand")[0]) {
         *err = "Program pipe command is required.";
         return NULL;
     }
@@ -432,6 +434,7 @@ rs_json *rs_panel_view(const rs_state *st, const char *host) {
         rs_json_arr_push(providers_out, provider_view(st, rs_json_arr_at(providers, i), host));
     }
     rs_json_obj_set(out, "providers", providers_out);
+    rs_json_obj_set(out, "providerOptionFields", rs_provider_options_schema());
 
     const rs_json *keys = rs_json_obj_get(st->root, "apiKeys");
     rs_json *keys_out = rs_json_new_arr();
@@ -489,6 +492,7 @@ rs_json *rs_panel_keys_view(const rs_state *st) {
 int rs_panel_create_provider(rs_state *st, const rs_json *body, const char **err) {
     const char *name = rs_json_obj_str(body, "name", "");
     const char *webhook = rs_json_obj_str(body, "errorWebhookUrl", "");
+    if (!rs_provider_options_patch_valid(NULL, rs_json_obj_get(body, "options"), err)) return -400;
     const char *trimmed = NULL;
     if (rs_trim(name, strlen(name), true, &trimmed) == 0) { *err = "Provider name is required."; return -400; }
     if (webhook[0] && !is_http_url(webhook)) { *err = "Webhook URL must begin with http:// or https://."; return -400; }
@@ -497,6 +501,7 @@ int rs_panel_create_provider(rs_state *st, const rs_json *body, const char **err
     char *id = make_id("provider");
     rs_json_obj_set_str(p, "id", id);
     free(id);
+    rs_json_obj_set(p, "options", rs_provider_options_merge(rs_json_obj_get(p, "options"), rs_json_obj_get(body, "options")));
     rs_json_obj_set_str(p, "name", name);
     rs_json_obj_set_str(p, "logo", rs_json_obj_str(body, "logo", ""));
     rs_json_obj_set_str(p, "proxy", rs_json_obj_str(body, "proxy", ""));
@@ -533,10 +538,12 @@ int rs_panel_update_provider(rs_state *st, const char *id, const rs_json *body, 
     if (!p) { *err = "Provider not found."; return -404; }
     const char *name = rs_json_obj_str(body, "name", "");
     const char *webhook = rs_json_obj_str(body, "errorWebhookUrl", "");
+    if (!rs_provider_options_patch_valid(rs_json_obj_get(p, "options"), rs_json_obj_get(body, "options"), err)) return -400;
     const char *trimmed = NULL;
     if (rs_trim(name, strlen(name), true, &trimmed) == 0) { *err = "Provider name is required."; return -400; }
     if (webhook[0] && !is_http_url(webhook)) { *err = "Webhook URL must begin with http:// or https://."; return -400; }
 
+    rs_json_obj_set(p, "options", rs_provider_options_merge(rs_json_obj_get(p, "options"), rs_json_obj_get(body, "options")));
     rs_json_obj_set_str(p, "name", name);
     // logo keeps its existing value when the body omits it.
     if (rs_json_obj_get(body, "logo")) set_str_from(p, "logo", body, "");
@@ -681,7 +688,7 @@ int rs_panel_create_stream(rs_state *st, const char *provider_id, const rs_json 
     rs_json *p = find_provider(st, provider_id);
     if (!p) { *err = "Provider not found."; return -404; }
     char *id = make_id("stream");
-    rs_json *stream = stream_from_body(body, id, err);
+    rs_json *stream = stream_from_body(body, id, p, err);
     free(id);
     if (!stream) return -400;
     const rs_json *streams = rs_json_obj_get(p, "streams");
@@ -697,7 +704,7 @@ int rs_panel_update_stream(rs_state *st, const char *stream_id, const rs_json *b
     rs_json *provider = NULL;
     rs_json *existing = find_stream(st, stream_id, &provider);
     if (!existing) { *err = "Stream not found."; return -404; }
-    rs_json *updated = stream_from_body(body, stream_id, err);
+    rs_json *updated = stream_from_body(body, stream_id, provider, err);
     if (!updated) return -400;
 
     // Channel/event-import fields have no editor inputs, so carry them over from
@@ -709,6 +716,8 @@ int rs_panel_update_stream(rs_state *st, const char *stream_id, const rs_json *b
         const rs_json *v = rs_json_obj_get(existing, carried[i]);
         if (v) rs_json_obj_set(updated, carried[i], rs_json_clone(v));
     }
+    if (rs_json_obj_get(body, "autostart"))
+        rs_json_obj_set_bool(updated, "autostart", rs_json_obj_bool(body, "autostart", false));
     // For an imported stream with no per-stream override, the scripting toggles
     // the editor didn't send stay as they were.
     bool imported = rs_json_obj_str(existing, "sourceType", "")[0] != '\0';
@@ -790,6 +799,17 @@ static rs_json *find_imported_stream(rs_json *streams, const char *name, const c
     return NULL;
 }
 
+static bool import_contains_name(const rs_json *list, const char *name) {
+    for (size_t i = 0; i < rs_json_arr_len(list); i++) {
+        const char *raw = entry_str(rs_json_arr_at(list, i), "Name", "name");
+        char *trimmed = rs_trim_dup(raw, strlen(raw), true);
+        bool matches = trimmed && strcmp(trimmed, name) == 0;
+        free(trimmed);
+        if (matches) return true;
+    }
+    return false;
+}
+
 int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const char *action,
                                    const rs_json *doc, const rs_json *logos,
                                    int *imported, const char **err) {
@@ -814,7 +834,9 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
     }
 
     int count = 0;
+    long long max_events = events ? rs_provider_option_int(p, "maxEventsCount") : 0;
     for (size_t i = 0; i < rs_json_arr_len(list); i++) {
+        if (max_events > 0 && count >= max_events) break;
         const rs_json *entry = rs_json_arr_at(list, i);
         if (rs_json_type_of(entry) != RS_JSON_OBJ) continue;
         const char *raw_name = entry_str(entry, "Name", "name");
@@ -822,6 +844,27 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
         if (!name || !name[0]) { free(name); continue; }
 
         rs_json *stream = find_imported_stream(streams, name, source_type);
+        if (!stream && events && rs_provider_option_bool(p, "reuseEventIndex")) {
+            for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+                rs_json *old = (rs_json *)rs_json_arr_at(streams, j);
+                long long end = rs_json_obj_int(old, "scriptEnd", 0);
+                if (strcmp(rs_json_obj_str(old, "sourceType", ""), "event") != 0 ||
+                    strcmp(rs_json_obj_str(old, "status", ""), "running") == 0 ||
+                    end <= 0 || end > (long long)time(NULL) ||
+                    import_contains_name(list, rs_json_obj_str(old, "name", ""))) continue;
+                // Reuse only the stable public ID. Credentials, source URLs and
+                // operator selections from the previous event must not leak.
+                rs_json *empty = rs_json_new_obj();
+                rs_json *fresh = stream_build(empty, rs_json_obj_str(old, "id", ""));
+                rs_json_free(empty);
+                while (rs_json_obj_len(old)) rs_json_obj_remove(old, rs_json_obj_key_at(old, 0));
+                for (size_t k = 0; k < rs_json_obj_len(fresh); k++)
+                    rs_json_obj_set(old, rs_json_obj_key_at(fresh, k), rs_json_clone(rs_json_obj_value_at(fresh, k)));
+                rs_json_free(fresh);
+                stream = old;
+                break;
+            }
+        }
         if (!stream) {
             char *id = make_id("stream");
             rs_json *empty = rs_json_new_obj();
@@ -872,6 +915,16 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
         }
         free(name);
         count++;
+    }
+    if (!events && rs_provider_option_bool(p, "autoRemoveMissingChannels")) {
+        rs_json *kept = rs_json_new_arr();
+        for (size_t i = 0; i < rs_json_arr_len(streams); i++) {
+            const rs_json *stream = rs_json_arr_at(streams, i);
+            if (strcmp(rs_json_obj_str(stream, "sourceType", ""), "channel") != 0 ||
+                import_contains_name(list, rs_json_obj_str(stream, "name", "")))
+                rs_json_arr_push(kept, rs_json_clone(stream));
+        }
+        rs_json_obj_set(p, "streams", kept);
     }
     if (imported) *imported = count;
     return 0;
@@ -924,6 +977,14 @@ int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool runnin
     rs_json *provider = NULL;
     rs_json *stream = find_stream(st, stream_id, &provider);
     if (!stream) { *err = "Stream not found."; return -404; }
+    if (running && strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") != 0) {
+        long long limit = rs_provider_option_int(provider, "maxStreamsConcurrency");
+        long long active = 0;
+        const rs_json *streams = rs_json_obj_get(provider, "streams");
+        for (size_t i = 0; i < rs_json_arr_len(streams); i++)
+            if (strcmp(rs_json_obj_str(rs_json_arr_at(streams, i), "status", "stopped"), "running") == 0) active++;
+        if (limit > 0 && active >= limit) { *err = "Provider maximum concurrent streams reached."; return -409; }
+    }
     rs_json_obj_set_str(stream, "status", running ? "running" : "stopped");
     rs_json_obj_set(stream, "lastError", rs_json_new_null());
     return 0;
@@ -1012,6 +1073,7 @@ rs_json *rs_panel_export_provider(const rs_state *st, const char *provider_id) {
         rs_json_obj_set_str(provider, copied[i],
                             rs_json_obj_str(found, copied[i], strcmp(copied[i], "accountSelectionMode") == 0 ? "fixed" : ""));
     }
+    rs_json_obj_set(provider, "options", rs_provider_options_merge(rs_json_obj_get(found, "options"), NULL));
     rs_json_obj_set_bool(provider, "inheritUrlParams", rs_json_obj_bool(found, "inheritUrlParams", false));
     rs_json_obj_set_bool(provider, "forceIpv6", rs_json_obj_bool(found, "forceIpv6", false));
     rs_json_obj_set_bool(provider, "rotateProxies", rs_json_obj_bool(found, "rotateProxies", false));
@@ -1050,6 +1112,7 @@ int rs_panel_import_provider(rs_state *st, const rs_json *doc, const char *scrip
         return -400;
     }
 
+    if (!rs_provider_options_patch_valid(NULL, rs_json_obj_get(source, "options"), err)) return -400;
     rs_json *p = rs_json_clone(source);
     if (!p) { *err = "Out of memory."; return -500; }
 

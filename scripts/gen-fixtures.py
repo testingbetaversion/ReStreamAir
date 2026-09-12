@@ -271,8 +271,8 @@ def write_c(path):
         lines.append("        %s," % c_string(case["decryption_keys"]))
         lines.append("        %s," % c_string(case["headers"]))
         lines.append("        %s, %s," % (c_string(case["proxy"]), c_string(case["segment_url_params"])))
-        lines.append("        %s, %d, %s, %s, %d," % (ids, count, types_ids, types, count))
-        lines.append("        %s, %s, %d, %d," % (c_string(TEMP_DIR), c_string(OUTPUT_PLAYLIST),
+        lines.append("        %s, NULL, %d, %s, %s, %d," % (ids, count, types_ids, types, count))
+        lines.append("        %s, %s, %d, %d, 0, false, false," % (c_string(TEMP_DIR), c_string(OUTPUT_PLAYLIST),
                                                   PLAYLIST_SEGMENTS, SEGMENT_SECONDS))
         lines.append("    },")
     lines.append("};")

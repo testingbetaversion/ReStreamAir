@@ -13,6 +13,7 @@
 
 #include "net.h"
 #include "probe.h"
+#include "epg.h"
 #include "rs_dash.h"
 #include "ffrun.h"
 #include "service.h"
@@ -66,9 +67,9 @@ static void pipeline_log(void *ctx, const char *stream_id, const char *level,
 static int pipeline_start(const char *stream_id, const char *const *argv,
                           const char *const *producer_argv,
                           const char *const *env_keys, const char *const *env_values,
-                          size_t env_count) {
+                          size_t env_count, const rs_source_policy *policy) {
     return g_ffrun ? rs_ffrun_start(g_ffrun, stream_id, argv, producer_argv,
-                                    env_keys, env_values, env_count) : -1;
+                                    env_keys, env_values, env_count, policy) : -1;
 }
 
 static void pipeline_stop(const char *stream_id) {
@@ -227,6 +228,7 @@ int main(int argc, char **argv) {
     std::string web_root_error;
     std::string web_root = rs_webroot_resolve(web, &web_root_error, nullptr);
 
+    restream_server_set_epg_handler(rs_epg_timezone);
     restream_server_set_probe_handler(rs_probe_source);
     restream_server_set_fetch_handler(rs_fetch_url);
     restream_server_set_webhook_handler(rs_post_json);
