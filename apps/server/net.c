@@ -192,6 +192,51 @@ static CURL *thread_handle(void) {
 
 static bool thread_handle_is_owned(void) { return g_handle_key_ok; }
 
+// --- CA trust store, for the static build -----------------------------------
+//
+// A statically linked binary carries its own TLS library, and that library was
+// compiled on Alpine: its built-in CA path is Alpine's, which does not exist on
+// the Debian or RHEL box the download lands on. The host's trust store is fine,
+// it is just somewhere else on every distro — so find it once and hand libcurl
+// the answer. Without this the single-file build serves the panel perfectly and
+// fails every upstream HTTPS fetch with "unable to get local issuer
+// certificate", which is a failure that looks like a broken source.
+//
+// Dynamically linked builds use the system libcurl and already agree with the
+// system about where certificates live, so this compiles to nothing there.
+#ifdef RS_STATIC_BUILD
+static const char *g_ca_bundle;
+
+static void ca_bundle_probe(void) {
+    // curl reads these itself, but only at curl_easy_init(); setting CAINFO
+    // below would silently override them, so they come first here.
+    const char *env = getenv("CURL_CA_BUNDLE");
+    if (!env || !env[0]) env = getenv("SSL_CERT_FILE");
+    if (env && env[0]) { g_ca_bundle = env; return; }
+
+    static const char *const candidates[] = {
+        "/etc/ssl/certs/ca-certificates.crt",                  // Debian, Ubuntu, Alpine, Arch
+        "/etc/pki/tls/certs/ca-bundle.crt",                    // RHEL, CentOS, Fedora
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",   // newer RHEL family
+        "/etc/ssl/ca-bundle.pem",                              // openSUSE
+        "/etc/ssl/cert.pem",                                   // Alpine, FreeBSD, macOS
+    };
+    for (size_t i = 0; i < sizeof candidates / sizeof *candidates; i++) {
+        if (access(candidates[i], R_OK) == 0) { g_ca_bundle = candidates[i]; return; }
+    }
+    // Nothing found: leave the compiled-in default alone rather than pointing
+    // libcurl at a path that does not exist.
+}
+
+static void apply_ca_bundle(CURL *curl) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, ca_bundle_probe);
+    if (g_ca_bundle) curl_easy_setopt(curl, CURLOPT_CAINFO, g_ca_bundle);
+}
+#else
+static void apply_ca_bundle(CURL *curl) { (void)curl; }
+#endif
+
 // --- HTTP/2, and the origins that cannot do it ------------------------------
 //
 // HTTP/2 multiplexes every request for one origin onto a single connection, so
@@ -312,6 +357,15 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    // Everything this server fetches is a manifest, a segment or a key over
+    // HTTP(S). libcurl's default set is far wider than that — file://, ftp://,
+    // dict://, gopher:// and the rest are all compiled in — and a URL reaching
+    // here is not always one we chose: playback routes carry a caller-supplied
+    // target, and a redirect can change the scheme even when the first URL was
+    // ours. Pinning both the request and the redirect chain keeps a wrong or
+    // hostile target a failed HTTP fetch rather than a local file read.
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
     curl_easy_setopt(curl, CURLOPT_IPRESOLVE,
                      force_ipv6 ? (long)CURL_IPRESOLVE_V6 : (long)CURL_IPRESOLVE_WHATEVER);
     if (timeout_ms <= 0) timeout_ms = 30000;
@@ -433,6 +487,7 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     bool session_client = active_policy && active_policy->use_cookies;
     CURL *curl = session_client ? curl_easy_init() : thread_handle();
     if (!curl) { snprintf(errbuf, errbuf_len, "Could not initialise HTTP client."); return -1; }
+    apply_ca_bundle(curl);   // after the handle is acquired: curl_easy_reset() clears it
     bool borrowed = !session_client && thread_handle_is_owned();  // false: this handle is ours to free
 
     char host[256];
@@ -1131,6 +1186,7 @@ int rs_post_json(const char *url, const char *json, long *status,
         snprintf(errbuf, errbuf_len, "Could not initialise webhook HTTP client.");
         return -1;
     }
+    apply_ca_bundle(curl);
     struct curl_slist *headers = curl_slist_append(NULL, "Content-Type: application/json");
     http_buf response = {NULL, 0, 0};
     curl_easy_setopt(curl, CURLOPT_URL, url);

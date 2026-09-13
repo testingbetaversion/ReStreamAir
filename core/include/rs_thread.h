@@ -31,6 +31,30 @@
 #include <time.h>
 #include <errno.h>
 
+// musl gives a new thread a 128 KB stack where glibc gives 8 MB. The engine's
+// own frames fit either, but what it calls into does not reliably: an OpenSSL
+// handshake, libxml2's recursive descent over an MPD and mongoose's request
+// path all run on these threads. The shipped Linux binary is a static musl
+// build (-DRS_STATIC=ON), so the difference would surface as a stack overflow
+// on a user's machine and never in a glibc CI job. Ask for 1 MB — still 8x
+// under glibc's default, and the process runs one thread per representation
+// plus a bounded download pool, so the address space costs nothing that counts.
+#if defined(__linux__) && !defined(__GLIBC__)
+static inline int rs_pthread_create_stack(pthread_t *t, const pthread_attr_t *attr,
+                                          void *(*fn)(void *), void *arg) {
+    pthread_attr_t own;
+    int rc;
+    if (attr) return pthread_create(t, attr, fn, arg);   // caller sized it itself
+    if (pthread_attr_init(&own) != 0) return pthread_create(t, NULL, fn, arg);
+    pthread_attr_setstacksize(&own, 1024 * 1024);
+    rc = pthread_create(t, &own, fn, arg);
+    pthread_attr_destroy(&own);
+    return rc;
+}
+// Defined after the function above, so the call inside it is the real one.
+#define pthread_create(t, attr, fn, arg) rs_pthread_create_stack((t), (attr), (fn), (arg))
+#endif
+
 #else  // ---------------------------------------------------------------- Win32
 
 #ifndef WIN32_LEAN_AND_MEAN

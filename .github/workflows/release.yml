@@ -38,18 +38,18 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release
       - name: Self-test
         run: ctest --test-dir build --output-on-failure
-      - name: Stage the tarball
+      - name: Stage the zip
         run: |
           STAGE="restreamair-${{ steps.ver.outputs.tag }}-macos"
           mkdir -p "$STAGE"
           cp build/restreamair-server "$STAGE/restreamair"
           cp -R public "$STAGE/public"
           cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
-          tar -czf "$STAGE.tar.gz" "$STAGE"
+          zip -qr "$STAGE.zip" "$STAGE"
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: restreamair-${{ steps.ver.outputs.tag }}-macos.tar.gz
+          path: restreamair-${{ steps.ver.outputs.tag }}-macos.zip
           if-no-files-found: error
 
   build-linux:
@@ -62,47 +62,91 @@ jobs:
           TAG="${{ github.event.inputs.tag }}"; [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
           if [ "$TAG" = "main" ]; then TAG="nightly"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-      # Built inside ubuntu:22.04 rather than on the runner: glibc, libcurl and
-      # libxml2 are resolved at runtime, and linking against the OLDEST glibc we
-      # support is what makes the binary run on newer distros as well. The other
-      # direction does not work.
-      - name: Build (ubuntu:22.04 container)
+      # One statically linked musl executable: libcurl, libxml2, OpenSSL and
+      # libc are all inside it, so nothing is resolved at runtime and no glibc
+      # version is recorded. The previous ubuntu:22.04 build linked glibc 2.35
+      # and died on anything older with `version GLIBC_2.34 not found`; building
+      # against an even older glibc only moves that line, it does not remove it.
+      - name: Build (Alpine, static musl)
         run: |
-          docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash -c '
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.20 sh -c '
             set -e
-            apt-get update -qq
-            apt-get install -y -qq cmake build-essential libcurl4-openssl-dev libxml2-dev >/dev/null
-            cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+            PKGS="build-base cmake pkgconf linux-headers
+                  curl-dev curl-static libxml2-dev libxml2-static
+                  openssl-dev openssl-libs-static zlib-dev zlib-static
+                  xz-dev xz-static nghttp2-static brotli-static zstd-static
+                  c-ares-static libidn2-static libunistring-static libpsl-static"
+            # One transaction normally; if a package name has drifted in this
+            # Alpine, fall back to per-package so the missing one is named
+            # rather than taking the whole install down with it. The link step
+            # is the real gate on whether the set was complete.
+            apk add --no-cache $PKGS ||
+              for p in $PKGS; do apk add --no-cache "$p" || echo "not in this Alpine: $p"; done
+            cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DRS_STATIC=ON
             cmake --build build-release -j"$(nproc)"
             ./build-release/restream_selftest
           '
-      - name: Stage the tarball
+      # The claim the whole job rests on, checked rather than assumed: an ELF
+      # with no DT_NEEDED entries asks the host for nothing.
+      - name: The binary needs no shared libraries
+        run: |
+          file build-release/restreamair-server
+          if readelf -d build-release/restreamair-server 2>/dev/null | grep -q NEEDED; then
+            readelf -d build-release/restreamair-server | grep NEEDED
+            echo "binary still depends on shared libraries"; exit 1
+          fi
+          echo "no shared library dependencies"
+      - name: Stage the zip
         run: |
           STAGE="restreamair-${{ steps.ver.outputs.tag }}-linux-x86_64"
           mkdir -p "$STAGE"
           cp build-release/restreamair-server "$STAGE/restreamair"
           cp -R public "$STAGE/public"
           cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
-          tar -czf "$STAGE.tar.gz" "$STAGE"
+          zip -qr "$STAGE.zip" "$STAGE"
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"
-      # Gold standard: unpack on a bare Ubuntu carrying only the two runtime
-      # libraries, and check the panel actually answers.
-      - name: Runs on a bare Ubuntu with only libcurl + libxml2
+      # Gold standard: run it on distros far older than the build host, with
+      # nothing installed in them at all — no libcurl, no libxml2, no apt step.
+      # ubuntu:18.04 is glibc 2.27 and debian:10 is 2.28, both well below the
+      # 2.33 a user reported missing; alpine proves the musl-native case.
+      - name: Runs untouched on old distros
         run: |
-          docker run --rm -v "$PWD/$STAGE:/app:ro" ubuntu:24.04 bash -c '
-            set -e
-            apt-get update -qq && apt-get install -y -qq libcurl4 libxml2 ca-certificates curl >/dev/null
-            cd /app
-            ./restreamair --port 8799 --bind 127.0.0.1 --root /app/public &
-            sleep 3
-            test "$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8799/)" = "200"
-            curl -fsS http://127.0.0.1:8799/ping
-            echo "panel serves the UI on bare Ubuntu: OK"
-          '
+          for image in ubuntu:18.04 debian:10 alpine:3.18; do
+            echo "== $image =="
+            id=$(docker run -d --rm -v "$PWD/$STAGE:/app:ro" -p 8799:8799 "$image" \
+                   /app/restreamair --port 8799 --bind 0.0.0.0 --root /app/public --no-download)
+            sleep 5
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/ || echo none)
+            ping=$(curl -s http://127.0.0.1:8799/ping || echo none)
+            docker logs "$id" 2>&1 | tail -20
+            docker stop "$id" >/dev/null
+            [ "$code" = "200" ] || { echo "$image: panel returned $code"; exit 1; }
+            echo "$image: panel serves the UI — OK ($ping)"
+          done
+      # The one thing a static build can plausibly get wrong: the TLS library is
+      # now ours, and its compiled-in CA path is Alpine's. Started with no
+      # public/ beside it, the panel bootstraps its front-end from GitHub over
+      # HTTPS — so a panel that answers 200 here has verified a real
+      # certificate chain against the host's trust store. See apps/server/net.c.
+      - name: Verifies upstream HTTPS against the host trust store
+        run: |
+          mkdir -p bare && cp "$STAGE/restreamair" bare/
+          id=$(docker run -d --rm -v "$PWD/bare:/app" -w /app -p 8798:8798 debian:12 \
+                 sh -c 'apt-get update -qq && apt-get install -y -qq ca-certificates >/dev/null &&
+                        exec /app/restreamair --port 8798 --bind 0.0.0.0')
+          for i in $(seq 1 24); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8798/ || echo none)
+            [ "$code" = "200" ] && break
+            sleep 5
+          done
+          docker logs "$id" 2>&1 | tail -30
+          docker stop "$id" >/dev/null
+          [ "$code" = "200" ] || { echo "front-end bootstrap over HTTPS failed ($code)"; exit 1; }
+          echo "downloaded public/ over TLS and served it: OK"
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: restreamair-${{ steps.ver.outputs.tag }}-linux-x86_64.tar.gz
+          path: restreamair-${{ steps.ver.outputs.tag }}-linux-x86_64.zip
           if-no-files-found: error
 
   build-windows:

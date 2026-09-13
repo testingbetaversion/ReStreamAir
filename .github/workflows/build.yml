@@ -135,30 +135,74 @@ jobs:
       # A successful manually-triggered Build should leave something useful to
       # download from its Summary page. Package the runnable server together
       # with the panel files and documentation, just like a release archive.
-      - name: Package build artifact (Unix)
-        if: runner.os != 'Windows'
+      - name: Package build artifact (macOS)
+        if: runner.os == 'macOS'
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            PLATFORM=macos
-          else
-            PLATFORM=linux-x86_64
-          fi
-          STAGE="restreamair-${RELEASE_TAG}-${PLATFORM}"
+          STAGE="restreamair-${RELEASE_TAG}-macos"
           mkdir -p "$STAGE"
           cp build/restreamair-server "$STAGE/restreamair"
           cp -R public "$STAGE/public"
           cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
-          tar -czf "$STAGE.tar.gz" "$STAGE"
+          zip -qr "$STAGE.zip" "$STAGE"
+
+      # The runner build above is what the tests ran against; it is NOT what
+      # gets uploaded. A binary linked on ubuntu-latest records that runner's
+      # glibc symbol versions and dies on any older distro with
+      # `version GLIBC_2.38 not found`. The artifact is a separate static musl
+      # build instead — the same one release.yml ships, needing no libc, no
+      # libcurl and no libxml2 on the machine it lands on.
+      - name: Build the portable Linux binary (Alpine, static musl)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.20 sh -c '
+            set -e
+            PKGS="build-base cmake pkgconf linux-headers
+                  curl-dev curl-static libxml2-dev libxml2-static
+                  openssl-dev openssl-libs-static zlib-dev zlib-static
+                  xz-dev xz-static nghttp2-static brotli-static zstd-static
+                  c-ares-static libidn2-static libunistring-static libpsl-static"
+            apk add --no-cache $PKGS ||
+              for p in $PKGS; do apk add --no-cache "$p" || echo "not in this Alpine: $p"; done
+            cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DRS_STATIC=ON
+            cmake --build build-static -j"$(nproc)"
+            ./build-static/restream_selftest
+          '
+          file build-static/restreamair-server
+          if readelf -d build-static/restreamair-server 2>/dev/null | grep -q NEEDED; then
+            readelf -d build-static/restreamair-server | grep NEEDED
+            echo "binary still depends on shared libraries"; exit 1
+          fi
+
+      - name: Package build artifact (Linux)
+        if: runner.os == 'Linux'
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          STAGE="restreamair-${RELEASE_TAG}-linux-x86_64"
+          mkdir -p "$STAGE"
+          cp build-static/restreamair-server "$STAGE/restreamair"
+          cp -R public "$STAGE/public"
+          cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
+          zip -qr "$STAGE.zip" "$STAGE"
+          # Prove the packaged binary runs where the runner build would not.
+          id=$(docker run -d --rm -v "$PWD/$STAGE:/app:ro" -p 8797:8797 ubuntu:18.04 \
+                 /app/restreamair --port 8797 --bind 0.0.0.0 --root /app/public --no-download)
+          sleep 5
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8797/ || echo none)
+          docker logs "$id" 2>&1 | tail -20
+          docker stop "$id" >/dev/null
+          [ "$code" = "200" ] || { echo "ubuntu:18.04 (glibc 2.27): panel returned $code"; exit 1; }
+          echo "runs on glibc 2.27: OK"
 
       - name: Upload build artifact (Unix)
         if: runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: restreamair-${{ inputs.release_tag }}-${{ runner.os == 'macOS' && 'macos' || 'linux-x86_64' }}
-          path: restreamair-${{ inputs.release_tag }}-${{ runner.os == 'macOS' && 'macos' || 'linux-x86_64' }}.tar.gz
+          path: restreamair-${{ inputs.release_tag }}-${{ runner.os == 'macOS' && 'macos' || 'linux-x86_64' }}.zip
           if-no-files-found: error
           retention-days: 30
 

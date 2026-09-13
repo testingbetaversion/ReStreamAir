@@ -132,8 +132,33 @@ if(NOT RS_BUILD_SERVER)
     return()
 endif()
 
-find_package(CURL REQUIRED)
-find_package(LibXml2 REQUIRED)
+# -DRS_STATIC=ON links everything — libcurl, libxml2, OpenSSL and libc itself —
+# into the executable, so the Linux download is one file that needs nothing
+# installed beside it. Build it against musl (Alpine), not glibc: a glibc
+# binary records the *build* machine's symbol versions
+# (`version GLIBC_2.38 not found` on anything older), and glibc's static NSS
+# still dlopen()s at runtime, so static there buys neither portability nor
+# self-containment. musl has no symbol versioning and resolves DNS in-process.
+#
+# CMake's FindCURL/FindLibXml2 hand back the shared libraries and nothing about
+# their private dependencies, which is exactly what a static link needs, so the
+# static path asks pkg-config for the full transitive set instead.
+option(RS_STATIC "Link everything, libc included, into one executable (musl only)" OFF)
+
+if(RS_STATIC)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(PC_CURL REQUIRED libcurl)
+    pkg_check_modules(PC_XML2 REQUIRED libxml-2.0)
+    set(RS_CURL_LIBS ${PC_CURL_STATIC_LDFLAGS} ${PC_XML2_STATIC_LDFLAGS})
+    set(RS_XML_LIBS  ${PC_XML2_STATIC_LDFLAGS})
+    set(RS_HTTP_INCLUDES ${PC_CURL_STATIC_INCLUDE_DIRS} ${PC_XML2_STATIC_INCLUDE_DIRS})
+else()
+    find_package(CURL REQUIRED)
+    find_package(LibXml2 REQUIRED)
+    set(RS_CURL_LIBS CURL::libcurl LibXml2::LibXml2)
+    set(RS_XML_LIBS  LibXml2::LibXml2)
+    set(RS_HTTP_INCLUDES "")
+endif()
 add_executable(restreamair-server
     apps/server/main.cpp
     apps/server/webroot.cpp
@@ -144,14 +169,23 @@ add_executable(restreamair-server
     apps/server/ffrun.c
     apps/server/service.c
 )
-target_link_libraries(restreamair-server PRIVATE restream_core CURL::libcurl LibXml2::LibXml2)
-target_include_directories(restreamair-server PRIVATE apps/server)
+target_link_libraries(restreamair-server PRIVATE restream_core ${RS_CURL_LIBS})
+target_include_directories(restreamair-server PRIVATE apps/server ${RS_HTTP_INCLUDES})
+if(RS_STATIC)
+    target_link_options(restreamair-server PRIVATE -static)
+    # net.c reads this: a statically linked TLS stack carries Alpine's CA path,
+    # which does not exist on the machine the download lands on.
+    target_compile_definitions(restreamair-server PRIVATE RS_STATIC_BUILD=1)
+endif()
 target_compile_options(restreamair-server PRIVATE ${RS_WARNINGS})
 set_source_files_properties(apps/server/webroot.cpp apps/server/probe.c apps/server/net.c apps/server/rs_dash.c apps/server/ffrun.c apps/server/service.c PROPERTIES COMPILE_OPTIONS "${RS_WARNINGS}")
 
 add_executable(restream_provider_runtime_test
     core/tests/provider_runtime_main.c apps/server/ffrun.c apps/server/epg.c)
-target_link_libraries(restream_provider_runtime_test PRIVATE restream_base LibXml2::LibXml2 Threads::Threads)
-target_include_directories(restream_provider_runtime_test PRIVATE apps/server)
+target_link_libraries(restream_provider_runtime_test PRIVATE restream_base ${RS_XML_LIBS} Threads::Threads)
+target_include_directories(restream_provider_runtime_test PRIVATE apps/server ${RS_HTTP_INCLUDES})
+if(RS_STATIC)
+    target_link_options(restream_provider_runtime_test PRIVATE -static)
+endif()
 target_compile_options(restream_provider_runtime_test PRIVATE ${RS_WARNINGS})
 add_test(NAME provider_runtime COMMAND restream_provider_runtime_test)

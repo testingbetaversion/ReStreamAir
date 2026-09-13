@@ -184,6 +184,25 @@ The built-in server is plain HTTP. Use a TLS-terminating reverse proxy when traf
 
 ## Install and deploy
 
+### Download a release
+
+Every release is a `.zip` holding the executable, `public/`, and the docs.
+Unpack it and run it — there is nothing to install first:
+
+```bash
+unzip restreamair-v1.1.0-linux-x86_64.zip
+cd restreamair-v1.1.0-linux-x86_64
+chmod +x restreamair          # only if your unzip tool dropped the flag
+./restreamair -p 1234
+```
+
+The Linux build is statically linked against musl, so it depends on no system
+libraries at all — not libcurl, not libxml2, not a particular glibc. It runs the
+same on a current distro and on one old enough that a normally linked binary
+would refuse to start with `version GLIBC_2.38 not found`. It still trusts the
+host's own CA certificates: the trust store is located at startup, so `curl`
+working on the box means upstream HTTPS works here too.
+
 ### Build requirements
 
 - CMake 3.16+
