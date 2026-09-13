@@ -1,4 +1,4 @@
-const CACHE_NAME = "restreamair-shell-v53";
+const CACHE_NAME = "restreamair-shell-v54";
 const SHELL_FILES = [
   "/",
   "/app.js",
@@ -9,7 +9,26 @@ const SHELL_FILES = [
   "/icons/icon-512.png",
 ];
 
-const PASSTHROUGH_PREFIXES = ["/api/", "/play/", "/proxy/", "/restream/"];
+// Everything the server serves that is not the panel shell. These must reach
+// the network untouched: the navigate branch below answers ANY navigation from
+// the cached "/" entry, so a media path missing from this list is handed
+// index.html instead of the stream — clicking a /direct/… or /download/… link
+// downloaded the app shell — and the generic handler underneath it would try to
+// put an endless byte tail into Cache Storage.
+const PASSTHROUGH_PREFIXES = [
+  "/api/",
+  "/play/",
+  "/restream/",
+  "/direct/",
+  "/download/",
+  "/source/",
+  "/ping",
+  // The Xtream-compatible client API and its live paths.
+  "/live/",
+  "/player_api.php",
+  "/get.php",
+  "/xmltv.php",
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(

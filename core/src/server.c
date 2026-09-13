@@ -939,6 +939,17 @@ static void security_headers(restream_server_t *s, struct mg_connection *c,
     }
 }
 
+// "remember me", as either shape. The panel posts the string "true" (see
+// app.js), but a JSON boolean is the spelling any other client reaches for
+// first, and reading only the string meant those callers silently got a
+// one-day session where they had asked for thirty.
+static bool body_remember(const rs_json *body) {
+    const rs_json *v = rs_json_obj_get(body, "remember");
+    if (!v) return false;
+    if (rs_json_type_of(v) == RS_JSON_BOOL) return rs_json_as_bool(v, false);
+    return strcmp(rs_json_as_str(v, ""), "true") == 0;
+}
+
 // --- auth helpers ----------------------------------------------------------
 
 // The username of the caller's live session, or NULL. Caller frees.
@@ -1057,7 +1068,7 @@ static void handle_auth_setup(restream_server_t *s, struct mg_connection *c,
     rs_json *body = rs_json_parse(hm->body.buf, hm->body.len);
     char *username = body ? body_str(body, "username") : NULL;
     char *password = body ? body_str(body, "password") : NULL;
-    bool remember = body && strcmp(rs_json_as_str(rs_json_obj_get(body, "remember"), ""), "true") == 0;
+    bool remember = body && body_remember(body);
     rs_json_free(body);
 
     // Trim the username before storing or comparing it.
@@ -1118,7 +1129,7 @@ static void handle_auth_login(restream_server_t *s, struct mg_connection *c,
     rs_json *body = rs_json_parse(hm->body.buf, hm->body.len);
     char *username = body ? body_str(body, "username") : NULL;
     char *password = body ? body_str(body, "password") : NULL;
-    bool remember = body && strcmp(rs_json_as_str(rs_json_obj_get(body, "remember"), ""), "true") == 0;
+    bool remember = body && body_remember(body);
     rs_json_free(body);
 
     char *ip = client_ip(s, c, hm);
@@ -1760,8 +1771,11 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     }
     n = fill_common_script_args(provider, stream, args, n, RS_SCRIPT_ARG_CAP);
     if (stream) {
-        args[n++] = rs_script_arg("id", stream_id, false);
-        args[n++] = rs_script_arg("url", rs_json_obj_str(stream, "url", ""), false);
+        // Bounded like every other push in this function — the array is
+        // RS_SCRIPT_ARG_CAP wide and fill_common_script_args is free to fill it.
+        if (n < RS_SCRIPT_ARG_CAP) args[n++] = rs_script_arg("id", stream_id, false);
+        if (n < RS_SCRIPT_ARG_CAP)
+            args[n++] = rs_script_arg("url", rs_json_obj_str(stream, "url", ""), false);
         // Every action a stream can run is parameterised by the tokens the
         // channel/event import stored, exactly as the automatic pipeline
         // passes them — otherwise a hook tested from the panel is invoked with
@@ -4911,6 +4925,14 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     const rs_json *provider = provider_of(&server->state, stream);
 
     char *variant = query_var(hm, "variant");
+    // Same rule as the ?u= target in serve_restream_item: this comes from the
+    // player, not from the master playlist we rewrote, so it cannot be trusted
+    // to name an origin we chose.
+    if (variant && !url_is_http(variant)) {
+        free(variant);
+        reply_error(c, 400, "Variant target must be an http or https URL.");
+        return;
+    }
     const char *manifest_url = variant ? variant : stream_source_target(stream);
     if (!manifest_url[0]) { free(variant); reply_error(c, 400, "Stream has no source URL."); return; }
 
@@ -5088,6 +5110,19 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     // mongoose poll loop every other connection also depends on.
     char *url = query_var(hm, "u");
     if (!url) { reply_error(c, 400, "Missing ?u= target."); return; }
+    // ?u= is attacker-controlled: it arrives from the player, not from the
+    // playlist we rewrote, and playback is unauthenticated until an API key
+    // exists. Without this the route is an open proxy — the server fetches
+    // whatever it is pointed at, from inside the network it runs in, carrying
+    // this stream's proxy and headers, and hands the body (or, for a refusal,
+    // the body snippet in the error text) straight back to the caller.
+    // Restricting the scheme here is one half; rs_fetch_url pins libcurl to
+    // HTTP(S) for the redirect chain, which this cannot see.
+    if (!url_is_http(url)) {
+        free(url);
+        reply_error(c, 400, "Segment target must be an http or https URL.");
+        return;
+    }
     const rs_json *provider = provider_of(&server->state, stream);
 
     char *dec = query_var(hm, "dec");

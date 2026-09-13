@@ -799,6 +799,15 @@ static int fetch_through_one_proxy(const char *url, const char *proxy,
                                    char **content_type, char **content_range,
                                    char **effective_url, char *errbuf, size_t errbuf_len,
                                    long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx) {
+    // One scheme rule for every downloader. The libcurl path pins this with
+    // CURLOPT_PROTOCOLS, but an external curl/aria2c is a separate program with
+    // its own defaults — and it would read a file:// or ftp:// target happily.
+    // Everything this function is ever asked for is HTTP(S), so refuse the rest
+    // here rather than depending on which tool the provider happens to select.
+    if (!url || (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0)) {
+        snprintf(errbuf, errbuf_len, "Refusing to fetch a non-HTTP(S) URL.");
+        return -1;
+    }
     // NULL / "" / "internal" / "libcurl" → in-process libcurl. Otherwise run the
     // chosen external tool, falling back to libcurl if it isn't installed so a
     // missing binary never dead-ends a stream.

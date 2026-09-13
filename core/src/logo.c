@@ -164,18 +164,26 @@ char* rs_logo_lookup(rs_logo_cache *lc, const char *name, rs_logo_fetch_fn fetch
         rs_free(response);
     }
 
-    if (logo_url) {
-        cJSON_ReplaceItemInObjectCaseSensitive(lc->cache_json, key, cJSON_CreateString(logo_url));
-        if (!cJSON_GetObjectItemCaseSensitive(lc->cache_json, key)) {
-            cJSON_AddItemToObject(lc->cache_json, key, cJSON_CreateString(logo_url));
-        }
-    } else {
-        cJSON_ReplaceItemInObjectCaseSensitive(lc->cache_json, key, cJSON_CreateString(""));
-        if (!cJSON_GetObjectItemCaseSensitive(lc->cache_json, key)) {
-            cJSON_AddItemToObject(lc->cache_json, key, cJSON_CreateString(""));
+    // Record the result — a miss is cached as "" so the same name does not go
+    // back to the network on every import.
+    //
+    // Replace only when the key is already there. cJSON_ReplaceItemInObject*
+    // takes no ownership when the key is absent: it strdups the name onto the
+    // node it was handed, discovers there is nothing to replace, and returns
+    // false, leaking both. That is the common path here — a lookup only reaches
+    // this line when the cache did NOT have the name — so the old
+    // replace-then-add pair leaked one node per newly resolved logo, which a
+    // bulk channel import does thousands of at a time.
+    cJSON *value = cJSON_CreateString(logo_url ? logo_url : "");
+    if (value) {
+        if (cJSON_GetObjectItemCaseSensitive(lc->cache_json, key)) {
+            if (!cJSON_ReplaceItemInObjectCaseSensitive(lc->cache_json, key, value))
+                cJSON_Delete(value);
+        } else if (!cJSON_AddItemToObject(lc->cache_json, key, value)) {
+            cJSON_Delete(value);
         }
     }
-    
+
     persist_cache(lc);
     rs_free(key);
     return logo_url;

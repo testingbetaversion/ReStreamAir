@@ -540,10 +540,13 @@ char* rs_cdm_resolve_keys(const char *script_path, const char *cdm_type, const r
     rs_strv_dispose(&args);
     
     if (ret != 0) {
+        // NULL, not the script's stderr. The contract in rs_cdm.h is "the
+        // parsed KID:KEY list, or NULL"; handing back the error text instead
+        // would have the caller store a diagnostic message as the stream's
+        // decryption keys, which then silently fails to decrypt anything.
         rs_free(out_stdout);
-        return out_stderr; // Caller handles stderr if they want, but return type is char*.
-        // Actually, return NULL on failure might be better, but the prompt doesn't specify.
-        // Let's just return NULL for now, we don't have exception throwing.
+        rs_free(out_stderr);
+        return NULL;
     }
     rs_free(out_stderr);
 

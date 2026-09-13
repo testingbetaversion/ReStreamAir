@@ -504,15 +504,15 @@ char *rs_ffmpeg_resolve(void) {
 
 char *rs_ffmpeg_install_plan(void) {
 #if defined(__APPLE__)
-    return strdup("brew install ffmpeg-full");
+    return rs_strdup("brew install ffmpeg-full");
 #elif defined(__linux__)
-    return strdup("apt-get update && apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev libavutil-dev libswresample-dev libswscale-dev");
+    return rs_strdup("apt-get update && apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev libavutil-dev libswresample-dev libswscale-dev");
 #elif defined(_WIN32)
     // The command to run, not a command the panel runs: unattended package
     // installs on Windows commonly need an elevated prompt and an interactive
     // agreement, so the server only offers the line and the operator runs it.
     // The POST that installs in place stays POSIX-only for that reason.
-    return strdup("winget install --id Gyan.FFmpeg -e");
+    return rs_strdup("winget install --id Gyan.FFmpeg -e");
 #else
     return NULL;
 #endif

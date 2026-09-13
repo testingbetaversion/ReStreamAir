@@ -66,8 +66,25 @@ static void free_boxes(rs_mp4_box *boxes, size_t count) {
     for (size_t i = 0; i < count; i++) free_boxes(boxes[i].children, boxes[i].children_count);
     rs_free(boxes);
 }
+// Container nesting this parser will follow. The deepest path a real file has
+// is moov > trak > mdia > minf > stbl > stsd > encv > sinf > schi > tenc, so
+// sixteen is generous — and it is a bound, not a guess: a box header is eight
+// bytes, so a segment of nothing but nested "moov" headers would otherwise
+// recurse once per eight bytes of input and exhaust the stack. These bytes come
+// off the network from whatever the manifest pointed at.
+#define RS_MP4_MAX_DEPTH 16
+
+static rs_mp4_box* parse_boxes_at(const uint8_t *bytes, size_t start, size_t end,
+                                  size_t *out_count, int depth);
+
 static rs_mp4_box* parse_boxes(const uint8_t *bytes, size_t start, size_t end, size_t *out_count) {
+    return parse_boxes_at(bytes, start, end, out_count, 0);
+}
+
+static rs_mp4_box* parse_boxes_at(const uint8_t *bytes, size_t start, size_t end,
+                                  size_t *out_count, int depth) {
     *out_count = 0;
+    if (depth >= RS_MP4_MAX_DEPTH) return NULL;
     size_t cap = 4;
     rs_mp4_box *boxes = malloc(cap * sizeof(rs_mp4_box));
     if (!boxes) return NULL;
@@ -89,7 +106,9 @@ static rs_mp4_box* parse_boxes(const uint8_t *bytes, size_t start, size_t end, s
         strcpy(box.type, type);
         box.start = offset; box.header_size = header_size;
         box.payload_start = offset + header_size; box.end = offset + box_size;
-        if (is_container_box(type)) box.children = parse_boxes(bytes, box.payload_start, box.end, &box.children_count);
+        if (is_container_box(type))
+            box.children = parse_boxes_at(bytes, box.payload_start, box.end,
+                                          &box.children_count, depth + 1);
         if (*out_count >= cap) {
             cap *= 2;
             rs_mp4_box *nb = realloc(boxes, cap * sizeof(rs_mp4_box));
@@ -114,6 +133,11 @@ rs_cenc_keys rs_cenc_parse_keys(const char *text) {
     if (!copy) return res;
     size_t cap = 4;
     res.kids = malloc(cap * sizeof(char*)); res.keys = malloc(cap * sizeof(uint8_t*));
+    if (!res.kids || !res.keys) {
+        rs_free(res.kids); rs_free(res.keys); rs_free(copy);
+        res.kids = NULL; res.keys = NULL;
+        return res;
+    }
     char *entry = copy;
     while (entry && *entry) {
         char *end = strpbrk(entry, "|\n\r");
@@ -126,20 +150,31 @@ rs_cenc_keys rs_cenc_parse_keys(const char *text) {
             size_t key_len = rs_trim(colon+1, strlen(colon+1), true, &key_trim);
             if (kid_len > 0 && key_len > 0) {
                 char *kid_clean = rs_trim_dup(kid_trim, kid_len, true);
-                for (size_t i = 0; kid_clean[i]; i++) kid_clean[i] = (char)tolower((unsigned char)kid_clean[i]);
                 char *key_clean = rs_trim_dup(key_trim, key_len, true);
                 uint8_t kb[16];
-                if (strlen(key_clean) == 32 && hex_decode(key_clean, kb) == 0) {
-                    if (res.count >= cap) {
-                        cap *= 2;
-                        res.kids = realloc(res.kids, cap * sizeof(char*));
-                        res.keys = realloc(res.keys, cap * sizeof(uint8_t*));
+                if (kid_clean && key_clean) {
+                    for (size_t i = 0; kid_clean[i]; i++)
+                        kid_clean[i] = (char)tolower((unsigned char)kid_clean[i]);
+                }
+                if (kid_clean && key_clean && strlen(key_clean) == 32 && hex_decode(key_clean, kb) == 0) {
+                    bool room = res.count < cap;
+                    if (!room) {
+                        size_t ncap = cap * 2;
+                        char **nkids = realloc(res.kids, ncap * sizeof(char*));
+                        if (nkids) res.kids = nkids;
+                        uint8_t **nkeys = nkids ? realloc(res.keys, ncap * sizeof(uint8_t*)) : NULL;
+                        if (nkeys) { res.keys = nkeys; cap = ncap; room = true; }
                     }
-                    res.kids[res.count] = kid_clean;
-                    res.keys[res.count] = malloc(16);
-                    memcpy(res.keys[res.count], kb, 16);
-                    res.count++;
-                } else { rs_free(kid_clean); }
+                    uint8_t *key_bytes = room ? malloc(16) : NULL;
+                    if (key_bytes) {
+                        memcpy(key_bytes, kb, 16);
+                        res.kids[res.count] = kid_clean;
+                        res.keys[res.count] = key_bytes;
+                        res.count++;
+                        kid_clean = NULL;  // owned by res now
+                    }
+                }
+                rs_free(kid_clean);
                 rs_free(key_clean);
             }
         }

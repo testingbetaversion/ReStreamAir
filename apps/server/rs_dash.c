@@ -22,6 +22,15 @@
 // template inheritance (AdaptationSet -> Representation), and BaseURL stacking.
 // SegmentBase/SegmentList and $SubNumber$ low-latency chunks are not handled.
 
+// Upper bound on the media segments one representation's plan may hold. The
+// caller trims to the window it asked for anyway, so this only decides how much
+// memory a manifest is allowed to make the expansion take.
+#define RS_DASH_MAX_SEGMENTS 5000
+// Per-<S> repeat ceiling. @r is an arbitrary integer from the document; beyond
+// this it describes more history than any DVR window has, and clamping keeps
+// the segment-count arithmetic below well inside its type.
+#define RS_DASH_MAX_REPEAT 1000000u
+
 // --- libxml2 helpers (same idiom as probe.c) -------------------------------
 
 static bool node_is(xmlNode *n, const char *name) {
@@ -192,7 +201,9 @@ static void template_from_node(xmlNode *st, seg_template *out) {
             if ((a = attr(s, "t"))) { e.t = strtoll(a, NULL, 10); free(a); }
             if ((a = attr(s, "d"))) { e.d = strtoll(a, NULL, 10); free(a); }
             if ((a = attr(s, "r"))) { e.r = strtoll(a, NULL, 10); free(a); }
-            out->timeline = realloc(out->timeline, (out->timeline_count + 1) * sizeof(tl_entry));
+            tl_entry *grown = realloc(out->timeline, (out->timeline_count + 1) * sizeof(tl_entry));
+            if (!grown) break;  // keep what parsed; the plan is short, not corrupt
+            out->timeline = grown;
             out->timeline[out->timeline_count++] = e;
         }
     }
@@ -212,7 +223,8 @@ static void merge_template(const seg_template *parent, const seg_template *child
     out->timeline_count = tl->timeline_count;
     if (out->timeline_count) {
         out->timeline = malloc(out->timeline_count * sizeof(tl_entry));
-        memcpy(out->timeline, tl->timeline, out->timeline_count * sizeof(tl_entry));
+        if (out->timeline) memcpy(out->timeline, tl->timeline, out->timeline_count * sizeof(tl_entry));
+        else out->timeline_count = 0;
     }
     out->have = parent->have || child->have;
 }
@@ -350,15 +362,64 @@ int rs_dash_plan_build(const char *mpd_xml, size_t len, const char *mpd_url,
 
                     // Expand the timeline (or a @duration window) to media segments.
                     size_t cap = 0;
+                    bool oom = false;
                     if (t.timeline_count) {
                         long long number = t.start_number ? t.start_number : 1;
                         long long cur = t.pto;
+
+                        // @r is a repeat count straight out of the manifest and
+                        // nothing upstream bounds it. Expanded literally, each
+                        // repeat costs a heap segment and a resolved URL, so one
+                        // "r=2000000000" — a hostile origin, or simply a
+                        // packager bug — walks the process out of memory before
+                        // the caller ever gets to trim the window.
+                        //
+                        // Counting first, then materialising only the tail, is
+                        // what makes the bound safe to apply: a long DVR window
+                        // (a day of two-second segments is 43200 entries) is
+                        // perfectly legitimate, and truncating it from the front
+                        // would keep the OLDEST segments and hand the engine
+                        // media hours behind the live edge. The newest are the
+                        // ones that matter, and the caller trims to `want` from
+                        // that end anyway.
+                        unsigned long long total = 0;
                         for (size_t i = 0; i < t.timeline_count; i++) {
+                            long long r = t.timeline[i].r;
+                            unsigned long long reps = r <= 0 ? 0 : (unsigned long long)r;
+                            if (reps > RS_DASH_MAX_REPEAT) reps = RS_DASH_MAX_REPEAT;
+                            total += reps + 1;
+                        }
+                        unsigned long long skip =
+                            total > RS_DASH_MAX_SEGMENTS ? total - RS_DASH_MAX_SEGMENTS : 0;
+
+                        for (size_t i = 0; i < t.timeline_count && !oom; i++) {
                             tl_entry *e = &t.timeline[i];
                             if (e->t >= 0) cur = e->t;
                             long long reps = e->r < 0 ? 0 : e->r;
-                            for (long long k = 0; k <= reps; k++) {
-                                if (out->count >= cap) { cap = cap ? cap * 2 : 64; out->segments = realloc(out->segments, cap * sizeof(rs_dash_segment)); }
+                            if (reps > (long long)RS_DASH_MAX_REPEAT) reps = RS_DASH_MAX_REPEAT;
+                            unsigned long long here = (unsigned long long)reps + 1;
+                            // Step over a whole entry arithmetically rather than
+                            // looping it: skipping 2 billion repeats one at a
+                            // time is a CPU stall even when it allocates nothing.
+                            if (skip >= here) {
+                                skip -= here;
+                                number += (long long)here;
+                                cur += (long long)here * e->d;
+                                continue;
+                            }
+                            long long first = (long long)skip;
+                            number += first;
+                            cur += first * e->d;
+                            skip = 0;
+                            for (long long k = first; k <= reps; k++) {
+                                if (out->count >= cap) {
+                                    size_t ncap = cap ? cap * 2 : 64;
+                                    rs_dash_segment *grown =
+                                        realloc(out->segments, ncap * sizeof(rs_dash_segment));
+                                    if (!grown) { oom = true; break; }
+                                    out->segments = grown;
+                                    cap = ncap;
+                                }
                                 char *path = fill_template(t.media, rid, bandwidth, number, cur);
                                 rs_dash_segment *seg = &out->segments[out->count++];
                                 seg->url = rs_url_resolve(base, path);
@@ -406,12 +467,19 @@ int rs_dash_plan_build(const char *mpd_xml, size_t len, const char *mpd_url,
                                                ? (long long)(out->time_shift_buffer_depth / seg_dur)
                                                : 10);
                             if (n < 1) n = 1;
-                            if (n > 5000) n = 5000;
+                            if (n > (long long)RS_DASH_MAX_SEGMENTS) n = RS_DASH_MAX_SEGMENTS;
                             long long start_idx = newest - n + 1;
                             if (start_idx < 0) start_idx = 0;
 
-                            for (long long idx = start_idx; idx <= newest; idx++) {
-                                if (out->count >= cap) { cap = cap ? cap * 2 : 64; out->segments = realloc(out->segments, cap * sizeof(rs_dash_segment)); }
+                            for (long long idx = start_idx; idx <= newest && !oom; idx++) {
+                                if (out->count >= cap) {
+                                    size_t ncap = cap ? cap * 2 : 64;
+                                    rs_dash_segment *grown =
+                                        realloc(out->segments, ncap * sizeof(rs_dash_segment));
+                                    if (!grown) { oom = true; break; }
+                                    out->segments = grown;
+                                    cap = ncap;
+                                }
                                 long long number = first_number + idx;
                                 long long media_time = t.pto + idx * (long long)t.duration;
                                 char *path = fill_template(t.media, rid, bandwidth, number, media_time);
@@ -821,7 +889,18 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
             pthread_mutex_unlock(&g_dash_mu);
             return NULL;
         }
-        xml = rs_strdup(entry->xml);
+        // memcpy, not rs_strdup: `len` is a byte count and the body is not
+        // guaranteed to be NUL-free. Copying with strdup while carrying the
+        // original length forward left xmlReadMemory and rs_dash_plan_build
+        // reading `len` bytes out of a shorter allocation.
+        xml = (char *)malloc(entry->len + 1);
+        if (!xml) {
+            pthread_mutex_unlock(&g_dash_mu);
+            snprintf(errbuf, errbuf_len, "Out of memory copying the cached MPD.");
+            return NULL;
+        }
+        memcpy(xml, entry->xml, entry->len);
+        xml[entry->len] = '\0';
         len = entry->len;
         effurl = entry->effurl ? rs_strdup(entry->effurl) : NULL;
         pthread_mutex_unlock(&g_dash_mu);
@@ -842,8 +921,16 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
             free(entry->xml); free(entry->effurl);
             entry->proxy = proxy ? rs_strdup(proxy) : NULL;
             entry->headers = headers ? rs_strdup(headers) : NULL;
-            entry->xml = xml ? rs_strdup(xml) : NULL;
-            entry->len = len;
+            entry->xml = NULL;
+            entry->len = 0;
+            if (xml) {
+                entry->xml = (char *)malloc(len + 1);
+                if (entry->xml) {
+                    memcpy(entry->xml, xml, len);
+                    entry->xml[len] = '\0';
+                    entry->len = len;
+                }
+            }
             entry->effurl = effurl ? rs_strdup(effurl) : NULL;
             entry->force_ipv6 = force_ipv6;
             entry->time = time(NULL);

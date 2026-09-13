@@ -104,38 +104,58 @@ static uint64_t clamped_add(uint64_t base, int64_t delta) {
     return base > magnitude ? base - magnitude : 0;
 }
 
+// Moves one tfdt's baseMediaDecodeTime by `delta_units`, in place.
+static void shift_tfdt(uint8_t *out, size_t len, const rs_box_info *tfdt, int64_t delta_units) {
+    size_t ps = tfdt->payload_start;
+    if (ps >= len) return;
+    uint8_t version = out[ps];
+    size_t offset = ps + 4;
+
+    if (version == 1) {
+        if (offset + 8 <= len && offset + 8 <= tfdt->end) {
+            uint64_t current = read_u64(out + offset);
+            write_u64(out + offset, clamped_add(current, delta_units));
+        }
+    } else {
+        if (offset + 4 <= len && offset + 4 <= tfdt->end) {
+            uint64_t current = (uint64_t)read_u32(out + offset);
+            write_u32(out + offset, (uint32_t)clamped_add(current, delta_units));
+        }
+    }
+}
+
 uint8_t* rs_audio_shift_segment(const uint8_t *data, size_t len, int64_t delta_units, size_t *out_len) {
     if (!data || !out_len) return NULL;
     
-    uint8_t *out = malloc(len);
+    uint8_t *out = malloc(len ? len : 1);
     if (!out) return NULL;
     memcpy(out, data, len);
     *out_len = len;
     
     if (delta_units == 0) return out;
-    
-    rs_box_info moof, traf, tfdt;
-    if (!find_box(out, 0, len, "moof", &moof)) return out;
-    if (!find_box(out, moof.payload_start, moof.end, "traf", &traf)) return out;
-    if (!find_box(out, traf.payload_start, traf.end, "tfdt", &tfdt)) return out;
-    
-    size_t ps = tfdt.payload_start;
-    if (ps >= len) return out;
-    uint8_t version = out[ps];
-    size_t offset = ps + 4;
-    
-    if (version == 1) {
-        if (offset + 8 <= len) {
-            uint64_t current = read_u64(out + offset);
-            uint64_t shifted = clamped_add(current, delta_units);
-            write_u64(out + offset, shifted);
+
+    // EVERY moof, and every traf inside it — not just the first of each.
+    //
+    // A CMAF segment may legally carry several moof/mdat fragment pairs, and the
+    // sources this engine is pointed at routinely do (see the same loop in
+    // rs_cenc_decrypt_segment). Shifting only the leading fragment moved the
+    // start of the segment while leaving the rest where it was, so the lip-sync
+    // offset inserted a delta_units-wide hole *inside* every segment — the knob
+    // made A/V worse rather than better on exactly the packaging it is usually
+    // reached for. find_box returns the first match at or after `start` and
+    // reports the box end, so stepping `start` to that end walks them all.
+    size_t moof_at = 0;
+    rs_box_info moof;
+    while (moof_at < len && find_box(out, moof_at, len, "moof", &moof)) {
+        size_t traf_at = moof.payload_start;
+        rs_box_info traf;
+        while (traf_at < moof.end && find_box(out, traf_at, moof.end, "traf", &traf)) {
+            rs_box_info tfdt;
+            if (find_box(out, traf.payload_start, traf.end, "tfdt", &tfdt))
+                shift_tfdt(out, len, &tfdt, delta_units);
+            traf_at = traf.end;
         }
-    } else {
-        if (offset + 4 <= len) {
-            uint64_t current = (uint64_t)read_u32(out + offset);
-            uint64_t shifted = clamped_add(current, delta_units);
-            write_u32(out + offset, (uint32_t)shifted);
-        }
+        moof_at = moof.end;
     }
     
     return out;

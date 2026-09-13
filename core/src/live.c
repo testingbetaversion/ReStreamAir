@@ -2187,6 +2187,27 @@ static double director_retry_delay(int failures, bool throttled) {
     return d > 0 ? d : RS_LIVE_DIRECTOR_RETRY;
 }
 
+// Reports a failed manifest poll, and says whether this engine has now given
+// up on itself.
+//
+// `terminal` is what rs_live_condition hands the supervisor, and the supervisor
+// answers a 1 by stopping the pipeline and scheduling a restart. Setting it on
+// the FIRST failure therefore made every line of the backoff above unreachable:
+// the loop below refuses to poll once terminal is set, so the engine parked
+// after one refusal and a transient 429 cost a full restart plus
+// restartDelaySeconds instead of the three-second retry it logged. Give the
+// backoff the few attempts it exists for, and only then hand the stream over.
+// (A source that is down for longer than that is still caught: the stall
+// timeout in rs_live_condition watches media progress, not polls.)
+#define RS_LIVE_DIRECTOR_FAIL_LIMIT 4
+static bool director_note_failure(live_stream *st, int failures) {
+    if (failures < RS_LIVE_DIRECTOR_FAIL_LIMIT) return false;
+    pthread_mutex_lock(&st->mu);
+    st->terminal = 1;
+    pthread_mutex_unlock(&st->mu);
+    return true;
+}
+
 // The stream's download pool. Sized once, from parallelDownloads, and shared
 // by every rendition for the life of the stream — a thread that comes and goes
 // throws away the keep-alive connection that is the whole reason it is
@@ -2290,12 +2311,14 @@ static void *director_main(void *arg) {
         char err[256] = {0};
         char *json = manifest_fetch(st, &cfg, ids, want, err, sizeof(err));
         if (!json) {
-            pthread_mutex_lock(&st->mu); st->terminal = 1; pthread_mutex_unlock(&st->mu);
             fails++;
             throttled = rs_live_status_is_throttle(status_from_error(err)) != 0;
+            bool gave_up = director_note_failure(st, fails);
             double wait = director_retry_delay(fails, throttled);
-            lgf(st, "error", "manifest", cfg.mpd_url, 0, -1, "%s — retrying in %.1fs",
-                err[0] ? err : "could not read the MPD", wait);
+            lgf(st, "error", "manifest", cfg.mpd_url, 0, -1, "%s — %s",
+                err[0] ? err : "could not read the MPD",
+                gave_up ? "giving up on this engine; the supervisor decides what happens next"
+                        : "retrying");
             free(pinned);
             cfg_snap_dispose(&cfg);
             if (!live_wait(st, wait)) break;
@@ -2305,16 +2328,30 @@ static void *director_main(void *arg) {
         rs_json *root = rs_json_parse(json, strlen(json));
         free(json);
         if (!root) {
-            pthread_mutex_lock(&st->mu); st->terminal = 1; pthread_mutex_unlock(&st->mu);
             fails++;
             throttled = false;
+            bool gave_up = director_note_failure(st, fails);
             double wait = director_retry_delay(fails, throttled);
             lgf(st, "error", "manifest", cfg.mpd_url, 0, -1,
-                "malformed DASH description — retrying in %.1fs", wait);
+                "malformed DASH description — %s",
+                gave_up ? "giving up on this engine; the supervisor decides what happens next"
+                        : "retrying");
             free(pinned);
             cfg_snap_dispose(&cfg);
             if (!live_wait(st, wait)) break;
             continue;
+        }
+        // A window is in hand, so whatever went wrong before is over. Clearing
+        // the error report matters as much as resetting the counter: the
+        // supervisor reads it through rs_live_condition every tick, and a flag
+        // that only ever latched on meant a recovered engine was still asked to
+        // restart.
+        if (fails > 0) {
+            pthread_mutex_lock(&st->mu);
+            if (st->terminal == 1) st->terminal = 0;
+            pthread_mutex_unlock(&st->mu);
+            lgf(st, "info", "manifest", cfg.mpd_url, 0, -1,
+                "manifest recovered after %d consecutive failure%s", fails, fails == 1 ? "" : "s");
         }
         fails = 0;
         throttled = false;
