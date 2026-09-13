@@ -179,9 +179,29 @@ def run(binary):
                         return value
                     time.sleep(0.15)
                 raise AssertionError("Timed out waiting for provider maintenance")
+            def applied_script_runs():
+                _, result, _ = client.json("GET", f"/api/logs?streamId=script:{scheduled['id']}&limit=300")
+                return sum(1 for entry in result["entries"] if entry["event"] == "scriptEnd")
+            def settle_scripts():
+                # Turning auto-refresh off stops new runs being SCHEDULED, but a run
+                # the timer already dispatched still lands, and a background run is
+                # applied on the maintenance tick rather than when the script exits
+                # — so it can overtake the manual runs below and import whatever the
+                # catalogue said when it started. Every applied run logs scriptEnd,
+                # so wait for that count to stop moving before the catalogue is
+                # rewritten to mean something else. Without this the test is a race
+                # against a one-second timer, and losing it plants an event ending in
+                # 2100 that autoRemoveFinishedEvents will never clean up.
+                last, since = applied_script_runs(), time.monotonic()
+                while time.monotonic() - since < 1.5:
+                    time.sleep(0.1)
+                    count = applied_script_runs()
+                    if count != last:
+                        last, since = count, time.monotonic()
             configure_scheduled({"autoRefreshEvents": True, "eventsRefreshSeconds": 1})
             first = wait_for(lambda: next((s for s in scheduled_streams() if s["name"] == "Scheduled event"), None))
             configure_scheduled({"autoRefreshEvents": False})
+            settle_scripts()
             catalogue.write_text('{"events":[{"name":"Scheduled event","end":1}]}')
             assert client.request("POST", scheduled_route + "/script/events", {})[0] == 200
             configure_scheduled({"reuseEventIndex": True})
