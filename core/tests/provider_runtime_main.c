@@ -2,6 +2,7 @@
 #include "ffrun.h"
 #include "epg.h"
 #include "rs_proc.h"
+#include "rs_thread.h"   // clock_gettime, on Windows too
 #include "rs_provider_options.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,8 +18,21 @@ static void log_event(void *ctx, const char *sid, const char *level, const char 
     if (!strcmp(event, "ffmpegHalted")) halted++;
     if (!strcmp(event, "ffmpegStalled")) stalls++;
 }
+// Polls for a real elapsed span, not for a count of nominal sleeps. Counting
+// iterations silently overruns: each one also costs a poll and whatever the
+// scheduler adds to a 20ms sleep, so a "1300ms" window really ran ~1520ms on an
+// idle machine and past 3s on a loaded CI runner. These windows are deliberately
+// placed BETWEEN one restart deadline and the next — overrunning one does not
+// make the check more patient, it lets a second restart happen and turns
+// `starts == 2` into 3, which is how this failed on macOS CI and nowhere else.
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
 static void poll_for(rs_ffrun *runner, int milliseconds) {
-    for (int elapsed = 0; elapsed < milliseconds; elapsed += 20) { rs_ffrun_poll(runner); rs_proc_sleep_ms(20); }
+    double until = now_ms() + milliseconds;
+    while (now_ms() < until) { rs_ffrun_poll(runner); rs_proc_sleep_ms(20); }
 }
 int main(int argc, char **argv) {
     if (argc > 1) {
@@ -40,7 +54,7 @@ int main(int argc, char **argv) {
     rs_ffrun_stop(runner, "test"); starts = halted = 0;
     policy.no_restart_error = 0; policy.cooldown = 1;
     rs_ffrun_start(runner, "test", command, NULL, NULL, NULL, 0, &policy);
-    poll_for(runner, 2400);
+    poll_for(runner, 2000);   // restart at 1s, the next at 3s: a second either side
     check("restart delay and exponential cooldown", starts == 2 && halted == 0);
     rs_ffrun_stop(runner, "test"); starts = halted = 0;
     command[1] = "finished";
@@ -50,7 +64,7 @@ int main(int argc, char **argv) {
     rs_ffrun_stop(runner, "test"); starts = halted = 0;
     policy.restart_finished = 1;
     rs_ffrun_start(runner, "test", command, NULL, NULL, NULL, 0, &policy);
-    poll_for(runner, 1300);
+    poll_for(runner, 1500);   // restart at 1s, the next at 2s
     check("restart finished broadcast", starts == 2 && halted == 0);
     rs_ffrun_stop(runner, "test"); starts = halted = stalls = 0;
     policy.no_restart_error = 1; policy.stalled_seconds = 1;
