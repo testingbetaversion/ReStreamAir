@@ -26,6 +26,7 @@
 #include "rs_ffargs.h"
 #include "rs_json.h"
 #include "rs_live.h"
+#include "rs_logo.h"
 #include "rs_m3u8.h"
 #include "rs_mpegts.h"
 #include "rs_metrics.h"
@@ -1056,6 +1057,82 @@ static void test_state_repeated_save(void) {
     remove("rs-selftest-state-save.json.tmp");
 }
 
+// The logo cache is what a catalogue import spends its time in, so the two
+// properties that keep a 900-channel import from taking minutes are pinned
+// here: a name is asked about the network exactly once ever (a miss is
+// remembered as one), and a batch defers the file write to its end instead of
+// rewriting the whole cache after every single name.
+static int g_logo_fetches = 0;
+static char *counting_fetch(const char *url, void *ctx) {
+    (void)ctx;
+    g_logo_fetches++;
+    // Only the first name resolves; the second is the miss path.
+    if (strstr(url, "Hit")) return rs_strdup("[{\"domain\":\"example.com\"}]");
+    return rs_strdup("[]");
+}
+
+static bool file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+static void test_logo_cache(void) {
+    const char *path = "rs-selftest-logos.json";
+    remove(path);
+    g_logo_fetches = 0;
+
+    rs_logo_cache *lc = rs_logo_cache_create(path);
+    check("logo/empty-cache-knows-nothing", !rs_logo_cache_has(lc, "Hit Channel"));
+
+    char *url = rs_logo_lookup(lc, "Hit Channel", counting_fetch, NULL);
+    check_str("logo/resolves", url ? url : "",
+              "https://www.google.com/s2/favicons?sz=128&domain=example.com");
+    rs_free(url);
+    check("logo/one-fetch", g_logo_fetches == 1);
+    check("logo/hit-now-cached", rs_logo_cache_has(lc, "Hit Channel"));
+    // rs_logo_cache_has must key names exactly as rs_logo_lookup does, or the
+    // import's budget check would send already-known names back to the network.
+    check("logo/has-normalises", rs_logo_cache_has(lc, "  hit   channel  "));
+    check("logo/unbatched-write", file_exists(path));
+
+    // A second ask for the same name is answered from memory.
+    url = rs_logo_lookup(lc, "Hit Channel", counting_fetch, NULL);
+    check("logo/cached-name-skips-fetch", g_logo_fetches == 1);
+    rs_free(url);
+
+    // A miss is remembered too — the name resolves to nothing, but asking
+    // about it again must not cost another round trip.
+    url = rs_logo_lookup(lc, "Absent Channel", counting_fetch, NULL);
+    check("logo/miss-returns-nothing", url == NULL);
+    check("logo/miss-fetched-once", g_logo_fetches == 2);
+    check("logo/miss-now-cached", rs_logo_cache_has(lc, "Absent Channel"));
+    url = rs_logo_lookup(lc, "Absent Channel", counting_fetch, NULL);
+    check("logo/cached-miss-skips-fetch", g_logo_fetches == 2);
+    rs_free(url);
+    rs_logo_cache_destroy(lc);
+
+    // Batched: nothing reaches the file until the batch ends, and what lands
+    // then holds every name the batch resolved.
+    remove(path);
+    lc = rs_logo_cache_create(path);
+    rs_logo_cache_begin_batch(lc);
+    rs_free(rs_logo_lookup(lc, "Hit One", counting_fetch, NULL));
+    rs_free(rs_logo_lookup(lc, "Hit Two", counting_fetch, NULL));
+    check("logo/batch-defers-write", !file_exists(path));
+    check("logo/batch-still-caches", rs_logo_cache_has(lc, "Hit One"));
+    rs_logo_cache_end_batch(lc);
+    check("logo/batch-writes-at-end", file_exists(path));
+    rs_logo_cache_destroy(lc);
+
+    lc = rs_logo_cache_create(path);
+    check("logo/batch-persisted-first", rs_logo_cache_has(lc, "Hit One"));
+    check("logo/batch-persisted-second", rs_logo_cache_has(lc, "Hit Two"));
+    rs_logo_cache_destroy(lc);
+    remove(path);
+}
+
 static void test_cdm_pssh(void) {
     // A Widevine box built from a KID: version 0, the Widevine system id, and a
     // WidevinePsshData payload of one `key_ids` field (tag 0x12, length 0x10).
@@ -1440,7 +1517,7 @@ static void test_panel(void) {
     const char *sid = rs_json_obj_str(imported_stream, "id", "");
     rs_json *mirrors = parse_json("[\"https://backup.example/a.mpd\"]");
     check("panel/session-manifest",
-          rs_panel_apply_session_manifest(&st, sid, "https://cdn.example/live/1.mpd", mirrors,
+          rs_panel_apply_session_manifest(&st, sid, "https://cdn.example/live/1.mpd", mirrors, NULL,
                                           "Authorization: Bearer x", "", 300, &err) == 0);
     rs_json_free(mirrors);
     imported_stream = rs_json_arr_at(rs_json_obj_get(rs_json_arr_at(providers, 0), "streams"), 1);
@@ -1456,7 +1533,7 @@ static void test_panel(void) {
     check_str("panel/session-manifest-keeps-media-headers",
               rs_json_obj_str(imported_stream, "mediaHeaders", ""), "");
     check("panel/session-manifest-rejects-bad-url",
-          rs_panel_apply_session_manifest(&st, sid, "ftp://nope", NULL, "", "", 0, &err) == -400);
+          rs_panel_apply_session_manifest(&st, sid, "ftp://nope", NULL, NULL, "", "", 0, &err) == -400);
 
     check("panel/cdm-keys", rs_panel_set_stream_keys(&st, sid, "aa:bb", &err) == 0);
     check_str("panel/cdm-keys-stored",
@@ -2507,6 +2584,7 @@ int main(int argc, char **argv) {
     test_auth_throttle();
     test_netmatch();
     test_state_repeated_save();
+    test_logo_cache();
     test_panel();
     test_provider_options();
     test_cdm_pssh();

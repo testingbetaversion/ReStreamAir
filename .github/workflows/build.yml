@@ -10,6 +10,11 @@ on:
         description: 'Release tag to create, for example v0.14.0'
         required: true
         type: string
+      full_checks:
+        description: 'Also run sanitizer suites and the MinGW cross-build'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -27,9 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install libcurl + libxml2 (Linux)
+      - name: Install core libraries and FFmpeg (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libxml2-dev
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libxml2-dev ffmpeg
 
       - name: Install libxml2 (macOS)
         if: runner.os == 'macOS'
@@ -75,7 +80,8 @@ jobs:
       # The HTTP layer the self-test cannot reach: the auth gate, the viewer
       # role, the login throttle, session persistence across a restart, cookie
       # attributes and the mode of state.json.
-      - name: API end-to-end
+      - name: API and playback checks (once on Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           BIN=build/restreamair-server
@@ -83,9 +89,12 @@ jobs:
           python3 scripts/api-smoke.py --binary "$BIN"
           python3 scripts/provider-options-smoke.py --binary "$BIN"
           python3 scripts/provider-engine-smoke.py --binary "$BIN"
+          python3 scripts/manifest-recovery-smoke.py --binary "$BIN"
+          node scripts/panel-playback-smoke.js
+          python3 scripts/hls-buffer-smoke.py --binary "$BIN" --multi
 
-      - name: Smoke test the panel binary (Unix)
-        if: runner.os != 'Windows'
+      - name: Smoke test the panel binary (macOS)
+        if: runner.os == 'macOS'
         run: |
           ./build/restreamair-server --port 8799 --bind 127.0.0.1 --root public &
           sleep 3
@@ -145,6 +154,8 @@ jobs:
           mkdir -p "$STAGE"
           cp build/restreamair-server "$STAGE/restreamair"
           cp -R public "$STAGE/public"
+          mkdir -p "$STAGE/scripts"
+          cp -R scripts/providers "$STAGE/scripts/providers"
           cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
           zip -qr "$STAGE.zip" "$STAGE"
 
@@ -185,6 +196,8 @@ jobs:
           mkdir -p "$STAGE"
           cp build-static/restreamair-server "$STAGE/restreamair"
           cp -R public "$STAGE/public"
+          mkdir -p "$STAGE/scripts"
+          cp -R scripts/providers "$STAGE/scripts/providers"
           cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
           zip -qr "$STAGE.zip" "$STAGE"
           # Prove the packaged binary runs where the runner build would not.
@@ -216,6 +229,8 @@ jobs:
           mkdir -p "$STAGE"
           cp build/Release/restreamair-server.exe "$STAGE/restreamair.exe"
           cp -R public "$STAGE/public"
+          mkdir -p "$STAGE/scripts"
+          cp -R scripts/providers "$STAGE/scripts/providers"
           cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
           7z a "$STAGE.zip" "$STAGE" >/dev/null
 
@@ -233,6 +248,7 @@ jobs:
   # a security bug.
   core-sanitizers:
     name: C core (sanitizers)
+    if: inputs.full_checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -264,6 +280,7 @@ jobs:
   # portable to a second Windows toolchain rather than to one compiler.
   windows-cross:
     name: C core (MinGW cross-build)
+    if: inputs.full_checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -283,12 +300,16 @@ jobs:
       - name: Build
         run: cmake --build build-mingw -j"$(nproc)"
 
-  # Publish only after every platform build and both diagnostic jobs pass. The
+  # Platform builds are required. Optional diagnostics must pass when selected. The
   # same packages remain downloadable from the Build run's Artifacts section
   # and are also attached to the requested entry on the Releases page.
   release:
     name: Publish GitHub release
     needs: [core, core-sanitizers, windows-cross]
+    if: >-
+      always() && !cancelled() && needs.core.result == 'success' &&
+      (needs.core-sanitizers.result == 'success' || needs.core-sanitizers.result == 'skipped') &&
+      (needs.windows-cross.result == 'success' || needs.windows-cross.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write

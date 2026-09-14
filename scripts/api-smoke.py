@@ -379,6 +379,8 @@ def test_refresh_and_events(client, viewer):
 
 def test_health_and_gate(client):
     print("health and the authentication gate")
+    status, ui, _ = client.request("GET", "/")
+    check("panel UI is served", status == 200 and b"ReStreamAir" in ui)
     status, _, _ = client.request("GET", "/ping")
     check("ping answers 200", status == 200, f"got {status}")
 
@@ -681,6 +683,39 @@ def test_provider_routes(client):
     check("Xtream rejects invalid credentials in the expected response shape",
           status == 200 and rejected.get("user_info", {}).get("auth") == 0,
           f"{status} {rejected}")
+
+    # Keep a second account distinct throughout login, export and revocation.
+    # Reserved characters exercise both query and /live/ path encoding.
+    from urllib.parse import urlencode, quote, urlsplit, parse_qs
+    second_label = "room + / & TV"
+    _, key_doc, _ = client.json("POST", "/api/keys", {"label": second_label})
+    second_key = next(k for k in key_doc["keys"] if k["label"] == second_label)
+    second_query = urlencode({"username": second_label, "password": second_key["key"]})
+    _, login, _ = client.json("GET", "/player_api.php?" + second_query)
+    check("Xtream accepts the second user's encoded login", login.get("user_info", {}).get("auth") == 1)
+    _, mixed, _ = client.json("GET", "/player_api.php?" + urlencode({"username": "xc-test", "password": second_key["key"]}))
+    check("Xtream rejects a password belonging to another user", mixed.get("user_info", {}).get("auth") == 0)
+    for route in ["/api/playlist.m3u8", f"/api/providers/{provider['id']}/playlist.m3u8"]:
+        status, data, _ = client.request("GET", route + "?" + urlencode({"key": second_key["key"]}))
+        entries = [urlsplit(line) for line in data.decode().splitlines() if line and not line.startswith("#")]
+        check(f"{route} exports complete URLs for the selected user", status == 200 and bool(entries) and all(
+            entry.scheme == "http" and entry.netloc == f"127.0.0.1:{client.port}" and
+            parse_qs(entry.query).get("key") == [second_key["key"]] for entry in entries))
+    status, data, _ = client.request("GET", "/api/playlist.m3u8")
+    check("export without a selection includes an existing playback key", status == 200 and f"?key={xc_key}" in data.decode())
+    status, data, _ = client.request("GET", "/get.php?" + second_query + "&type=m3u_plus&output=m3u8")
+    urls = [line for line in data.decode().splitlines() if line and not line.startswith("#")]
+    check("Xtream playlist preserves the requested user", status == 200 and bool(urls) and all(
+        f"/live/{quote(second_label, safe='')}/{second_key['key']}/" in url for url in urls))
+    if urls:
+        status, _, headers = client.request("GET", urlsplit(urls[0]).path)
+        check("encoded Xtream URL redirects using that user's key", status == 302 and
+              parse_qs(urlsplit(headers.get("Location", "")).query).get("key") == [second_key["key"]])
+    client.request("DELETE", f"/api/keys/{second_key['id']}")
+    _, login, _ = client.json("GET", "/player_api.php?" + second_query)
+    check("revoking a key disables its Xtream login", login.get("user_info", {}).get("auth") == 0)
+    status, _, _ = client.request("GET", "/api/playlist.m3u8?key=" + second_key["key"])
+    check("export rejects a revoked selected key", status == 400)
 
     # Export, then import the same document back and confirm it lands as a
     # separate provider with regenerated ids.
@@ -989,6 +1024,7 @@ def main():
     parser.add_argument("--binary", default="build/restreamair-server",
                         help="path to restreamair-server (default: build/restreamair-server)")
     parser.add_argument("--keep", action="store_true", help="keep the scratch directory for inspection")
+    parser.add_argument("--playlists-only", action="store_true", help="Check only setup, provider/playlist exports and Xtream credentials")
     args = parser.parse_args()
 
     if not os.path.exists(args.binary):
@@ -1001,24 +1037,28 @@ def main():
         with HLSOrigin() as origin, WebhookSink() as webhook_sink:
             with Server(args.binary, workdir, port) as server:
                 admin = Client(port)
-                test_health_and_gate(admin)
-                test_setup_and_cookie(admin)
-                test_state_permissions(workdir)
-                test_legacy_account_upgrade(workdir, admin)
-                test_proxy_headers(admin)
-                viewer = test_viewer_role(admin, port)
-                test_external_access(admin, viewer)
-                test_refresh_and_events(admin, viewer)
-                test_login_throttle(port)
-                test_provider_routes(admin)
-                test_script_action_api(workdir, admin)
-                test_provider_webhooks(admin, webhook_sink)
-                playback = test_hls_playback_routes(admin, origin)
-                if playback:
-                    test_async_hls_cleanup(server, admin, origin, *playback)
-                test_sessions_are_hashed_at_rest(workdir, admin)
-                test_session_persistence(server, admin, viewer)
-                test_logout(admin)
+                if args.playlists_only:
+                    test_setup_and_cookie(admin)
+                    test_provider_routes(admin)
+                else:
+                    test_health_and_gate(admin)
+                    test_setup_and_cookie(admin)
+                    test_state_permissions(workdir)
+                    test_legacy_account_upgrade(workdir, admin)
+                    test_proxy_headers(admin)
+                    viewer = test_viewer_role(admin, port)
+                    test_external_access(admin, viewer)
+                    test_refresh_and_events(admin, viewer)
+                    test_login_throttle(port)
+                    test_provider_routes(admin)
+                    test_script_action_api(workdir, admin)
+                    test_provider_webhooks(admin, webhook_sink)
+                    playback = test_hls_playback_routes(admin, origin)
+                    if playback:
+                        test_async_hls_cleanup(server, admin, origin, *playback)
+                    test_sessions_are_hashed_at_rest(workdir, admin)
+                    test_session_persistence(server, admin, viewer)
+                    test_logout(admin)
     finally:
         if args.keep:
             print(f"\nscratch directory kept at {workdir}")

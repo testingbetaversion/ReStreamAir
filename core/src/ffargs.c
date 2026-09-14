@@ -203,10 +203,10 @@ static const char *representation_type(const rs_ffargs_inputs *in, const char *i
     return NULL;
 }
 
-static void append_hls_output(rs_strv *args, const rs_ffargs_inputs *in, bool multi, size_t variants) {
+static void append_hls_output(rs_strv *args, const rs_ffargs_inputs *in, bool multi, size_t variants, size_t audio_count, bool buffered_multi) {
     // The TS modes emit MPEG-TS segments; the fmp4 mode and the generic
     // resident default emit CMAF/fMP4.
-    bool use_ts = str_equal(in->input_mode, "ffmpegTsHls") || str_equal(in->input_mode, "ffmpegMultiTsHls");
+    bool use_ts = str_equal(in->input_mode, "ffmpegTsHls") || str_equal(in->input_mode, "ffmpegMultiTsHls") || str_equal(in->input_mode, "hlsBuffered");
     const char *ext = use_ts ? "ts" : "m4s";
     const char *dir = or_empty(in->temp_dir);
 
@@ -232,14 +232,25 @@ static void append_hls_output(rs_strv *args, const rs_ffargs_inputs *in, bool mu
         rs_strv_push(args, "aac_adtstoasc");
     }
 
-    if (multi && variants > 1) {
+    if (buffered_multi || (multi && variants > 1)) {
         rs_strv_push(args, "-hls_segment_filename");
         rs_strv_pushf(args, "%s/%%v/seg_%%05d.%s", dir, ext);
         rs_strv_push(args, "-master_pl_name");
         rs_strv_push(args, "master.m3u8");
 
         rs_buf map = RS_BUF_INIT;
-        for (size_t i = 0; i < variants; i++) {
+        if (buffered_multi) {
+            for (size_t i = 0; i < audio_count; i++) {
+                if (map.len) rs_buf_append_char(&map, ' ');
+                rs_buf_appendf(&map, "a:%zu,agroup:audio,name:audio_%zu%s", i, i,
+                               i == 0 ? ",default:yes" : "");
+            }
+            for (size_t i = 0; i < variants; i++) {
+                if (map.len) rs_buf_append_char(&map, ' ');
+                rs_buf_appendf(&map, "v:%zu,name:video_%zu%s", i, i,
+                               audio_count ? ",agroup:audio" : "");
+            }
+        } else for (size_t i = 0; i < variants; i++) {
             if (i > 0) rs_buf_append_char(&map, ' ');
             rs_buf_appendf(&map, "v:%zu,a:0", i);
         }
@@ -326,7 +337,20 @@ int rs_ffargs_build(const rs_ffargs_inputs *in, rs_ffargs_command *out) {
         }
     }
 
-    if (multi && video_count > 1) {
+    bool buffered_multi = str_equal(in->input_mode, "hlsBuffered") &&
+                           (video_count > 1 || audio_count > 1);
+    if (buffered_multi) {
+        for (size_t i = 0; i < in->representation_id_count; i++) {
+            const char *type = representation_type(in, in->representation_ids[i]);
+            rs_strv_push(&args, "-map");
+            rs_strv_pushf(&args, "0:%s:%zu", str_equal(type, "audio") ? "a" : "v",
+                          in->representation_input_indices ? in->representation_input_indices[i] : 0);
+        }
+        if (audio_count == 0 && in->muxed_audio) {
+            rs_strv_push(&args, "-map"); rs_strv_push(&args, "0:a:0");
+            audio_count = 1;
+        }
+    } else if (multi && video_count > 1) {
         // One HLS variant per selected video, each mapped to a distinct source
         // video stream, all sharing the first audio. The trailing "?" keeps a
         // missing stream non-fatal, and the var_stream_map built in
@@ -390,7 +414,7 @@ int rs_ffargs_build(const rs_ffargs_inputs *in, rs_ffargs_command *out) {
             rs_free_strv(tokens, token_count);
         }
     } else {
-        append_hls_output(&args, in, multi, video_count > 1 ? video_count : 1);
+        append_hls_output(&args, in, multi, buffered_multi ? video_count : (video_count > 1 ? video_count : 1), audio_count, buffered_multi);
     }
 
     rs_strv env_keys = RS_STRV_INIT;

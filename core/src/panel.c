@@ -187,7 +187,7 @@ static rs_json *stream_build(const rs_json *body, const char *id) {
 
     // Enumerated fields fall back to their default when the value isn't valid.
     static const char *valid_inputs[] = {"internal", "ffmpegResident", "ffmpegTsHls",
-                                         "ffmpegMultiTsHls", "ffmpegFmp4Hls", "pipe",
+                                         "ffmpegMultiTsHls", "ffmpegFmp4Hls", "hlsBuffered", "pipe",
                                          "nm3u8dlre"};
     bool input_ok = false;
     for (size_t i = 0; i < sizeof(valid_inputs) / sizeof(valid_inputs[0]); i++) {
@@ -219,7 +219,7 @@ static rs_json *stream_build(const rs_json *body, const char *id) {
     }
     rs_json_obj_set(s, "cdnUrls", cdn);
 
-    rs_json_obj_set_bool(s, "directSource", rs_json_obj_bool(body, "directSource", false));
+    rs_json_obj_set_bool(s, "directSource", strcmp(input_mode, "hlsBuffered") != 0 && rs_json_obj_bool(body, "directSource", false));
     rs_json_obj_set_str(s, "nm3u8dlreParams", rs_json_obj_str(body, "nm3u8dlreParams", ""));
 
     // Scripting & DRM.
@@ -711,7 +711,7 @@ int rs_panel_update_stream(rs_state *st, const char *stream_id, const rs_json *b
     // the existing stream rather than resetting them (a PUT merges, not replaces).
     static const char *carried[] = {"sourceType", "mode", "scriptVideoSelector", "scriptAudioSelector",
                                     "onDemand", "speedUp", "autostart", "scriptStart", "scriptEnd",
-                                    "recordEvent"};
+                                    "recordEvent", "cdnHeaders"};
     for (size_t i = 0; i < sizeof(carried) / sizeof(carried[0]); i++) {
         const rs_json *v = rs_json_obj_get(existing, carried[i]);
         if (v) rs_json_obj_set(updated, carried[i], rs_json_clone(v));
@@ -937,7 +937,7 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
 // a zero heartbeat mean "the script didn't say", and leave what was configured
 // alone rather than clearing it.
 int rs_panel_apply_session_manifest(rs_state *st, const char *stream_id, const char *url,
-                                    const rs_json *cdn_urls, const char *manifest_headers,
+                                    const rs_json *cdn_urls, const rs_json *cdn_headers, const char *manifest_headers,
                                     const char *media_headers, int heartbeat_seconds,
                                     const char **err) {
     rs_json *provider = NULL;
@@ -953,6 +953,7 @@ int rs_panel_apply_session_manifest(rs_state *st, const char *stream_id, const c
     rs_json_obj_set(stream, "cdnUrls",
                     cdn_urls && rs_json_type_of(cdn_urls) == RS_JSON_ARR
                         ? rs_json_clone(cdn_urls) : rs_json_new_arr());
+    rs_json_obj_set(stream, "cdnHeaders", cdn_headers ? rs_json_clone(cdn_headers) : rs_json_new_obj());
     if (manifest_headers && manifest_headers[0])
         rs_json_obj_set_str(stream, "manifestHeaders", manifest_headers);
     if (media_headers && media_headers[0])

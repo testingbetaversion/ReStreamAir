@@ -21,6 +21,18 @@ void rs_logo_cache_destroy(rs_logo_cache *lc);
 // NOTE: This requires HTTP fetching which depends on the fetch handler.
 char* rs_logo_lookup(rs_logo_cache *lc, const char *name, rs_logo_fetch_fn fetch, void *fetch_ctx);
 
+// True when the name already has a decision recorded — a resolved URL or a
+// remembered miss — so a lookup for it will not touch the network. Lets a bulk
+// caller spend its network budget only on the names that actually need it.
+bool rs_logo_cache_has(rs_logo_cache *lc, const char *name);
+
+// Batches the cache-file write that every resolved name would otherwise
+// trigger on its own. Between begin and end the results are held in memory and
+// the file is written once, at the end; a catalogue import resolving hundreds
+// of names rewrote the whole file hundreds of times without this. Calls nest.
+void rs_logo_cache_begin_batch(rs_logo_cache *lc);
+void rs_logo_cache_end_batch(rs_logo_cache *lc);
+
 #ifdef __cplusplus
 }
 #endif

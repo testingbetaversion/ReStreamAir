@@ -78,6 +78,32 @@ Selecting multiple video qualities produces an HLS master playlist. The stream U
 
 The internal remuxer is the default and does not need FFmpeg. It supports live DASH-to-HLS and HLS passthrough, buffering, CENC clear-key decryption, and HLS AES-128 decryption.
 
+For HLS downloaded and served entirely by this server, select **Input/output
+pipeline → Buffered HLS · download on first viewer**, save, and press **Start**.
+Start arms the stream. The first viewer starts a shared FFmpeg downloader;
+selected video qualities and audio tracks are copied into a rolling disk buffer
+without re-encoding. All viewers read the local segments. Downloading stops
+after 30 seconds without viewer requests and restarts with a fresh buffer when
+someone returns. FFmpeg must be installed. Initial playback can take a few
+seconds while the buffer fills. The first playlist request waits up to 20 seconds;
+if the source is still unavailable, it returns 503 and the logs explain why.
+Playlist count and HLS segment duration control this buffer; the other DASH
+buffer controls do not apply. With no track selection, the first video and
+audio track are used.
+
+HLS proxy playlists and source probes try the configured CDNs in order after
+an upstream failure, including 403. Once all fail, a stream with Session
+manifest enabled runs its manifest action once and retries the fresh sources.
+Refresh has a 60-second cooldown to avoid repeated script launches. Logs show
+`cdnFallback` and `manifestRefresh`; a provider outage can still make every
+fresh URL fail. CDN-specific headers returned by the script follow that CDN's
+playlists and segments.
+
+The optional [DLive scripts](scripts/providers/dlive/README.md) return shortly
+after the first resolved HLS URL, retaining alternatives completed within a
+one-second grace period. Install both Python files together. Use `fast=0` in
+stream script parameters to wait for all players and retain the full CDN list.
+
 FFmpeg modes run a supervised resident process for inputs or outputs that need it. Program-pipe mode runs a producer and sends its stdout to FFmpeg. The command is argv-based; shell syntax only works when you explicitly invoke a shell.
 
 Some modes shown by the panel are reserved but not fully wired. In particular, N_m3u8DL-RE resident integration and some external output modes may return `501` or an explanatory start error.
@@ -107,6 +133,17 @@ Other useful routes:
 | `/ping` | Unauthenticated health check. |
 
 When at least one playback key exists, pass it as `?key=<key>` or `Authorization: Bearer <key>`. With no playback keys, viewing URLs are open to anyone who can reach the server.
+
+The player's **Playback user** selector controls the complete M3U8 URL, the
+embedded player, copied links and panel playlist exports. Generating an API key
+selects that new user automatically. The choice is remembered in this browser;
+revoking it selects a remaining key, or open playback if none remain.
+
+Each entry in **API Keys** shows its Xtream server, username (label), password
+(key), and a complete **M3U playlist URL** with a Copy button. This `/get.php`
+URL uses that specific account and works without a panel login. It lists all
+configured channels; each stream still needs a working source and must be
+started before playback. Xtream login success does not prove the source is online.
 
 ## HTTP management API
 
@@ -220,6 +257,30 @@ ctest --test-dir build --output-on-failure
 ```
 
 macOS needs Xcode Command Line Tools plus `brew install libxml2 pkg-config`. Windows builds use the repository's vcpkg manifest.
+
+### Checks after building
+
+Building compiles the application. Tests are separate and check behavior with
+local fixtures, without using your provider accounts or live channels.
+The manual **Build** workflow uses this reduced default set:
+
+| Check | Why it remains / where it runs |
+|---|---|
+| CTest `selftest` | Parsing, crypto, command generation, state and platform process/thread behavior. Runs on each supported OS. |
+| CTest `provider_runtime` | Provider session isolation, concurrency, timeouts and downloader policy. Runs on each supported OS. |
+| `api-smoke.py` | Real HTTP server: UI serving, login, playback authorization, keys, permissions and persistence. Once on Linux. |
+| `provider-options-smoke.py` | Provider options survive API saves and affect runtime configuration. Once on Linux. |
+| `provider-engine-smoke.py` | Real downloader/engine behavior against local sources. Once on Linux. |
+| `manifest-recovery-smoke.py` | 403 CDN fallback, fresh manifests/headers, cooldown and stale-request protection. Once on Linux. |
+| `panel-playback-smoke.js` | The panel includes playback keys only on local playback links. Once on Linux. |
+| `hls-buffer-smoke.py --multi` | First viewer starts downloading; selected qualities/audio are served locally; viewers share a worker; idle stops it. Once on Linux, with FFmpeg. |
+| Native/package smoke checks | macOS/Windows binaries launch; Windows needs no third-party DLLs; the separate static Linux artifact starts on an older distro. These check the binaries being shipped. |
+
+**Full checks** defaults off. Enabling it additionally runs ASan/UBSan memory
+checks and a MinGW cross-build. Ordinary edits need only a build and the tests
+for the changed behavior; the HTTP suites are no longer repeated on all three
+operating systems. The standalone DLive `test_fast.py` is an offline timing
+check to run when changing those optional scripts; it is not part of core CI.
 
 ### Docker
 

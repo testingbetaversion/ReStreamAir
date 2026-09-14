@@ -277,6 +277,13 @@ level, text and date filtering are client-side. See [log schema](EVENTS.md#logs)
 | `POST /api/providers/<id>/webhook/test` | `202 {"ok":true,"queued":true}`; delivery is asynchronous. |
 | `GET /api/logo-lookup?name=<encoded-name>` | `200 {"url":"…"}`; no match returns `404`. |
 
+Both M3U export routes accept `?key=<playback-key>` to embed that account's
+credential in every complete playback URL. With no selection, they use the
+first configured key; with no keys, links are open. An invalid selected key
+returns 400. Exports use the request's HTTP/HTTPS scheme, honoring configured
+trusted proxies. Downloading these management exports still requires panel
+authentication; use the credentialed Xtream `/get.php` URL in an IPTV client.
+
 Provider PUT requires `name`. Most omitted fields reset to these defaults;
 merge your edits into the provider object from state to retain other settings.
 `logo` and `scriptActions` are preserved when omitted. The nested `options` object merges supplied fields and preserves omitted fields. `streams` and computed
@@ -399,10 +406,11 @@ across PUT; it is not writable through the ordinary editor route.
 | `forceOffline`, `reducedManifestPolling`, `prioritizeOldest` | Booleans, `false`. Static MPD permission, reduced polling and backlog preference. |
 | `audioDelayMs` | Signed integer milliseconds, default 0. |
 | `decryptionKeys`, `hlsKey`, `hlsIV` | Strings, `""`. DASH KID:KEY pairs; HLS AES key/IV in hex. |
-| `inputMode` | `internal` default, `ffmpegResident`, `ffmpegTsHls`, `ffmpegMultiTsHls`, `ffmpegFmp4Hls`, `pipe`, `nm3u8dlre`. |
+| `inputMode` | `internal` default, `hlsBuffered`, `ffmpegResident`, `ffmpegTsHls`, `ffmpegMultiTsHls`, `ffmpegFmp4Hls`, `pipe`, `nm3u8dlre`. |
 | `outputMode`, `outputTarget` | `hls` default, `srtServer`, `udpSrt`, `custom`; destination string `""`. Some combinations are not implemented. |
 | `pipeCommand`, `nm3u8dlreParams` | Strings, `""`; argv-style command / external-tool options. |
 | `cdnUrls` | HTTP(S) URL string array, `[]`. Invalid entries are dropped. |
+| `cdnHeaders` | Session output: per-CDN manifest/media headers keyed by manifest URL. Populated by the manifest script; preserved on editor saves. |
 | `directSource` | Boolean, `false`; redirect playback to source. |
 | `useCdm`, `sessionManifest` | Booleans, `false`; enable script key/session-manifest workflows. |
 | `scriptParams`, `scriptOverride` | Strings, `""`; flat `key=value` arguments and optional server-side script path override. |
@@ -414,6 +422,19 @@ across PUT; it is not writable through the ordinary editor route.
 `cdmType` to empty. Catalogue imports may supply `CdmType`. Stored enums do not
 guarantee a pipeline is available: check the Start response. A successful Start
 means startup was accepted, not that a playable segment is already buffered.
+
+`hlsBuffered` requires `kind: "m3u8"`, `outputMode: "hls"` and installed FFmpeg.
+It forces `directSource` off. Start arms the stream; the first authenticated
+viewer starts one shared downloader. FFmpeg copies the selected video/audio
+tracks into a rolling disk buffer and every viewer receives local playlists
+and segments. An empty selection uses the first video and audio track.
+`playlistSegments` and `hlsSegmentSeconds` control the output window. DASH-only
+download-ahead, keep-count and playout-delay settings do not tune this mode.
+The initial playlist request waits up to 20 seconds for the buffer, then returns
+`503` if it is still unavailable. After 30 seconds
+without viewer requests, downloading stops; a later viewer starts a fresh buffer.
+Explicit Stop disarms the stream. The private local FFmpeg feed retains the
+server's upstream headers, proxy policy and HLS manifest recovery.
 
 ```sh
 provider_id=provider_from_state
@@ -432,17 +453,34 @@ state/logs first, because the operation may already have completed.
 
 ### Probe
 
-Request: `{"url":"https://…","proxy":"","headers":"User-Agent: MyClient",
-"forceIpv6":false,"rotateProxies":false}`. Only URL is essential. It is fetched
-from the server; supplying an empty proxy does not automatically inherit a
-provider because this route has no provider ID.
+Request: `{"url":"https://…","providerId":"…","streamId":"…",
+"cdnUrls":["https://backup.example/index.m3u8"],"proxy":"",
+"headers":"User-Agent: MyClient","forceIpv6":false,"rotateProxies":false}`.
+Supply a URL or a saved `streamId`. The server fetches it. `providerId` applies
+provider defaults; `streamId` supplies the saved source, mirrors and stream
+settings. Explicit request settings override those defaults, including an
+explicit empty proxy. A URL different from the saved stream is probed separately
+and cannot refresh or overwrite that stream.
+
+The probe tries the primary and each distinct CDN in order after a failed fetch,
+including HTTP 403. If all fail for a saved stream with `sessionManifest` and an
+allowed manifest action, it runs that action once and retries the fresh list.
+Automatic refresh has a 60-second per-stream cooldown and waits for a later
+request if another provider script is busy. HLS proxy playlists use the same
+recovery; relative rendition paths are rebased onto mirrors. Unrelated absolute
+rendition URLs are not guessed. Recovery returns an error if fresh sources or
+the provider script still fail.
 
 Response fields: `kind` (`mpd`/`m3u8`), `representations` (array), `protection`
 (object mapping representation ID to KID array), `drm` (object with `kids`,
 `pssh`, `psshWidevine`, `psshPlayReady`, `keyUris`). Each representation includes
 `id`, `type`, and optional/nullable `language`, `bandwidth`, `width`, `height`,
 `codecs`, and DASH `frameRate`. HLS IDs may be variant URIs. An empty representation list is possible
-for a simple media playlist. Treat nullable metadata as unknown.
+for a simple media playlist. Treat nullable metadata as unknown. `sourceUrl`
+identifies the source that answered. A successful session refresh also returns
+`session` with the saved `url`, `cdnUrls`, `cdnHeaders`, `manifestHeaders`,
+`mediaHeaders` and `heartbeatSeconds`; use these to avoid saving expired values
+back from an open editor. Probing does not start a stopped stream.
 
 ## Scripts and scheduled events
 

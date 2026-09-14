@@ -322,7 +322,8 @@
               <div class="form-row">
                 <label>Input
                   <select name="inputMode">
-                    <option value="internal">Internal remuxer (no ffmpeg)</option>
+                    <option value="internal">Internal remuxer / HLS proxy</option>
+                    <option value="hlsBuffered" data-needs-ffmpeg disabled>Buffered HLS · download on first viewer</option>
                     <option value="ffmpegResident" data-needs-ffmpeg disabled>FFmpeg resident</option>
                     <option value="ffmpegTsHls" data-needs-ffmpeg disabled>FFmpeg TS HLS/Direct</option>
                     <option value="ffmpegMultiTsHls" data-needs-ffmpeg disabled>FFmpeg MultiTS HLS</option>
@@ -340,6 +341,7 @@
                   </select>
                 </label>
               </div>
+              <p id="hlsBufferHint" class="field-hint hidden">Downloads HLS into a shared rolling buffer when a viewer connects. Playback stays on this server; downloading stops after 30 seconds without viewer requests. Requires FFmpeg. Use Playlist count and HLS segment duration to size the buffer.</p>
               <label id="nm3u8dlreParamsField" class="hidden">N_m3u8DL-RE Params<span class="field-hint">Command-line arguments appended to the N_m3u8DL-RE execution</span><input name="nm3u8dlreParams"></label>
               <label id="pipeCommandField" class="hidden">Program command<span class="field-hint">Executable plus quoted arguments. Blank uses the provider Pipe command. Its stdout is the media input. No shell is implied; use <code>/bin/sh -c '…'</code> explicitly for shell pipelines.</span><input name="pipeCommand" placeholder="streamlink --stdout https://example/live best"></label>
               <label id="outputTargetField" class="hidden">Output target<span class="field-hint" id="outputTargetHint"></span><input name="outputTarget"></label>
@@ -365,12 +367,13 @@
 
           <div id="playerPanel" class="player-panel hidden">
             <video id="video" controls playsinline></video>
+            <label>Playback user<select id="playbackUserSelect"><option value="">Open playback — no API key</option></select></label>
             <div id="playerTrackControls" class="form-row hidden">
               <label id="qualitySelectField">Quality<select id="qualitySelect"></select></label>
               <label id="audioTrackSelectField">Audio<select id="audioTrackSelect"></select></label>
             </div>
             <div class="link-row">
-              <input id="playLink" readonly placeholder="Start a stream to get a play link">
+              <input id="playLink" readonly aria-label="Complete M3U8 playback URL" placeholder="Complete M3U8 playback URL">
               <button id="copyBtn" class="ghost"><span data-icon="copy"></span>Copy</button>
             </div>
             <div class="link-row link-row-list">
@@ -621,6 +624,7 @@
                 <p>Every stream is served at <code>/play/&lt;id&gt;/index.m3u8</code>, whatever produces it. The <b>Input/output pipeline</b> section chooses how:</p>
                 <ul>
                   <li><b>Internal remuxer</b> (default) — no ffmpeg needed; downloads, decrypts and remuxes segments itself.</li>
+                  <li><b>Buffered HLS · download on first viewer</b> — Start arms the stream. The first viewer starts a shared local buffer of the selected qualities and audio tracks. All segments are served by this server. Downloading stops after 30 seconds without viewer requests. Requires FFmpeg; it copies tracks without re-encoding. Playlist count and HLS segment duration control the buffer.</li>
                   <li><b>FFmpeg modes</b> — spawn a resident ffmpeg that reads the source and copy-remuxes to HLS, or pushes to SRT/UDP/TCP via the <b>Output target</b>.</li>
                   <li><b>Program pipe → FFmpeg</b> — runs any executable and feeds its stdout to FFmpeg. Enter executable + quoted arguments directly (for example <code>streamlink --stdout URL best</code>). It does not silently invoke a shell; use <code>/bin/sh -c '…'</code> explicitly when the command itself needs shell pipes or redirects.</li>
                   <li><b>N_m3u8DL-RE</b> — reserved for that downloader; its resident process integration is not wired yet.</li>

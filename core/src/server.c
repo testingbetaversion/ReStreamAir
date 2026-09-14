@@ -128,6 +128,8 @@ struct restream_server {
     pthread_cond_t pending_cv;      // signalled whenever pending job ownership changes
     bool ffmpeg_install_running;    // guarded by pending_mu; installer thread holds the server alive
     pthread_mutex_t logo_mu;        // serialises RS_PENDING_LOGO workers' access to logo_cache (not itself thread-safe)
+    char pipeline_feed_key[65];  // random per-process credential, accepted only from this host
+    char pipeline_feed_origin[256];
     uint16_t listen_port;   // the port actually bound, which is what /api/state must report
     // A restart requested from Settings. Restarting replaces this process, so it
     // cannot happen inside the request handler — the reply would never reach the
@@ -232,6 +234,7 @@ static const char *stream_source_target(const rs_json *stream);
 // Forward declaration: query helpers are defined with the routing code below,
 // but the playback handlers above them need it.
 static char *query_var(struct mg_http_message *hm, const char *name);
+static char *query_encode(const char *s);
 
 // Forward declarations: the async HLS-passthrough fetch machinery is defined
 // just above serve_hls_playlist (its only dispatcher), but ev_handler,
@@ -246,6 +249,8 @@ static void log_record(restream_server_t *s, const char *sid, const char *level,
                        const char *message);
 static char *primary_proxy(const char *list);
 static char *effective_proxy(const rs_json *provider, const rs_json *stream, bool category_on);
+static char *effective_headers(const rs_json *provider, const rs_json *stream, const char *field);
+static void pending_job_finish_buffer(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf);
 
 // Forward declaration: apply_cenc is defined between serve_hls_playlist and
 // serve_restream_item, but pending_job_finish_item (defined just above
@@ -262,7 +267,8 @@ static uint8_t *apply_cenc(const char *decryption_keys, const char *selected_kid
 static void dispatch_logo_lookup(restream_server_t *server, struct mg_connection *c, const char *name);
 static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
                            char *url, char *proxy, char *headers,
-                           bool force_ipv6, bool rotate_proxies, const rs_json *provider);
+                           bool force_ipv6, bool rotate_proxies, const rs_json *provider,
+                           const rs_json *stream, const rs_json *mirrors);
 static void dispatch_script_action(restream_server_t *server, struct mg_connection *c,
                                    const char *sid, const char *action, const char *script_path,
                                    char **args, int argc, double timeout);
@@ -578,7 +584,7 @@ static bool log_always(const char *event) {
         "playlistReady", "renditions", "initReady", "discontinuity",
         "login", "logout", "loginFailed", "scriptStart", "scriptCommand", "scriptOutput",
         "scriptError", "scriptEnd", "scriptImport", "scriptManifest", "cdm",
-        "playbackDenied",
+        "playbackDenied", "manifestFetch", "cdnFallback", "manifestRefresh",
     };
     if (!event) return false;
     for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); i++)
@@ -1901,7 +1907,16 @@ static void m3u_attr_append(rs_buf *out, const char *text) {
 // `only_provider` NULL exports every provider; otherwise just that one.
 static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
                                struct mg_http_message *hm, const char *only_provider) {
+    char *key = query_var(hm, "key");
+    const rs_json *keys = rs_json_obj_get(s->state.root, "apiKeys");
+    if (key && !rs_panel_playback_allowed(&s->state, key)) {
+        free(key); reply_error(c, 400, "The selected playback key is invalid or revoked."); return;
+    }
+    if (!key && rs_json_arr_len(keys)) key = rs_strdup(rs_json_obj_str(rs_json_arr_at(keys, 0), "key", ""));
+    char *encoded_key = key && key[0] ? query_encode(key) : NULL;
+    free(key);
     char *host = request_host(hm);
+    const char *scheme = request_is_secure(s, c, hm) ? "https://" : "http://";
     const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
     bool found = only_provider == NULL;
     const char *filename = "restreamair-all";
@@ -1943,14 +1958,17 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
             rs_buf_append_str(&body, "\",");
             m3u_attr_append(&body, name);
             rs_buf_append_char(&body, '\n');
-            rs_buf_append_str(&body, "http://");
+            rs_buf_append_str(&body, scheme);
             rs_buf_append_str(&body, host);
             rs_buf_append_str(&body, "/play/");
             rs_buf_append_str(&body, id);
-            rs_buf_append_str(&body, "/index.m3u8\n");
+            rs_buf_append_str(&body, "/index.m3u8");
+            if (encoded_key) rs_buf_appendf(&body, "?key=%s", encoded_key);
+            rs_buf_append_char(&body, '\n');
         }
     }
     free(host);
+    free(encoded_key);
 
     char *text = rs_buf_take(&body);
     if (!found) { rs_free(text); reply_error(c, 404, "Provider not found."); return; }
@@ -2241,8 +2259,28 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
             if (!rs_json_obj_get(body, "forceIpv6")) force_ipv6 = rs_json_obj_bool(provider, "forceIpv6", false);
             if (!rs_json_obj_get(body, "rotateProxies")) rotate_proxies = rs_json_obj_bool(provider, "rotateProxies", false);
         }
+        const char *sid = rs_json_obj_str(body, "streamId", "");
+        const rs_json *stream = sid[0] ? rs_panel_find_stream(&s->state, sid) : NULL;
+        if (sid[0] && !stream) {
+            free(url); free(proxy); free(headers); rs_json_free(body);
+            reply_error(c, 404, "Stream not found."); return true;
+        }
+        if (stream) {
+            provider = provider_of(&s->state, stream);
+            // Editing a different URL is a standalone probe: it must not
+            // refresh or overwrite the saved stream's session.
+            if (url[0] && strcmp(url, stream_source_target(stream))) stream = NULL;
+        }
+        if (stream) {
+            if (!url[0]) { free(url); url = rs_strdup(stream_source_target(stream)); }
+            if (!rs_json_obj_get(body, "headers")) { free(headers); headers = effective_headers(provider, stream, "manifestHeaders"); }
+            if (!rs_json_obj_get(body, "proxy")) { free(proxy); proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true)); }
+            if (!rs_json_obj_get(body, "forceIpv6")) force_ipv6 = rs_json_obj_bool(provider, "forceIpv6", false);
+            if (!rs_json_obj_get(body, "rotateProxies")) rotate_proxies = rs_json_obj_bool(provider, "rotateProxies", false);
+        }
+        dispatch_probe(s, c, url, proxy, headers, force_ipv6, rotate_proxies, provider,
+                       stream, rs_json_obj_get(body, "cdnUrls"));  // copies context, owns strings
         rs_json_free(body);
-        dispatch_probe(s, c, url, proxy, headers, force_ipv6, rotate_proxies, provider);  // takes ownership
         return true;
     }
 
@@ -2657,6 +2695,21 @@ static char *playback_key(struct mg_http_message *hm) {
     }
     free(auth);
     return NULL;
+}
+
+static bool is_pipeline_feed(restream_server_t *s, struct mg_connection *c, const char *key) {
+    if (!key || !s->pipeline_feed_key[0] || strcmp(key, s->pipeline_feed_key)) return false;
+    char peer[80], local[80];
+    peer_ip(c, peer, sizeof(peer));
+    mg_snprintf(local, sizeof(local), "%M", mg_print_ip, &c->loc);
+    return rs_ip_matches(peer, "loopback") || rs_ip_matches(peer, local);
+}
+
+static bool pipeline_feed_active(restream_server_t *s, const char *stream_id) {
+    const rs_json *stream = rs_panel_find_stream(&s->state, stream_id);
+    return stream && !strcmp(rs_json_obj_str(stream, "status", ""), "running") &&
+        !strcmp(rs_json_obj_str(stream, "inputMode", ""), "hlsBuffered") &&
+        rs_json_obj_num(rs_json_obj_get(s->provider_timers, stream_id), "bufferedViewerAt", 0) > 0;
 }
 
 // Reads a query variable into a fresh string sized to the query (a proxied
@@ -3147,7 +3200,7 @@ static const char *effective_downloader_params(const rs_json *provider, const rs
 // The rewrite transforms need the stream id to build restream/variant paths.
 // Picks a filename with an extension ffmpeg's HLS demuxer will accept
 // (keys/maps aside, it validates the segment URL's extension). Keeps the source
-// URL's own extension when it's a short alphanumeric one, else a sane default.
+// URL's media extension, else a sane default (some origins disguise TS as PDF).
 static void proxy_filename(const char *abs_uri, rs_m3u8_line_kind kind, char *out, size_t outlen) {
     if (kind == RS_M3U8_LINE_KEY) { snprintf(out, outlen, "key.key"); return; }
     if (kind == RS_M3U8_LINE_MAP) { snprintf(out, outlen, "init.mp4"); return; }
@@ -3160,9 +3213,10 @@ static void proxy_filename(const char *abs_uri, rs_m3u8_line_kind kind, char *ou
     }
     if (dot) {
         size_t elen = plen - (size_t)(dot + 1 - abs_uri);
-        bool ok = elen >= 1 && elen <= 5;
-        for (size_t i = 0; ok && i < elen; i++)
-            if (!isalnum((unsigned char)dot[1 + i])) ok = false;
+        static const char *allowed[] = {"ts", "m2ts", "m4s", "mp4", "m4a", "aac", "mp3", "ac3", "ec3", "vtt", "webvtt"};
+        bool ok = false;
+        for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
+            if (elen == strlen(allowed[i]) && !strncmp(dot + 1, allowed[i], elen)) ok = true;
         if (ok) { snprintf(out, outlen, "seg.%.*s", (int)elen, dot + 1); return; }
     }
     snprintf(out, outlen, "seg.ts");
@@ -3173,7 +3227,18 @@ typedef struct {
     const char *playback_key;
     bool decrypt_cenc;
     const char *cenc_kid;
+    const char *cdn_root;
 } playlist_route_ctx;
+
+static char *playlist_cdn_hint(char *url, const playlist_route_ctx *ctx) {
+    if (!url || !ctx->cdn_root || !ctx->cdn_root[0]) return url;
+    char *encoded = query_encode(ctx->cdn_root);
+    if (!encoded) { free(url); return NULL; }
+    rs_buf out = RS_BUF_INIT;
+    rs_buf_appendf(&out, "%s&cdn=%s", url, encoded);
+    free(url); free(encoded);
+    return rs_buf_take(&out);
+}
 
 static char *media_transform(void *ud, const char *abs_uri, rs_m3u8_line_kind kind, int64_t seq) {
     const playlist_route_ctx *ctx = (const playlist_route_ctx *)ud;
@@ -3203,7 +3268,7 @@ static char *media_transform(void *ud, const char *abs_uri, rs_m3u8_line_kind ki
     free(enc);
     free(key);
     free(kid);
-    return out;
+    return playlist_cdn_hint(out, ctx);
 }
 
 static char *master_transform(void *ud, const char *abs_uri) {
@@ -3218,7 +3283,7 @@ static char *master_transform(void *ud, const char *abs_uri) {
                       key ? "&key=" : "", key ? key : "");
     free(enc);
     free(key);
-    return out;
+    return playlist_cdn_hint(out, ctx);
 }
 
 // The DASH engine renders request-independent playlists in the background.
@@ -3287,6 +3352,7 @@ typedef enum {
     RS_PENDING_PROBE,
     RS_PENDING_SCRIPT,
     RS_PENDING_STREAM_START,
+    RS_PENDING_BUFFER,
 } rs_pending_kind;
 
 struct rs_pending_job {
@@ -3322,6 +3388,16 @@ struct rs_pending_job {
                                    // request (and any X-Forwarded-For) is gone
                                    // by the time the worker reports back
     rs_source_policy source_policy;
+    // Manifest/probe recovery snapshots. Workers never read the state DOM.
+    char *source_base;
+    char *source_status;
+    char *source_relative;  // empty = root; NULL = unrelated absolute variant
+    rs_json *source_roots;
+    rs_json *source_headers;
+    char *source_generic_headers, *source_default_headers, *source_default_media_headers;
+    char *source_header_root;
+    unsigned long long source_token;
+    bool recovery_attempted;
     char *script_path;             // SCRIPT only
     char *script_action;           // SCRIPT only, e.g. "login" / "channels"
     char **script_args;            // SCRIPT only, each rs_script_arg-owned
@@ -3353,6 +3429,11 @@ static void pending_job_free(rs_pending_job *pf) {
     free(pf->range); free(pf->downloader); free(pf->downloader_params);
     free(pf->decryption_keys); free(pf->cenc_kid); free(pf->hls_key); free(pf->hls_iv);
     free(pf->user_agent); free(pf->playback_key_str); free(pf->client_ip);
+    free(pf->source_base); free(pf->source_status); free(pf->source_relative);
+    rs_json_free(pf->source_roots);
+    rs_json_free(pf->source_headers);
+    free(pf->source_generic_headers); free(pf->source_default_headers);
+    free(pf->source_default_media_headers); free(pf->source_header_root);
     free(pf->script_path);
     free(pf->script_action);
     rs_json_free(pf->script_import);
@@ -3461,19 +3542,48 @@ static rs_json *parse_script_document(const char *stdout_text) {
     return last;
 }
 
+// How long one import may spend asking the logo service about names it has
+// never seen, and how often it says so while it does.
+#define RS_IMPORT_LOGO_BUDGET_MS   20000.0
+#define RS_IMPORT_LOGO_PROGRESS_MS  5000.0
+
 // Resolves a logo for every distinct entry name in the parsed document, so the
 // poll thread can fill in the imported streams without making network calls of
 // its own. Each miss is an HTTP lookup, so this runs here on the worker and
 // under logo_mu — the cache is a plain JSON tree with no locking of its own,
 // exactly as the RS_PENDING_LOGO case above explains. Returns an object of
 // name -> URL holding only the names that resolved, or NULL when none did.
+//
+// A catalogue import is the one caller that hands this hundreds of names at
+// once, and it used to do the worst possible thing with them: one blocking
+// round trip per name, the whole cache file rewritten after each one, and not a
+// single line logged. An 899-channel import spent 2m48s here — all of it after
+// the script had already exited and printed its last byte, so the panel's
+// still-open POST looked for three minutes like a script that would not
+// finish. Three things bound it now:
+//
+//   - the cache file is written once for the run, not once per name;
+//   - only names the cache has never decided on cost a round trip, so a
+//     re-import of a catalogue already resolved is pure memory;
+//   - those round trips stop after RS_IMPORT_LOGO_BUDGET_MS. Names past the
+//     budget are simply not looked up — and, not having been looked up, are
+//     not remembered as misses either, so the next import continues where this
+//     one stopped rather than repeating it.
+//
+// Progress is logged under the script's own stream id, which is what the
+// panel's script terminal is already polling, so the wait is visible while it
+// happens instead of only in hindsight.
 static rs_json *resolve_import_logos(restream_server_t *server, rs_pending_job *pf) {
     const rs_json *list = rs_json_obj_get(pf->script_import,
                                           strcmp(pf->script_action, "events") == 0 ? "Events" : "Channels");
     if (!list || rs_json_type_of(list) != RS_JSON_ARR) return NULL;
     rs_json *logos = rs_json_new_obj();
+    size_t resolved = 0, fetched = 0, deferred = 0;
+    double started = now_ms();
+    double next_progress = started + RS_IMPORT_LOGO_PROGRESS_MS;
     pthread_mutex_lock(&server->logo_mu);
     if (!server->logo_cache) server->logo_cache = rs_logo_cache_create("logos.json");
+    rs_logo_cache_begin_batch(server->logo_cache);
     for (size_t i = 0; i < rs_json_arr_len(list); i++) {
         const rs_json *entry = rs_json_arr_at(list, i);
         const rs_json *raw = rs_json_obj_get(entry, "Name");
@@ -3482,12 +3592,39 @@ static rs_json *resolve_import_logos(restream_server_t *server, rs_pending_job *
         // Trimmed, because that is the key the import stores the stream under.
         char *name = rs_trim_dup(value, strlen(value), true);
         if (!name || !name[0] || rs_json_obj_get(logos, name)) { free(name); continue; }
+        // A cached name — hit or remembered miss — is free, so the budget only
+        // ever holds back the names that would actually go to the network.
+        bool cached = rs_logo_cache_has(server->logo_cache, name);
+        if (!cached && now_ms() - started >= RS_IMPORT_LOGO_BUDGET_MS) {
+            deferred++;
+            free(name);
+            continue;
+        }
         char *url = rs_logo_lookup(server->logo_cache, name, logo_fetch_wrapper, NULL);
-        if (url && url[0]) rs_json_obj_set_str(logos, name, url);
+        if (!cached) fetched++;
+        if (url && url[0]) { rs_json_obj_set_str(logos, name, url); resolved++; }
         free(url);
         free(name);
+        if (!cached && now_ms() >= next_progress) {
+            log_recordf(server, pf->stream_id, "info", "scriptImport", NULL, 0, -1,
+                        "resolving logos: %zu looked up, %zu found, %.0fs of %.0fs budget used",
+                        fetched, resolved, (now_ms() - started) / 1000.0,
+                        RS_IMPORT_LOGO_BUDGET_MS / 1000.0);
+            next_progress = now_ms() + RS_IMPORT_LOGO_PROGRESS_MS;
+        }
     }
+    rs_logo_cache_end_batch(server->logo_cache);
     pthread_mutex_unlock(&server->logo_mu);
+    if (deferred)
+        log_recordf(server, pf->stream_id, "info", "scriptImport", NULL, 0, -1,
+                    "resolved %zu logos in %.0fs; %zu name%s left for the next import "
+                    "(logo lookups are capped at %.0fs per import)",
+                    resolved, (now_ms() - started) / 1000.0, deferred,
+                    deferred == 1 ? "" : "s", RS_IMPORT_LOGO_BUDGET_MS / 1000.0);
+    else if (fetched)
+        log_recordf(server, pf->stream_id, "info", "scriptImport", NULL, 0, -1,
+                    "resolved %zu logos in %.0fs (%zu looked up)",
+                    resolved, (now_ms() - started) / 1000.0, fetched);
     return logos;
 }
 
@@ -3549,7 +3686,7 @@ typedef struct rs_stream_start {
     // Result, filled by the worker.
     bool manifest_applied;
     char *manifest_url;
-    rs_json *cdn_urls;
+    rs_json *cdn_urls, *cdn_headers;
     char *manifest_headers, *media_headers;
     int heartbeat_seconds;
     char *keys;
@@ -3568,6 +3705,7 @@ static void stream_start_free(struct rs_stream_start *st) {
     free(st->manifest_url); free(st->manifest_headers); free(st->media_headers);
     free(st->keys);
     rs_json_free(st->cdn_urls);
+    rs_json_free(st->cdn_headers);
     free(st);
 }
 
@@ -3743,6 +3881,28 @@ static bool stream_start_parse_manifest(rs_stream_start *st, const char *stdout_
     free(st->media_headers);
     st->manifest_headers = header_object_to_text(header_block(headers, "manifest", "Manifest"));
     st->media_headers = header_object_to_text(header_block(headers, "media", "Media"));
+    // A CDN may require a different Referer/Origin from the primary. Preserve
+    // those headers with its URL instead of discarding them during import.
+    rs_json_free(st->cdn_headers);
+    st->cdn_headers = rs_json_new_obj();
+    for (size_t i = 0; i < rs_json_arr_len(cdn); i++) {
+        const rs_json *entry = rs_json_arr_at(cdn, i);
+        const char *mirror = rs_json_obj_str(entry, "ManifestUrl", rs_json_obj_str(entry, "manifestUrl", ""));
+        const rs_json *h = header_block(entry, "headers", "Headers");
+        if (!url_is_http(mirror) || !h) continue;
+        char *mh = header_object_to_text(header_block(h, "manifest", "Manifest"));
+        char *dh = header_object_to_text(header_block(h, "media", "Media"));
+        if (!strcmp(mirror, url)) {
+            if (mh[0]) { free(st->manifest_headers); st->manifest_headers = rs_strdup(mh); }
+            if (dh[0]) { free(st->media_headers); st->media_headers = rs_strdup(dh); }
+        } else {
+            rs_json *value = rs_json_new_obj();
+            if (mh[0]) rs_json_obj_set_str(value, "manifestHeaders", mh);
+            if (dh[0]) rs_json_obj_set_str(value, "mediaHeaders", dh);
+            rs_json_obj_set(st->cdn_headers, mirror, value);
+        }
+        free(mh); free(dh);
+    }
     // The DRM scrape happens immediately after this function. Use the fresh
     // session headers for that fetch rather than the stale headers snapshotted
     // before action=manifest ran.
@@ -4275,13 +4435,129 @@ static void stream_start_worker(restream_server_t *server, const char *sid, rs_s
     if (st->want_cdm && source && source[0]) stream_start_resolve_keys(server, sid, st, source);
 }
 
-static void *pending_job_worker(void *arg) {
-    rs_pending_job *pf = (rs_pending_job *)arg;
-    restream_server_t *server = pf->server;
+static rs_stream_start *stream_start_snapshot(const rs_json *provider, const rs_json *stream,
+                                              bool want_manifest, bool want_cdm) {
+    const char *stream_id = rs_json_obj_str(stream, "id", "");
+    const char *script = rs_panel_effective_script_path(provider, stream);
+    rs_stream_start *st = (rs_stream_start *)calloc(1, sizeof(*st));
+    char **args = (char **)calloc(RS_SCRIPT_ARG_CAP, sizeof(char *));
+    if (!st || !args) { free(st); free(args); return NULL; }
 
-    switch (pf->kind) {
-    case RS_PENDING_PLAYLIST:
-    case RS_PENDING_ITEM: {
+    int n = fill_common_script_args(provider, stream, args, 0, RS_SCRIPT_ARG_CAP);
+    if (n < RS_SCRIPT_ARG_CAP) args[n++] = rs_script_arg("id", stream_id, false);
+    int url_arg = -1;
+    if (n < RS_SCRIPT_ARG_CAP) {
+        url_arg = n;
+        args[n++] = rs_script_arg("url", rs_json_obj_str(stream, "url", ""), false);
+    }
+    n = append_script_params(args, n, RS_SCRIPT_ARG_CAP, rs_json_obj_str(stream, "scriptParams", ""));
+
+    rs_provider_source_policy(provider, &st->source_policy);
+    st->script_timeout = (double)rs_provider_option_int(provider, "scriptTimeoutSeconds");
+    st->url_arg = url_arg;
+    st->script_path = rs_strdup(script);
+    st->default_cdn = rs_strdup(rs_provider_option_str(provider, "defaultCdn"));
+    st->args = args;
+    st->argc = n;
+    st->kind = rs_strdup(rs_json_obj_str(stream, "kind", "mpd"));
+    st->url = rs_strdup(rs_json_obj_str(stream, "url", ""));
+    st->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    st->media_proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
+    st->headers = effective_headers(provider, stream, "manifestHeaders");
+    st->media_fetch_headers = effective_headers(provider, stream, "mediaHeaders");
+    st->provider_headers = rs_provider_headers(provider);
+    st->downloader = rs_strdup(effective_downloader(provider, stream));
+    st->dl_params = rs_strdup(effective_downloader_params(provider, stream));
+    st->rep = rs_strdup(selected_video_rep(stream));
+    if (st->rep[0]) st->source_policy.video_filter[0] = 0;
+    st->host = rs_strdup("");
+    st->force_ipv6 = rs_json_obj_bool(provider, "forceIpv6", false);
+    st->rotate_proxies = rs_json_obj_bool(provider, "rotateProxies", false);
+    st->want_manifest = want_manifest;
+    st->want_cdm = want_cdm;
+    st->want_pssh_hook = rs_panel_script_action_allowed(provider, stream, "pssh");
+    st->want_initparse = rs_panel_script_action_allowed(provider, stream, "initparse");
+    st->cdm_mode = rs_strdup(rs_json_obj_str(stream, "cdmMode", "external"));
+    st->cdm_type = rs_strdup(rs_json_obj_str(stream, "cdmType", ""));
+    st->cached_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
+
+    return st;
+}
+
+// Preserve CDN order and skip duplicate/invalid entries. A variant is rebased
+// only when its path is relative to a known manifest directory; an unrelated
+// absolute URL cannot safely be mapped to a different rendition.
+static void source_add(rs_json *roots, const char *url) {
+    if (!url_is_http(url)) return;
+    for (size_t i = 0; i < rs_json_arr_len(roots); i++)
+        if (!strcmp(url, rs_json_as_str(rs_json_arr_at(roots, i), ""))) return;
+    rs_json_arr_push(roots, rs_json_new_str(url));
+}
+
+static rs_json *source_roots(const char *primary, const rs_json *mirrors) {
+    rs_json *roots = rs_json_new_arr();
+    source_add(roots, primary);
+    for (size_t i = 0; i < rs_json_arr_len(mirrors); i++)
+        source_add(roots, rs_json_as_str(rs_json_arr_at(mirrors, i), ""));
+    return roots;
+}
+
+static void pending_source_context(restream_server_t *server, rs_pending_job *pf,
+                                    const rs_json *stream, const rs_json *mirrors,
+                                    bool variant) {
+    const char *base = stream ? stream_source_target(stream) : pf->url;
+    pf->source_base = rs_strdup(base);
+    pf->source_status = rs_strdup(rs_json_obj_str(stream, "status", "stopped"));
+    pf->source_roots = source_roots(base, mirrors ? mirrors : rs_json_obj_get(stream, "cdnUrls"));
+    const rs_json *cdn_headers = rs_json_obj_get(stream, "cdnHeaders");
+    pf->source_headers = cdn_headers ? rs_json_clone(cdn_headers) : rs_json_new_obj();
+    pf->source_generic_headers = rs_provider_headers(provider_of(&server->state, stream));
+    pf->source_default_headers = rs_strdup(pf->headers ? pf->headers : "");
+    pf->source_default_media_headers = rs_strdup(pf->media_headers ? pf->media_headers : "");
+    pf->source_token = (unsigned long long)rs_json_obj_int(
+        rs_json_obj_get(server->provider_timers, pf->stream_id), "startToken", 0);
+    if (!variant) pf->source_relative = rs_strdup("");
+    else for (size_t i = 0; i < rs_json_arr_len(pf->source_roots); i++) {
+        const char *root = rs_json_as_str(rs_json_arr_at(pf->source_roots, i), "");
+        if (!strcmp(root, pf->url)) {
+            pf->source_relative = rs_strdup(""); pf->source_header_root = rs_strdup(root); break;
+        }
+        char *dir = rs_url_resolve(root, ".");
+        if (dir && !strncmp(pf->url, dir, strlen(dir))) {
+            pf->source_relative = rs_strdup(pf->url + strlen(dir));
+            pf->source_header_root = rs_strdup(root);
+            free(dir); break;
+        }
+        free(dir);
+    }
+}
+
+static void pending_source_clear_result(rs_pending_job *pf) {
+    free(pf->body); pf->body = NULL; pf->body_len = 0;
+    free(pf->content_type); pf->content_type = NULL;
+    free(pf->content_range); pf->content_range = NULL;
+    pf->status = 0; pf->err[0] = 0; pf->rc = -1;
+}
+
+static bool pending_source_try(rs_pending_job *pf, const char *url, const char *root) {
+    pending_source_clear_result(pf);
+    char *header_root = rs_strdup(root ? root : "");
+    free(pf->source_header_root); pf->source_header_root = header_root;
+    const rs_json *h = rs_json_obj_get(pf->source_headers, header_root);
+    const char *mh = rs_json_obj_str(h, "manifestHeaders", NULL);
+    const char *dh = rs_json_obj_str(h, "mediaHeaders", NULL);
+    free(pf->headers);
+    pf->headers = mh ? join_header_text(pf->source_generic_headers, mh) : rs_strdup(pf->source_default_headers);
+    free(pf->media_headers);
+    pf->media_headers = dh ? join_header_text(pf->source_generic_headers, dh) : rs_strdup(pf->source_default_media_headers);
+    char *target = rs_strdup(url);
+    free(pf->url); pf->url = target;
+    if (pf->kind == RS_PENDING_PROBE) {
+        pf->body = g_probe_handler(pf->url, pf->proxy, pf->headers,
+                                   pf->force_ipv6, pf->rotate_proxies,
+                                   pf->err, sizeof(pf->err), &pf->source_policy);
+        pf->rc = pf->body ? 0 : -1;
+    } else {
         char *effective = NULL;
         pf->rc = g_fetch_handler(pf->url, pf->proxy, pf->headers, pf->range,
                                  pf->downloader, pf->downloader_params,
@@ -4289,8 +4565,96 @@ static void *pending_job_worker(void *arg) {
                                  &pf->body, &pf->body_len, &pf->status,
                                  &pf->content_type, &pf->content_range, &effective,
                                  pf->err, sizeof(pf->err), 30000, NULL, NULL, &pf->source_policy);
-        if (pf->rc == 0 && effective && effective[0]) { free(pf->url); pf->url = effective; }
+        if (!pf->rc && effective && effective[0]) { free(pf->url); pf->url = effective; }
         else free(effective);
+        if (!pf->rc && (!pf->body || !strstr(pf->body, "#EXTM3U"))) {
+            pf->rc = -1;
+            snprintf(pf->err, sizeof(pf->err), "Source did not return an HLS playlist.");
+        }
+    }
+    if (pf->rc && pf->stream_id)
+        log_record(pf->server, pf->stream_id, "error", "manifestFetch", pf->url,
+                   pf->status, -1, pf->err[0] ? pf->err : "Manifest fetch failed.");
+    return pf->rc == 0;
+}
+
+static void pending_source_fetch(rs_pending_job *pf) {
+    if (pf->start) {
+        // This second worker round is dispatched only after every old CDN
+        // failed and the poll thread claimed the stream's refresh cooldown.
+        stream_start_worker(pf->server, pf->stream_id, pf->start);
+        if (pf->start->err[0]) {
+            pending_source_clear_result(pf);
+            snprintf(pf->err, sizeof(pf->err), "%s", pf->start->err);
+            return;
+        }
+        rs_json_free(pf->source_roots);
+        pf->source_roots = source_roots(pf->start->manifest_url, pf->start->cdn_urls);
+        rs_json_free(pf->source_headers); pf->source_headers = rs_json_clone(pf->start->cdn_headers);
+        free(pf->source_default_headers); pf->source_default_headers = rs_strdup(pf->start->headers);
+        free(pf->source_default_media_headers); pf->source_default_media_headers = rs_strdup(pf->start->media_fetch_headers);
+        if (pf->start->keys && pf->start->keys[0]) {
+            free(pf->decryption_keys); pf->decryption_keys = rs_strdup(pf->start->keys);
+        }
+    }
+    // Start with the requested variant, which may have come from a mirror or
+    // redirect. Subsequent candidates keep the same relative rendition path.
+    char *requested = rs_strdup(pf->url);
+    if (!pf->start && pending_source_try(pf, requested,
+            pf->source_header_root ? pf->source_header_root : pf->source_base)) { free(requested); return; }
+    if (pf->source_relative) for (size_t i = 0; i < rs_json_arr_len(pf->source_roots); i++) {
+        const char *root = rs_json_as_str(rs_json_arr_at(pf->source_roots, i), "");
+        char *url = pf->source_relative[0] ? rs_url_resolve(root, pf->source_relative) : rs_strdup(root);
+        if (!url || (!pf->start && !strcmp(url, requested))) { free(url); continue; }
+        if (pf->stream_id)
+            log_recordf(pf->server, pf->stream_id, "info", "cdnFallback", url, 0, -1,
+                        "trying %smanifest source %zu of %zu", pf->start ? "refreshed " : "",
+                        i + 1, rs_json_arr_len(pf->source_roots));
+        bool ok = pending_source_try(pf, url, root);
+        free(url);
+        if (ok) break;
+    }
+    free(requested);
+}
+
+static void *pending_job_worker(void *arg) {
+    rs_pending_job *pf = (rs_pending_job *)arg;
+    restream_server_t *server = pf->server;
+
+    switch (pf->kind) {
+    case RS_PENDING_BUFFER: {
+        // Keep the initial player request open while FFmpeg warms up. VLC and
+        // ffplay can stop on an immediate 503 instead of retrying the playlist.
+        uint64_t deadline = mg_millis() + 20000;
+        while (mg_millis() < deadline) {
+            pthread_mutex_lock(&server->pending_mu);
+            bool cancelled = pf->cancelled;
+            pthread_mutex_unlock(&server->pending_mu);
+            if (cancelled) break;
+            pf->body = (char *)read_file(pf->url, &pf->body_len);
+            if (!pf->body && pf->source_base) {
+                pf->body = (char *)read_file(pf->source_base, &pf->body_len);
+                if (pf->body) { free(pf->url); pf->url = rs_strdup(pf->source_base); }
+            }
+            if (pf->body) break;
+            rs_proc_sleep_ms(50);
+        }
+        break;
+    }
+    case RS_PENDING_PLAYLIST:
+    case RS_PENDING_ITEM: {
+        if (pf->kind == RS_PENDING_PLAYLIST) pending_source_fetch(pf);
+        else {
+            char *effective = NULL;
+            pf->rc = g_fetch_handler(pf->url, pf->proxy, pf->headers, pf->range,
+                                     pf->downloader, pf->downloader_params,
+                                     pf->force_ipv6, pf->rotate_proxies,
+                                     &pf->body, &pf->body_len, &pf->status,
+                                     &pf->content_type, &pf->content_range, &effective,
+                                     pf->err, sizeof(pf->err), 30000, NULL, NULL, &pf->source_policy);
+            if (pf->rc == 0 && effective && effective[0]) { free(pf->url); pf->url = effective; }
+            else free(effective);
+        }
         if (pf->kind == RS_PENDING_PLAYLIST && pf->rc == 0 && pf->body
             && pf->decryption_keys && pf->decryption_keys[0]
             && !rs_m3u8_is_master(pf->body)) {
@@ -4340,10 +4704,7 @@ static void *pending_job_worker(void *arg) {
         pf->rc = pf->body ? 0 : -1;
         break;
     case RS_PENDING_PROBE:
-        pf->body = g_probe_handler(pf->url, pf->proxy, pf->headers,
-                                   pf->force_ipv6, pf->rotate_proxies,
-                                   pf->err, sizeof(pf->err), &pf->source_policy);
-        pf->rc = pf->body ? 0 : -1;
+        pending_source_fetch(pf);
         break;
     case RS_PENDING_SCRIPT:
         pf->rc = rs_script_run_stream(pf->script_path, (const char **)pf->script_args, pf->script_argc,
@@ -4431,7 +4792,8 @@ static void dispatch_logo_lookup(restream_server_t *server, struct mg_connection
 // replies to `c`.
 static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
                            char *url, char *proxy, char *headers,
-                           bool force_ipv6, bool rotate_proxies, const rs_json *provider) {
+                           bool force_ipv6, bool rotate_proxies, const rs_json *provider,
+                           const rs_json *stream, const rs_json *mirrors) {
     rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
     if (!pf) {
         free(url); free(proxy); free(headers);
@@ -4439,12 +4801,14 @@ static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
         return;
     }
     pf->kind = RS_PENDING_PROBE;
+    if (stream) pf->stream_id = rs_strdup(rs_json_obj_str(stream, "id", ""));
     rs_provider_source_policy(provider, &pf->source_policy);
     pf->url = url;
     pf->proxy = proxy;
     pf->headers = headers;  // pf owns all three now
     pf->force_ipv6 = force_ipv6;
     pf->rotate_proxies = rotate_proxies;
+    pending_source_context(server, pf, stream, mirrors, false);
     if (!pending_job_dispatch(server, c, pf)) {
         pending_job_free(pf);
         reply_error(c, 500, "Could not start the probe.");
@@ -4534,7 +4898,8 @@ static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job 
         || strstr(pf->body, "urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95")
         || strstr(pf->body, "METHOD=SAMPLE-AES-CTR");
     bool decrypts_cenc = has_clear_keys && advertises_cenc;
-    playlist_route_ctx ctx = {pf->stream_id, pf->playback_key_str, decrypts_cenc, playlist_kid};
+    playlist_route_ctx ctx = {pf->stream_id, pf->playback_key_str, decrypts_cenc, playlist_kid,
+        rs_json_obj_get(pf->source_headers, pf->source_header_root) ? pf->source_header_root : NULL};
     bool server_decrypts_hls = decrypts_cenc || (pf->hls_key && pf->hls_key[0] != '\0');
     char *rewritten;
     if (rs_m3u8_is_master(pf->body)) {
@@ -4617,8 +4982,9 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
     // log the fetch so the stream's Logs tab shows download activity.
     const char *peer = pf->client_ip ? pf->client_ip : "";
     const char *identity = (pf->playback_key_str && pf->playback_key_str[0]) ? pf->playback_key_str : peer;
-    rs_metrics_record(server->metrics, pf->stream_id, identity, peer,
-                      pf->user_agent ? pf->user_agent : "", (int)body_len);
+    if (!pf->playback_key_str || strcmp(pf->playback_key_str, server->pipeline_feed_key))
+        rs_metrics_record(server->metrics, pf->stream_id, identity, peer,
+                          pf->user_agent ? pf->user_agent : "", (int)body_len);
     log_recordf(server, pf->stream_id, "info", pf->is_map ? "serveInit" : "serveSegment",
                 pf->url, status, (long long)body_len, "fetched for %s", peer);
 
@@ -4663,7 +5029,23 @@ static void pending_job_finish_probe(struct mg_connection *c, rs_pending_job *pf
     if (!pf->body) { reply_error(c, 400, pf->err[0] ? pf->err : "Could not probe the source."); return; }
     char headers_out[128 + sizeof(RS_CORS_HEADERS)];
     snprintf(headers_out, sizeof(headers_out), "%sCache-Control: no-store\r\n", JSON_HEADERS);
-    mg_http_reply(c, 200, headers_out, "%s", pf->body);
+    rs_json *result = rs_json_parse(pf->body, strlen(pf->body));
+    if (result) {
+        rs_json_obj_set_str(result, "sourceUrl", pf->url);
+        if (pf->start && pf->start->manifest_applied) {
+            const rs_json *stream = rs_panel_find_stream(&pf->server->state, pf->stream_id);
+            rs_json *session = rs_json_new_obj();
+            static const char *fields[] = {"url", "cdnUrls", "cdnHeaders", "manifestHeaders", "mediaHeaders", "heartbeatSeconds"};
+            for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+                const rs_json *value = rs_json_obj_get(stream, fields[i]);
+                if (value) rs_json_obj_set(session, fields[i], rs_json_clone(value));
+            }
+            rs_json_obj_set(result, "session", session);
+        }
+        char *json = rs_json_serialize(result, false);
+        mg_http_reply(c, 200, headers_out, "%s", json ? json : pf->body);
+        free(json); rs_json_free(result);
+    } else mg_http_reply(c, 200, headers_out, "%s", pf->body);
 }
 
 // Completes the live transcript with the exit status, persists state (a script
@@ -4749,7 +5131,7 @@ static void pending_job_finish_stream_start(restream_server_t *server, struct mg
     const char *err = NULL;
     if (st->manifest_applied)
         rs_panel_apply_session_manifest(&server->state, pf->stream_id, st->manifest_url,
-                                        st->cdn_urls, st->manifest_headers, st->media_headers,
+                                        st->cdn_urls, st->cdn_headers, st->manifest_headers, st->media_headers,
                                         st->heartbeat_seconds, &err);
     if (st->keys && st->keys[0])
         rs_panel_set_stream_keys(&server->state, pf->stream_id, st->keys, &err);
@@ -4824,50 +5206,13 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
         return true;
     }
 
-    rs_stream_start *st = (rs_stream_start *)calloc(1, sizeof(*st));
+    rs_stream_start *st = stream_start_snapshot(provider, stream, want_manifest, want_cdm);
     rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
-    char **args = (char **)calloc(RS_SCRIPT_ARG_CAP, sizeof(char *));
-    if (!st || !pf || !args) { free(st); free(pf); free(args); return false; }
-
-    int n = fill_common_script_args(provider, stream, args, 0, RS_SCRIPT_ARG_CAP);
-    if (n < RS_SCRIPT_ARG_CAP) args[n++] = rs_script_arg("id", stream_id, false);
-    int url_arg = -1;
-    if (n < RS_SCRIPT_ARG_CAP) {
-        url_arg = n;
-        args[n++] = rs_script_arg("url", rs_json_obj_str(stream, "url", ""), false);
-    }
-    n = append_script_params(args, n, RS_SCRIPT_ARG_CAP, rs_json_obj_str(stream, "scriptParams", ""));
-
-    rs_provider_source_policy(provider, &st->source_policy);
+    if (!st || !pf) { stream_start_free(st); free(pf); return false; }
     st->token = ++s->next_start_token;
     rs_json_obj_set_int(provider_timer(s, stream_id), "startToken", (long long)st->token);
-    st->script_timeout = (double)rs_provider_option_int(provider, "scriptTimeoutSeconds");
-    st->url_arg = url_arg;
-    st->script_path = rs_strdup(script);
-    st->default_cdn = rs_strdup(rs_provider_option_str(provider, "defaultCdn"));
-    st->args = args;
-    st->argc = n;
-    st->kind = rs_strdup(rs_json_obj_str(stream, "kind", "mpd"));
-    st->url = rs_strdup(rs_json_obj_str(stream, "url", ""));
-    st->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
-    st->media_proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
-    st->headers = effective_headers(provider, stream, "manifestHeaders");
-    st->media_fetch_headers = effective_headers(provider, stream, "mediaHeaders");
-    st->provider_headers = rs_provider_headers(provider);
-    st->downloader = rs_strdup(effective_downloader(provider, stream));
-    st->dl_params = rs_strdup(effective_downloader_params(provider, stream));
-    st->rep = rs_strdup(selected_video_rep(stream));
-    if (st->rep[0]) st->source_policy.video_filter[0] = 0;
+    free(st->host);
     st->host = hm ? request_host(hm) : rs_strdup("");
-    st->force_ipv6 = rs_json_obj_bool(provider, "forceIpv6", false);
-    st->rotate_proxies = rs_json_obj_bool(provider, "rotateProxies", false);
-    st->want_manifest = want_manifest;
-    st->want_cdm = want_cdm;
-    st->want_pssh_hook = rs_panel_script_action_allowed(provider, stream, "pssh");
-    st->want_initparse = rs_panel_script_action_allowed(provider, stream, "initparse");
-    st->cdm_mode = rs_strdup(rs_json_obj_str(stream, "cdmMode", "external"));
-    st->cdm_type = rs_strdup(rs_json_obj_str(stream, "cdmType", ""));
-    st->cached_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
 
     pf->kind = RS_PENDING_STREAM_START;
     pf->stream_id = rs_strdup(stream_id);
@@ -4884,6 +5229,59 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
         return false;
     }
     return true;
+}
+
+// Called on the poll thread between worker rounds. Session state is applied
+// here, never by a worker, and only while the request still describes the
+// same stream generation. Recovery does not start or stop a stream.
+static bool pending_source_finish(restream_server_t *server, struct mg_connection *c,
+                                   rs_pending_job *pf) {
+    if ((pf->kind != RS_PENDING_PLAYLIST && pf->kind != RS_PENDING_PROBE) || !pf->stream_id)
+        return false;
+    const rs_json *stream = rs_panel_find_stream(&server->state, pf->stream_id);
+    unsigned long long token = (unsigned long long)rs_json_obj_int(
+        rs_json_obj_get(server->provider_timers, pf->stream_id), "startToken", 0);
+    if (!stream || token != pf->source_token || strcmp(stream_source_target(stream), pf->source_base) ||
+        strcmp(rs_json_obj_str(stream, "status", "stopped"), pf->source_status)) {
+        pending_source_clear_result(pf);
+        snprintf(pf->err, sizeof(pf->err), "Stream changed during the request; retry with its current source.");
+        return false;
+    }
+    if (pf->start && pf->start->manifest_applied && !pf->start->err[0]) {
+        const char *err = NULL;
+        rs_panel_apply_session_manifest(&server->state, pf->stream_id, pf->start->manifest_url,
+            pf->start->cdn_urls, pf->start->cdn_headers, pf->start->manifest_headers, pf->start->media_headers,
+            pf->start->heartbeat_seconds, &err);
+        if (pf->start->keys && pf->start->keys[0])
+            rs_panel_set_stream_keys(&server->state, pf->stream_id, pf->start->keys, &err);
+        if (rs_state_save(&server->state) != 0)
+            log_record(server, pf->stream_id, "error", "manifestRefresh", NULL, 0, -1,
+                       "Refreshed session is in memory but could not be saved.");
+    }
+    if (!pf->rc || pf->recovery_attempted || !pf->source_relative) return false;
+    pf->recovery_attempted = true;
+    const rs_json *provider = provider_of(&server->state, stream);
+    if (!rs_json_obj_bool(stream, "sessionManifest", false) ||
+        !rs_panel_script_action_allowed(provider, stream, "manifest") ||
+        !rs_panel_effective_script_path(provider, stream)[0]) return false;
+    rs_json *timer = provider_timer(server, pf->stream_id);
+    double now = now_ms();
+    if (provider_job_busy(server, provider) ||
+        now - rs_json_obj_num(timer, "manifestRefreshAt", 0) < 60000.0) {
+        log_record(server, pf->stream_id, "info", "manifestRefresh", NULL, 0, -1,
+                   "All manifest sources failed; refresh is busy or in its 60-second cooldown.");
+        return false;
+    }
+    pf->start = stream_start_snapshot(provider, stream, true,
+        pf->kind == RS_PENDING_PLAYLIST && rs_json_obj_bool(stream, "useCdm", false) &&
+        rs_panel_script_action_allowed(provider, stream, "cdm"));
+    if (!pf->start) return false;
+    rs_json_obj_set(timer, "manifestRefreshAt", rs_json_new_num(now));
+    log_record(server, pf->stream_id, "info", "manifestRefresh", NULL, 0, -1,
+               "All manifest sources failed; running manifest and retrying the fresh CDN list.");
+    if (pending_job_dispatch(server, c, pf)) return true;
+    snprintf(pf->err, sizeof(pf->err), "Could not dispatch manifest recovery.");
+    return false;
 }
 
 static void pending_job_finish(restream_server_t *server, struct mg_connection *c, struct mg_str *data) {
@@ -4904,6 +5302,7 @@ static void pending_job_finish(restream_server_t *server, struct mg_connection *
         return;
     }
 
+    if (pending_source_finish(server, c, pf)) return;
     switch (pf->kind) {
     case RS_PENDING_PLAYLIST: pending_job_finish_playlist(c, pf); break;
     case RS_PENDING_ITEM: pending_job_finish_item(server, c, pf); break;
@@ -4911,6 +5310,7 @@ static void pending_job_finish(restream_server_t *server, struct mg_connection *
     case RS_PENDING_PROBE: pending_job_finish_probe(c, pf); break;
     case RS_PENDING_SCRIPT: pending_job_finish_script(server, c, pf); break;
     case RS_PENDING_STREAM_START: pending_job_finish_stream_start(server, c, pf); break;
+    case RS_PENDING_BUFFER: pending_job_finish_buffer(server, c, pf); break;
     }
     pending_job_free(pf);
 }
@@ -4953,6 +5353,11 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     pf->decryption_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
     pf->hls_key = rs_strdup(rs_json_obj_str(stream, "hlsKey", ""));
     pf->playback_key_str = playback_key(hm);
+    pending_source_context(server, pf, stream, NULL, variant != NULL);
+    char *cdn_hint = query_var(hm, "cdn");
+    if (cdn_hint && rs_json_obj_get(pf->source_headers, cdn_hint)) {
+        free(pf->source_header_root); pf->source_header_root = cdn_hint;
+    } else free(cdn_hint);
     free(variant);
 
     if (!pending_job_dispatch(server, c, pf)) {
@@ -5148,6 +5553,15 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     pf->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
     rs_provider_source_policy(provider, &pf->source_policy);
     pf->headers = effective_headers(provider, stream, is_key ? "hlsKeyHeaders" : "mediaHeaders");
+    char *cdn_hint = query_var(hm, "cdn");
+    const rs_json *cdn = rs_json_obj_get(rs_json_obj_get(stream, "cdnHeaders"), cdn_hint ? cdn_hint : "");
+    const char *cdn_media = rs_json_obj_str(cdn, "mediaHeaders", NULL);
+    if (cdn_media && (!is_key || !rs_json_obj_str(stream, "hlsKeyHeaders", "")[0])) {
+        char *generic = rs_provider_headers(provider);
+        free(pf->headers); pf->headers = join_header_text(generic, cdn_media);
+        free(generic);
+    }
+    free(cdn_hint);
     pf->downloader = rs_strdup(effective_downloader(provider, stream));
     pf->downloader_params = rs_strdup(effective_downloader_params(provider, stream));
     pf->force_ipv6 = provider && rs_json_obj_bool(provider, "forceIpv6", false);
@@ -5192,12 +5606,18 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
     if (!stream) return -1;
     bool running = strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0;
     if (!running || !stream_needs_pipeline(stream)) {
+        rs_json_obj_remove(provider_timer(s, stream_id), "bufferedViewerAt");
         pipeline_stop_stream(stream_id);
         return 0;
     }
 
     const char *input = rs_json_obj_str(stream, "inputMode", "internal");
     const char *output = rs_json_obj_str(stream, "outputMode", "hls");
+    bool buffered = strcmp(input, "hlsBuffered") == 0;
+    if (buffered && (strcmp(rs_json_obj_str(stream, "kind", ""), "m3u8") || strcmp(output, "hls"))) {
+        snprintf(errbuf, errbuf_len, "Buffered HLS requires an HLS source and HLS output.");
+        return -1;
+    }
     if (strcmp(input, "nm3u8dlre") == 0) {
         snprintf(errbuf, errbuf_len, "N_m3u8DL-RE process supervision is not wired yet.");
         return -1;
@@ -5223,6 +5643,21 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
         return -1;
     }
 
+    if (buffered && rs_json_obj_num(rs_json_obj_get(s->provider_timers, stream_id), "bufferedViewerAt", 0) <= 0) {
+        free(ffmpeg);
+        pipeline_stop_stream(stream_id);
+        return 0;  // armed; the first viewer starts the shared downloader
+    }
+    if (buffered && !s->pipeline_feed_key[0]) {
+        uint8_t bytes[32];
+        if (rs_random_bytes(bytes, sizeof(bytes)) != 0) {
+            free(ffmpeg);
+            snprintf(errbuf, errbuf_len, "Could not create the internal HLS feed credential.");
+            return -1;
+        }
+        for (size_t i = 0; i < sizeof(bytes); i++)
+            snprintf(s->pipeline_feed_key + i * 2, 3, "%02x", bytes[i]);
+    }
     RS_MKDIR("runtime");
     RS_MKDIR("runtime/ffmpeg");
     char out_dir[512], playlist[560];
@@ -5238,7 +5673,8 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
     const char **type_ids = rep_count ? (const char **)calloc(rep_count, sizeof(*type_ids)) : NULL;
     const char **type_values = rep_count ? (const char **)calloc(rep_count, sizeof(*type_values)) : NULL;
     size_t *input_indices = rep_count ? (size_t *)calloc(rep_count, sizeof(*input_indices)) : NULL;
-    size_t used = 0, videos = 0;
+    size_t used = 0, videos = 0, audios = 0;
+    bool muxed_audio = false;
     for (size_t i = 0; i < rep_count && rep_ids && type_ids && type_values && input_indices; i++) {
         const char *id = rs_json_as_str(rs_json_arr_at(selected, i), "");
         if (!id[0]) continue;
@@ -5263,7 +5699,11 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
                 if (strcmp(type_values[j], type) == 0) ordinal++;
         }
         input_indices[used] = ordinal;
-        if (strcmp(type, "audio") != 0) videos++;
+        if (strcmp(type, "audio") != 0) {
+            videos++;
+            const char *codecs = rs_json_obj_str(m, "codecs", "");
+            if (strstr(codecs, "mp4a") || strstr(codecs, "ac-3") || strstr(codecs, "ec-3") || strstr(codecs, "opus")) muxed_audio = true;
+        } else audios++;
         used++;
     }
     if (strcmp(input, "ffmpegMultiTsHls") == 0 && videos > 1) {
@@ -5274,6 +5714,16 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
         }
     }
 
+    if (buffered && (videos > 1 || audios > 1)) {
+        for (size_t i = 0; i < videos; i++) {
+            char variant[560]; snprintf(variant, sizeof(variant), "%s/video_%zu", out_dir, i); RS_MKDIR(variant);
+        }
+        size_t tracks = audios ? audios : (muxed_audio ? 1 : 0);
+        for (size_t i = 0; i < tracks; i++) {
+            char variant[560]; snprintf(variant, sizeof(variant), "%s/audio_%zu", out_dir, i); RS_MKDIR(variant);
+        }
+    }
+
     const rs_json *provider = provider_of(&s->state, stream);
     char *proxy_list = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
     char *proxy = primary_proxy(proxy_list);
@@ -5281,15 +5731,18 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
     char *headers = effective_headers(provider, stream, "manifestHeaders");
     rs_ffargs_inputs in;
     memset(&in, 0, sizeof(in));
-    in.source_url = stream_source_target(stream);
+    char feed_url[640];
+    snprintf(feed_url, sizeof(feed_url), "%s/play/%s/index.m3u8?key=%s",
+             s->pipeline_feed_origin, stream_id, s->pipeline_feed_key);
+    in.source_url = buffered ? feed_url : stream_source_target(stream);
     in.kind = rs_json_obj_str(stream, "kind", "mpd");
     in.input_mode = input;
     in.output_mode = output;
     in.output_target = rs_json_obj_str(stream, "outputTarget", "");
-    in.decryption_keys = rs_json_obj_str(stream, "decryptionKeys", "");
-    in.headers = headers;
-    in.proxy = proxy;
-    in.segment_url_params = provider ? rs_json_obj_str(provider, "segmentUrlParams", "") : "";
+    in.decryption_keys = buffered ? "" : rs_json_obj_str(stream, "decryptionKeys", "");
+    in.headers = buffered ? "" : headers;
+    in.proxy = buffered ? "" : proxy;
+    in.segment_url_params = !buffered && provider ? rs_json_obj_str(provider, "segmentUrlParams", "") : "";
     in.representation_ids = rep_ids;
     in.representation_input_indices = input_indices;
     in.representation_id_count = used;
@@ -5301,8 +5754,10 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
     in.playlist_segments = rs_provider_playlist_segments(provider, stream);
     in.segment_seconds = rs_provider_segment_seconds(provider, stream);
     in.http_timeout_seconds = (int)rs_provider_option_int(provider, "httpGetTimeoutSeconds");
+    if (buffered && in.http_timeout_seconds < 120) in.http_timeout_seconds = 120;
     in.no_reconnect = rs_provider_option_bool(provider, "noRestartOnError");
     in.report_progress = true;
+    in.muxed_audio = muxed_audio;
 
     rs_ffargs_command cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -5554,7 +6009,7 @@ static bool provider_job_busy(restream_server_t *s, const rs_json *provider) {
         if (pf->cancelled || !pf->stream_id) continue;
         if (pf->kind == RS_PENDING_SCRIPT)
             busy = !strncmp(pf->stream_id, "script:", 7) && !strcmp(pf->stream_id + 7, pid);
-        if (pf->kind == RS_PENDING_STREAM_START) {
+        if (pf->kind == RS_PENDING_STREAM_START || pf->start) {
             const rs_json *streams = rs_json_obj_get(provider, "streams");
             for (size_t i = 0; i < rs_json_arr_len(streams) && !busy; i++)
                 busy = !strcmp(rs_json_obj_str(rs_json_arr_at(streams, i), "id", ""), pf->stream_id);
@@ -5667,6 +6122,13 @@ static void provider_maintenance(restream_server_t *s) {
             const char *id = rs_json_obj_str(stream, "id", "");
             rs_json *stimer = provider_timer(s, id);
             bool running = !strcmp(rs_json_obj_str(stream, "status", "stopped"), "running");
+            double viewer_at = rs_json_obj_num(stimer, "bufferedViewerAt", 0);
+            if (viewer_at > 0 && (!running || now - viewer_at >= 30.0)) {
+                rs_json_obj_remove(stimer, "bufferedViewerAt");
+                pipeline_stop_stream(id);
+                log_record(s, id, "info", "hlsBufferIdle", NULL, 0, -1,
+                           "No HLS viewer requests for 30 seconds; downloader stopped.");
+            }
             if (!running && g_pipeline_running && g_pipeline_running(id)) pipeline_stop_stream(id);
             int condition = running ? rs_live_condition(s->live, id) : 0;
             double healthy_since = rs_json_obj_num(stimer, "healthySince", 0);
@@ -6590,6 +7052,47 @@ static bool safe_pipeline_relative_path(const char *path) {
     return true;
 }
 
+static char *pipeline_playlist_uri(void *ctx, const char *absolute) {
+    static const char base[] = "http://pipeline.local";
+    if (strncmp(absolute, base, sizeof(base) - 1)) return NULL;
+    return playlist_with_playback_key(absolute + sizeof(base) - 1, (const char *)ctx);
+}
+
+static char *pipeline_playlist_media_uri(void *ctx, const char *absolute,
+                                          rs_m3u8_line_kind kind, int64_t sequence) {
+    (void)kind; (void)sequence;
+    return pipeline_playlist_uri(ctx, absolute);
+}
+
+static void pipeline_reply_playlist(struct mg_connection *c, const char *id, const char *path,
+                                     const char *data, const char *key) {
+    char base[1024];
+    const char *relative_path = strstr(path, id);
+    snprintf(base, sizeof(base), "http://pipeline.local/play/%s", relative_path ? relative_path : "");
+    char *playlist = data ? (rs_m3u8_is_master(data)
+        ? rs_m3u8_rewrite_master(data, base, false, pipeline_playlist_uri, (void *)key)
+        : rs_m3u8_rewrite(data, base, false, pipeline_playlist_media_uri, (void *)key)) : NULL;
+    if (!playlist) { reply_error(c, 503, "HLS buffer is updating; retry shortly."); return; }
+    mg_http_reply(c, 200, RS_CORS_HEADERS "Content-Type: application/vnd.apple.mpegurl\r\nCache-Control: no-store\r\n", "%s", playlist);
+    free(playlist);
+}
+
+static void pending_job_finish_buffer(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf) {
+    if (!pipeline_feed_active(server, pf->stream_id)) {
+        reply_error(c, 404, "HLS buffer was stopped."); return;
+    }
+    if (!pf->body) {
+        mg_http_reply(c, 503, RS_CORS_HEADERS "Content-Type: application/json\r\nRetry-After: 1\r\n",
+                      "{\"error\":\"HLS buffer is still warming up; check the stream logs.\"}");
+        return;
+    }
+    rs_json_obj_set(provider_timer(server, pf->stream_id), "bufferedViewerAt", rs_json_new_num(now_ms() / 1000.0));
+    rs_metrics_record(server->metrics, pf->stream_id,
+        pf->playback_key_str && pf->playback_key_str[0] ? pf->playback_key_str : pf->client_ip,
+        pf->client_ip, pf->user_agent ? pf->user_agent : "", (int)pf->body_len);
+    pipeline_reply_playlist(c, pf->stream_id, pf->url, pf->body, pf->playback_key_str);
+}
+
 static bool serve_pipeline_hls(restream_server_t *server, struct mg_connection *c,
                                struct mg_http_message *hm) {
     char *tail = capture(hm, "/play/#");
@@ -6613,14 +7116,38 @@ static bool serve_pipeline_hls(restream_server_t *server, struct mg_connection *
         return true;
     }
 
+    if (!strcmp(rs_json_obj_str(stream, "inputMode", ""), "hlsBuffered")) {
+        const char *sid = rs_json_obj_str(stream, "id", tail);
+        rs_json *timer = provider_timer(server, sid);
+        bool first = rs_json_obj_num(timer, "bufferedViewerAt", 0) <= 0;
+        rs_json_obj_set(timer, "bufferedViewerAt", rs_json_new_num(now_ms() / 1000.0));
+        if (first) {
+            // A previous viewer's files are no longer live. Recreate only this
+            // stream's generated output directory before the next session.
+            char directory[512]; snprintf(directory, sizeof(directory), "runtime/ffmpeg/%s", sid);
+            if (remove_tree(directory) != 0) {
+                rs_json_obj_remove(timer, "bufferedViewerAt");
+                free(tail); reply_error(c, 500, "Could not clear the previous HLS buffer."); return true;
+            }
+            char error[256] = {0};
+            if (pipeline_sync_stream(server, sid, error, sizeof(error)) != 0) {
+                rs_json_obj_remove(timer, "bufferedViewerAt");
+                free(tail); reply_error(c, 502, error); return true;
+            }
+            log_record(server, sid, "info", "hlsBufferStart", NULL, 0, -1,
+                       "First viewer connected; downloading HLS into a shared local buffer.");
+        }
+    }
     const char *relative = slash;
+    bool wait_for_buffer = !strcmp(relative, "index.m3u8") &&
+        !strcmp(rs_json_obj_str(stream, "inputMode", ""), "hlsBuffered");
     char path[1024];
-    const char *id = rs_json_obj_str(stream, "id", tail);
+    const char *id = rs_json_obj_str(stream, "id", "");
     if (strcmp(relative, "index.m3u8") == 0) {
         const char *mode = rs_json_obj_str(stream, "inputMode", "ffmpegResident");
         snprintf(path, sizeof(path), "runtime/ffmpeg/%s/%s", id,
-                 strcmp(mode, "ffmpegMultiTsHls") == 0 ? "master.m3u8" : "live.m3u8");
-        if (strcmp(mode, "ffmpegMultiTsHls") == 0) {
+                 (!strcmp(mode, "ffmpegMultiTsHls") || !strcmp(mode, "hlsBuffered")) ? "master.m3u8" : "live.m3u8");
+        if (!strcmp(mode, "ffmpegMultiTsHls") || !strcmp(mode, "hlsBuffered")) {
             FILE *test = fopen(path, "rb");
             if (!test) snprintf(path, sizeof(path), "runtime/ffmpeg/%s/live.m3u8", id);
             else fclose(test);
@@ -6637,11 +7164,44 @@ static bool serve_pipeline_hls(restream_server_t *server, struct mg_connection *
 
     FILE *test = fopen(path, "rb");
     if (!test) {
+        if (wait_for_buffer) {
+            rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
+            if (!pf) { reply_error(c, 500, "Out of memory."); return true; }
+            pf->kind = RS_PENDING_BUFFER;
+            pf->stream_id = rs_strdup(id);
+            snprintf(path, sizeof(path), "runtime/ffmpeg/%s/master.m3u8", id);
+            pf->url = rs_strdup(path);
+            snprintf(path, sizeof(path), "runtime/ffmpeg/%s/live.m3u8", id);
+            pf->source_base = rs_strdup(path);
+            pf->client_ip = client_ip(server, c, hm);
+            pf->user_agent = header_dup(hm, "User-Agent");
+            pf->playback_key_str = playback_key(hm);
+            if (!pending_job_dispatch(server, c, pf)) {
+                pending_job_free(pf); reply_error(c, 503, "Could not wait for the HLS buffer.");
+            }
+            return true;
+        }
         mg_http_reply(c, 503, RS_CORS_HEADERS "Content-Type: application/json\r\nRetry-After: 1\r\n",
                       "{\"error\":\"FFmpeg output is warming up.\"}");
         return true;
     }
+    fseek(test, 0, SEEK_END);
+    long length = ftell(test);
     fclose(test);
+    char *ip = client_ip(server, c, hm);
+    char *ua = header_dup(hm, "User-Agent");
+    char *key = playback_key(hm);
+    rs_metrics_record(server->metrics, id, key && key[0] ? key : ip,
+                      ip, ua ? ua : "", length > 0 && length < INT_MAX ? (int)length : 0);
+    free(ip); free(ua);
+    if (strstr(path, ".m3u8") && strlen(path) >= 5 && !strcmp(path + strlen(path) - 5, ".m3u8")) {
+        size_t size = 0;
+        uint8_t *data = read_file(path, &size);
+        pipeline_reply_playlist(c, id, path, (char *)data, key);
+        free(data); free(key);
+        return true;
+    }
+    free(key);
     struct mg_http_serve_opts opts = {0};
     opts.extra_headers = RS_CORS_HEADERS "Cache-Control: no-store\r\n";
     mg_http_serve_file(c, hm, path, &opts);
@@ -6661,7 +7221,8 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
 
     // Playback auth: an API key is required only once at least one exists.
     char *key = playback_key(hm);
-    bool allowed = rs_panel_playback_allowed(&server->state, key);
+    bool feed = is_pipeline_feed(server, c, key);
+    bool allowed = feed || rs_panel_playback_allowed(&server->state, key);
     if (!allowed) {
         char *ip = client_ip(server, c, hm);
         log_recordf(server, "__panel__", "error", "playbackDenied", NULL, 401, -1,
@@ -6682,7 +7243,8 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
             id = capture_dup(rcaps[0]);
             fname = capture_dup(rcaps[1]);
         }
-        if (id && fname) serve_restream_item(server, c, hm, id, fname);
+        if (feed && id && !pipeline_feed_active(server, id)) reply_error(c, 404, "HLS buffer is idle.");
+        else if (id && fname) serve_restream_item(server, c, hm, id, fname);
         else reply_error(c, 400, "Bad restream path.");
         free(id); free(fname);
         return true;
@@ -6754,7 +7316,7 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
         return true;
     }
 
-    if (is_play && serve_pipeline_hls(server, c, hm)) return true;
+    if (is_play && !feed && serve_pipeline_hls(server, c, hm)) return true;
 
     // /play/<segment>/index.m3u8 or index.mpd
     bool is_m3u8 = mg_match(hm->uri, mg_str("/play/*/index.m3u8"), NULL);
@@ -6765,6 +7327,9 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
         free(segment);
         if (!stream) { reply_error(c, 404, "Stream not found."); return true; }
         const char *st_val = rs_json_obj_str(stream, "status", "stopped");
+        if (feed && !pipeline_feed_active(server, rs_json_obj_str(stream, "id", ""))) {
+            reply_error(c, 404, "HLS buffer is idle."); return true;
+        }
         if (strcmp(st_val, "running") != 0 && !rs_json_obj_bool(stream, "directSource", false)) {
             reply_error(c, 404, "Stream is stopped.");
             return true;
@@ -6781,7 +7346,8 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
         const char *input_mode = rs_json_obj_str(stream, "inputMode", "internal");
         // HLS passthrough is the one live path in C so far: a kind=m3u8 stream on
         // the internal remuxer, fetched and rewritten per request.
-        if (is_m3u8 && strcmp(kind, "m3u8") == 0 && strcmp(input_mode, "internal") == 0) {
+        if (is_m3u8 && strcmp(kind, "m3u8") == 0 &&
+            (!strcmp(input_mode, "internal") || (feed && !strcmp(input_mode, "hlsBuffered")))) {
             if (!g_fetch_handler) { reply_error(c, 501, "Proxy playback isn't in this build."); return true; }
             serve_hls_playlist(server, c, hm, stream);
             return true;
@@ -7102,6 +7668,10 @@ bool restream_server_start(restream_server_t* server, uint16_t port, const char*
     }
 
     server->listen_port = port;
+    const char *feed_host = bind_address && bind_address[0] ? bind_address : "127.0.0.1";
+    if (!strcmp(feed_host, "0.0.0.0")) feed_host = "127.0.0.1";
+    if (!strcmp(feed_host, "[::]") || !strcmp(feed_host, "::")) feed_host = "[::1]";
+    snprintf(server->pipeline_feed_origin, sizeof(server->pipeline_feed_origin), "http://%s:%u", feed_host, (unsigned)port);
 
     // Pass the server through as fn_data so ev_handler can read the web root.
     server->c = mg_http_listen(&server->mgr, listen_url, ev_handler, server);

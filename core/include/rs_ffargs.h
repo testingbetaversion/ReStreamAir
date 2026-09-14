@@ -47,6 +47,7 @@ typedef struct {
     int http_timeout_seconds; // 0 keeps the legacy 15s default
     bool no_reconnect;
     bool report_progress;
+    bool muxed_audio;  // HLS variant CODECS advertises embedded audio
 } rs_ffargs_inputs;
 
 typedef struct {

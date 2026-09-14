@@ -44,6 +44,8 @@ jobs:
           mkdir -p "$STAGE"
           cp build/restreamair-server "$STAGE/restreamair"
           cp -R public "$STAGE/public"
+          mkdir -p "$STAGE/scripts"
+          cp -R scripts/providers "$STAGE/scripts/providers"
           cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
           zip -qr "$STAGE.zip" "$STAGE"
       - uses: actions/upload-artifact@v4
@@ -102,6 +104,8 @@ jobs:
           mkdir -p "$STAGE"
           cp build-release/restreamair-server "$STAGE/restreamair"
           cp -R public "$STAGE/public"
+          mkdir -p "$STAGE/scripts"
+          cp -R scripts/providers "$STAGE/scripts/providers"
           cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
           zip -qr "$STAGE.zip" "$STAGE"
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"
@@ -190,6 +194,8 @@ jobs:
           mkdir -p "$STAGE"
           cp build-release/Release/restreamair-server.exe "$STAGE/restreamair.exe"
           cp -R public "$STAGE/public"
+          mkdir -p "$STAGE/scripts"
+          cp -R scripts/providers "$STAGE/scripts/providers"
           cp README.md SCRIPTING.md API.md EVENTS.md "$STAGE/"
           7z a "$STAGE.zip" "$STAGE" >/dev/null
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"

@@ -9,6 +9,8 @@
 struct rs_logo_cache {
     char *cache_file_path;
     cJSON *cache_json; // Root object representing the cache dictionary
+    int batch_depth;   // >0 while a bulk caller is holding the file write back
+    bool dirty;        // a batched result is waiting to be written
 };
 
 rs_logo_cache* rs_logo_cache_create(const char *cache_file_path) {
@@ -38,8 +40,13 @@ rs_logo_cache* rs_logo_cache_create(const char *cache_file_path) {
     return lc;
 }
 
+static void persist_cache(rs_logo_cache *lc);
+
 void rs_logo_cache_destroy(rs_logo_cache *lc) {
     if (!lc) return;
+    // A batch that never reached its end — shutdown mid-import, say — still has
+    // real lookups in it, and throwing them away means paying for them again.
+    if (lc->dirty) persist_cache(lc);
     if (lc->cache_json) {
         cJSON_Delete(lc->cache_json);
     }
@@ -49,6 +56,7 @@ void rs_logo_cache_destroy(rs_logo_cache *lc) {
 
 static void persist_cache(rs_logo_cache *lc) {
     if (!lc->cache_file_path || !lc->cache_json) return;
+    lc->dirty = false;
     char *json_str = cJSON_PrintUnformatted(lc->cache_json);
     if (json_str) {
         FILE *f = fopen(lc->cache_file_path, "wb");
@@ -58,6 +66,24 @@ static void persist_cache(rs_logo_cache *lc) {
         }
         cJSON_free(json_str);
     }
+}
+
+// Called after every change to the in-memory cache. Writing the whole file
+// here is fine for a one-off lookup and quadratic for a bulk one, so a caller
+// that is about to resolve many names opens a batch and takes a single write.
+static void cache_changed(rs_logo_cache *lc) {
+    if (lc->batch_depth > 0) { lc->dirty = true; return; }
+    persist_cache(lc);
+}
+
+void rs_logo_cache_begin_batch(rs_logo_cache *lc) {
+    if (lc) lc->batch_depth++;
+}
+
+void rs_logo_cache_end_batch(rs_logo_cache *lc) {
+    if (!lc || lc->batch_depth == 0) return;
+    if (--lc->batch_depth > 0) return;
+    if (lc->dirty) persist_cache(lc);
 }
 
 static char* normalize_name(const char *name) {
@@ -85,10 +111,11 @@ static char* url_encode(const char *s) {
     return rs_buf_take(&b);
 }
 
-char* rs_logo_lookup(rs_logo_cache *lc, const char *name, rs_logo_fetch_fn fetch, void *fetch_ctx) {
-    if (!lc || !name || !fetch) return NULL;
-    
-    // Trim whitespaces
+// Splits a caller-supplied name into the trimmed form the query is built from
+// and the normalised form the cache is keyed by, so rs_logo_lookup and
+// rs_logo_cache_has can never disagree about whether a name is cached. Returns
+// false (having written nothing) for a name with no usable characters.
+static bool split_name(const char *name, char **out_trimmed, char **out_key) {
     const char *trimmed = name;
     size_t len = strlen(name);
     while (len > 0 && rs_is_space(trimmed[0])) {
@@ -98,17 +125,37 @@ char* rs_logo_lookup(rs_logo_cache *lc, const char *name, rs_logo_fetch_fn fetch
     while (len > 0 && rs_is_space(trimmed[len - 1])) {
         len--;
     }
-    if (len == 0) return NULL;
-    
+    if (len == 0) return false;
+
     char *trimmed_str = rs_trim_dup(trimmed, len, false);
-    if (!trimmed_str) return NULL;
+    if (!trimmed_str) return false;
 
     char *key = normalize_name(trimmed_str);
     if (!key || key[0] == '\0') {
         rs_free(trimmed_str);
         rs_free(key);
-        return NULL;
+        return false;
     }
+
+    if (out_trimmed) *out_trimmed = trimmed_str; else rs_free(trimmed_str);
+    *out_key = key;
+    return true;
+}
+
+bool rs_logo_cache_has(rs_logo_cache *lc, const char *name) {
+    if (!lc || !name) return false;
+    char *key = NULL;
+    if (!split_name(name, NULL, &key)) return false;
+    bool present = cJSON_GetObjectItemCaseSensitive(lc->cache_json, key) != NULL;
+    rs_free(key);
+    return present;
+}
+
+char* rs_logo_lookup(rs_logo_cache *lc, const char *name, rs_logo_fetch_fn fetch, void *fetch_ctx) {
+    if (!lc || !name || !fetch) return NULL;
+
+    char *trimmed_str = NULL, *key = NULL;
+    if (!split_name(name, &trimmed_str, &key)) return NULL;
 
     cJSON *cached = cJSON_GetObjectItemCaseSensitive(lc->cache_json, key);
     if (cached && cJSON_IsString(cached)) {
@@ -184,7 +231,7 @@ char* rs_logo_lookup(rs_logo_cache *lc, const char *name, rs_logo_fetch_fn fetch
         }
     }
 
-    persist_cache(lc);
+    cache_changed(lc);
     rs_free(key);
     return logo_url;
 }

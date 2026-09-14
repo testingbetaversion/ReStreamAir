@@ -50,6 +50,8 @@ let selectedProviderId = null;
 let selectedStreamId = null;
 let hls = null;
 let pipHls = null;
+let pipStreamId = null;
+let selectedPlaybackKeyId;
 let currentView = "server";
 let eventSource = null;
 let authenticated = false;
@@ -138,6 +140,7 @@ async function refreshOnce() {
   // to paint the old `stopped` snapshot over the new running state. That made
   // a successful broadcast visibly "drop" until another refresh.
   if (epoch !== stateMutationEpoch) return;
+  const previousPlaybackKey = selectedPlaybackKey()?.key;
   state = fresh;
   applyRefreshSettings(state.refresh);
   if (!selectedProviderId && state.providers[0]) selectedProviderId = state.providers[0].id;
@@ -149,6 +152,7 @@ async function refreshOnce() {
   // representations just picked) gets replaced by that stream's saved data.
   if (!editingNewStream && !selectedStream() && provider?.streams[0]) selectedStreamId = provider.streams[0].id;
   render();
+  if (previousPlaybackKey !== selectedPlaybackKey()?.key) reloadPlaybackForUser();
 }
 
 function refresh() {
@@ -171,6 +175,7 @@ function selectedStream() {
 }
 
 function render() {
+  renderPlaybackUser();
   renderProviders();
   renderEditor();
   renderKeys();
@@ -444,7 +449,10 @@ function exportProvider(providerId, providerName) {
 
 function exportProviderPlaylist(providerId, providerName) {
   const link = document.createElement("a");
-  link.href = `/api/providers/${providerId}/playlist.m3u8`;
+  const url = new URL(`/api/providers/${providerId}/playlist.m3u8`, location.origin);
+  const key = selectedPlaybackKey();
+  if (key) url.searchParams.set("key", key.key);
+  link.href = url.href;
   link.download = `${providerName}.m3u8`;
   document.body.appendChild(link);
   link.click();
@@ -704,12 +712,94 @@ function renderStreamsGrid() {
 }
 
 
+function rememberPlaybackKey(id) {
+  selectedPlaybackKeyId = id || "";
+  try { localStorage.setItem("restreamair-playback-key-id", selectedPlaybackKeyId); } catch {}
+}
+
+function selectedPlaybackKey() {
+  if (selectedPlaybackKeyId === undefined) {
+    try { selectedPlaybackKeyId = localStorage.getItem("restreamair-playback-key-id") || ""; }
+    catch { selectedPlaybackKeyId = ""; }
+  }
+  const keys = (state.apiKeys || []).filter((entry) => entry.key);
+  const key = keys.find((entry) => entry.id === selectedPlaybackKeyId) || keys[keys.length - 1] || null;
+  if ((key?.id || "") !== selectedPlaybackKeyId) rememberPlaybackKey(key?.id);
+  return key;
+}
+
+// Panel credentials and playback keys are separate. Use the selected account
+// only on this server's playback routes, including copied and native-HLS URLs.
+function playbackUrl(value) {
+  if (!value) return "";
+  const url = new URL(value, location.origin);
+  const origin = new URL(location.origin);
+  if (!/^https?:$/.test(url.protocol) || url.host !== origin.host || !/^\/(play|restream|proxy|direct|download|source)\//.test(url.pathname)) return value;
+  url.protocol = origin.protocol;
+  const key = selectedPlaybackKey();
+  if (key) url.searchParams.set("key", key.key);
+  else url.searchParams.delete("key");
+  return url.href;
+}
+
+function streamPlaybackUrl(stream) {
+  return stream ? playbackUrl(stream.playUrl || `/play/${encodeURIComponent(stream.id)}/index.m3u8`) : "";
+}
+
+function xtreamPlaylistUrl(key) {
+  const url = new URL("/get.php", location.origin);
+  url.search = new URLSearchParams({ username: key.label, password: key.key, type: "m3u_plus", output: "m3u8" }).toString();
+  return url.href;
+}
+
+function renderPlaybackUser() {
+  const select = $("#playbackUserSelect");
+  const key = selectedPlaybackKey();
+  select.innerHTML = key ? (state.apiKeys || []).map((entry) =>
+    `<option value="${escapeAttr(entry.id)}">${escapeHtml(entry.label)}</option>`).join("")
+    : '<option value="">Open playback — no API key</option>';
+  select.value = key?.id || "";
+  select.disabled = !key;
+  const exportUrl = new URL("/api/playlist.m3u8", location.origin);
+  if (key) exportUrl.searchParams.set("key", key.key);
+  $("#exportAllPlaylistBtn").href = exportUrl.href;
+}
+
+function reloadPlaybackForUser() {
+  if (!$("#playerPanel").classList.contains("hidden") && $("#streamEditorDialog").open) loadPlayer();
+  const pipStream = pipStreamId && findStreamById(pipStreamId);
+  if (pipStream) {
+    const url = streamPlaybackUrl(pipStream);
+    if (pipHls) pipHls.loadSource(url);
+    else { $("#pipVideo").src = url; $("#pipVideo").play().catch(() => {}); }
+  }
+}
+
+function selectPlaybackUser(id) {
+  rememberPlaybackKey(id);
+  render();
+  reloadPlaybackForUser();
+}
+
+// Key mutations return {keys: [...]}, not the full /api/state document.
+function applyKeyList(result, preferNew = false) {
+  const oldIds = new Set((state.apiKeys || []).map((key) => key.id));
+  const previous = selectedPlaybackKey()?.key;
+  stateMutationEpoch++;
+  state.apiKeys = result.keys || [];
+  const added = preferNew && state.apiKeys.find((key) => !oldIds.has(key.id));
+  if (added) rememberPlaybackKey(added.id);
+  const changed = previous !== selectedPlaybackKey()?.key;
+  render();
+  if (changed) reloadPlaybackForUser();
+}
+
 // Copy the stream's HLS (m3u8) output URL — the panel always serves playback
 // as `/play/<id>/index.m3u8`, so this is the one URL to hand a player. Falls
 // back to building it from the current origin if the server hasn't populated
 // playUrl yet (e.g. the stream has never been started).
 async function copyStreamOutputUrl(stream, button) {
-  const url = stream.playUrl || `${location.origin}/play/${stream.id}/index.m3u8`;
+  const url = streamPlaybackUrl(stream);
   if (await copyToClipboard(url)) {
     if (button) flashButtonCopied(button);
   } else {
@@ -860,7 +950,7 @@ function renderEditor() {
   editingNewStream = false;
 
   // Read-only live status can always reflect the latest server state.
-  $("#playLink").value = stream.playUrl || "";
+  $("#playLink").value = streamPlaybackUrl(stream);
   setLinkField($("#directLink"), stream.directStreamUrls || {});
   $("#statusBox").textContent = JSON.stringify({
     status: stream.status,
@@ -977,6 +1067,24 @@ function renderEditor() {
   enlistQualitiesForEditor(stream);
 }
 
+// Keep refreshed session fields in the editor so Save cannot restore expired
+// URLs/headers. Preserve any fields the user changed while the probe ran.
+function applyProbeSession(stream, result) {
+  const session = result.session;
+  if (!stream || !session) return;
+  const form = $("#streamForm");
+  if (JSON.stringify(collectCdnMirrors()) === JSON.stringify(stream.cdnUrls || []))
+    renderCdnMirrors(session.cdnUrls || []);
+  for (const field of ["manifestHeaders", "mediaHeaders", "heartbeatSeconds"]) {
+    const input = form.elements[field];
+    if (input && session[field] !== undefined && input.value === String(stream[field] ?? ""))
+      input.value = session[field];
+  }
+  Object.assign(stream, session);
+  form.elements.url.value = session.url;
+  lastAutoDetectedUrl = session.url;
+}
+
 // Background re-probe for the editor: merges the freshly-detected full
 // representation list with whatever was saved, keeping the saved selection.
 async function enlistQualitiesForEditor(stream) {
@@ -986,11 +1094,12 @@ async function enlistQualitiesForEditor(stream) {
   try {
     const result = await request("/api/probe", {
       method: "POST",
-      body: JSON.stringify({ providerId: selectedProvider()?.id || "", url, proxy: stream.proxy || selectedProvider()?.proxy || "", headers: providerProbeHeaders(stream.manifestHeaders), forceIpv6: Boolean(selectedProvider()?.forceIpv6), rotateProxies: Boolean(selectedProvider()?.rotateProxies) }),
+      body: JSON.stringify({ streamId, providerId: selectedProvider()?.id || "", url, proxy: stream.proxy || selectedProvider()?.proxy || "", headers: providerProbeHeaders(stream.manifestHeaders), forceIpv6: Boolean(selectedProvider()?.forceIpv6), rotateProxies: Boolean(selectedProvider()?.rotateProxies) }),
     });
     // The user may have switched to another stream (or started editing the
     // URL, which triggers its own detect) while the probe was in flight.
-    if (lastEditorStreamId !== streamId || detecting) return;
+    if (lastEditorStreamId !== streamId || detecting || $("#streamForm").elements.url.value.trim() !== url) return;
+    applyProbeSession(stream, result);
     const detected = result.representations || [];
     const byId = new Map(detected.map((rep) => [rep.id, rep]));
     // Keep any saved representation the probe didn't return (e.g. a selected
@@ -1051,7 +1160,7 @@ function streamPayload() {
     forceOffline: form.elements.forceOffline.checked,
     reducedManifestPolling: form.elements.reducedManifestPolling.checked,
     autostart: form.elements.autostart.checked,
-    directSource: form.elements.directSource.checked,
+    directSource: form.elements.inputMode.value === "hlsBuffered" ? false : form.elements.directSource.checked,
     manifestHeaders: form.elements.manifestHeaders.value,
     mediaHeaders: form.elements.mediaHeaders.value,
     hlsKeyHeaders: form.elements.hlsKeyHeaders.value,
@@ -1255,6 +1364,7 @@ function openBigPlayer(provider, stream) {
 // per representation — instead of a read-only text field the user has to
 // select-all and copy out of.
 function setLinkField(container, urls, options = {}) {
+  urls = Object.fromEntries(Object.entries(urls).map(([id, url]) => [id, playbackUrl(url)]));
   const keys = Object.keys(urls);
   container.innerHTML = "";
   container.dataset.full = keys.map((k) => (keys.length === 1 ? urls[k] : `${k}: ${urls[k]}`)).join("\n");
@@ -1389,7 +1499,7 @@ function loadPlayer() {
   $("#playerTrackControls").classList.add("hidden");
   $("#qualitySelect").innerHTML = "";
   $("#audioTrackSelect").innerHTML = "";
-  if (!stream?.playUrl) {
+  if (!stream) {
     video.removeAttribute("src");
     $("#statusBox").textContent = "Start the stream to get a play link.";
     return;
@@ -1404,7 +1514,7 @@ function loadPlayer() {
   // (iOS Safari, mainly) where hls.js can't run at all (no MSE).
   if (window.Hls && window.Hls.isSupported()) {
     hls = new window.Hls(HLS_CONFIG);
-    hls.loadSource(stream.playUrl);
+    hls.loadSource(streamPlaybackUrl(stream));
     hls.attachMedia(video);
     hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
       video.play().catch(() => {});
@@ -1422,7 +1532,7 @@ function loadPlayer() {
       }
     });
   } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-    video.src = stream.playUrl;
+    video.src = streamPlaybackUrl(stream);
     video.play().catch(() => {});
   } else {
     $("#statusBox").textContent = "This browser cannot play HLS and hls.js is unavailable.";
@@ -1476,6 +1586,7 @@ function renderTrackControls(hlsInstance) {
 // outside our DOM) fires "leavepictureinpicture" with no dialog involved at
 // all, so this needed its own listener rather than reusing the dialog's.
 function stopPipPlayer() {
+  pipStreamId = null;
   if (pipHls) {
     pipHls.destroy();
     pipHls = null;
@@ -1504,10 +1615,11 @@ async function playInPictureInPicture(stream) {
     pipHls.destroy();
     pipHls = null;
   }
+  pipStreamId = stream.id;
   try {
     if (window.Hls && window.Hls.isSupported()) {
       pipHls = new window.Hls(HLS_CONFIG);
-      pipHls.loadSource(stream.playUrl);
+      pipHls.loadSource(streamPlaybackUrl(stream));
       pipHls.attachMedia(video);
       // No reload loop here like the main player's — requestPictureInPicture()
       // below only runs once, on this user gesture, and reopening the floating
@@ -1519,7 +1631,7 @@ async function playInPictureInPicture(stream) {
         stopPipPlayer();
       });
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = stream.playUrl;
+      video.src = streamPlaybackUrl(stream);
     } else {
       alert("This browser cannot play HLS and hls.js is unavailable.");
       return;
@@ -1609,7 +1721,15 @@ function updatePipelineFieldVisibility() {
   });
 
   const inputMode = form.elements.inputMode.value;
+  const buffered = inputMode === "hlsBuffered";
+  if (buffered) {
+    form.elements.directSource.checked = false;
+    form.elements.outputMode.value = "hls";
+  }
+  form.elements.directSource.disabled = buffered;
+  form.elements.outputMode.disabled = buffered;
   const outputMode = form.elements.outputMode.value;
+  $("#hlsBufferHint").classList.toggle("hidden", inputMode !== "hlsBuffered");
   const targetField = $("#outputTargetField");
   targetField.classList.toggle("hidden", outputMode === "hls");
   $("#outputTargetHint").textContent = OUTPUT_TARGET_HINTS[outputMode] || "";
@@ -1910,10 +2030,14 @@ async function detectSource() {
   $("#detectStatus").textContent = "Detecting…";
   try {
     const proxy = form.elements.proxy.value || selectedProvider()?.proxy || "";
+    const savedStream = selectedStream();
+    const streamId = !editingNewStream && savedStream?.url === url ? savedStream.id : undefined;
     const result = await request("/api/probe", {
       method: "POST",
-      body: JSON.stringify({ providerId: selectedProvider()?.id || "", url, proxy, headers: providerProbeHeaders(form.elements.manifestHeaders.value), forceIpv6: Boolean(selectedProvider()?.forceIpv6), rotateProxies: Boolean(selectedProvider()?.rotateProxies) }),
+      body: JSON.stringify({ streamId, cdnUrls: collectCdnMirrors(), providerId: selectedProvider()?.id || "", url, proxy, headers: providerProbeHeaders(form.elements.manifestHeaders.value), forceIpv6: Boolean(selectedProvider()?.forceIpv6), rotateProxies: Boolean(selectedProvider()?.rotateProxies) }),
     });
+    if (form.elements.url.value.trim() !== url || (streamId && selectedStream()?.id !== streamId)) return;
+    applyProbeSession(savedStream, result);
     probeResult = result;
     selectedRepIds = new Set();
     const kind = result.kind === "m3u8" ? "m3u8" : "mpd";
@@ -2089,11 +2213,28 @@ async function pollScriptOutput(providerId) {
   }
 }
 
+// Only the actions that actually sign in need an account, plus every action on
+// a provider whose script declares a sign-in step — those scripts are handed
+// user=/password= for the session they all share. A script that declares
+// neither (say channels + manifest against a public catalogue) is invoked
+// without credentials by the server, which simply omits the arguments; blocking
+// it here on a missing account forced operators to invent a dummy one to get
+// past the dialog. Read the actions from the form rather than the saved
+// provider, so unticking Login takes effect on the same visit that unticks it.
+function scriptActionNeedsAccount(action) {
+  if (action === "login" || action === "pair") return true;
+  const declared = readScriptActions($("#providerScriptActions"));
+  return declared.includes("login") || declared.includes("pair");
+}
+
 async function runProviderScript(action) {
   const provider = selectedProvider();
   if (!provider) return;
   if (!$("#providerSettingsForm").elements.scriptPath.value.trim()) { alert("Set a script path first."); return; }
-  if (!activeScriptAccountIdDraft) { alert("Add and select an account first."); return; }
+  if (!activeScriptAccountIdDraft && scriptActionNeedsAccount(action)) {
+    alert("Add and select an account first.");
+    return;
+  }
   $("#scriptOutputBox").classList.remove("hidden");
   $("#scriptOutputBox").textContent = "Saving…";
   updateScriptOutputToggleLabel();
@@ -2431,28 +2572,45 @@ function renderKeys() {
     row.innerHTML = `
       <div class="key-top">
         <strong>${escapeHtml(key.label)}</strong>
-        <button type="button" class="danger" data-key-id="${escapeAttr(key.id)}"><span data-icon="trash"></span>Revoke</button>
+        <div class="actions">
+          <button type="button" class="ghost" data-use-key ${selectedPlaybackKey()?.id === key.id ? "disabled" : ""}>${selectedPlaybackKey()?.id === key.id ? "Selected for playback" : "Use this user"}</button>
+          <button type="button" class="danger" data-revoke-key><span data-icon="trash"></span>Revoke</button>
+        </div>
       </div>
+      <div class="field-hint">Xtream server: ${escapeHtml(location.origin)} · Username: ${escapeHtml(key.label)} · Password:</div>
       <div class="key-value">${escapeHtml(key.key)}</div>
+      <div class="link-row">
+        <input readonly aria-label="${escapeAttr(key.label)} M3U playlist URL" value="${escapeAttr(xtreamPlaylistUrl(key))}">
+        <button type="button" class="ghost" data-copy-playlist>Copy M3U URL</button>
+      </div>
       <div class="key-meta">${key.requests || 0} requests · ${formatBytes(key.bytes || 0)} · last seen ${key.lastSeenAt ? new Date(key.lastSeenAt).toLocaleString() : "never"}</div>
     `;
-    row.querySelector("button").addEventListener("click", () => revokeKey(key.id));
+    row.querySelector("[data-revoke-key]").addEventListener("click", () => revokeKey(key.id));
+    row.querySelector("[data-use-key]").addEventListener("click", () => selectPlaybackUser(key.id));
+    row.querySelector("[data-copy-playlist]").addEventListener("click", async (event) => {
+      const url = xtreamPlaylistUrl(key);
+      if (await copyToClipboard(url)) flashButtonCopied(event.currentTarget);
+      else window.prompt("Copy the M3U playlist URL:", url);
+    });
     list.appendChild(row);
   }
   applyIcons(list);
 }
 
 async function revokeKey(id) {
-  state = await request(`/api/keys/${id}`, { method: "DELETE" });
-  render();
+  try { applyKeyList(await request(`/api/keys/${id}`, { method: "DELETE" })); }
+  catch (error) { alert(`Couldn't revoke key: ${error.message || error}`); }
 }
+
+$("#playbackUserSelect").addEventListener("change", (event) => selectPlaybackUser(event.currentTarget.value));
 
 $("#keyForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
-  state = await request("/api/keys", { method: "POST", body: JSON.stringify({ label: form.elements.label.value }) });
-  form.reset();
-  render();
+  try {
+    applyKeyList(await request("/api/keys", { method: "POST", body: JSON.stringify({ label: form.elements.label.value }) }), true);
+    form.reset();
+  } catch (error) { alert(`Couldn't generate key: ${error.message || error}`); }
 });
 
 // MARK: - Logs

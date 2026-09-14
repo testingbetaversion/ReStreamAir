@@ -59,7 +59,7 @@ int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool runnin
 // CDN mirrors, and — when the script supplied them — the per-category headers
 // and heartbeat cadence. -400 if the URL isn't http(s), -404 if no such stream.
 int rs_panel_apply_session_manifest(rs_state *st, const char *stream_id, const char *url,
-                                    const rs_json *cdn_urls, const char *manifest_headers,
+                                    const rs_json *cdn_urls, const rs_json *cdn_headers, const char *manifest_headers,
                                     const char *media_headers, int heartbeat_seconds,
                                     const char **err);
 

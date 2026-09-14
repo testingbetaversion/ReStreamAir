@@ -88,7 +88,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "", "",
         NULL, NULL, 0, NULL, NULL, 0,
-        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false,
+        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false, false,
     },
     {
         "https://origin.example.com/live/stream.mpd", "mpd", "ffmpegFmp4Hls",
@@ -102,7 +102,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
     "",
         "http://127.0.0.1:8888", " ?token=abc&region=eu ",
         NULL, NULL, 0, NULL, NULL, 0,
-        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false,
+        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false, false,
     },
     {
         "https://origin.example.com/live/stream.mpd", "mpd", "ffmpegMultiTsHls",
@@ -111,7 +111,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "", "",
         rs_ff2_ids, NULL, 3, rs_ff2_ids, rs_ff2_types, 3,
-        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false,
+        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false, false,
     },
     {
         "https://origin.example.com/live/stream.mpd", "mpd", "ffmpegMultiTsHls",
@@ -120,7 +120,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "", "",
         rs_ff3_ids, NULL, 2, rs_ff3_ids, rs_ff3_types, 2,
-        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false,
+        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false, false,
     },
     {
         "https://origin.example.com/live/stream.mpd", "mpd", "ffmpegResident",
@@ -129,7 +129,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "", "",
         NULL, NULL, 0, NULL, NULL, 0,
-        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false,
+        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false, false,
     },
     {
         "https://origin.example.com/live/stream.mpd", "mpd", "ffmpegResident",
@@ -138,7 +138,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "", "",
         NULL, NULL, 0, NULL, NULL, 0,
-        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false,
+        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false, false,
     },
     {
         "rtmp://origin.example.com/live/stream", "mpd", "ffmpegResident",
@@ -147,7 +147,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "", "ignored=1",
         NULL, NULL, 0, NULL, NULL, 0,
-        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false,
+        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false, false,
     },
     {
         "https://origin.example.com/live/stream.m3u8?a=1", "m3u8", "ffmpegResident",
@@ -156,7 +156,7 @@ static const rs_ffargs_inputs rs_ffargs_cases[] = {
         "",
         "", "&more=2",
         NULL, NULL, 0, NULL, NULL, 0,
-        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false,
+        "/tmp/restreamair-fixture", "/tmp/restreamair-fixture/live.m3u8", 6, 4, 0, false, false, false,
     },
 };
 
