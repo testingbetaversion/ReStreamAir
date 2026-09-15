@@ -8,8 +8,10 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+import socket
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlsplit, parse_qs
 
@@ -150,6 +152,23 @@ print(json.dumps(reply))
                     path += "&variant=" + quote(variant, safe="")
                 return client.request("GET", path)
 
+            def wait_for(predicate, timeout=6):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    if predicate():
+                        return True
+                    time.sleep(0.05)
+                return False
+
+            def abandon_refresh(stream):
+                sock = socket.create_connection(("127.0.0.1", server.port))
+                sock.sendall((f"GET /play/{stream['id']}/index.m3u8?key={key} HTTP/1.1\r\n"
+                              "Host: localhost\r\n\r\n").encode())
+                try:
+                    assert wait_for(lambda: runs(stream) == 1), "refresh never started"
+                finally:
+                    sock.close()
+
             origin.requests.clear()
             status, doc, _ = client.json("POST", "/api/probe", {
                 "url": origin.base + "/bad/master.m3u8",
@@ -200,6 +219,26 @@ print(json.dumps(reply))
             status, payload, _ = client.request("GET", segment)
             check("CDN-specific media headers reach segments", status == 200 and payload == b"fixture segment")
             check("playback key is never forwarded to the origin", all("key=" not in path and "Authorization" not in headers for path, headers in origin.requests))
+
+            reply(delay=1)
+            stream = create("Disconnected recovery")
+            arm_playback(stream)
+            abandon_refresh(stream)
+            check("refresh survives the triggering player disconnecting",
+                  wait_for(lambda: stored(stream)["url"].endswith("?fresh=1")))
+            origin.requests.clear()
+            status, _, _ = play(stream)
+            check("next viewer uses saved fresh sources during cooldown",
+                  status == 200 and runs(stream) == 1 and "/bad2/master.m3u8" not in origin.paths())
+
+            reply(delay=1)
+            stream = create("Disconnected recovery edited")
+            arm_playback(stream)
+            abandon_refresh(stream)
+            edited_url = origin.base + "/good/master.m3u8"
+            client.json("PUT", f"/api/streams/{stream['id']}", {**stored(stream), "url": edited_url})
+            time.sleep(2)
+            check("detached recovery cannot overwrite a newer source edit", stored(stream)["url"] == edited_url)
 
             reply(ManifestUrl=origin.base + "/bad/new.m3u8", Cdn=[])
             stream = create("Exhausted refresh")

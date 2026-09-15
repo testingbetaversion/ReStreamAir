@@ -3457,6 +3457,11 @@ static bool pending_job_unlink_locked(restream_server_t *server, rs_pending_job 
     return true;
 }
 
+static bool pending_job_is_source_recovery(const rs_pending_job *pf) {
+    return (pf->kind == RS_PENDING_PLAYLIST || pf->kind == RS_PENDING_PROBE)
+        && pf->recovery_attempted && pf->start;
+}
+
 static void pending_job_free_list(rs_pending_job *head) {
     while (head) {
         rs_pending_job *next = head->next;
@@ -4725,12 +4730,16 @@ static void *pending_job_worker(void *arg) {
     pthread_mutex_lock(&server->pending_mu);
     pf->done = true;
 
-    // Keep pf linked until the poll thread consumes it. If the client already
-    // left, or if the wakeup pipe is unavailable, no one can build
-    // a reply, so the worker drops the result itself. The lock deliberately
+    // Keep pf linked until the poll thread consumes it. Session recovery must
+    // survive a lost client so its fresh URLs can still be saved. Other jobs
+    // without a reply destination can be dropped. The lock deliberately
     // covers mg_wakeup(): MG_EV_CLOSE and shutdown cannot free pf while the
     // worker is still handing its pointer to mongoose.
-    bool drop = pf->cancelled || (pf->conn_id && !mg_wakeup(&server->mgr, pf->conn_id, &pf, sizeof(pf)));
+    bool drop = pf->cancelled;
+    if (!drop && pf->conn_id && !mg_wakeup(&server->mgr, pf->conn_id, &pf, sizeof(pf))) {
+        if (pending_job_is_source_recovery(pf)) pf->conn_id = 0;
+        else drop = true;
+    }
     if (server->pending_workers > 0) server->pending_workers--;
     if (drop) pending_job_unlink_locked(server, pf);
     pthread_cond_broadcast(&server->pending_cv);
@@ -4848,6 +4857,14 @@ static void pending_job_cancel(restream_server_t *s, unsigned long conn_id) {
     while (*link) {
         rs_pending_job *pf = *link;
         if (pf->conn_id != conn_id) {
+            link = &pf->next;
+            continue;
+        }
+        if (pending_job_is_source_recovery(pf)) {
+            // A player may time out before the script/fresh fetch completes.
+            // Detach the reply, retaining the job for provider_maintenance to
+            // apply on the poll thread with the usual stale-state checks.
+            pf->conn_id = 0;
             link = &pf->next;
             continue;
         }
@@ -5257,6 +5274,9 @@ static bool pending_source_finish(restream_server_t *server, struct mg_connectio
         if (rs_state_save(&server->state) != 0)
             log_record(server, pf->stream_id, "error", "manifestRefresh", NULL, 0, -1,
                        "Refreshed session is in memory but could not be saved.");
+        else
+            log_record(server, pf->stream_id, "info", "manifestRefresh", pf->start->manifest_url, 0, -1,
+                       "Refreshed session saved; subsequent requests will use the new sources.");
     }
     if (!pf->rc || pf->recovery_attempted || !pf->source_relative) return false;
     pf->recovery_attempted = true;
@@ -6083,6 +6103,7 @@ static void provider_maintenance(restream_server_t *s) {
         if (!pf->cancelled) {
             if (pf->kind == RS_PENDING_SCRIPT) pending_job_finish_script(s, NULL, pf);
             if (pf->kind == RS_PENDING_STREAM_START) pending_job_finish_stream_start(s, NULL, pf);
+            if (pending_job_is_source_recovery(pf)) pending_source_finish(s, NULL, pf);
         }
         pending_job_free(pf);
     }

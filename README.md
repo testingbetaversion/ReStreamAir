@@ -96,7 +96,9 @@ an upstream failure, including 403. Once all fail, a stream with Session
 manifest enabled runs its manifest action once and retries the fresh sources.
 Refresh has a 60-second cooldown to avoid repeated script launches. Logs show
 `cdnFallback` and `manifestRefresh`; a provider outage can still make every
-fresh URL fail. CDN-specific headers returned by the script follow that CDN's
+fresh URL fail. Once refresh starts, it finishes and saves the new session even
+if the requesting player disconnects, provided the stream has not changed.
+CDN-specific headers returned by the script follow that CDN's
 playlists and segments.
 
 The optional [DLive scripts](scripts/providers/dlive/README.md) return shortly
