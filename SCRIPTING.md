@@ -56,11 +56,19 @@ The panel displays anything written to stdout or stderr.
 
 ReStreamAir starts the script as a child process:
 
-| File | Command used |
-|---|---|
-| `script.py` | `python3 -u script.py ...` |
-| `script.sh` or `script.bash` | `/bin/sh script.sh ...` |
-| Any other file | Executed directly; it needs a shebang and executable permission. |
+| File | Linux / macOS | Windows |
+|---|---|---|
+| `script.py` | `python3 -u script.py ...` | `python -u script.py ...` |
+| `script.sh` or `script.bash` | `/bin/sh script.sh ...` | `sh script.sh ...` (Git for Windows or WSL) |
+| `script.bat` or `script.cmd` | — | `cmd.exe /c script.bat ...` |
+| `script.ps1` | — | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File script.ps1 ...` |
+| Any other file | Executed directly; it needs a shebang and executable permission. | Executed directly. |
+
+A `.sh` script is run by `/bin/sh` even when its shebang names `bash`, so avoid bash-only syntax or rename it and make it executable.
+
+Each action is limited by the provider's **Script timeout** option (default 30 seconds, up to 3600). A script that runs longer is killed and the action fails. Whatever it printed before then is still shown.
+
+A stream can use a different script from its provider via its **Script override** setting. Playback and the stream-start actions run the override.
 
 Arguments are flat `key=value` tokens, not `--flags`:
 
@@ -79,12 +87,21 @@ The common arguments are:
 | `action` | What ReStreamAir wants the script to do. |
 | `sessiondir` | Durable directory for this provider's cookies and tokens. |
 | `cookies` | Suggested cookie-jar path inside `sessiondir`. |
-| `user`, `password` | Selected provider account, when non-empty. |
-| `bind`, `proxy`, `doh`, `worker` | Optional provider settings, present only when configured. |
+| `user`, `password` | The provider's active account, each only when non-empty. |
+| `bind`, `doh`, `worker` | The provider's script network settings, present only when configured. |
+| `proxy` | The first proxy in effect. For a stream action it is present only when the stream's **Use proxy for: Script** box is ticked. |
 
-Action-specific arguments may follow. A stream test adds the stream's `id` and source `url`.
+Any action run for a stream (every playback step, and a panel or API test with a `streamId`) also gets:
 
-Do not depend on argument order. Parse by key.
+| Argument | Meaning |
+|---|---|
+| `id` | The ReStreamAir stream ID, e.g. `stream_...`. |
+| `url` | The stream's source URL. May be empty for a session-manifest stream. |
+| script params | The stream's stored `ScriptParams` tokens, appended last. |
+
+Action-specific arguments such as `pssh=` or `kid=` follow.
+
+Do not depend on argument order. Parse by key. Script params come after the built-in arguments, so avoid giving them the names `id` or `url`: a script that takes the first match would read the built-in value. The examples here use `channel=` for that reason.
 
 ## Decoding values
 
@@ -131,7 +148,7 @@ Enable only the actions your script implements. **An action that isn't ticked is
 
 | Action | Use | Output |
 |---|---|---|
-| `login` | Sign in and save a session. | Progress text. Exit 0 on success. |
+| `login` | Sign in and save a session. With the provider option **Always reset session** on, the session directory is cleared first, but only while none of the provider's streams are running. | Progress text. Exit 0 on success. |
 | `pair` | Complete a device-code or pairing flow. | Print the code and progress. Exit 0 on success. |
 
 ### Catalogue actions
@@ -150,7 +167,7 @@ print(json.dumps({
         {
             "Name": "News",
             "Mode": "live",
-            "ScriptParams": "id=101",
+            "ScriptParams": "channel=101",
             "SessionManifest": True,
             "UseCdm": False,
             "Autostart": False
@@ -160,8 +177,9 @@ print(json.dumps({
 ```
 
 `ManifestScript` (or `manifestScript`) is accepted as a legacy alias for
-`ScriptParams`. Its `key=value` tokens are saved on the imported stream and
-passed to stream actions such as `manifest` and `cdm`.
+`ScriptParams`. Its space-separated `key=value` tokens are saved on the imported
+stream and passed to stream actions such as `manifest` and `cdm`. A value that
+needs it is `b64:`-encoded on the way through, the same as any other argument.
 
 Re-running an import matches entries by name and updates them instead of creating duplicates. Imported entries normally need either a source URL entered later or `SessionManifest: true` with a working `manifest` action.
 
@@ -179,7 +197,7 @@ Events use the same basic shape under `Events` and may include `Start`, `End`, a
 Example `manifest` response:
 
 ```python
-channel_id = arg("id")
+channel_id = arg("channel")   # from ScriptParams; arg("id") is the stream ID
 
 print(json.dumps({
     "ManifestUrl": f"https://cdn.example/live/{channel_id}.mpd",
@@ -275,14 +293,12 @@ python3 provider.py \
   action=manifest \
   sessiondir=/tmp/restreamair-session \
   cookies=/tmp/restreamair-session/cookies.txt \
-  id=101
+  id=stream_test \
+  url= \
+  channel=101
 ```
 
-For DRM parsing and an optional `cdm` script:
-
-```bash
-./restreamair cdmprobe mpd=<url> script=<path>
-```
+To test DRM parsing and a `cdm` action with real stream context, add the stream in the panel and use the script action buttons in its **Scripting & DRM** section, or call the `script/run` route described below. The server records the exact command line it ran, under the `scriptCommand` log event, so you can copy it into a terminal.
 
 ## Control ReStreamAir over HTTP
 
@@ -335,7 +351,7 @@ curl --fail-with-body --user "$auth" \
   "$base/api/providers/$provider_id/script/run"
 ```
 
-This direct test supplies the stream's ID and source URL. It does not start the stream or recreate the full live pipeline context.
+This direct test supplies the stream's ID, source URL and script params (plus `cdm=external` and an empty `challenge=` for `cdm`). It does not start the stream or recreate the full live pipeline context.
 
 Clear the provider's saved script session:
 
