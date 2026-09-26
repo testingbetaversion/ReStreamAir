@@ -6,6 +6,8 @@ Use one when a provider needs custom login, device pairing, channel discovery, e
 
 If you only want to start, stop, create, or inspect streams from another application, skip to [Control ReStreamAir over HTTP](#control-restreamair-over-http). That uses the management API and does not require a provider script.
 
+For a complete starting point, copy [`scripts/providers/example/provider.py`](scripts/providers/example/provider.py). It implements every action against a pretend provider, and the [worked examples](#worked-examples) below show what each action receives and prints.
+
 ## Five-minute example
 
 This script implements `login`. It reads the arguments ReStreamAir supplies and saves a pretend token in the provider's private session directory.
@@ -225,10 +227,10 @@ The C server stores heartbeat settings but does not run a periodic heartbeat sch
 
 | Action | Important inputs | Expected output |
 |---|---|---|
-| `url` | `url` | Replacement URL or `{"Url":"..."}`. Empty output keeps the original. |
-| `downloadmanifest` | `url` | Raw manifest text or `{"ManifestContent":"..."}`. |
-| `pssh` | `pssh`, `url` | Replacement PSSH or `{"ProcessedPssh":"..."}`. |
-| `initparse` | `url`, base64 `init` | JSON containing any discovered KID/PSSH values. |
+| `url` | `url` | Replacement URL or `{"Url":"..."}`. Empty output keeps the original. Run from the panel or API only; playback does not call it yet. |
+| `downloadmanifest` | `url` | Raw manifest text or `{"ManifestContent":"..."}`. Run from the panel or API only; playback does not call it yet. |
+| `pssh` | `pssh`, `url` | Replacement PSSH or `{"ProcessedPssh":"..."}`. Empty output keeps the original. |
+| `initparse` | `url`, `init` (plain base64 of the init segment, no `b64:` prefix) | JSON with any of `kid`/`kids` and `pssh`/`psshAll`/`psshWidevine`/`psshPlayReady`, each a string or an array. |
 | `cdm` | KIDs, PSSH values, key URI, CDM type | Clear keys as `KID:KEY` lines or JSON. |
 
 On every start of a stream that has **DRM keys via script** ticked, ReStreamAir first runs `manifest`, then searches the fresh manifest, its first HLS media playlist and the init segment for every KID, PSSH box and HLS key URI. If the stored clear keys already cover every discovered KID, they are reused and `cdm` is skipped. A missing or changed KID—or DRM input with no identifiable KID—runs `cdm` and passes `kid=`, `pssh=`, `psshAll=`, `psshWidevine=`, `psshPlayReady=` and `keyUri=`, along with `cdm=external`, the stream's `cdmType=` and its script params. The returned pairs replace the active decryption keys. For Widevine/PlayReady HLS, the rewritten playlist removes the DRM key tag and routes its fMP4 init and media fragments through server-side CENC decryption.
@@ -300,6 +302,277 @@ python3 provider.py \
 
 To test DRM parsing and a `cdm` action with real stream context, add the stream in the panel and use the script action buttons in its **Scripting & DRM** section, or call the `script/run` route described below. The server records the exact command line it ran, under the `scriptCommand` log event, so you can copy it into a terminal.
 
+## Worked examples
+
+Each example below runs [`scripts/providers/example/provider.py`](scripts/providers/example/provider.py) from a terminal with the arguments ReStreamAir would pass, followed by what the script prints. Lines ReStreamAir parses go to stdout. Progress lines go to stderr, and the panel shows both.
+
+Set up a scratch session directory first:
+
+```bash
+cd scripts/providers/example
+S=/tmp/rs-example
+```
+
+### Reading arguments
+
+The example parses every argument once into a dictionary:
+
+```python
+ARGS = {}
+for token in sys.argv[1:]:
+    key, _, raw = token.partition("=")
+    # Keep the first value: built-in arguments (id, url) come before the
+    # stream's script params, so a param can never shadow them.
+    ARGS.setdefault(key, decode(raw))
+
+def arg(name, default=""):
+    return ARGS.get(name, default) or default
+```
+
+It prints results with `print(json.dumps(...))`, progress with `print(..., file=sys.stderr)`, and exits nonzero on failure.
+
+### `login`
+
+The panel passes the active account. The password always arrives `b64:`-encoded.
+
+```bash
+python3 provider.py action=login sessiondir=$S cookies=$S/cookies.txt \
+  user=me@example.com password=b64:aHVudGVyMg==
+```
+
+```text
+Signing in as me@example.com...
+Login saved
+```
+
+The script writes `$S/session.json` and exits 0. Later actions read the token from there. Without a login, they fail:
+
+```bash
+python3 provider.py action=manifest sessiondir=/tmp/empty channel=101; echo "exit=$?"
+```
+
+```text
+Not logged in - run the Login action first
+exit=1
+```
+
+### `pair`
+
+Print the code the user has to enter, then wait for approval. Flush as you go, so the code shows in the panel while the script is still running. In the example, pairing replaces the session saved by `login`.
+
+```bash
+python3 provider.py action=pair sessiondir=$S
+```
+
+```text
+Open https://example.com/activate and enter code ABCD-1234
+Device paired
+```
+
+### `channels`
+
+```bash
+python3 provider.py action=channels sessiondir=$S
+```
+
+```json
+{"Channels": [
+  {"Name": "Example News", "ScriptParams": "channel=101", "SessionManifest": true, "UseCdm": false},
+  {"Name": "Example Sport", "ScriptParams": "channel=202", "SessionManifest": true, "UseCdm": true, "CdmType": "widevine"}
+]}
+```
+
+This imports two streams, or updates them if they already exist. Each one keeps `channel=...` as its script params, and gets its URL from `manifest` at start. **Example Sport** also gets its keys from `cdm`.
+
+Channel and event entries accept these fields: `Name` (required), `Mode`, `ScriptParams`, `SessionManifest`, `UseCdm`, `CdmType`, `OnDemand`, `SpeedUp`, `Autostart` and `RecordEvent`. Events also accept `Start` and `End`. Lower-camel-case spellings such as `sessionManifest` are accepted too. An import never sets a source URL.
+
+### `events`
+
+```bash
+python3 provider.py action=events sessiondir=$S
+```
+
+```json
+{"Events": [
+  {"Name": "Cup Final", "ScriptParams": "event=9001", "SessionManifest": true,
+   "Start": 1790439091, "End": 1790446291, "RecordEvent": false}
+]}
+```
+
+`Start` and `End` are Unix epoch seconds. They are stored for display and for your own scheduler, and they don't start anything by themselves.
+
+### `epg`
+
+Print XMLTV (or JSON). ReStreamAir stores it verbatim.
+
+```bash
+python3 provider.py action=epg sessiondir=$S
+```
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<tv><channel id="101"><display-name>Example News</display-name></channel></tv>
+```
+
+### `manifest`
+
+On start, ReStreamAir passes the stream ID, its current URL (empty for an imported stream) and its script params:
+
+```bash
+python3 provider.py action=manifest sessiondir=$S cookies=$S/cookies.txt \
+  id=stream_abc url= channel=101
+```
+
+```json
+{
+  "ManifestUrl": "https://cdn1.example.com/live/101/index.mpd?token=token-for-me@example.com",
+  "Cdn": [{"Name": "backup", "ManifestUrl": "https://cdn2.example.com/live/101/index.mpd?token=token-for-me@example.com"}],
+  "Headers": {
+    "manifest": {"Authorization": "Bearer token-for-me@example.com"},
+    "media": {"Referer": "https://example.com/"}
+  },
+  "Heartbeat": {"PeriodMs": 300000}
+}
+```
+
+`Headers.manifest` is sent with manifest requests and `Headers.media` with segment requests. A `Cdn` entry may carry its own `Headers` block in the same shape.
+
+A stream with no `channel=` param cannot be resolved, so the script fails and the start is refused:
+
+```text
+This stream has no channel= or event= script param
+```
+
+### `start`, `stop`, `heartbeat`
+
+These only need an exit code. Anything printed is just shown in the log.
+
+```bash
+python3 provider.py action=start sessiondir=$S id=stream_abc channel=101
+python3 provider.py action=heartbeat sessiondir=$S
+python3 provider.py action=stop sessiondir=$S id=stream_abc channel=101
+```
+
+```text
+Claimed a playback slot for 101
+Session still alive
+Released the playback slot for 101
+```
+
+### `url`
+
+Print a replacement URL, or nothing to keep the original:
+
+```bash
+python3 provider.py action=url sessiondir=$S url=https://cdn1.example.com/live/101/index.mpd
+```
+
+```json
+{"Url": "https://cdn1.example.com/live/101/index.mpd?token=token-for-me@example.com"}
+```
+
+### `downloadmanifest`
+
+```bash
+python3 provider.py action=downloadmanifest sessiondir=$S url=https://cdn1.example.com/live/101/index.m3u8
+```
+
+```json
+{"ManifestContent": "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"}
+```
+
+Printing the raw manifest text instead of JSON works too.
+
+### `pssh`
+
+ReStreamAir passes the PSSH box it found as plain base64. Print nothing to keep it, or print a replacement box:
+
+```bash
+python3 provider.py action=pssh sessiondir=$S pssh=AAAAW3Bzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAADsIARIQ... url=https://...
+```
+
+No output means the original box is kept. A replacement is used only if it is a complete, valid `pssh` box. Otherwise the original is kept.
+
+### `initparse`
+
+`init` is the whole init segment as plain base64. Return any KIDs or PSSH boxes you find:
+
+```python
+def action_initparse():
+    init = base64.b64decode(arg("init"))
+    kids = []
+    i = init.find(b"tenc")
+    if i >= 0 and len(init) >= i + 28:
+        kids.append(init[i + 12:i + 28].hex())   # tenc default KID
+    reply({"kids": kids})
+```
+
+```json
+{"kids": ["c3d43de9ff5b5a45cdc9f4e7f177a1a5"]}
+```
+
+These are added to what the built-in parser already found.
+
+### `cdm`
+
+At start, a `cdm` call for a Widevine stream looks like this (the long values are shortened here):
+
+```bash
+python3 provider.py action=cdm sessiondir=$S cookies=$S/cookies.txt \
+  id=stream_abc url=https://cdn1.example.com/live/202/index.mpd channel=202 \
+  cdm=external challenge= cdmType=widevine \
+  kid=c3d43de9ff5b5a45cdc9f4e7f177a1a5 \
+  pssh=AAAAW3Bzc2gAAAAA7e+L... psshAll=AAAAW3Bzc2gAAAAA7e+L... \
+  psshWidevine=AAAAW3Bzc2gAAAAA7e+L...
+```
+
+```text
+cdmType=widevine kids=['c3d43de9ff5b5a45cdc9f4e7f177a1a5'] pssh=yes
+{"keys": [{"kid": "c3d43de9ff5b5a45cdc9f4e7f177a1a5", "key": "00112233445566778899aabbccddeeff"}]}
+```
+
+`kid`, `psshAll` and `keyUri` are comma-separated lists when there is more than one. The progress line goes to stderr, so only the JSON is parsed. Printing `c3d43de9ff5b5a45cdc9f4e7f177a1a5:00112233445566778899aabbccddeeff`, one pair per line, works as well.
+
+### A shell script
+
+A script doesn't have to be Python. This `provider.sh` implements `login` and `manifest` with `curl` and `jq`:
+
+```sh
+#!/bin/sh
+# Collect key=value arguments into shell variables prefixed arg_.
+for token in "$@"; do
+  key=${token%%=*}; value=${token#*=}
+  case $value in
+    b64:*) value=$(printf %s "${value#b64:}" | base64 -d) ;;
+  esac
+  case $key in
+    action|sessiondir|user|password|proxy|channel) eval "arg_$key=\$value" ;;
+  esac
+done
+
+session="$arg_sessiondir/session.json"
+proxy_opt=${arg_proxy:+--proxy "$arg_proxy"}
+
+case $arg_action in
+  login)
+    mkdir -p "$arg_sessiondir"
+    curl -fsS $proxy_opt -d "user=$arg_user" --data-urlencode "password=$arg_password" \
+      https://api.example.com/login > "$session" || { echo "Login failed" >&2; exit 1; }
+    echo "Login saved" >&2
+    ;;
+  manifest)
+    token=$(jq -r .token "$session") || { echo "Not logged in" >&2; exit 1; }
+    curl -fsS $proxy_opt -H "Authorization: Bearer $token" \
+      "https://api.example.com/channels/$arg_channel/play" |
+      jq --arg auth "Bearer $token" '{ManifestUrl: .url, Headers: {manifest: {Authorization: $auth}}}'
+    ;;
+  *)
+    echo "Unsupported action: $arg_action" >&2; exit 1 ;;
+esac
+```
+
+It runs under `/bin/sh`, so it sticks to POSIX shell. `eval` is safe here because it only ever assigns to names from a fixed list.
+
 ## Control ReStreamAir over HTTP
 
 The panel's server-side controls use the same HTTP API available to automation.
@@ -333,7 +606,23 @@ curl --fail-with-body --user "$auth" -X POST \
   "$base/api/providers/$provider_id/script/login"
 ```
 
-The completed response includes recent log `entries`, combined script `output`, and `exitCode`.
+The completed response includes recent log `entries`, combined script `output`, and `exitCode`. Check `exitCode` as well as the HTTP status, because a failed script still returns `200`:
+
+```bash
+curl -s --user "$auth" -X POST "$base/api/providers/$provider_id/script/login" | jq '{exitCode, output}'
+```
+
+```json
+{"exitCode": 0, "output": "Signing in as me@example.com...\nLogin saved\n"}
+```
+
+Import the provider's channels, then list the streams it created:
+
+```bash
+curl --fail-with-body --user "$auth" -X POST "$base/api/providers/$provider_id/script/channels"
+curl -s --user "$auth" "$base/api/state" |
+  jq --arg p "$provider_id" '.providers[] | select(.id == $p) | .streams[] | {id, name, scriptParams}'
+```
 
 Follow live script logs:
 
@@ -348,6 +637,15 @@ Test a hook against one configured stream:
 curl --fail-with-body --user "$auth" \
   -H 'Content-Type: application/json' \
   -d "{\"action\":\"pssh\",\"streamId\":\"$stream_id\"}" \
+  "$base/api/providers/$provider_id/script/run"
+```
+
+Or ask one stream for a fresh session manifest, with the same arguments a start would pass:
+
+```bash
+curl --fail-with-body --user "$auth" \
+  -H 'Content-Type: application/json' \
+  -d "{\"action\":\"manifest\",\"streamId\":\"$stream_id\"}" \
   "$base/api/providers/$provider_id/script/run"
 ```
 
