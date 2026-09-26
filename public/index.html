@@ -260,7 +260,7 @@
             <div id="scriptingGroup" class="key-field-group hidden">
               <div class="field-group-title">Scripting &amp; DRM<span class="field-hint">Drives this stream through a provider script (login → session manifest → keys → heartbeat). We're an IPTV restreamer, not a DRM client — the script returns clear keys; we don't run a real CDM.</span></div>
               <div id="importedScriptHint" class="field-hint hidden" style="margin-top:-8px; margin-bottom:8px; color:var(--accent);">Imported from channel/event script — params auto-filled</div>
-              <label>Script override<span class="field-hint">Path to a .py/.sh/executable for THIS stream. Blank = use the provider's script.</span><input name="scriptOverride" placeholder="blank = provider script"></label>
+              <label>Script override<span class="field-hint">Path to a .py/.sh/executable (or .bat/.cmd/.ps1 on Windows) for THIS stream. Blank = use the provider's script.</span><input name="scriptOverride" placeholder="blank = provider script"></label>
 
               <div class="script-toggle">
                 <label class="check"><input name="sessionManifest" type="checkbox"> Session manifest</label>
@@ -283,7 +283,7 @@
 
               <div class="form-row">
                 <label>Heartbeat (seconds)<span class="field-hint">0 = auto from the manifest's Heartbeat.PeriodMs</span><input name="heartbeatSeconds" type="number" min="0" step="1" value="0"></label>
-                <label>Script params<span class="field-hint">Auto-filled on channel import. key=value tokens sent to every action, e.g. <code>id=123 streamId=456</code></span><input name="scriptParams" placeholder="id=123 streamId=456"></label>
+                <label>Script params<span class="field-hint">Auto-filled on channel import. key=value tokens sent to every action after <code>id=</code> (this stream's ID) and <code>url=</code>, e.g. <code>channel=123 region=uk</code>. Don't name one <code>id</code> or <code>url</code>.</span><input name="scriptParams" placeholder="channel=123 region=uk"></label>
               </div>
               <div class="actions" style="margin-top: 4px;">
                 <button type="button" class="ghost" id="scriptRunManifestBtn" title="Run the session-manifest action — the same one Start runs to get a fresh source URL"><span data-icon="play"></span>Run manifest</button>
@@ -641,48 +641,93 @@
 
                 <h4 class="help-subhead">Set up a script</h4>
                 <ol>
-                  <li>Enter its full path in <b>Provider settings → Script path</b>.</li>
+                  <li>Enter its full path in <b>Provider settings → Script path</b>. A stream can use a different one through its <b>Script override</b>.</li>
                   <li>Add an account if the source needs one.</li>
-                  <li>Enable only the actions the script implements.</li>
-                  <li>Save, then use Login, Pair, Load channels/events/EPG, or the stream test buttons.</li>
+                  <li>Enable only the actions the script implements. An action that isn't ticked is never run.</li>
+                  <li>Save, then use Login, Pair, Load channels/events/EPG, or the stream's script buttons.</li>
                 </ol>
-
-                <p class="help-note"><b>How it is called:</b> ReStreamAir runs the program with flat <code>key=value</code> arguments such as <code>action=login</code>, <code>user=...</code>, <code>sessiondir=...</code>, and action-specific values. A password or any complex value arrives as <code>b64:&lt;base64&gt;</code>, so scripts must decode marked values.</p>
-
-                <p class="help-callout"><b>Keep sessions in <code>sessiondir</code>.</b> It survives server restarts. <b>Clear session</b> recursively deletes everything stored there, and the next script call creates it again.</p>
+                <p>For a starting point, copy <a href="https://github.com/testingbetaversion/ReStreamAir/blob/main/scripts/providers/example/provider.py" target="_blank" rel="noopener">scripts/providers/example/provider.py</a>. It implements every action against a pretend provider.</p>
 
                 <table class="help-table">
-                  <tr><th>Actions</th><th>What they do</th></tr>
-                  <tr><td><code>login</code>, <code>pair</code></td><td>Create and save a source session.</td></tr>
-                  <tr><td><code>channels</code>, <code>events</code>, <code>epg</code></td><td>Return streams or guide data for import.</td></tr>
-                  <tr><td><code>manifest</code></td><td>Return a fresh source URL, mirrors, headers, and heartbeat interval.</td></tr>
-                  <tr><td><code>start</code>, <code>stop</code>, <code>heartbeat</code></td><td>Manage the source-side session lifecycle.</td></tr>
-                  <tr><td><code>url</code>, <code>downloadmanifest</code>, <code>pssh</code>, <code>initparse</code></td><td>Adjust inputs used by the pipeline.</td></tr>
-                  <tr><td><code>cdm</code></td><td>Return clear <code>KID:KEY</code> pairs from an external authorized key workflow.</td></tr>
+                  <tr><th>File</th><th>Run as</th></tr>
+                  <tr><td><code>.py</code></td><td><code>python3 -u script.py …</code> (<code>python -u</code> on Windows)</td></tr>
+                  <tr><td><code>.sh</code>, <code>.bash</code></td><td><code>/bin/sh script.sh …</code>, so stick to POSIX shell</td></tr>
+                  <tr><td><code>.bat</code>, <code>.cmd</code>, <code>.ps1</code></td><td>Windows only: <code>cmd.exe /c</code> or <code>powershell.exe -File</code></td></tr>
+                  <tr><td>Anything else</td><td>Run directly. It needs a shebang and execute permission.</td></tr>
+                </table>
+                <p>Each run is limited by the provider's <b>Script timeout</b> option (30&nbsp;s by default). A script that runs longer is killed.</p>
+
+                <h4 class="help-subhead">Arguments</h4>
+                <p>Arguments are flat <code>key=value</code> tokens, not <code>--flags</code>. Parse them by key, because the order isn't fixed:</p>
+                <pre class="help-pre">action=manifest
+sessiondir=runtime/sessions/provider_…
+cookies=runtime/sessions/provider_…/cookies.txt
+user=me@example.com
+password=b64:aHVudGVyMg==
+proxy=http://10.0.0.2:3128
+id=stream_…
+url=
+channel=101</pre>
+                <ul>
+                  <li><code>sessiondir</code>, <code>cookies</code>: always sent. <code>user</code>, <code>password</code>: the provider's active account. <code>bind</code>, <code>doh</code>, <code>worker</code>, <code>proxy</code>: only when configured. For a stream, <code>proxy</code> is sent only when its <b>Use proxy for: Script</b> box is ticked.</li>
+                  <li>Actions run for a stream also get <code>id</code> (the ReStreamAir stream ID), <code>url</code> (its source URL, often empty for imported streams), and then its <b>Script params</b>. Params come last, so don't name one <code>id</code> or <code>url</code>.</li>
+                  <li>A password, or any value containing spaces, quotes, backslashes or non-ASCII text, arrives as <code>b64:&lt;base64&gt;</code>. Decode marked values. URLs arrive as they are.</li>
+                </ul>
+                <pre class="help-pre">def arg(name, default=""):
+    for item in sys.argv[1:]:
+        key, _, raw = item.partition("=")
+        if key == name:
+            if raw.startswith("b64:"):
+                return base64.b64decode(raw[4:]).decode("utf-8")
+            return raw
+    return default</pre>
+
+                <p class="help-callout"><b>Keep sessions in <code>sessiondir</code>.</b> It survives server restarts. <b>Clear session</b> recursively deletes everything stored there, and so does <b>Always reset session</b> before a login while none of the provider's streams are running. The next script call creates it again.</p>
+
+                <h4 class="help-subhead">Actions</h4>
+                <table class="help-table">
+                  <tr><th>Action</th><th>When it runs</th><th>What it prints</th></tr>
+                  <tr><td><code>login</code>, <code>pair</code></td><td>Login / Pair buttons</td><td>Progress text; exit 0 on success.</td></tr>
+                  <tr><td><code>channels</code>, <code>events</code></td><td>Load channels / events</td><td><code>{"Channels":[…]}</code> or <code>{"Events":[…]}</code></td></tr>
+                  <tr><td><code>epg</code></td><td>Load EPG</td><td>XMLTV or JSON, stored as-is.</td></tr>
+                  <tr><td><code>manifest</code></td><td>Every start with <b>Session manifest</b> ticked, and when all sources fail</td><td><code>ManifestUrl</code>, <code>Cdn</code>, <code>Headers</code>, <code>Heartbeat</code></td></tr>
+                  <tr><td><code>initparse</code>, <code>pssh</code>, <code>cdm</code></td><td>Every start with <b>DRM keys via script</b> ticked, when keys are needed</td><td>KIDs/PSSH, a replacement PSSH, or clear keys</td></tr>
+                  <tr><td><code>start</code>, <code>stop</code>, <code>heartbeat</code>, <code>url</code>, <code>downloadmanifest</code></td><td>Only when run by hand from the panel or API. Playback doesn't call them yet.</td><td>Exit code; <code>url</code> prints <code>{"Url":"…"}</code>, <code>downloadmanifest</code> prints the manifest or <code>{"ManifestContent":"…"}</code></td></tr>
                 </table>
 
-                <h4 class="help-subhead">Small channel response</h4>
+                <h4 class="help-subhead">Example: <code>channels</code></h4>
                 <pre class="help-pre">{
-  "Channels": [{
-    "Name": "News",
-    "Mode": "live",
-    "ScriptParams": "id=101",
-    "SessionManifest": true,
-    "UseCdm": false
-  }]
+  "Channels": [
+    { "Name": "News",  "ScriptParams": "channel=101", "SessionManifest": true, "UseCdm": false },
+    { "Name": "Sport", "ScriptParams": "channel=202", "SessionManifest": true, "UseCdm": true, "CdmType": "widevine" }
+  ]
 }</pre>
+                <p>Re-running an import updates entries with the same name instead of duplicating them. An import never sets a source URL, so imported streams need <b>Session manifest</b> or a URL typed in later. Other accepted fields: <code>Mode</code>, <code>Autostart</code>, and, for events, <code>Start</code>/<code>End</code> in Unix seconds.</p>
 
-                <h4 class="help-subhead">Small manifest response</h4>
+                <h4 class="help-subhead">Example: <code>manifest</code></h4>
+                <p>Called with <code>id=stream_… url= channel=101</code>:</p>
                 <pre class="help-pre">{
-  "ManifestUrl": "https://cdn.example/live/101.mpd",
+  "ManifestUrl": "https://cdn1.example.com/live/101/index.mpd?token=…",
+  "Cdn": [ { "Name": "backup", "ManifestUrl": "https://cdn2.example.com/live/101/index.mpd?token=…" } ],
   "Headers": {
-    "manifest": { "Authorization": "Bearer ..." }
+    "manifest": { "Authorization": "Bearer …" },
+    "media":    { "Referer": "https://example.com/" }
   },
   "Heartbeat": { "PeriodMs": 300000 }
 }</pre>
 
-                <p><b>Output:</b> put JSON or keys on stdout, debugging on stderr, and exit nonzero on failure. Output appears in this panel and in Logs.</p>
-                <p><b>More examples:</b> <a href="https://github.com/testingbetaversion/ReStreamAir/blob/main/SCRIPTING.md" target="_blank" rel="noopener">Provider scripting guide</a> starts with a working script and HTTP examples. <a href="https://github.com/testingbetaversion/ReStreamAir/blob/main/API.md" target="_blank" rel="noopener">HTTP API reference</a> lists every management route.</p>
+                <h4 class="help-subhead">Example: <code>cdm</code></h4>
+                <p>Called with <code>cdm=external challenge= cdmType=widevine kid=c3d43de9… pssh=AAAAW3Bzc2g… psshAll=… psshWidevine=…</code>, plus the stream's <code>id</code>, <code>url</code> and params. <code>kid</code>, <code>psshAll</code> and <code>keyUri</code> are comma-separated when there's more than one. Print either:</p>
+                <pre class="help-pre">c3d43de9ff5b5a45cdc9f4e7f177a1a5:11223344556677889900aabbccddeeff</pre>
+                <pre class="help-pre">{"keys":[{"kid":"c3d43de9ff5b5a45cdc9f4e7f177a1a5","key":"11223344556677889900aabbccddeeff"}]}</pre>
+
+                <h4 class="help-subhead">Try it from a terminal</h4>
+                <pre class="help-pre">python3 provider.py action=login sessiondir=/tmp/rs user=me@example.com password=b64:aHVudGVyMg==
+python3 provider.py action=manifest sessiondir=/tmp/rs id=stream_test url= channel=101</pre>
+                <p>Every run is logged with its exact command line (the <code>scriptCommand</code> event), so you can copy a real one out of <b>Logs</b>.</p>
+
+                <p><b>Output:</b> put JSON or keys on stdout, progress and errors on stderr, and exit nonzero on failure. Both streams appear in this panel and in Logs. If a script prints several JSON objects, the last one is used.</p>
+                <p><b>More examples:</b> the <a href="https://github.com/testingbetaversion/ReStreamAir/blob/main/SCRIPTING.md" target="_blank" rel="noopener">provider scripting guide</a> has a worked example for every action, a shell-script version, and HTTP API calls. The <a href="https://github.com/testingbetaversion/ReStreamAir/blob/main/API.md" target="_blank" rel="noopener">HTTP API reference</a> lists every management route.</p>
               </article>
 
               <article id="help-drm" class="help-card">
@@ -691,7 +736,7 @@
                 <ul>
                   <li><b>Manual keys</b> — paste <code>KID:KEY</code> hex pairs (one per line) in the stream editor's decryption box. Leave <b>CDM keys</b> unticked to keep using them unchanged.</li>
                   <li><b>Get keys via script</b> — tick <b>CDM keys</b> in the stream's Script actions. On every start ReStreamAir runs <code>manifest</code> and searches the fresh manifest, HLS media playlist and init segment for DRM. Stored keys are reused when they cover every discovered KID; <code>cdm</code> runs only for a missing or changed KID, or when DRM is present but no KID can be identified. For protected HLS, the panel removes the DRM tags and decrypts the fMP4 init and media fragments before serving them. The script always runs the license exchange itself — ReStreamAir has no embedded CDM, so <code>challenge=</code> is passed empty.</li>
-                  <li><b>Refine what's sent</b> — the optional <b>PSSH parsing</b> and <b>Init parsing</b> actions let the script rewrite the PSSH or pull extra KIDs/PSSH out of the init segment before the <code>cdm</code> call.</li>
+                  <li><b>Refine what's sent</b> — the optional <b>PSSH parsing</b> and <b>Init parsing</b> actions let the script rewrite the PSSH or pull extra KIDs/PSSH out of the init segment before the <code>cdm</code> call. <code>pssh</code> gets <code>pssh=</code> and prints a replacement box, or nothing to keep it. <code>initparse</code> gets the whole init segment as plain base64 in <code>init=</code> (no <code>b64:</code> prefix) and prints e.g. <code>{"kids":["c3d4…"]}</code>. It may also return <code>pssh</code>, <code>psshAll</code>, <code>psshWidevine</code> or <code>psshPlayReady</code>.</li>
                 </ul>
                 <p>Key output formats accepted: bare <code>KID:KEY</code> lines, <code>--&gt; KID:KEY</code>, or JSON <code>{"keys":[{"kid","key"}]}</code>. This decrypts <code>cenc</code> (AES-CTR) directly; <code>cbcs</code> pattern encryption isn't supported.</p>
               </article>
@@ -705,8 +750,9 @@
   "Headers": { "Manifest": { "User-Agent": "…" }, "Media": { … } },
   "Heartbeat": { "Url": "", "Params": "", "PeriodMs": 300000 }
 }</pre>
-                <p>CDN mirrors become failover sources, Headers apply per fetch category, and <code>Heartbeat.PeriodMs</code> auto-sets the heartbeat interval (which re-runs the <code>heartbeat</code> action that often to keep the session alive). The stream editor's <b>Heartbeat (seconds)</b> overrides it when non-zero.</p>
-                <p class="help-note"><b><code>manifest</code> is also the recovery hook.</b> When a fetch fails on the primary URL <i>and</i> every CDN mirror, the script is asked for a fresh one, which is saved and retried — inline for <code>.m3u8</code> passthrough, in the background once a <code>.mpd</code> worker has needed two restarts in a row. Throttled to one refresh per stream per minute. So a token that expires mid-stream recovers on its own.</p>
+                <p>CDN mirrors become failover sources, and Headers apply per fetch category (a <code>Cdn</code> entry may carry its own <code>Headers</code>). If <code>ManifestUrl</code> is empty, the first usable CDN URL becomes the primary. A failed <code>manifest</code> refuses the start instead of playing a stale URL.</p>
+                <p class="help-note"><b>Heartbeat isn't automatic yet.</b> <code>Heartbeat.PeriodMs</code> is stored as the stream's heartbeat interval, but nothing runs the <code>heartbeat</code> action on a timer. If your source needs one, call it yourself through <code>POST /api/providers/&lt;id&gt;/script/heartbeat</code>.</p>
+                <p class="help-note"><b><code>manifest</code> is also the recovery hook.</b> When a playlist fetch or source probe fails on the primary URL <i>and</i> every CDN mirror, the script is asked for a fresh session, which is saved and retried. This happens at most once per stream per minute, and the fresh session is saved even if the player that triggered it has gone. A <code>.mpd</code> stream restarted by the provider's restart policy runs <code>manifest</code> again as part of that start. So a token that expires mid-stream recovers on its own.</p>
               </article>
 
               <article id="help-logs" class="help-card">

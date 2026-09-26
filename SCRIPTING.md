@@ -221,7 +221,9 @@ print(json.dumps({
 When `ManifestUrl` is empty but `Cdn` contains usable URLs, the first CDN URL
 becomes the primary source and the remaining entries stay available as mirrors.
 
-The C server stores heartbeat settings but does not run a periodic heartbeat scheduler. Call declared `start`, `stop`, or `heartbeat` actions explicitly through the script API when your integration needs them. These are independent of the monitoring SSE keepalive.
+`manifest` is also the recovery hook. When a playlist fetch or source probe fails on the primary URL and on every CDN mirror, a stream with **Session manifest** ticked runs `manifest` once and retries the fresh sources. The fresh session is saved even if the player that triggered it has disconnected. There is a 60-second cooldown per stream, and the logs show `cdnFallback` and `manifestRefresh` events. A `.mpd` stream restarted by the provider's restart policy runs `manifest` again as part of that start.
+
+The server stores the heartbeat interval but does not run a periodic heartbeat scheduler. Playback never calls `start`, `stop` or `heartbeat` either. Call declared `start`, `stop`, or `heartbeat` actions explicitly through the script API when your integration needs them. These are independent of the monitoring SSE keepalive.
 
 ### Pipeline and key actions
 
