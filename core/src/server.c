@@ -270,6 +270,7 @@ static void live_sync_all(restream_server_t *s);
 static void provider_maintenance(restream_server_t *s);
 static void backup_tick(restream_server_t *s);
 static double stream_delivery_speed(restream_server_t *server, const char *stream_id);
+static void speed_prune(restream_server_t *server);
 static int backup_now(restream_server_t *s, char *name, size_t name_cap);
 static int clear_provider_session(const char *provider_id);
 static bool provider_job_busy(restream_server_t *s, const rs_json *provider);
@@ -1807,6 +1808,7 @@ static void maintenance_tick(void *arg) {
                        err[0] ? err : "the restart could not be handed to systemd");
     }
     backup_tick(s);
+    speed_prune(s);
     rs_metrics_prune(s->metrics);  // expire stale clients/rate windows every tick
     collect_ingest(s);
     provider_maintenance(s);
@@ -5449,6 +5451,31 @@ static void record_delivery_speed(restream_server_t *server, const rs_pending_jo
     rs_json_obj_set(entry, "r", rs_json_new_num(r));
     rs_json_obj_set_int(entry, "t", (long long)time(NULL));
     rs_json_obj_set(per_stream, dir, entry);
+}
+
+// Drops renditions not fetched for a minute, and streams left with none. The
+// keys are upstream directories, and token-in-path CDNs (Disney's dvt2=…~hmac=…)
+// mint a new one every session, so without this the map only ever grows.
+static void speed_prune(restream_server_t *server) {
+    static long long next = 0;
+    long long now = (long long)time(NULL);
+    if (now < next || !server->speed) return;
+    next = now + 60;
+    rs_json *fresh = rs_json_new_obj();
+    if (!fresh) return;
+    for (size_t i = 0; i < rs_json_obj_len(server->speed); i++) {
+        const rs_json *per_stream = rs_json_obj_value_at(server->speed, i);
+        rs_json *kept = NULL;
+        for (size_t j = 0; j < rs_json_obj_len(per_stream); j++) {
+            const rs_json *entry = rs_json_obj_value_at(per_stream, j);
+            if (now - (long long)rs_json_obj_num(entry, "t", 0) > 60) continue;
+            if (!kept && !(kept = rs_json_new_obj())) break;
+            rs_json_obj_set(kept, rs_json_obj_key_at(per_stream, j), rs_json_clone(entry));
+        }
+        if (kept) rs_json_obj_set(fresh, rs_json_obj_key_at(server->speed, i), kept);
+    }
+    rs_json_free(server->speed);
+    server->speed = fresh;
 }
 
 // The slowest rendition fetched in the last 30 seconds, or a negative value

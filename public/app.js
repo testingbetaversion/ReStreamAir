@@ -624,7 +624,8 @@ async function bulkStreamRequest(kind, rows) {
   try {
     return await request("/api/streams/bulk", { method: "POST", body: JSON.stringify({ action: kind, ids }) });
   } catch (error) {
-    if (error.status !== 404 && error.status !== 405) throw error;
+    // 501 is what an older server says for an /api route it doesn't know.
+    if (error.status !== 404 && error.status !== 405 && error.status !== 501) throw error;
     return undefined;
   }
 }
@@ -755,8 +756,11 @@ function renderStreamsGrid() {
 
   const allRows = state.providers.flatMap((provider) => provider.streams.map((stream) => ({ provider, stream })));
   const filteredRows = filteredStreamRows();
-  const liveIds = new Set(allRows.map(({ stream }) => stream.id));
-  for (const id of [...streamsGridSelected]) if (!liveIds.has(id)) streamsGridSelected.delete(id);
+  // Only what the filters show can be ticked: a stream hidden by a filter (or
+  // deleted) drops out of the selection, so the count and the bulk buttons
+  // always describe the same set.
+  const visibleIds = new Set(filteredRows.map(({ stream }) => stream.id));
+  for (const id of [...streamsGridSelected]) if (!visibleIds.has(id)) streamsGridSelected.delete(id);
 
   // Bulk actions and the running-only toggle operate on this same filtered set
   // (all pages of it, or the ticked part of it).
@@ -3574,7 +3578,7 @@ async function refreshBackupList() {
   try {
     renderBackupList((await request("/api/backups")).backups || []);
   } catch (error) {
-    $("#backupList").textContent = error.status === 404 ? "This server version does not support backups yet." : "";
+    $("#backupList").textContent = [404, 501].includes(error.status) ? "This server version does not support backups yet." : "";
   }
 }
 
