@@ -468,6 +468,11 @@ typedef struct {
     double seg_duration;       // last observed segment duration, for sizing
     long long skipped;         // segments the window moved past, never fetched
 
+    // Smoothed media-published-per-second (the pollDone figure), for the
+    // panel. Guarded by the stream mutex; rt_at 0 = no report yet.
+    double rt;
+    double rt_at;
+
     long long highest_time_val;
 } live_rep;
 
@@ -1920,6 +1925,15 @@ static void *writer_main(void *arg) {
             // drains its buffer and stalls regardless of how correct the
             // segments are.
             double realtime = elapsed > 0 ? added_seconds / elapsed : 0;
+            // One 5s window holds two or three 2s segments, so a single report
+            // swings 0.8x/1.2x on a source that is exactly on time; smooth it.
+            // Only once the rep is playing: the startup fill is a burst.
+            if (started) {
+                pthread_mutex_lock(&st->mu);
+                rep->rt = rep->rt_at > 0 ? 0.75 * rep->rt + 0.25 * realtime : realtime;
+                rep->rt_at = now_seconds();
+                pthread_mutex_unlock(&st->mu);
+            }
             lgf(st, "info", "pollDone", NULL, 0, added_bytes,
                 "%s: +%lu segments (%.1fs media) %.2fx realtime, %lu downloads failed; "
                 "pending %lu (%lu fetching, %lu waiting, %lu ready, %lu failed), "
@@ -3169,6 +3183,25 @@ char *rs_live_status_line(rs_live *live, const char *stream_id) {
     }
     pthread_mutex_unlock(&live->mu);
     return out;
+}
+
+double rs_live_realtime(rs_live *live, const char *stream_id) {
+    if (!live || !stream_id) return -1;
+    double slowest = -1;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        double now = now_seconds();
+        for (size_t i = 0; i < st->nreps; i++) {
+            const live_rep *r = st->reps[i];
+            if (!r || r->rt_at <= 0 || now - r->rt_at > 4 * RS_LIVE_REPORT_INTERVAL) continue;
+            if (slowest < 0 || r->rt < slowest) slowest = r->rt;
+        }
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    return slowest;
 }
 
 long long rs_live_drain_ingest(rs_live *live, const char *stream_id) {

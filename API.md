@@ -257,7 +257,13 @@ State's top-level fields:
 Stream state contains stored configuration plus `running` (boolean), `status`
 (`running` or `stopped`), `lastError` (nullable), `activeClients`, `bandwidth` and
 `inputBandwidth` (`bytesPerSecond`, `allTimeBytes`), and the URL fields `playUrl`,
-`sourceUrl`, `directUrl`, `directStreamUrls`, `downloadUrls`. These URLs may use a
+`sourceUrl`, `directUrl`, `directStreamUrls`, `downloadUrls`. While a stream is
+active it may also carry `realtime` and `realtimeSource`: with `engine` (internal
+DASH), media published per second for the slowest rendition, about `1.0` when
+keeping up and below `0.95` when falling behind; with `download` (HLS
+pass-through), seconds of media fetched per second of downloading over the last
+30 s, where below `1` viewers buffer. Absent when nothing was measured recently.
+These URLs may use a
 unique name slug; IDs are preferable for integrations. Generated absolute URLs
 currently use `http://` and the request Host. Behind HTTPS, construct playback
 URLs from your configured public base URL and stream ID rather than trusting
