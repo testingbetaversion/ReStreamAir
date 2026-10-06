@@ -4,7 +4,7 @@ ReStreamAir exposes three different kinds of events:
 
 | Interface | What it contains |
 |---|---|
-| `GET /api/events` | Live monitoring snapshots over Server-Sent Events (SSE). |
+| `GET /api/events` | Live monitoring snapshots over Server-Sent Events (SSE), or one snapshot as plain JSON with `?format=json`. |
 | `GET /api/logs` | Diagnostic, lifecycle and script log entries. |
 | Provider `events` script action | Scheduled programme/event metadata imported as streams. |
 
@@ -12,6 +12,17 @@ An optional provider error webhook pushes selected errors to an external HTTP
 receiver. These interfaces do not share a common message format. Management
 routes require a panel account; playback keys do not authenticate them.
 See [API.md](API.md) for authentication, CORS and the full route reference.
+
+## One snapshot as JSON
+
+Add `format=json` to get a single snapshot as an ordinary `200
+application/json` reply instead of a stream: the same object a stream's
+`data:` line carries. Use it to poll, or to open the link in a browser.
+`?auth=` works here like on every management route:
+
+```text
+http://your-server:1234/api/events?format=json&auth=admin:password
+```
 
 ## Monitoring stream
 

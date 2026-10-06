@@ -2,7 +2,8 @@
 
 The web panel and external clients use the same HTTP routes. This reference
 covers the C/C++ server in this repository. Routes are relative to your server,
-for example `https://streams.example.com` or `http://127.0.0.1:8787` locally.
+for example `https://streams.example.com`. Read inside the panel's Help view,
+the examples already use the address you opened the panel at.
 
 - [Authentication](#authentication)
 - [Browser access and CORS](#browser-access-and-cors)
@@ -48,7 +49,7 @@ ignored when an Authorization header is present. URL credentials end up in
 browser history and proxy logs, so prefer the header where you can:
 
 ```text
-http://your-server:1234/api/events?intervalMs=1000&auth=admin:password
+http://your-server:1234/api/events?format=json&auth=admin:password
 ```
 
 ```sh
@@ -238,7 +239,7 @@ if (wasRunning) await api(`/api/streams/${encodeURIComponent(stream.id)}/start`,
 | Method and route | Result |
 |---|---|
 | `GET /api/state` | `200` full configuration view described below. |
-| `GET /api/events[?intervalMs=N]` | `200 text/event-stream`; monitoring snapshots, not configuration state or lifecycle notifications. See [EVENTS.md](EVENTS.md). |
+| `GET /api/events[?intervalMs=N]` | `200 text/event-stream`, or one `200` JSON snapshot with `?format=json`; monitoring snapshots, not configuration state or lifecycle notifications. See [EVENTS.md](EVENTS.md). |
 | `GET /api/logs[?streamId=ID&limit=150&verbose=1]` | `200 {"entries":[…],"availableDates":[]}`; newest first. `verbose=1` adds `debug` entries and a `verbose` object, and keeps debug capture on for 60 s ([verbose logging](EVENTS.md#verbose-debug-logging)). |
 | `DELETE /api/logs[?streamId=ID]` | Clear matching visible history, return the same log envelope. Omit ID to clear all logs. |
 | `GET /ping` | `200 {"status":"ok","build":"…"}`; binary build date/time, no authentication. |
@@ -286,6 +287,21 @@ level, text and date filtering are client-side. See [log schema](EVENTS.md#logs)
 | `GET /api/providers/<id>/epg` | Last stored script EPG as XML or JSON; `404` if absent. |
 | `POST /api/providers/<id>/webhook/test` | `202 {"ok":true,"queued":true}`; delivery is asynchronous. |
 | `GET /api/logo-lookup?name=<encoded-name>` | `200 {"url":"…"}`; no match returns `404`. |
+
+Both playlist routes also filter and can answer in JSON:
+
+| Query | Effect |
+|---|---|
+| `type=event` / `channel` / `manual` | Only streams added that way (`manual` = created by hand). |
+| `running=1` | Only streams that are running. |
+| `q=<text>` | Only names containing the text, case-insensitive. |
+| `format=json` | `[{"name","url","provider","type","running","start","end"}]` instead of M3U; `start`/`end` (Unix seconds) only on events. |
+
+For example, every event's name and playable link:
+
+```text
+http://your-server:1234/api/playlist.m3u8?type=event&format=json&auth=admin:password
+```
 
 Both M3U export routes accept `?key=<playback-key>` to embed that account's
 credential in every complete playback URL. With no selection, they use the
@@ -549,6 +565,8 @@ Xtream logins.
 |---|---|
 | `GET /api/settings` | `port` (active), `storedPort` (saved preference), `bindAddress`, `trustedProxies`, and all four refresh fields. |
 | `POST /api/settings` | Partial JSON object; returns settings plus `note`. Fields below. |
+| `GET /api/backups` | `{"dir":"backups","backups":[{"name","time","bytes"}]}`, newest first; `time` is Unix seconds. |
+| `POST /api/backups` | Back up `state.json` now; `{"name":"state-…json","backups":[…]}`. |
 | `GET /api/service` | Systemd status; unavailable platforms return `{"systemdAvailable":false}`. |
 | `POST /api/service/install` | Optional `port`, `bindAddress`; `200 {"installed":true}`. |
 | `POST /api/service/restart` | `200 {"restarting":true}`; restart is deferred until after the response. |
@@ -561,7 +579,9 @@ Xtream logins.
 
 Settings POST accepts `port` (1–65535), `bindAddress` (string),
 `trustedProxies` (string: comma/space-separated addresses, CIDRs, `loopback`,
-`private`, `any`; empty trusts none) and the [refresh fields](#refresh-intervals).
+`private`, `any`; empty trusts none), `backupHours` (0 = off, default 24) and
+`backupKeep` (0 = keep all, default 14) for the periodic `state.json`
+backups in `backups/`, and the [refresh fields](#refresh-intervals).
 Port/bind changes require restart; trusted proxies and refresh changes apply
 live. CLI overrides remain authoritative for the listener. Unknown settings
 fields are ignored. Invalid port values are currently ignored; refresh fields

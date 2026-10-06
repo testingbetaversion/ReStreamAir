@@ -264,6 +264,38 @@ bool list_remote_files(const std::string &ref, std::vector<std::string> &files,
     return true;
 }
 
+// The newest commit on `ref` that touched public/. A refresh is only worth
+// doing when this moves; commits elsewhere in the repository (the C engine, the
+// docs outside public/) leave the panel exactly as it was.
+bool latest_public_commit(const std::string &ref, std::string &sha, std::string &err) {
+    std::string url = std::string("https://api.github.com/repos/") + kRepo +
+                      "/commits?sha=" + ref + "&path=public&per_page=1";
+    std::string body;
+    if (!fetch(url, "application/vnd.github+json", kMaxFileBytes, body, err)) return false;
+    rs_json *root = rs_json_parse(body.data(), body.size());
+    sha = rs_json_as_str(rs_json_obj_get(rs_json_arr_at(root, 0), "sha"), "");
+    rs_json_free(root);
+    if (sha.empty()) {
+        err = "the commit listing for public/ was not readable";
+        return false;
+    }
+    return true;
+}
+
+// The public/ commit a cache was filled from, per its stamp; empty when the
+// stamp predates the field or can't be read.
+std::string cached_public_commit(const std::string &dir) {
+    FILE *f = std::fopen(join(dir, kStamp).c_str(), "rb");
+    if (!f) return "";
+    char buffer[2048];
+    size_t n = std::fread(buffer, 1, sizeof(buffer), f);
+    std::fclose(f);
+    rs_json *root = rs_json_parse(buffer, n);
+    std::string sha = rs_json_as_str(rs_json_obj_get(root, "publicCommit"), "");
+    rs_json_free(root);
+    return sha;
+}
+
 bool write_file(const std::string &path, const std::string &data, std::string &err) {
     // Write beside the target and rename, so a reader never sees a half file
     // and a crash mid-download leaves the previous copy intact.
@@ -361,12 +393,16 @@ bool download_into(const std::string &dir, const rs_webroot_options &options, st
         return false;
     }
 
-    char stamp[512];
+    // Best effort: without it the background check simply refreshes once more
+    // and records it then.
+    std::string public_commit, ignored;
+    latest_public_commit(source_ref, public_commit, ignored);
+    char stamp[640];
     std::snprintf(stamp, sizeof(stamp),
-                  "{\"repo\":\"%s\",\"ref\":\"%s\",\"commit\":\"%s\",\"files\":%zu,"
-                  "\"bytes\":%zu,\"fetched\":%lld,\"listed\":%s}\n",
-                  kRepo, options.ref.c_str(), commit.c_str(), files.size(), total,
-                  (long long)std::time(nullptr), listed ? "true" : "false");
+                  "{\"repo\":\"%s\",\"ref\":\"%s\",\"commit\":\"%s\",\"publicCommit\":\"%s\","
+                  "\"files\":%zu,\"bytes\":%zu,\"fetched\":%lld,\"listed\":%s}\n",
+                  kRepo, options.ref.c_str(), commit.c_str(), public_commit.c_str(), files.size(),
+                  total, (long long)std::time(nullptr), listed ? "true" : "false");
     if (!write_file(join(dir, kStamp), stamp, err)) return false;
     return true;
 }
@@ -438,6 +474,27 @@ bool refresh_cache(const std::string &dir, const rs_webroot_options &options, st
 }  // namespace
 
 const char *rs_webroot_repo(void) { return kRepo; }
+
+bool rs_webroot_is_cache(const std::string &dir) {
+    for (const std::string &candidate : cache_candidates()) {
+        if (absolute_path(candidate) == dir) return true;
+    }
+    return false;
+}
+
+int rs_webroot_update(const rs_webroot_options &options, const std::string &dir, std::string *err) {
+    std::string sink;
+    if (!err) err = &sink;
+    if (!safe_ref(options.ref)) {
+        *err = "unusable --web-ref";
+        return -1;
+    }
+    std::string latest;
+    if (!latest_public_commit(options.ref, latest, *err)) return -1;
+    if (latest == cached_public_commit(dir)) return 0;
+    if (!refresh_cache(dir, options, *err)) return -1;
+    return 1;
+}
 
 std::string rs_webroot_resolve(const rs_webroot_options &options, std::string *err,
                                bool *downloaded) {

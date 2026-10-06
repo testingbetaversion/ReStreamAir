@@ -31,4 +31,16 @@ std::string rs_webroot_resolve(const rs_webroot_options &options, std::string *e
 // The repository the front-end is fetched from, for startup messages.
 const char *rs_webroot_repo(void);
 
+// True when `dir` (as returned by rs_webroot_resolve) is one of the download
+// caches — the only kind of web root that may be refreshed in place. A
+// checkout's public/ or an explicit --root is the operator's and is never
+// written to.
+bool rs_webroot_is_cache(const std::string &dir);
+
+// For a running server: asks GitHub for the newest commit that touched public/
+// on options.ref, and when it differs from what `dir` holds, downloads the new
+// copy and swaps it in whole. Returns 1 when it updated, 0 when already
+// current, -1 on failure (*err says why; the existing files stay in place).
+int rs_webroot_update(const rs_webroot_options &options, const std::string &dir, std::string *err);
+
 #endif  // RS_WEBROOT_H

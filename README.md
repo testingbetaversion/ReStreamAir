@@ -305,6 +305,7 @@ docker run -d --name restreamair \
 --refresh-web     refresh the cached panel files
 --web-ref REF     fetch panel files from a tag, branch, or commit
 --no-download     never download panel files
+--web-refresh M   check GitHub every M minutes for newer panel files (default 10, 0 = off)
 --verbose         always record debug logs (otherwise only while Logs → Verbose is open)
 --max-open-files N      files held open for viewers at once (default: a quarter of `ulimit -n`)
 --file-queue-timeout S  seconds a request waits for a free slot before a 503 (default 15)
@@ -312,6 +313,8 @@ docker run -d --name restreamair \
 ```
 
 Saved port and bind settings apply after restart. Command-line values take precedence.
+
+A binary with no `public/` beside it downloads the panel files from GitHub at startup and, while running, swaps in a newer copy whenever `public/` changes on `main` (or `--web-ref`). A local `public/` or `--root` directory is never written to; update a checkout with `git pull`.
 
 Files served to viewers (FFmpeg HLS segments and playlists, panel assets) stay open until the client has downloaded them. To avoid `Too many open files`, the server raises its soft descriptor limit to the hard limit at startup, keeps at most `--max-open-files` served files open, and queues further requests until a slot frees up. A client that stops reading is disconnected after `--file-open-timeout`, releasing its file. Busy replies and timeouts appear in Logs as `fileQueueFull` and `fileOpenTimeout`.
 

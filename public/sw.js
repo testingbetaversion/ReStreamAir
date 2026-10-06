@@ -1,4 +1,4 @@
-const CACHE_NAME = "restreamair-shell-v55";
+const CACHE_NAME = "restreamair-shell-v56";
 const SHELL_FILES = [
   "/",
   "/app.js",
@@ -54,21 +54,25 @@ self.addEventListener("fetch", (event) => {
   // "/" entry rather than letting the generic handler below store a separate
   // copy of the shell per path — and per query string, since caches.match keys
   // on the full URL.
+  //
+  // Network first, cache as the offline fallback. Cache-first meant a browser
+  // kept the app.js it had until someone remembered to bump CACHE_NAME — the
+  // server could pull a new front-end and nobody would see it.
   if (event.request.mode === "navigate") {
-    event.respondWith(
-      caches.match("/").then((cached) => cached || fetch(event.request))
-    );
+    event.respondWith(networkFirst(new Request("/"), event.request));
     return;
   }
-
-  event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request).then((response) => {
-        const copy = response.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
-        return response;
-      }).catch(() => cached);
-    })
-  );
+  event.respondWith(networkFirst(event.request, event.request));
 });
+
+// Fetch `request` and refresh the cached copy under `key`; when the network is
+// unreachable, answer from the cache instead.
+function networkFirst(key, request) {
+  return fetch(request).then((response) => {
+    if (response.ok) {
+      const copy = response.clone();
+      caches.open(CACHE_NAME).then((cache) => cache.put(key, copy));
+    }
+    return response;
+  }).catch(() => caches.match(key).then((cached) => cached || Response.error()));
+}

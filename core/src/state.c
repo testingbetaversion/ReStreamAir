@@ -11,11 +11,15 @@
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
+#include <direct.h>
 #else
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+#include <sys/stat.h>
+#include <time.h>
 
 // state.json holds admin password hashes, session tokens' hashes, API keys and
 // — for script providers — account passwords in the clear, because the script
@@ -199,6 +203,169 @@ int rs_state_save(const rs_state *st) {
 #endif
     free(tmp);
     return 0;
+}
+
+// --- backups ------------------------------------------------------------------
+//
+// Timestamped copies of the saved file, named state-YYYYMMDD-HHMMSS.json (UTC)
+// so that name order is age order. They hold everything state.json does, so
+// they are created owner-only exactly like it.
+
+static bool backup_name_ok(const char *name) {
+    // state-YYYYMMDD-HHMMSS.json, nothing else in the directory is ours.
+    if (strlen(name) != 26 || strncmp(name, "state-", 6) != 0 || strcmp(name + 21, ".json") != 0)
+        return false;
+    for (int i = 6; i < 21; i++) {
+        if (i == 14) { if (name[i] != '-') return false; }
+        else if (name[i] < '0' || name[i] > '9') return false;
+    }
+    return true;
+}
+
+static int cmp_names_desc(const void *a, const void *b) {
+    return strcmp(*(const char *const *)b, *(const char *const *)a);
+}
+
+// Names of the backups in `dir`, newest first. Caller frees each and the array.
+static char **backup_names(const char *dir, size_t *count) {
+    *count = 0;
+    size_t cap = 0;
+    char **names = NULL;
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s\\state-*.json", dir);
+    struct _finddata_t entry;
+    intptr_t handle = _findfirst(pattern, &entry);
+    if (handle == -1) return NULL;
+    do {
+        const char *name = entry.name;
+#else
+    DIR *d = opendir(dir);
+    if (!d) return NULL;
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        const char *name = entry->d_name;
+#endif
+        if (!backup_name_ok(name)) continue;
+        if (*count == cap) {
+            size_t next = cap ? cap * 2 : 16;
+            char **grown = (char **)realloc(names, next * sizeof(*names));
+            if (!grown) break;
+            names = grown;
+            cap = next;
+        }
+        char *copy = (char *)malloc(strlen(name) + 1);
+        if (!copy) break;
+        strcpy(copy, name);
+        names[(*count)++] = copy;
+#ifdef _WIN32
+    } while (_findnext(handle, &entry) == 0);
+    _findclose(handle);
+#else
+    }
+    closedir(d);
+#endif
+    if (*count > 1) qsort(names, *count, sizeof(*names), cmp_names_desc);
+    return names;
+}
+
+static void free_names(char **names, size_t count) {
+    for (size_t i = 0; i < count; i++) free(names[i]);
+    free(names);
+}
+
+// The UTC time a backup name encodes, as Unix seconds; 0 if unreadable.
+static long long backup_name_time(const char *name) {
+    struct tm tm = {0};
+    if (sscanf(name, "state-%4d%2d%2d-%2d%2d%2d.json", &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+               &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6) return 0;
+    tm.tm_year -= 1900;
+    tm.tm_mon -= 1;
+#ifdef _WIN32
+    return (long long)_mkgmtime(&tm);
+#else
+    return (long long)timegm(&tm);
+#endif
+}
+
+int rs_state_backup(const rs_state *st, const char *dir, int keep, char *name_out, size_t name_cap) {
+    if (name_out && name_cap) name_out[0] = '\0';
+    if (!st || !st->path || !dir || !dir[0]) return -1;
+#ifdef _WIN32
+    _mkdir(dir);
+#else
+    mkdir(dir, 0700);
+#endif
+    FILE *in = fopen(st->path, "rb");
+    if (!in) return -1;
+
+    time_t now = time(NULL);
+    struct tm utc;
+#ifdef _WIN32
+    gmtime_s(&utc, &now);
+#else
+    gmtime_r(&now, &utc);
+#endif
+    char name[32];
+    strftime(name, sizeof(name), "state-%Y%m%d-%H%M%S.json", &utc);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+
+    FILE *out = open_private(path);
+    if (!out) { fclose(in); return -1; }
+    char buffer[65536];
+    size_t n;
+    bool ok = true;
+    while ((n = fread(buffer, 1, sizeof(buffer), in)) > 0) {
+        if (fwrite(buffer, 1, n, out) != n) { ok = false; break; }
+    }
+    if (ferror(in)) ok = false;
+    fclose(in);
+    if (fflush(out) != 0) ok = false;
+    fclose(out);
+    if (!ok) { remove(path); return -1; }
+    if (name_out && name_cap) snprintf(name_out, name_cap, "%s", name);
+
+    // Retention: only files matching the backup naming pattern are ever
+    // considered, so nothing an operator drops in the directory is touched.
+    if (keep > 0) {
+        size_t count = 0;
+        char **names = backup_names(dir, &count);
+        for (size_t i = (size_t)keep; i < count; i++) {
+            snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+            remove(path);
+        }
+        free_names(names, count);
+    }
+    return 0;
+}
+
+rs_json *rs_state_list_backups(const char *dir) {
+    rs_json *out = rs_json_new_arr();
+    if (!out) return NULL;
+    size_t count = 0;
+    char **names = backup_names(dir, &count);
+    for (size_t i = 0; i < count; i++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+        struct stat sb;
+        rs_json *item = rs_json_new_obj();
+        if (!item) break;
+        rs_json_obj_set_str(item, "name", names[i]);
+        rs_json_obj_set_int(item, "time", backup_name_time(names[i]));
+        rs_json_obj_set_int(item, "bytes", stat(path, &sb) == 0 ? (long long)sb.st_size : 0);
+        rs_json_arr_push(out, item);
+    }
+    free_names(names, count);
+    return out;
+}
+
+long long rs_state_last_backup_time(const char *dir) {
+    size_t count = 0;
+    char **names = backup_names(dir, &count);
+    long long t = count ? backup_name_time(names[0]) : 0;
+    free_names(names, count);
+    return t;
 }
 
 void rs_state_dispose(rs_state *st) {

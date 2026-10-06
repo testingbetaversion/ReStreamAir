@@ -529,6 +529,15 @@
                 <div class="actions"><button type="submit">Save refresh intervals</button></div>
               </form>
               <p id="refreshSettingsStatus" class="field-hint" role="status"></p>
+              <h3>Backups</h3>
+              <p class="field-hint">Copies of <code>state.json</code> (providers, streams, accounts, keys) saved on this server in <code>backups/</code> next to it, readable only by the account running the panel. To restore one, stop the server and copy it over <code>state.json</code>.</p>
+              <form id="backupForm" class="form-row">
+                <label>Every (hours)<span class="field-hint">0 turns automatic backups off.</span><input name="backupHours" type="number" min="0" max="8760" step="1" value="24" required></label>
+                <label>Keep newest<span class="field-hint">Older backups are deleted. 0 keeps all of them.</span><input name="backupKeep" type="number" min="0" max="10000" step="1" value="14" required></label>
+                <div class="actions"><button type="submit">Save backup settings</button><button id="backupNowBtn" type="button" class="ghost">Back up now</button></div>
+              </form>
+              <p id="backupStatus" class="field-hint" role="status"></p>
+              <div id="backupList" class="field-hint"></div>
               <div id="servicePanel" class="hidden">
                 <h3>Service</h3>
                 <div id="serviceStatus" class="field-hint"></div>

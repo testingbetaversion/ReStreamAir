@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <string>
+#include <thread>
 
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -44,6 +46,9 @@ void print_usage(const char *program) {
                  "  --refresh-web     fetch into the cache even when local public/ exists\n"
                  "  --web-ref REF     branch, tag or commit to fetch the front-end from (default main)\n"
                  "  --no-download     never fetch; use public/ or an existing cache only\n"
+                 "  --web-refresh M   while running, check GitHub every M minutes for a newer\n"
+                 "                    front-end and swap it in (default 10, 0 = off; only for\n"
+                 "                    a downloaded cache, never a local public/ or --root)\n"
                  "  --verbose         always record debug-level logs (HTTP requests with headers and\n"
                  "                    timings, DRM discovery, playback requests) and print\n"
                  "                    mongoose's trace to stderr (default: errors only)\n"
@@ -211,6 +216,7 @@ int main(int argc, char **argv) {
     bool port_from_argv = false;
     bool bind_from_argv = false;
     unsigned long max_open_files = 0, file_queue_timeout = 0, file_open_timeout = 0;
+    unsigned long web_refresh_minutes = 10;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -243,6 +249,11 @@ int main(int argc, char **argv) {
             web.ref = argv[++i];
         } else if (std::strcmp(arg, "--no-download") == 0) {
             web.no_download = true;
+        } else if (std::strcmp(arg, "--web-refresh") == 0) {
+            if (!needs_value(arg, i, argc, arg)) return 2;
+            const char *value = argv[++i];
+            if (std::strcmp(value, "0") == 0) web_refresh_minutes = 0;
+            else if (!parse_count(arg, value, 7 * 24 * 60, &web_refresh_minutes)) return 2;
         } else if (std::strcmp(arg, "--verbose") == 0) {
             verbose = true;
         } else if (std::strcmp(arg, "--max-open-files") == 0) {
@@ -339,9 +350,36 @@ int main(int argc, char **argv) {
     }
     std::fflush(stdout);
 
+    // A single downloaded binary otherwise keeps the front-end it fetched at
+    // startup until someone restarts it. Check on a timer instead and swap a
+    // newer copy in whole; the server keeps serving the same path, so the next
+    // request simply gets the new files.
+    std::thread web_refresher;
+    if (web_refresh_minutes > 0 && !web.no_download && !web_root.empty() &&
+        rs_webroot_is_cache(web_root)) {
+        std::printf("  checking github.com/%s for a newer front-end every %lu min\n",
+                    rs_webroot_repo(), web_refresh_minutes);
+        std::fflush(stdout);
+        web_refresher = std::thread([web, web_root, web_refresh_minutes]() {
+            const auto period = std::chrono::minutes(web_refresh_minutes);
+            auto next = std::chrono::steady_clock::now() + period;
+            while (g_stop == 0) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (std::chrono::steady_clock::now() < next) continue;
+                next = std::chrono::steady_clock::now() + period;
+                std::string err;
+                int rc = rs_webroot_update(web, web_root, &err);
+                if (rc > 0) std::printf("front-end updated from github.com/%s\n", rs_webroot_repo());
+                else if (rc < 0) std::printf("front-end update check failed: %s\n", err.c_str());
+                std::fflush(stdout);
+            }
+        });
+    }
+
     while (g_stop == 0) {
         restream_server_poll(server, 200);
     }
+    if (web_refresher.joinable()) web_refresher.join();
 
     std::printf("\nrestreamair-server stopping\n");
     restream_server_stop(server);
