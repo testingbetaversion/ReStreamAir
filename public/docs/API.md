@@ -380,6 +380,7 @@ provider.
 | `DELETE /api/streams/<id>` | Stop and delete; `200` state. |
 | `POST /api/streams/<id>/start` | No body or `{}`; `200` state. Script-based starts wait for manifest/key work before replying. |
 | `POST /api/streams/<id>/stop` | No body or `{}`; `200` state. Worker shutdown completes asynchronously. |
+| `POST /api/streams/bulk` | `{"action":"stop"\|"delete","ids":["<id>",...]}`; `200` state after one save. Unknown ids are skipped. Starts are per stream only. |
 | `POST /api/probe` | Source probe request below; `200` probe result. |
 
 Create requires nonblank `name` and HTTP(S) `url`. For `inputMode: "pipe"`,

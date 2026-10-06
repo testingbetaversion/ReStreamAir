@@ -580,6 +580,24 @@ textarea {
 .stream-grid-card:hover { border-color: var(--field-border-hover); box-shadow: var(--shadow-lift); transform: translateY(-1px); }
 .stream-grid-card > * { min-width: 0; }
 
+/* Bulk-selection tick, pinned to the card's top-left corner so it never
+   competes with the centred hero layout. */
+.stream-grid-card { position: relative; }
+.stream-grid-card .stream-select {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  cursor: pointer;
+}
+.stream-grid-card .stream-select input { width: 16px; height: 16px; margin: 0; cursor: pointer; }
+.stream-grid-card .provider-tag { padding-left: 26px; }
+.stream-grid-card.selected { border-color: var(--active-accent); background: var(--accent-tint); }
+
 /* The grid card's action row carries six controls (copy, big-player, PiP,
    logs, start/stop, delete). Let it wrap on a narrow card rather than
    overflow the card edge, and don't force Delete to the far right with an
@@ -1419,6 +1437,14 @@ pre {
   border-bottom: 1px solid var(--line);
 }
 .bulk-action-bar .bulk-spacer { flex: 1 1 auto; }
+.bulk-action-bar .bulk-select-page,
+.bulk-action-bar .bulk-page-size { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; margin: 0; white-space: nowrap; }
+.bulk-action-bar .bulk-select-page { cursor: pointer; }
+.bulk-action-bar .bulk-select-page input { margin: 0; }
+.bulk-action-bar .bulk-page-size select { width: auto; font-size: 12px; padding: 4px 8px; }
+.grid-pager { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 0 16px 16px; }
+.grid-pager button { font-size: 12px; padding: 6px 10px; }
+.grid-pager button[disabled] { opacity: 0.4; cursor: not-allowed; }
 .bulk-action-bar button { font-size: 12px; padding: 6px 10px; }
 .bulk-action-bar button[disabled] { opacity: 0.4; cursor: not-allowed; }
 .bulk-toggle.active { color: var(--active-accent); border-color: var(--active-accent); background: var(--accent-tint); }

@@ -2564,6 +2564,42 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         reply_after_mutation(s, c, hm, rc, err);
         return true;
     }
+    // Bulk stop/delete: {"action":"stop"|"delete","ids":[...]}. One save and one
+    // state view for the whole batch — doing it per stream rewrote the entire
+    // state.json for every id, which is what made "Delete all" crawl through a
+    // few hundred imported events. Start stays per stream: a script-driven
+    // start replies from a worker and can't be folded into one response.
+    if (mg_match(hm->uri, mg_str("/api/streams/bulk"), NULL) && method_is(hm, "POST")) {
+        rs_json *body = parse_body(hm);
+        const char *action = rs_json_obj_str(body, "action", "");
+        bool del = strcmp(action, "delete") == 0;
+        if (!del && strcmp(action, "stop") != 0) {
+            rs_json_free(body);
+            reply_error(c, 400, "action must be \"stop\" or \"delete\".");
+            return true;
+        }
+        char *ip = client_ip(s, c, hm);
+        const rs_json *ids = rs_json_obj_get(body, "ids");
+        size_t n = rs_json_arr_len(ids), done = 0;
+        for (size_t i = 0; i < n; i++) {
+            const char *id = rs_json_as_str(rs_json_arr_at(ids, i), "");
+            if (!id[0]) continue;
+            const char *err = NULL;
+            rs_json_obj_remove(s->provider_timers, id);
+            live_stop_stream(s, id);
+            pipeline_stop_stream(id);
+            int rc = del ? rs_panel_delete_stream(&s->state, id, &err)
+                         : rs_panel_set_stream_running(&s->state, id, false, &err);
+            if (rc == 0) done++;
+        }
+        log_recordf(s, "__panel__", "info", del ? "streamDelete" : "streamStop", NULL, 0, -1,
+                    "bulk %s of %lu stream(s) by %s (%lu requested)", action,
+                    (unsigned long)done, ip, (unsigned long)n);
+        rs_free(ip);
+        rs_json_free(body);
+        reply_after_mutation(s, c, hm, 0, NULL);
+        return true;
+    }
     // Start/stop. Both are answered immediately: starting only flips the stored
     // status and kicks off the background engine, and stopping only flags it.
     // Neither waits on the network, which is what made these buttons feel dead

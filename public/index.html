@@ -402,17 +402,32 @@
               </div>
             </div>
             <div class="bulk-action-bar">
+              <label class="bulk-select-page" title="Select every stream on this page"><input id="gridSelectPageBox" type="checkbox">Select page</label>
+              <button id="gridClearSelectionBtn" type="button" class="ghost hidden" title="Untick every selected stream">Clear selection</button>
               <button id="gridRunningOnlyBtn" type="button" class="ghost bulk-toggle" title="Show only running streams"><span data-icon="broadcast"></span>Running only</button>
+              <label class="bulk-page-size" title="Streams shown per page">Per page
+                <select id="streamsGridPageSize">
+                  <option value="100">100</option>
+                  <option value="250">250</option>
+                  <option value="500">500</option>
+                  <option value="0">All</option>
+                </select>
+              </label>
               <span class="bulk-spacer"></span>
               <button id="gridImportChannelsBtn" type="button" class="ghost" disabled title="Filter All Streams to a single provider that has an import script"><span data-icon="refresh"></span>Import channels</button>
               <button id="gridImportEventsBtn" type="button" class="ghost" disabled title="Filter All Streams to a single provider that has an import script"><span data-icon="refresh"></span>Import events</button>
-              <button id="gridStartAllBtn" type="button" class="ghost"><span data-icon="play"></span>Start all</button>
-              <button id="gridStopAllBtn" type="button" class="ghost"><span data-icon="stop"></span>Stop all</button>
-              <button id="gridDeleteAllBtn" type="button" class="ghost danger-ghost"><span data-icon="trash"></span>Delete all</button>
+              <button id="gridStartAllBtn" type="button" class="ghost" data-icon-name="play"><span data-icon="play"></span>Start all</button>
+              <button id="gridStopAllBtn" type="button" class="ghost" data-icon-name="stop"><span data-icon="stop"></span>Stop all</button>
+              <button id="gridDeleteAllBtn" type="button" class="ghost danger-ghost" data-icon-name="trash"><span data-icon="trash"></span>Delete all</button>
             </div>
             <div id="streamsGridImportStatus" class="field-hint hidden"></div>
             <pre id="streamsGridImportOutput" class="script-output hidden" aria-label="Import output"></pre>
             <div id="streamsGrid" class="stream-grid empty-state">No streams yet.</div>
+            <div id="streamsGridPager" class="grid-pager hidden">
+              <button id="streamsGridPrevBtn" type="button" class="ghost">‹ Previous</button>
+              <span id="streamsGridPageLabel" class="field-hint"></span>
+              <button id="streamsGridNextBtn" type="button" class="ghost">Next ›</button>
+            </div>
           </div>
         </section>
 
