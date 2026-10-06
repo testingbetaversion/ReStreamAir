@@ -19,6 +19,7 @@
 #include "rs_script.h"
 #include "rs_state.h"
 #include "rs_internal.h"
+#include "rs_file_gate.h"
 #include "rs_sysstats.h"
 #include "../deps/mongoose.h"
 #include <stdarg.h>
@@ -143,6 +144,9 @@ struct restream_server {
     rs_ts_client *ts_head;          // open muxed-MPEG-TS viewers
     rs_ts_session *ts_sessions;     // one mux per stream with .ts viewers on it
     rs_logo_cache *logo_cache;
+    rs_file_gate *file_gate;        // bounds served files: open limit, wait queue, open timeout
+    uint64_t file_gate_rejected_logged;
+    uint64_t file_gate_timed_out_logged;
     rs_log_entry log_ring[RS_LOG_CAP];
     size_t log_head;        // next write slot
     size_t log_count;       // entries in use (<= RS_LOG_CAP)
@@ -1573,6 +1577,31 @@ static void collect_ingest(restream_server_t *s) {
     }
 }
 
+// Surfaces what the file gate had to do since the last report, once a second
+// at most, so a run of busy replies or stalled viewers shows in Logs without a
+// line per request.
+static void file_gate_report(restream_server_t *s) {
+    rs_file_gate_stats st;
+    rs_file_gate_get_stats(s->file_gate, &st);
+    if (st.rejected > s->file_gate_rejected_logged) {
+        log_recordf(s, "__panel__", "warn", "fileQueueFull", NULL, 0, -1,
+                    "%llu file request(s) answered 503: %zu/%zu files open, %zu/%zu waiting",
+                    (unsigned long long)(st.rejected - s->file_gate_rejected_logged),
+                    st.open, st.max_open, st.queued, st.max_queued);
+        s->file_gate_rejected_logged = st.rejected;
+    }
+    if (st.timed_out > s->file_gate_timed_out_logged) {
+        log_recordf(s, "__panel__", "warn", "fileOpenTimeout", NULL, 0, -1,
+                    "closed %llu connection(s) that held a served file open too long",
+                    (unsigned long long)(st.timed_out - s->file_gate_timed_out_logged));
+        s->file_gate_timed_out_logged = st.timed_out;
+    }
+}
+
+static void file_gate_tick(void *arg) {
+    rs_file_gate_tick(((restream_server_t *)arg)->file_gate);
+}
+
 // Maintenance always runs once a second, even with snapshots paused.
 static void maintenance_tick(void *arg) {
     restream_server_t *s = (restream_server_t *)arg;
@@ -1592,6 +1621,7 @@ static void maintenance_tick(void *arg) {
     // Doing it here rather than in the stop handler is what makes Stop return
     // instantly instead of waiting for an in-flight segment download.
     rs_live_reap(s->live);
+    file_gate_report(s);
 }
 
 // The Logs view. Everything the server does lands in the ring buffer — panel
@@ -7169,9 +7199,8 @@ static bool serve_pipeline_hls(restream_server_t *server, struct mg_connection *
         snprintf(path, sizeof(path), "runtime/ffmpeg/%s/%s", id,
                  (!strcmp(mode, "ffmpegMultiTsHls") || !strcmp(mode, "hlsBuffered")) ? "master.m3u8" : "live.m3u8");
         if (!strcmp(mode, "ffmpegMultiTsHls") || !strcmp(mode, "hlsBuffered")) {
-            FILE *test = fopen(path, "rb");
-            if (!test) snprintf(path, sizeof(path), "runtime/ffmpeg/%s/live.m3u8", id);
-            else fclose(test);
+            struct stat master;
+            if (stat(path, &master) != 0) snprintf(path, sizeof(path), "runtime/ffmpeg/%s/live.m3u8", id);
         }
     } else {
         if (!safe_pipeline_relative_path(relative)) {
@@ -7183,8 +7212,10 @@ static bool serve_pipeline_hls(restream_server_t *server, struct mg_connection *
     }
     free(tail);
 
-    FILE *test = fopen(path, "rb");
-    if (!test) {
+    // stat, not fopen: an existence check should not spend a descriptor, and
+    // must not mistake "out of descriptors" for "not written yet".
+    struct stat item;
+    if (stat(path, &item) != 0) {
         if (wait_for_buffer) {
             rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
             if (!pf) { reply_error(c, 500, "Out of memory."); return true; }
@@ -7206,9 +7237,7 @@ static bool serve_pipeline_hls(restream_server_t *server, struct mg_connection *
                       "{\"error\":\"FFmpeg output is warming up.\"}");
         return true;
     }
-    fseek(test, 0, SEEK_END);
-    long length = ftell(test);
-    fclose(test);
+    long long length = (long long)item.st_size;
     char *ip = client_ip(server, c, hm);
     char *ua = header_dup(hm, "User-Agent");
     char *key = playback_key(hm);
@@ -7225,7 +7254,7 @@ static bool serve_pipeline_hls(restream_server_t *server, struct mg_connection *
     free(key);
     struct mg_http_serve_opts opts = {0};
     opts.extra_headers = RS_CORS_HEADERS "Cache-Control: no-store\r\n";
-    mg_http_serve_file(c, hm, path, &opts);
+    rs_file_gate_serve_file(server->file_gate, c, hm, path, &opts);
     return true;
 }
 
@@ -7415,6 +7444,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         if (server) {
             pending_job_cancel(server, c->id);
             direct_forget_conn(server, c->id);
+            rs_file_gate_forget(server->file_gate, c->id);
         }
         return;
     }
@@ -7526,10 +7556,10 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         if (is_panel_view_path(hm->uri)) {
             char index_path[1024];
             snprintf(index_path, sizeof(index_path), "%s/index.html", server->web_root);
-            mg_http_serve_file(c, hm, index_path, &opts);
+            rs_file_gate_serve_file(server->file_gate, c, hm, index_path, &opts);
             return;
         }
-        mg_http_serve_dir(c, hm, &opts);
+        rs_file_gate_serve_dir(server->file_gate, c, hm, &opts);
         return;
     }
 
@@ -7551,6 +7581,8 @@ restream_server_t* restream_server_create(void) {
     // happen — it's just a local socketpair) pending_job_dispatch refuses to
     // dispatch and those routes reply with a clean 500 instead of hanging.
     server->wakeup_ok = mg_wakeup_init(&server->mgr);
+    // NULL only on OOM, in which case files are served unbounded as before.
+    server->file_gate = rs_file_gate_create(&server->mgr);
     server->c = NULL;
     server->is_running = false;
     server->web_root = NULL;
@@ -7580,6 +7612,7 @@ restream_server_t* restream_server_create(void) {
         rs_json_free(server->provider_timers);
         rs_state_dispose(&server->state);
         mg_mgr_free(&server->mgr);
+        rs_file_gate_destroy(server->file_gate);
         pthread_mutex_destroy(&server->pending_mu);
         pthread_cond_destroy(&server->pending_cv);
         pthread_mutex_destroy(&server->logo_mu);
@@ -7663,6 +7696,16 @@ void restream_server_set_dash_handler(restream_dash_fn handler) {
     g_dash_handler = handler;
 }
 
+void restream_server_set_file_limits(restream_server_t *server, size_t max_open,
+                                     unsigned queue_timeout_s, unsigned open_timeout_s) {
+    if (!server) return;
+    rs_file_gate_limits limits = {0};
+    limits.max_open = max_open;
+    limits.queue_timeout_ms = (uint64_t)queue_timeout_s * 1000;
+    limits.open_timeout_ms = (uint64_t)open_timeout_s * 1000;
+    rs_file_gate_set_limits(server->file_gate, &limits);
+}
+
 uint16_t restream_server_stored_port(const restream_server_t* server) {
     if (!server) return 0;
     const rs_json *settings = rs_json_obj_get(server->state.root, "settings");
@@ -7705,6 +7748,8 @@ bool restream_server_start(restream_server_t* server, uint16_t port, const char*
     // Direct links run on their own faster timer: a second of added latency on
     // every segment is the very cost they exist to avoid.
     mg_timer_add(&server->mgr, RS_DIRECT_PUMP_MS, MG_TIMER_REPEAT, pump_direct_links, server);
+    // Hands freed file slots to waiting requests promptly; cheap when idle.
+    mg_timer_add(&server->mgr, 100, MG_TIMER_REPEAT, file_gate_tick, server);
     server->is_running = true;
     // Streams that state.json says were running come back up on their own, so a
     // restart does not silently leave every stream dark until someone notices.
@@ -7733,6 +7778,10 @@ void restream_server_destroy(restream_server_t* server) {
         // them before freeing the mongoose manager and lifecycle locks.
         pending_job_wait_idle(server);
         mg_mgr_free(&server->mgr);
+        // After mg_mgr_free: closing the connections closes their files,
+        // which still report back to the gate.
+        rs_file_gate_destroy(server->file_gate);
+        server->file_gate = NULL;
         // Direct-link viewers and their muxes hold no threads, but they do hold
         // buffers; their connections are gone with the manager.
         while (server->direct_head) {
