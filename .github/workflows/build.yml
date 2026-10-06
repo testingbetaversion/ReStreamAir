@@ -86,6 +86,7 @@ jobs:
         run: |
           BIN=build/restreamair-server
           [ -f "$BIN" ] || BIN=build/Release/restreamair-server.exe
+          python3 scripts/sync-panel-docs.py --check
           python3 scripts/api-smoke.py --binary "$BIN"
           python3 scripts/provider-options-smoke.py --binary "$BIN"
           python3 scripts/provider-engine-smoke.py --binary "$BIN"

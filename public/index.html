@@ -562,8 +562,14 @@
               <a href="#help-accounts">Accounts &amp; security</a>
               <a href="#help-run">Running the binary</a>
               <a href="#help-api">HTTP API, keys &amp; CLI</a>
+              <div class="help-toc-group">Full reference</div>
+              <a href="/help?doc=readme" data-doc="readme">README — install &amp; run</a>
+              <a href="/help?doc=api" data-doc="api">HTTP API reference</a>
+              <a href="/help?doc=events" data-doc="events">Events, logs &amp; webhooks</a>
+              <a href="/help?doc=scripting" data-doc="scripting">Provider scripting</a>
             </nav>
-            <div class="help-body">
+            <article id="helpDoc" class="help-card help-doc hidden"></article>
+            <div id="helpCards" class="help-body">
               <article id="help-start" class="help-card">
                 <h3>Getting started</h3>
                 <p>ReStreamAir re-streams DASH/HLS sources as clean HLS you can play in any player. Create a <b>Provider</b> (a group of streams that share settings and credentials), add <b>Streams</b> under it, then hit play or copy the output URL.</p>
@@ -815,7 +821,8 @@ cd restreamair-vX-linux-x86_64
               <article id="help-api" class="help-card">
                 <h3>HTTP API, keys &amp; CLI</h3>
                 <ul>
-                  <li><b>Every server action in this panel uses the public HTTP API.</b> Scripts can use HTTP Basic auth with a panel admin account: <code>curl --user 'admin:password' http://host:8787/api/state</code>. Provider/stream CRUD, start/stop, probe, imports/exports, script actions, logs, users, keys, settings, service control and installers all live under <code>/api/</code>; the repository's <code>API.md</code> is the complete route reference.</li>
+                  <li><b>Every server action in this panel uses the public HTTP API.</b> Scripts can use HTTP Basic auth with a panel admin account: <code>curl --user 'admin:password' http://host:8787/api/state</code>. Provider/stream CRUD, start/stop, probe, imports/exports, script actions, logs, users, keys, settings, service control and installers all live under <code>/api/</code>. The complete route reference is right here: <a href="/help?doc=api" data-doc-link="api">HTTP API reference</a>; events, logs and webhooks are in <a href="/help?doc=events" data-doc-link="events">Events, logs &amp; webhooks</a>, and the script protocol in <a href="/help?doc=scripting" data-doc-link="scripting">Provider scripting</a>.</li>
+                  <li><b>Playing an event with authentication:</b> step-by-step in <a href="/help?doc=events#doc-playing-an-event-with-authentication" data-doc-link="events" data-doc-anchor="playing-an-event-with-authentication">Playing an event, with authentication</a>.</li>
                   <li><b>External websites:</b> CORS accepts every origin. Send an explicit Basic Authorization header with <code>fetch</code> and <code>credentials: "omit"</code>. For live monitoring, stream <code>GET /api/events?intervalMs=1000</code> using fetch; native EventSource cannot set authorization headers. See <code>API.md</code> for a complete browser example.</li>
                   <li><b>Refresh intervals:</b> Settings controls event snapshots, state, logs and script/install progress independently. External SSE clients can override their own interval with <code>intervalMs</code>; 0 pauses periodic data while retaining connection keepalives.</li>
                   <li><b>Common automation routes:</b> <code>POST /api/streams/&lt;id&gt;/start</code> and <code>/stop</code>, <code>POST /api/providers/&lt;id&gt;/script/&lt;action&gt;</code>, and <code>GET /api/logs?streamId=&lt;id&gt;</code>. Mutations return fresh state JSON. Viewer accounts can read but receive <code>403</code> on writes.</li>

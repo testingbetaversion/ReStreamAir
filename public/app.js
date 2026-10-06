@@ -53,6 +53,16 @@ let pipHls = null;
 let pipStreamId = null;
 let selectedPlaybackKeyId;
 let currentView = "server";
+// Help: which reference document /help?doc=… shows ("" = the quick-start
+// cards), and an anchor inside it to scroll to once it has loaded.
+const HELP_DOCS = {
+  readme: { file: "README.md", title: "README" },
+  api: { file: "API.md", title: "HTTP API reference" },
+  events: { file: "EVENTS.md", title: "Events, logs & webhooks" },
+  scripting: { file: "SCRIPTING.md", title: "Provider scripting" },
+};
+let helpDoc = "";
+let helpAnchor = location.hash.startsWith("#doc-") ? location.hash.slice(5) : "";
 let eventSource = null;
 let authenticated = false;
 let probeResult = null;
@@ -279,6 +289,7 @@ function urlForView(view) {
   const path = VIEW_ROUTES[view] || VIEW_ROUTES[DEFAULT_VIEW];
   const params = new URLSearchParams();
   if (view === "grid" && streamsGridProviderId) params.set("provider", streamsGridProviderId);
+  if (view === "help" && helpDoc) params.set("doc", helpDoc);
   if (view === "logs") {
     const streamId = pendingLogStreamId !== null
       ? pendingLogStreamId
@@ -301,6 +312,7 @@ function routeFromLocation() {
     view: ROUTE_VIEWS[path] || DEFAULT_VIEW,
     provider: params.get("provider") || "",
     stream: params.get("stream") || "",
+    doc: params.get("doc") || "",
   };
 }
 
@@ -320,6 +332,7 @@ function applyRoute() {
   const route = routeFromLocation();
   if (route.view === "grid") streamsGridProviderId = route.provider;
   if (route.view === "logs" && route.stream) pendingLogStreamId = route.stream;
+  if (route.view === "help") helpDoc = HELP_DOCS[route.doc] ? route.doc : "";
   // "replace", not "none": adopting the route should also canonicalise the
   // address, so "/" and the "#/logs" hash form land on the same URL every other
   // navigation produces — without pushing a duplicate history entry.
@@ -350,6 +363,7 @@ function switchView(view, { history: historyMode = "push" } = {}) {
     if (view === "grid") renderStreamsGrid();
     if (view === "server" || view === "monitor") repaintMonitorIfActive();
     if (view === "settings") loadSettingsView();
+    if (view === "help") renderHelpDoc();
     // Logs auto-refresh only while the tab is actually open, same reasoning
     // as the existing "no overhead when closed" comment on loadLogs itself.
     stopRefreshPoll(logsPollTimer);
@@ -2955,6 +2969,222 @@ document.querySelectorAll(".log-mode-btn").forEach((button) => {
     document.querySelectorAll(".log-mode-btn").forEach((b) => b.classList.toggle("active", b === button));
     loadLogs();
   });
+});
+
+// MARK: - Help: reference documentation
+//
+// The repository's own Markdown (README, API, EVENTS, SCRIPTING), copied into
+// public/docs/ by scripts/sync-panel-docs.py, rendered here so the panel never
+// carries a second, drifting copy of the reference. The quick-start cards stay
+// in index.html; ?doc=<name> on /help shows one document instead.
+
+// HELP_DOCS, helpDoc and helpAnchor are declared near the top of the file:
+// boot-time routing reads them before this section runs.
+const HELP_REPO_URL = "https://github.com/testingbetaversion/ReStreamAir/blob/main/";
+const helpDocCache = new Map();
+
+function openHelpDoc(name, anchor = "") {
+  helpDoc = HELP_DOCS[name] ? name : "";
+  helpAnchor = anchor;
+  if (currentView !== "help") switchView("help");
+  else { syncUrl("help"); renderHelpDoc(); }
+}
+
+async function renderHelpDoc() {
+  const cards = $("#helpCards");
+  const docEl = $("#helpDoc");
+  if (!cards || !docEl) return;
+  document.querySelectorAll(".help-toc [data-doc]").forEach((link) =>
+    link.classList.toggle("active", link.dataset.doc === helpDoc));
+  if (!helpDoc) {
+    cards.classList.remove("hidden");
+    docEl.classList.add("hidden");
+    return;
+  }
+  cards.classList.add("hidden");
+  docEl.classList.remove("hidden");
+  const meta = HELP_DOCS[helpDoc];
+  const loading = docEl.dataset.doc !== helpDoc;
+  if (loading) {
+    docEl.dataset.doc = helpDoc;
+    docEl.innerHTML = `<p class="help-note">Loading ${escapeHtml(meta.title)}…</p>`;
+    try {
+      let text = helpDocCache.get(meta.file);
+      if (!text) {
+        const response = await fetch(`/docs/${meta.file}`, { cache: "no-cache" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        text = await response.text();
+        helpDocCache.set(meta.file, text);
+      }
+      if (docEl.dataset.doc !== helpDoc) return;  // switched while loading
+      docEl.innerHTML = `<div class="help-doc-bar"><span>${escapeHtml(meta.file)}</span>` +
+        `<a href="${HELP_REPO_URL}${meta.file}" target="_blank" rel="noopener">View on GitHub</a></div>` +
+        renderMarkdown(text);
+    } catch (error) {
+      docEl.dataset.doc = "";
+      docEl.innerHTML = `<p class="help-note">Could not load ${escapeHtml(meta.file)} (${escapeHtml(error.message || error)}). ` +
+        `Read it on <a href="${HELP_REPO_URL}${meta.file}" target="_blank" rel="noopener">GitHub</a>.</p>`;
+      return;
+    }
+  }
+  const anchor = helpAnchor;
+  helpAnchor = "";
+  const target = anchor ? document.getElementById(`doc-${anchor}`) : null;
+  // A re-render of the document already showing keeps the reader's place.
+  if (target) target.scrollIntoView({ block: "start" });
+  else if (loading) docEl.scrollIntoView({ block: "start" });
+}
+
+// GitHub's heading anchor rule, so links like API.md#playback-and-xtream work.
+function markdownSlug(text, used) {
+  let slug = text.toLowerCase().replace(/<[^>]+>/g, "").replace(/[^\p{L}\p{N}\s_-]/gu, "").trim().replace(/\s/g, "-");
+  const base = slug;
+  for (let n = 1; used.has(slug); n++) slug = `${base}-${n}`;
+  used.add(slug);
+  return slug;
+}
+
+function markdownLink(href) {
+  if (/^(https?:|mailto:)/i.test(href)) return { href, external: true };
+  if (href.startsWith("#")) return { href: `#doc-${href.slice(1)}`, anchor: href.slice(1), doc: helpDoc };
+  const [path, anchor = ""] = href.split("#");
+  const name = Object.keys(HELP_DOCS).find((key) => HELP_DOCS[key].file === path.replace(/^\.\//, ""));
+  if (name) return { href: `/help?doc=${name}${anchor ? `#doc-${anchor}` : ""}`, anchor, doc: name };
+  return { href: HELP_REPO_URL + path.replace(/^\.\//, "") + (anchor ? `#${anchor}` : ""), external: true };
+}
+
+// Inline Markdown: code spans first (their content is literal), then links,
+// bold, italic. Everything is escaped; only the tags built here are emitted.
+function markdownInline(text) {
+  const codes = [];
+  let out = text.replace(/(`+)([\s\S]*?[^`])\1(?!`)/g, (_, __, code) => {
+    codes.push(`<code>${escapeHtml(code.trim() === "" ? code : code.replace(/^ (.*) $/, "$1"))}</code>`);
+    return `\u0000${codes.length - 1}\u0000`;
+  });
+  out = escapeHtml(out);
+  out = out.replace(/!\[([^\]]*)\]\(&lt;?([^)]*?)&gt;?\)/g, (_, alt) => `<i>[screenshot: ${alt}]</i>`);
+  out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, label, rawHref) => {
+    const link = markdownLink(rawHref.replace(/&amp;/g, "&"));
+    const attrs = link.external
+      ? ` target="_blank" rel="noopener"`
+      : ` data-doc-link="${escapeAttr(link.doc || "")}" data-doc-anchor="${escapeAttr(link.anchor || "")}"`;
+    return `<a href="${escapeAttr(link.href)}"${attrs}>${label}</a>`;
+  });
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  out = out.replace(/(^|[^\w*])\*([^*\s][^*]*?)\*(?!\w)/g, "$1<i>$2</i>");
+  out = out.replace(/(^|[^\w])_([^_\s][^_]*?)_(?!\w)/g, "$1<i>$2</i>");
+  return out.replace(/\u0000(\d+)\u0000/g, (_, i) => codes[Number(i)]);
+}
+
+// Splits a table row on pipes that are not inside a code span.
+function markdownCells(line) {
+  const cells = [];
+  let cell = "", ticks = 0;
+  const body = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === "`") ticks ^= 1;
+    if (c === "\\" && body[i + 1] === "|") { cell += "|"; i++; continue; }
+    if (c === "|" && !ticks) { cells.push(cell.trim()); cell = ""; continue; }
+    cell += c;
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+
+// Block Markdown: the subset the repository's docs use — ATX headings, fenced
+// code, GFM tables, ordered/unordered lists, blockquotes, rules, paragraphs.
+function renderMarkdown(text) {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const used = new Set();
+  const html = [];
+  let i = 0;
+  const isBlockStart = (line) => /^(#{1,6}\s|```|\s*[-*+]\s|\s*\d+[.)]\s|>|\|)/.test(line) || /^(-{3,}|\*{3,})\s*$/.test(line);
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+    const fence = line.match(/^(`{3,})\s*([\w+-]*)/);
+    if (fence) {
+      const body = [];
+      for (i++; i < lines.length && !lines[i].startsWith(fence[1]); i++) body.push(lines[i]);
+      i++;
+      html.push(`<pre class="help-pre"><code>${escapeHtml(body.join("\n"))}</code></pre>`);
+      continue;
+    }
+    const heading = line.match(/^(#{1,6})\s+(.*?)\s*#*\s*$/);
+    if (heading) {
+      const level = Math.min(heading[1].length + 1, 6);  // h1 → h2: the view header owns h1
+      const slug = markdownSlug(heading[2].replace(/`/g, ""), used);
+      html.push(`<h${level} id="doc-${slug}" class="help-doc-h">${markdownInline(heading[2])}</h${level}>`);
+      i++;
+      continue;
+    }
+    if (/^(-{3,}|\*{3,})\s*$/.test(line)) { html.push("<hr>"); i++; continue; }
+    if (line.trim().startsWith("|") && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
+      const head = markdownCells(line);
+      const align = markdownCells(lines[i + 1]).map((c) => c.endsWith(":") ? (c.startsWith(":") ? "center" : "right") : "");
+      const rows = [];
+      for (i += 2; i < lines.length && lines[i].trim().startsWith("|"); i++) rows.push(markdownCells(lines[i]));
+      const cell = (tag, value, col) => `<${tag}${align[col] ? ` style="text-align:${align[col]}"` : ""}>${markdownInline(value)}</${tag}>`;
+      html.push(`<div class="help-table-wrap"><table class="help-table"><thead><tr>${head.map((c, n) => cell("th", c, n)).join("")}</tr></thead>` +
+        `<tbody>${rows.map((r) => `<tr>${head.map((_, n) => cell("td", r[n] || "", n)).join("")}</tr>`).join("")}</tbody></table></div>`);
+      continue;
+    }
+    if (line.startsWith(">")) {
+      const quote = [];
+      for (; i < lines.length && lines[i].startsWith(">"); i++) quote.push(lines[i].replace(/^>\s?/, ""));
+      html.push(`<blockquote class="help-callout">${renderMarkdown(quote.join("\n"))}</blockquote>`);
+      continue;
+    }
+    const item = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+    if (item) {
+      const ordered = /\d/.test(item[2]);
+      const indent = item[1].length;
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+        if (m && m[1].length === indent && /\d/.test(m[2]) === ordered) {
+          items.push([m[3]]);
+          i++;
+        } else if (items.length && lines[i].trim() && (/^\s/.test(lines[i]) || !isBlockStart(lines[i]))) {
+          items[items.length - 1].push(lines[i]);  // continuation or nested content
+          i++;
+        } else if (!lines[i].trim() && i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) {
+          items[items.length - 1].push("");
+          i++;
+        } else break;
+      }
+      const tag = ordered ? "ol" : "ul";
+      html.push(`<${tag}>${items.map((parts) => {
+        const [first, ...rest] = parts;
+        const nested = rest.map((l) => l.replace(/^ {1,4}/, "")).join("\n");
+        return `<li>${markdownInline(first)}${nested.trim() ? (/^\s*([-*+]|\d+[.)])\s|```/m.test(nested) ? renderMarkdown(nested) : " " + markdownInline(nested.replace(/\n/g, " "))) : ""}</li>`;
+      }).join("")}</${tag}>`);
+      continue;
+    }
+    const para = [];
+    for (; i < lines.length && lines[i].trim() && !(para.length && isBlockStart(lines[i])); i++) para.push(lines[i].trim());
+    html.push(`<p>${markdownInline(para.join(" "))}</p>`);
+  }
+  return html.join("\n");
+}
+
+document.addEventListener("click", (event) => {
+  if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return;
+  // A quick-start card link while a document is showing: back to the cards.
+  const card = event.target.closest('.help-toc a[href^="#help-"]');
+  if (card && helpDoc) {
+    event.preventDefault();
+    helpDoc = "";
+    syncUrl("help");
+    renderHelpDoc().then(() => document.querySelector(card.getAttribute("href"))?.scrollIntoView({ block: "start" }));
+    return;
+  }
+  const link = event.target.closest("a[data-doc-link], .help-toc a[data-doc]");
+  if (!link) return;
+  event.preventDefault();
+  const name = link.dataset.doc !== undefined ? link.dataset.doc : link.dataset.docLink;
+  openHelpDoc(name, link.dataset.docAnchor || "");
 });
 
 // MARK: - Settings (port + users)
