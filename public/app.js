@@ -523,6 +523,7 @@ function updateStreamCardDynamic(card, stream) {
     stats[1].textContent = `↓ ${formatBytesPerSecond((stream.inputBandwidth || {}).bytesPerSecond)}`;
     stats[2].textContent = `↑ ${formatBytesPerSecond((stream.bandwidth || {}).bytesPerSecond)}`;
   }
+  applyRealtimeBadge(card.querySelector(".stream-realtime"), stream);
   const selected = streamsGridSelected.has(stream.id);
   card.classList.toggle("selected", selected);
   const box = card.querySelector(".stream-select input");
@@ -538,6 +539,20 @@ function updateStreamCardDynamic(card, stream) {
 // Look a stream up in the current state by id. Click handlers must resolve the
 // stream at click time rather than closing over the object they were rendered
 // with — see the toggle handler in renderStreamsGrid.
+// How fast segments arrive compared with how fast they play, for the slowest
+// rendition over the last 30 seconds. Below 1× a viewer runs out of buffer.
+// Absent when nothing was fetched recently (nobody watching).
+function applyRealtimeBadge(el, stream) {
+  if (!el) return;
+  const value = stream.realtime;
+  const known = typeof value === "number" && Number.isFinite(value);
+  el.classList.toggle("hidden", !known);
+  if (!known) return;
+  el.textContent = `${value >= 10 ? value.toFixed(0) : value.toFixed(1)}× realtime`;
+  el.classList.toggle("slow", value < 1);
+  el.classList.toggle("tight", value >= 1 && value < 1.3);
+}
+
 function findStreamById(id) {
   for (const provider of state.providers) {
     const found = provider.streams.find((s) => s.id === id);
@@ -810,6 +825,7 @@ function renderStreamsGrid() {
         <span>${stream.activeClients ?? 0} active</span>
         <span title="Downloaded from the origin">↓ ${formatBytesPerSecond(inputBandwidth.bytesPerSecond)}</span>
         <span title="Served to viewers">↑ ${formatBytesPerSecond(bandwidth.bytesPerSecond)}</span>
+        <span class="stream-realtime hidden" title="Media seconds delivered per second of downloading, slowest rendition, last 30 s. Below 1× viewers will buffer."></span>
       </div>
       <div class="actions">
         <button type="button" class="ghost mini-icon-btn" data-action="copyurl" title="Copy the HLS (m3u8) output URL"><span data-icon="copy"></span></button>
@@ -867,6 +883,7 @@ function renderStreamsGrid() {
       const live = findStreamById(stream.id) || stream;
       await deleteStreamId(live.id, live.name);
     });
+    applyRealtimeBadge(card.querySelector(".stream-realtime"), stream);
     applyIcons(card);
     container.appendChild(card);
   }

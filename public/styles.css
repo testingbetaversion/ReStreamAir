@@ -596,6 +596,9 @@ textarea {
 }
 .stream-grid-card .stream-select input { width: 16px; height: 16px; margin: 0; cursor: pointer; }
 .stream-grid-card .provider-tag { padding-left: 26px; }
+.stream-realtime { font-weight: 700; color: var(--success); }
+.stream-realtime.tight { color: #f0b429; }
+.stream-realtime.slow { color: var(--danger); }
 .stream-grid-card.selected { border-color: var(--active-accent); background: var(--accent-tint); }
 
 /* The grid card's action row carries six controls (copy, big-player, PiP,

@@ -119,6 +119,8 @@ typedef struct rs_webhook_job {
     struct rs_webhook_job *next;
 } rs_webhook_job;
 
+#define RS_FETCH_POOL 24
+
 struct restream_server {
     struct mg_mgr mgr;
     struct mg_connection *c;
@@ -144,6 +146,22 @@ struct restream_server {
     // has flushed the response and the operator has seen it succeed.
     bool restart_pending;
     long long last_backup_s;  // newest backup's time; -1 until read from disk
+    // HLS pass-through delivery speed, poll thread only:
+    // {streamId: {renditionDir: {"r": seconds of media per second of fetch, "t": unix s}}}
+    rs_json *speed;
+    // Persistent workers for HLS pass-through fetches. A thread per request
+    // threw its libcurl handle away with it, so every playlist and segment paid
+    // a fresh TCP + TLS handshake to the proxy and again to the origin — over a
+    // distant proxy that was ~1.5s of a ~2.2s time-to-first-byte, per request.
+    // These threads keep their handle (and its warm connections) between jobs.
+    pthread_mutex_t fetch_mu;
+    pthread_cond_t fetch_cv;
+    rs_pending_job *fetch_head, *fetch_tail;
+    pthread_t fetch_threads[RS_FETCH_POOL];
+    int fetch_threads_n;
+    int fetch_idle;     // threads waiting for work
+    int fetch_queued;   // jobs queued but not yet picked up
+    bool fetch_stop;
     unsigned long long next_start_token;
     rs_json *provider_timers; // event-loop-owned scheduling state, never persisted
     rs_live *live;          // background DASH->HLS engines, one per running stream
@@ -251,6 +269,7 @@ static void pipeline_stop_stream(const char *stream_id);
 static void live_sync_all(restream_server_t *s);
 static void provider_maintenance(restream_server_t *s);
 static void backup_tick(restream_server_t *s);
+static double stream_delivery_speed(restream_server_t *server, const char *stream_id);
 static int backup_now(restream_server_t *s, char *name, size_t name_cap);
 static int clear_provider_session(const char *provider_id);
 static bool provider_job_busy(restream_server_t *s, const rs_json *provider);
@@ -1387,6 +1406,8 @@ static void inject_stream_metrics(restream_server_t *s, rs_json *view) {
                                 (long long)rs_metrics_input_bytes_per_sec(s->metrics, id));
             rs_json_obj_set_int(in, "allTimeBytes", rs_metrics_input_total_bytes(s->metrics, id));
             rs_json_obj_set(st, "inputBandwidth", in);
+            double speed = stream_delivery_speed(s, id);
+            if (speed >= 0) rs_json_obj_set(st, "realtime", rs_json_new_num(speed));
         }
     }
 }
@@ -2194,6 +2215,8 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
                 rs_json_obj_set_str(item, "name", name);
                 rs_json_obj_set_str(item, "url", url_text ? url_text : "");
                 rs_json_obj_set_str(item, "provider", provider_name);
+                const char *item_logo = rs_json_obj_str(stream, "logo", "");
+                rs_json_obj_set_str(item, "logo", item_logo[0] ? item_logo : provider_logo);
                 rs_json_obj_set_str(item, "type", source_type[0] ? source_type : "manual");
                 rs_json_obj_set(item, "running", rs_json_new_bool(running));
                 long long start = (long long)rs_json_obj_num(stream, "scriptStart", 0);
@@ -3568,6 +3591,47 @@ static char *playlist_cdn_hint(char *url, const playlist_route_ctx *ctx) {
     return rs_buf_take(&out);
 }
 
+static bool span_contains(const char *span, size_t len, const char *needle) {
+    size_t n = strlen(needle);
+    for (size_t i = 0; n <= len && i <= len - n; i++)
+        if (memcmp(span + i, needle, n) == 0) return true;
+    return false;
+}
+
+// Appends &d=<EXTINF seconds> to every rewritten segment link, so the fetch
+// that serves it can be measured against how much playback it buys. Returns a
+// new string (rs_free), or NULL on allocation failure.
+static char *playlist_tag_durations(const char *playlist) {
+    rs_buf out = RS_BUF_INIT;
+    char duration[32] = "";
+    const char *p = playlist;
+    while (*p) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        size_t text_len = len > 0 && p[len - 1] == '\r' ? len - 1 : len;
+        if (text_len > 8 && strncmp(p, "#EXTINF:", 8) == 0) {
+            size_t n = 0;
+            const char *v = p + 8;
+            while (n < sizeof(duration) - 1 && n < text_len - 8 &&
+                   ((v[n] >= '0' && v[n] <= '9') || v[n] == '.')) { duration[n] = v[n]; n++; }
+            duration[n] = '\0';
+            rs_buf_append(&out, p, len);
+        } else if (duration[0] && strncmp(p, "/restream/", 10) == 0 &&
+                   span_contains(p, text_len, "kind=segment")) {
+            rs_buf_append(&out, p, text_len);
+            rs_buf_appendf(&out, "&d=%s", duration);
+            if (text_len < len) rs_buf_append_char(&out, '\r');
+            duration[0] = '\0';
+        } else {
+            rs_buf_append(&out, p, len);
+        }
+        if (!end) break;
+        rs_buf_append_char(&out, '\n');
+        p = end + 1;
+    }
+    return rs_buf_take(&out);
+}
+
 static char *media_transform(void *ud, const char *abs_uri, rs_m3u8_line_kind kind, int64_t seq) {
     const playlist_route_ctx *ctx = (const playlist_route_ctx *)ud;
     const char *stream_id = ctx->stream_id;
@@ -3747,6 +3811,9 @@ struct rs_pending_job {
     // only has to fold them into the state.
     rs_json *script_import, *script_logos;
     struct rs_stream_start *start;  // STREAM_START only
+    struct rs_pending_job *fetch_next;  // server->fetch_head queue (pooled PLAYLIST/ITEM)
+    double media_seconds;  // ITEM: the segment's EXTINF duration (?d=), 0 when unknown
+    double fetch_seconds;  // ITEM: wall-clock time the upstream fetch took
     char err[256];
 };
 
@@ -4998,12 +5065,14 @@ static void *pending_job_worker(void *arg) {
         if (pf->kind == RS_PENDING_PLAYLIST) pending_source_fetch(pf);
         else {
             char *effective = NULL;
+            double fetch_started = now_ms();
             pf->rc = g_fetch_handler(pf->url, pf->proxy, pf->headers, pf->range,
                                      pf->downloader, pf->downloader_params,
                                      pf->force_ipv6, pf->rotate_proxies,
                                      &pf->body, &pf->body_len, &pf->status,
                                      &pf->content_type, &pf->content_range, &effective,
                                      pf->err, sizeof(pf->err), 30000, NULL, NULL, &pf->source_policy);
+            pf->fetch_seconds = (now_ms() - fetch_started) / 1000.0;
             if (pf->rc == 0 && effective && effective[0]) { free(pf->url); pf->url = effective; }
             else free(effective);
         }
@@ -5098,6 +5167,68 @@ static void *pending_job_worker(void *arg) {
     return NULL;
 }
 
+// One persistent pass-through worker: runs queued jobs through the ordinary
+// pending_job_worker (which does all of a job's accounting and hand-back) on
+// this same thread, so its libcurl handle — and the proxy/origin connections
+// it holds open — survive from one request to the next.
+static void *fetch_pool_thread(void *arg) {
+    restream_server_t *server = (restream_server_t *)arg;
+    for (;;) {
+        pthread_mutex_lock(&server->fetch_mu);
+        server->fetch_idle++;
+        while (!server->fetch_head && !server->fetch_stop)
+            pthread_cond_wait(&server->fetch_cv, &server->fetch_mu);
+        server->fetch_idle--;
+        rs_pending_job *pf = server->fetch_head;
+        if (!pf) { pthread_mutex_unlock(&server->fetch_mu); break; }  // stopping, queue drained
+        server->fetch_head = pf->fetch_next;
+        if (!server->fetch_head) server->fetch_tail = NULL;
+        server->fetch_queued--;
+        pthread_mutex_unlock(&server->fetch_mu);
+        pf->fetch_next = NULL;
+        pending_job_worker(pf);
+    }
+    return NULL;
+}
+
+// Queues `pf` for a pooled worker when one is free or can be started. Returns
+// false when all RS_FETCH_POOL threads are busy: the caller then spawns a
+// one-off thread as before, so a burst never waits behind slow fetches — it
+// just loses connection reuse for the overflow.
+static bool fetch_pool_take(restream_server_t *server, rs_pending_job *pf) {
+    pthread_mutex_lock(&server->fetch_mu);
+    bool ok = false;
+    if (!server->fetch_stop) {
+        if (server->fetch_idle > server->fetch_queued) {
+            ok = true;
+        } else if (server->fetch_threads_n < RS_FETCH_POOL &&
+                   pthread_create(&server->fetch_threads[server->fetch_threads_n], NULL,
+                                  fetch_pool_thread, server) == 0) {
+            server->fetch_threads_n++;
+            ok = true;
+        }
+    }
+    if (ok) {
+        pf->fetch_next = NULL;
+        if (server->fetch_tail) server->fetch_tail->fetch_next = pf;
+        else server->fetch_head = pf;
+        server->fetch_tail = pf;
+        server->fetch_queued++;
+        pthread_cond_signal(&server->fetch_cv);
+    }
+    pthread_mutex_unlock(&server->fetch_mu);
+    return ok;
+}
+
+static void fetch_pool_stop(restream_server_t *server) {
+    pthread_mutex_lock(&server->fetch_mu);
+    server->fetch_stop = true;
+    pthread_cond_broadcast(&server->fetch_cv);
+    pthread_mutex_unlock(&server->fetch_mu);
+    for (int i = 0; i < server->fetch_threads_n; i++) pthread_join(server->fetch_threads[i], NULL);
+    server->fetch_threads_n = 0;
+}
+
 // Hands `pf` off to a worker thread. On success pf stays in pending_head until
 // the event loop builds the reply, the client closes, or shutdown drops it. On
 // failure the caller must free it. Fills pf->server/conn_id, so callers only
@@ -5117,6 +5248,8 @@ static bool pending_job_dispatch(restream_server_t *server, struct mg_connection
     server->pending_workers++;
     pthread_mutex_unlock(&server->pending_mu);
 
+    if ((pf->kind == RS_PENDING_PLAYLIST || pf->kind == RS_PENDING_ITEM) && fetch_pool_take(server, pf))
+        return true;
     pthread_t tid;
     if (pthread_create(&tid, NULL, pending_job_worker, pf) != 0) {
         pthread_mutex_lock(&server->pending_mu);
@@ -5275,12 +5408,58 @@ static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job 
         // time; drop_key also passes the media sequence used as the implicit IV.
         rewritten = rs_m3u8_rewrite(pf->body, pf->url, server_decrypts_hls,
                                     media_transform, &ctx);
+        if (rewritten) {
+            char *annotated = playlist_tag_durations(rewritten);
+            if (annotated) { rs_free(rewritten); rewritten = annotated; }
+        }
     }
     rs_drm_challenge_free(&drm);
     if (!rewritten) { reply_error(c, 500, "Out of memory rewriting the playlist."); return; }
     mg_http_reply(c, 200, RS_CORS_HEADERS "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n"
                           "Cache-Control: no-store\r\n", "%s", rewritten);
     rs_free(rewritten);
+}
+
+// Folds one fetched segment into its rendition's delivery speed: seconds of
+// media per second spent fetching it. Keyed by the segment's upstream
+// directory, because audio and video arrive from different playlists and the
+// player stalls on whichever is slower — averaging them would hide it.
+static void record_delivery_speed(restream_server_t *server, const rs_pending_job *pf) {
+    if (pf->media_seconds <= 0 || pf->fetch_seconds <= 0 || pf->is_map || pf->is_key) return;
+    if (!server->speed && !(server->speed = rs_json_new_obj())) return;
+    rs_json *per_stream = (rs_json *)rs_json_obj_get(server->speed, pf->stream_id);
+    if (!per_stream) {
+        rs_json_obj_set(server->speed, pf->stream_id, rs_json_new_obj());
+        per_stream = (rs_json *)rs_json_obj_get(server->speed, pf->stream_id);
+        if (!per_stream) return;
+    }
+    char dir[512];
+    const char *q = strchr(pf->url, '?');
+    size_t len = q ? (size_t)(q - pf->url) : strlen(pf->url);
+    while (len > 0 && pf->url[len - 1] != '/') len--;
+    snprintf(dir, sizeof(dir), "%.*s", (int)(len < sizeof(dir) - 1 ? len : sizeof(dir) - 1), pf->url);
+    double sample = pf->media_seconds / pf->fetch_seconds;
+    const rs_json *prev = rs_json_obj_get(per_stream, dir);
+    double r = prev ? 0.7 * rs_json_obj_num(prev, "r", sample) + 0.3 * sample : sample;
+    rs_json *entry = rs_json_new_obj();
+    rs_json_obj_set(entry, "r", rs_json_new_num(r));
+    rs_json_obj_set_int(entry, "t", (long long)time(NULL));
+    rs_json_obj_set(per_stream, dir, entry);
+}
+
+// The slowest rendition fetched in the last 30 seconds, or a negative value
+// when nothing was fetched recently (no viewer, or not a pass-through stream).
+static double stream_delivery_speed(restream_server_t *server, const char *stream_id) {
+    const rs_json *per_stream = rs_json_obj_get(server->speed, stream_id);
+    long long now = (long long)time(NULL);
+    double slowest = -1;
+    for (size_t i = 0; i < rs_json_obj_len(per_stream); i++) {
+        const rs_json *entry = rs_json_obj_value_at(per_stream, i);
+        if (now - (long long)rs_json_obj_num(entry, "t", 0) > 30) continue;
+        double r = rs_json_obj_num(entry, "r", -1);
+        if (r >= 0 && (slowest < 0 || r < slowest)) slowest = r;
+    }
+    return slowest;
 }
 
 static void pending_job_finish_item(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf) {
@@ -5298,6 +5477,7 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
     // proxy path's contribution to the inbound figure; the live engine reports
     // its own downloads through rs_live_drain_ingest.
     rs_metrics_record_input(server->metrics, pf->stream_id, (long long)pf->body_len);
+    record_delivery_speed(server, pf);
 
     if (pf->decrypt) {
         size_t new_len = 0;
@@ -5945,6 +6125,10 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     char *seq_str = query_var(hm, "seq");
     pf->seq = seq_str ? atoi(seq_str) : 0;
     free(seq_str);
+    char *dur_str = query_var(hm, "d");
+    pf->media_seconds = dur_str ? atof(dur_str) : 0;
+    if (!(pf->media_seconds > 0 && pf->media_seconds < 120)) pf->media_seconds = 0;
+    free(dur_str);
     pf->user_agent = header_dup(hm, "User-Agent");
     pf->client_ip = client_ip(server, c, hm);
     pf->playback_key_str = playback_key(hm);
@@ -7977,6 +8161,8 @@ restream_server_t* restream_server_create(void) {
     server->pending_workers = 0;
     pthread_mutex_init(&server->pending_mu, NULL);
     pthread_cond_init(&server->pending_cv, NULL);
+    pthread_mutex_init(&server->fetch_mu, NULL);
+    pthread_cond_init(&server->fetch_cv, NULL);
     pthread_mutex_init(&server->logo_mu, NULL);
     pthread_mutex_init(&server->log_mu, NULL);
     pthread_mutex_init(&server->webhook_mu, NULL);
@@ -8166,6 +8352,8 @@ void restream_server_destroy(restream_server_t* server) {
         // fetching, logging, or queueing mg_wakeup() against this server. Drain
         // them before freeing the mongoose manager and lifecycle locks.
         pending_job_wait_idle(server);
+        fetch_pool_stop(server);
+        rs_json_free(server->speed);
         mg_mgr_free(&server->mgr);
         // After mg_mgr_free: closing the connections closes their files,
         // which still report back to the gate.
@@ -8205,6 +8393,8 @@ void restream_server_destroy(restream_server_t* server) {
         free(server->debug_ring);
         pthread_mutex_destroy(&server->pending_mu);
         pthread_cond_destroy(&server->pending_cv);
+        pthread_mutex_destroy(&server->fetch_mu);
+        pthread_cond_destroy(&server->fetch_cv);
         pthread_mutex_destroy(&server->logo_mu);
         pthread_mutex_destroy(&server->log_mu);
         pthread_mutex_destroy(&server->webhook_mu);
