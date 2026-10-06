@@ -24,7 +24,7 @@ See [SCRIPTING.md](SCRIPTING.md) for the provider subprocess protocol.
 
 | Surface | Authentication |
 |---|---|
-| `/api/*` management | Panel username/password in an explicit HTTP Basic header, or a panel session cookie. |
+| `/api/*` management | Panel username/password in an explicit HTTP Basic header, `?auth=username:password` (or its base64) in the URL, or a panel session cookie. |
 | `/api/auth/*` | Public setup/login/status/logout routes, described below. |
 | Playback | Playback key in `?key=…` or `Authorization: Bearer …`. Open when no playback keys exist. |
 | Xtream | Playback key label as `username`, key value as `password`. |
@@ -40,6 +40,16 @@ checked per request, shares the login failure throttle, and creates no session.
 If an Authorization header is present, it takes precedence over cookies; invalid
 explicit credentials do not fall back to a cookie. Use HTTPS outside a trusted
 local environment.
+
+Where a client cannot set headers (a plain `EventSource`, a browser address
+bar), put the same credentials in the URL as `?auth=username:password`, or the
+base64 the Basic header would carry. It is checked exactly like the header and
+ignored when an Authorization header is present. URL credentials end up in
+browser history and proxy logs, so prefer the header where you can:
+
+```text
+http://your-server:1234/api/events?intervalMs=1000&auth=admin:password
+```
 
 ```sh
 base=http://127.0.0.1:8787

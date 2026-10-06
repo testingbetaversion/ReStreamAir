@@ -1079,6 +1079,24 @@ static char *current_user(restream_server_t *s, struct mg_connection *c,
                           struct mg_http_message *hm, int *retry_after) {
     if (retry_after) *retry_after = 0;
     char *authorization = header_dup(hm, "Authorization");
+    // ?auth= stands in for the header where a client can't set one (a plain
+    // EventSource, a browser address bar). It takes "user:pass" or the same
+    // base64 the Basic header carries, and goes through the identical check and
+    // throttle. It does end up in URLs, so history and proxy logs see it.
+    if (!authorization) {
+        char *q = query_var(hm, "auth");
+        if (q && q[0]) {
+            // Query decoding turns an unescaped base64 '+' into a space.
+            if (!strchr(q, ':')) for (char *p = q; *p; p++) if (*p == ' ') *p = '+';
+            char *b64 = strchr(q, ':') ? rs_base64_encode((const uint8_t *)q, strlen(q)) : NULL;
+            const char *encoded = b64 ? b64 : q;
+            size_t len = strlen(encoded) + 7;
+            authorization = (char *)malloc(len);
+            if (authorization) snprintf(authorization, len, "Basic %s", encoded);
+            rs_free(b64);
+        }
+        free(q);
+    }
     if (authorization) {
         char *username = NULL, *password = NULL;
         int parsed = rs_auth_parse_basic(authorization, &username, &password);
