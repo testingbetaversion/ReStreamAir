@@ -548,9 +548,17 @@ function applyRealtimeBadge(el, stream) {
   const known = typeof value === "number" && Number.isFinite(value);
   el.classList.toggle("hidden", !known);
   if (!known) return;
-  el.textContent = `${value >= 10 ? value.toFixed(0) : value.toFixed(1)}× realtime`;
-  el.classList.toggle("slow", value < 1);
-  el.classList.toggle("tight", value >= 1 && value < 1.3);
+  // The internal engine reports media published per second, which sits at
+  // ~1.0 when a live source is on time, so only a real deficit (the same
+  // 0.95 its fallingBehind warning uses) is flagged. Pass-through reports
+  // download speed, where 1.0 has no slack left.
+  const engine = stream.realtimeSource === "engine";
+  el.textContent = `${value >= 10 ? value.toFixed(0) : (engine ? value.toFixed(2) : value.toFixed(1))}× realtime`;
+  el.title = engine
+    ? "Media the engine publishes per second, slowest rendition, smoothed. About 1.00× means it keeps up with the live source; below 0.95× viewers will stall."
+    : "Media seconds delivered per second of downloading, slowest rendition, last 30 s. Below 1× viewers will buffer.";
+  el.classList.toggle("slow", engine ? value < 0.95 : value < 1);
+  el.classList.toggle("tight", !engine && value >= 1 && value < 1.3);
 }
 
 function findStreamById(id) {

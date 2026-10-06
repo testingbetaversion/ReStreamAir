@@ -1417,8 +1417,19 @@ static void inject_stream_metrics(restream_server_t *s, rs_json *view) {
                                 (long long)rs_metrics_input_bytes_per_sec(s->metrics, id));
             rs_json_obj_set_int(in, "allTimeBytes", rs_metrics_input_total_bytes(s->metrics, id));
             rs_json_obj_set(st, "inputBandwidth", in);
+            // Two different measurements under one name, told apart by
+            // realtimeSource: the internal engine reports media published per
+            // second (about 1.0 when on time), HLS pass-through reports how
+            // fast segments download versus their duration (often well above 1).
+            double engine_rt = rs_live_realtime(s->live, id);
             double speed = stream_delivery_speed(s, id);
-            if (speed >= 0) rs_json_obj_set(st, "realtime", rs_json_new_num(speed));
+            if (engine_rt >= 0) {
+                rs_json_obj_set(st, "realtime", rs_json_new_num(engine_rt));
+                rs_json_obj_set_str(st, "realtimeSource", "engine");
+            } else if (speed >= 0) {
+                rs_json_obj_set(st, "realtime", rs_json_new_num(speed));
+                rs_json_obj_set_str(st, "realtimeSource", "download");
+            }
         }
     }
 }

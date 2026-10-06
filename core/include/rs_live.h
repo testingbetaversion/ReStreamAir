@@ -347,6 +347,11 @@ uint8_t *rs_live_take_after(rs_live *live, const char *stream_id, int rep_index,
 // the inbound rate is the full bitrate of the stream.
 long long rs_live_drain_ingest(rs_live *live, const char *stream_id);
 
+// Media published per second of wall clock for the slowest running rendition,
+// smoothed over the last few reports; about 1.0 for a live source that is
+// keeping up. Negative when no rendition has reported recently.
+double rs_live_realtime(rs_live *live, const char *stream_id);
+
 // A one-line health summary for the logs/diagnostics ("video 12 segs, seq 431,
 // 3 disc; audio 12 segs …"). Caller frees with rs_free, or NULL if unknown.
 char *rs_live_status_line(rs_live *live, const char *stream_id);
