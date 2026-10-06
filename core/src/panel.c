@@ -421,6 +421,16 @@ static rs_json *key_view(const rs_json *key) {
     rs_json_obj_set_int(v, "requests", 0);
     rs_json_obj_set_int(v, "bytes", 0);
     rs_json_obj_set(v, "lastSeenAt", rs_json_new_null());
+    rs_json_obj_set(v, "api", rs_json_new_bool(rs_json_obj_bool(key, "api", false)));
+    double expires = rs_json_obj_num(key, "expiresAt", 0);
+    if (expires > 0) {
+        char *at = iso8601_from_apple(expires);
+        rs_json_obj_set_str(v, "expiresAt", at);
+        free(at);
+    } else {
+        rs_json_obj_set(v, "expiresAt", rs_json_new_null());
+    }
+    rs_json_obj_set(v, "expired", rs_json_new_bool(!rs_panel_key_active(key)));
     return v;
 }
 
@@ -1186,6 +1196,29 @@ int rs_panel_delete_user(rs_state *st, const char *id, const char **err) {
     return 0;
 }
 
+bool rs_panel_key_active(const rs_json *key) {
+    double expires = rs_json_obj_num(key, "expiresAt", 0);
+    return expires <= 0 || expires > apple_epoch_now();
+}
+
+// expiresInHours: absent leaves the expiry alone, 0 removes it, a positive
+// number of hours sets it that far from now.
+static int apply_key_options(rs_json *k, const rs_json *body, const char **err) {
+    const rs_json *hours = rs_json_obj_get(body, "expiresInHours");
+    if (hours) {
+        double h = rs_json_as_num(hours, -1);
+        if (rs_json_type_of(hours) != RS_JSON_NUM || h < 0 || h > 24.0 * 3650) {
+            *err = "expiresInHours must be 0 (never) or a number of hours up to ten years.";
+            return -400;
+        }
+        if (h == 0) rs_json_obj_remove(k, "expiresAt");
+        else rs_json_obj_set(k, "expiresAt", rs_json_new_num(apple_epoch_now() + h * 3600.0));
+    }
+    const rs_json *api = rs_json_obj_get(body, "api");
+    if (api) rs_json_obj_set(k, "api", rs_json_new_bool(rs_json_as_bool(api, false)));
+    return 0;
+}
+
 int rs_panel_create_key(rs_state *st, const rs_json *body, const char **err) {
     rs_json *keys = keys_array(st);
     const char *label = rs_json_obj_str(body, "label", "");
@@ -1213,9 +1246,42 @@ int rs_panel_create_key(rs_state *st, const rs_json *body, const char **err) {
     rs_json_obj_set_str(k, "key", key);
     rs_json_obj_set_str(k, "label", label);
     rs_json_obj_set(k, "createdAt", rs_json_new_num(apple_epoch_now()));
+    int rc = apply_key_options(k, body, err);
+    if (rc != 0) { rs_json_free(k); return rc; }
     rs_json_arr_push(keys, k);
-    (void)err;
     return 0;
+}
+
+int rs_panel_update_key(rs_state *st, const char *id, const rs_json *body, const char **err) {
+    rs_json *keys = keys_array(st);
+    for (size_t i = 0; i < rs_json_arr_len(keys); i++) {
+        rs_json *k = (rs_json *)rs_json_arr_at(keys, i);
+        if (strcmp(rs_json_obj_str(k, "id", ""), id ? id : "") != 0) continue;
+        const char *label = rs_json_obj_str(body, "label", NULL);
+        if (label) {
+            const char *trimmed = NULL;
+            size_t len = rs_trim(label, strlen(label), true, &trimmed);
+            if (len) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "%.*s", (int)(len < sizeof(buf) - 1 ? len : sizeof(buf) - 1), trimmed);
+                rs_json_obj_set_str(k, "label", buf);
+            }
+        }
+        return apply_key_options(k, body, err);
+    }
+    *err = "Key not found.";
+    return -404;
+}
+
+const rs_json *rs_panel_api_key(const rs_state *st, const char *provided_key) {
+    if (!provided_key || !provided_key[0]) return NULL;
+    const rs_json *keys = rs_json_obj_get(st->root, "apiKeys");
+    for (size_t i = 0; i < rs_json_arr_len(keys); i++) {
+        const rs_json *k = rs_json_arr_at(keys, i);
+        if (strcmp(rs_json_obj_str(k, "key", ""), provided_key) == 0)
+            return rs_json_obj_bool(k, "api", false) && rs_panel_key_active(k) ? k : NULL;
+    }
+    return NULL;
 }
 
 int rs_panel_delete_key(rs_state *st, const char *id, const char **err) {
@@ -1258,8 +1324,11 @@ bool rs_panel_playback_allowed(const rs_state *st, const char *provided_key) {
     size_t count = rs_json_arr_len(keys);
     if (count == 0) return true;  // no keys configured: playback is open
     if (!provided_key || !provided_key[0]) return false;
+    // An expired key is no key — and keys that have all expired leave playback
+    // closed, not open: the operator chose to require one.
     for (size_t i = 0; i < count; i++) {
-        if (strcmp(rs_json_obj_str(rs_json_arr_at(keys, i), "key", ""), provided_key) == 0) return true;
+        const rs_json *k = rs_json_arr_at(keys, i);
+        if (strcmp(rs_json_obj_str(k, "key", ""), provided_key) == 0) return rs_panel_key_active(k);
     }
     return false;
 }

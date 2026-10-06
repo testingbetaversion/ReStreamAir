@@ -501,8 +501,19 @@
             <div class="keys-body">
               <form id="keyForm" class="actions">
                 <input name="label" placeholder="Label / Xtream username (e.g. living-room)">
+                <select name="expiresInHours" aria-label="Key expiry" title="When this key stops working">
+                  <option value="0">Never expires</option>
+                  <option value="1">Expires in 1 hour</option>
+                  <option value="24">Expires in 1 day</option>
+                  <option value="168">Expires in 7 days</option>
+                  <option value="720">Expires in 30 days</option>
+                  <option value="2160">Expires in 90 days</option>
+                  <option value="8760">Expires in 1 year</option>
+                </select>
+                <label class="inline-check" title="Also lets this key read the playlists (/api/playlist.m3u8, per-provider playlists) and /api/events — read-only, nothing else in the API."><input type="checkbox" name="api">API access</label>
                 <button type="submit"><span data-icon="plus"></span>Generate key</button>
               </form>
+              <div class="field-hint">A key with API access authenticates with <code>Authorization: Bearer &lt;key&gt;</code> (preferred — it stays out of URLs and logs) or <code>?key=&lt;key&gt;</code>, and can only read playlists and monitoring events. An expired key stops working for playback, Xtream and the API.</div>
               <div class="field-hint">Xtream setup: server URL = this ReStreamAir address, username = key label, password = generated key. Live TV is supported; VOD, series and catch-up are currently empty.</div>
               <div id="keyList" class="key-list empty-state">No keys yet — playback is open to anyone on the network.</div>
             </div>
