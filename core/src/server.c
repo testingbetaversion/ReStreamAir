@@ -149,6 +149,10 @@ struct restream_server {
     // HLS pass-through delivery speed, poll thread only:
     // {streamId: {renditionDir: {"r": seconds of media per second of fetch, "t": unix s}}}
     rs_json *speed;
+    // Shared HLS pass-through segments, poll thread only: one upstream fetch
+    // per segment however many viewers ask for it (see seg_cache_serve).
+    struct rs_seg_entry *seg_cache;
+    size_t seg_cache_bytes;
     // Persistent workers for HLS pass-through fetches. A thread per request
     // threw its libcurl handle away with it, so every playlist and segment paid
     // a fresh TCP + TLS handshake to the proxy and again to the origin — over a
@@ -271,6 +275,12 @@ static void provider_maintenance(restream_server_t *s);
 static void backup_tick(restream_server_t *s);
 static double stream_delivery_speed(restream_server_t *server, const char *stream_id);
 static void speed_prune(restream_server_t *server);
+struct rs_seg_entry;
+static void seg_cache_complete(restream_server_t *server, rs_pending_job *fetch);
+static bool seg_cache_serve(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf);
+static void seg_cache_evict(restream_server_t *server, bool everything);
+static void record_delivery_speed(restream_server_t *server, const rs_pending_job *pf);
+static void pending_job_finish_item(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf);
 static int backup_now(restream_server_t *s, char *name, size_t name_cap);
 static int clear_provider_session(const char *provider_id);
 static bool provider_job_busy(restream_server_t *s, const rs_json *provider);
@@ -1809,6 +1819,7 @@ static void maintenance_tick(void *arg) {
     }
     backup_tick(s);
     speed_prune(s);
+    seg_cache_evict(s, false);
     rs_metrics_prune(s->metrics);  // expire stale clients/rate windows every tick
     collect_ingest(s);
     provider_maintenance(s);
@@ -3816,6 +3827,8 @@ struct rs_pending_job {
     struct rs_pending_job *fetch_next;  // server->fetch_head queue (pooled PLAYLIST/ITEM)
     double media_seconds;  // ITEM: the segment's EXTINF duration (?d=), 0 when unknown
     double fetch_seconds;  // ITEM: wall-clock time the upstream fetch took
+    char *shared_key;      // ITEM: set on the one shared upstream fetch for a cached segment
+    bool from_cache;       // ITEM: result copied from the shared fetch; upstream already counted
     char err[256];
 };
 
@@ -3825,7 +3838,7 @@ static void pending_job_free(rs_pending_job *pf) {
     free(pf->media_proxy); free(pf->media_headers);
     free(pf->range); free(pf->downloader); free(pf->downloader_params);
     free(pf->decryption_keys); free(pf->cenc_kid); free(pf->hls_key); free(pf->hls_iv);
-    free(pf->user_agent); free(pf->playback_key_str); free(pf->client_ip);
+    free(pf->user_agent); free(pf->playback_key_str); free(pf->client_ip); free(pf->shared_key);
     free(pf->source_base); free(pf->source_status); free(pf->source_relative);
     rs_json_free(pf->source_roots);
     rs_json_free(pf->source_headers);
@@ -5426,6 +5439,210 @@ static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job 
     rs_free(rewritten);
 }
 
+// --- shared pass-through segments ---------------------------------------------
+//
+// Every viewer of a pass-through stream used to fetch every segment itself, so
+// ten viewers cost ten upstream downloads of the same bytes through the proxy.
+// Now the first request for a segment starts one fetch; requests for it while
+// that fetch runs wait on it; requests after it completes are answered from
+// memory. Only the raw upstream bytes are shared — each viewer's reply is still
+// built (decrypted, counted, logged) by pending_job_finish_item as before.
+//
+// Bounded: an entry is dropped RS_SEG_CACHE_TTL seconds after its fetch
+// completes, and completed entries are evicted oldest-first past
+// RS_SEG_CACHE_MAX_BYTES. In-flight entries hold no body. Everything is freed
+// at shutdown. Poll thread only — no locking.
+
+#define RS_SEG_CACHE_TTL 60.0
+#define RS_SEG_CACHE_MAX_BYTES ((size_t)256 * 1024 * 1024)
+
+typedef struct rs_seg_entry {
+    struct rs_seg_entry *next;  // newest first
+    char *key;
+    bool done;
+    double done_at;             // seconds, now_ms()/1000
+    char *body;
+    size_t body_len;
+    long status;
+    char *content_type;
+    char *url;                  // effective upstream URL
+    rs_pending_job *waiters;    // linked through fetch_next
+} rs_seg_entry;
+
+static void seg_entry_free(restream_server_t *server, rs_seg_entry *e) {
+    if (e->done) server->seg_cache_bytes -= e->body_len;
+    while (e->waiters) {
+        rs_pending_job *w = e->waiters;
+        e->waiters = w->fetch_next;
+        pending_job_free(w);
+    }
+    free(e->key); free(e->body); free(e->content_type); free(e->url);
+    free(e);
+}
+
+static rs_seg_entry *seg_cache_find(restream_server_t *server, const char *key) {
+    for (rs_seg_entry *e = server->seg_cache; e; e = e->next)
+        if (strcmp(e->key, key) == 0) return e;
+    return NULL;
+}
+
+static void seg_cache_unlink(restream_server_t *server, rs_seg_entry *target) {
+    for (rs_seg_entry **link = &server->seg_cache; *link; link = &(*link)->next)
+        if (*link == target) { *link = target->next; return; }
+}
+
+// Expired entries always go; then the oldest completed ones until the cache is
+// back under its byte cap. `everything` empties it (shutdown).
+static void seg_cache_evict(restream_server_t *server, bool everything) {
+    double now = now_ms() / 1000.0;
+    for (rs_seg_entry **link = &server->seg_cache; *link;) {
+        rs_seg_entry *e = *link;
+        if (everything || (e->done && now - e->done_at > RS_SEG_CACHE_TTL)) {
+            *link = e->next;
+            seg_entry_free(server, e);
+        } else link = &e->next;
+    }
+    while (server->seg_cache_bytes > RS_SEG_CACHE_MAX_BYTES) {
+        rs_seg_entry *oldest = NULL;
+        for (rs_seg_entry *e = server->seg_cache; e; e = e->next)
+            if (e->done) oldest = e;  // list is newest first: the last done one is oldest
+        if (!oldest) break;
+        seg_cache_unlink(server, oldest);
+        seg_entry_free(server, oldest);
+    }
+}
+
+// A viewer connection still worth answering (not already closing).
+static struct mg_connection *open_conn_by_id(restream_server_t *server, unsigned long id) {
+    for (struct mg_connection *c = server->mgr.conns; c; c = c->next)
+        if (c->id == id && !c->is_closing) return c;
+    return NULL;
+}
+
+// Gives a viewer's job the shared result, as if its own fetch had returned it.
+static bool seg_result_into(rs_pending_job *w, const rs_seg_entry *e) {
+    char *body = (char *)malloc(e->body_len ? e->body_len : 1);
+    if (!body) return false;
+    if (e->body_len) memcpy(body, e->body, e->body_len);
+    free(w->body); w->body = body; w->body_len = e->body_len;
+    free(w->content_type); w->content_type = e->content_type ? rs_strdup(e->content_type) : NULL;
+    if (e->url) { free(w->url); w->url = rs_strdup(e->url); }
+    w->status = e->status;
+    w->rc = 0;
+    w->from_cache = true;
+    return true;
+}
+
+static void seg_cache_finish_waiter(restream_server_t *server, rs_pending_job *w) {
+    struct mg_connection *c = open_conn_by_id(server, w->conn_id);
+    if (c) pending_job_finish_item(server, c, w);
+    pending_job_free(w);
+}
+
+// Answers `pf` from the cache, queues it behind an in-flight fetch, or starts
+// that fetch. Returns false only when the shared fetch could not be started;
+// the caller then fetches for this viewer alone, exactly as before.
+static bool seg_cache_serve(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf) {
+    if (!server->c || !server->wakeup_ok) return false;
+    rs_buf kb = RS_BUF_INIT;
+    rs_buf_appendf(&kb, "%s\n%d%d\n%s", pf->stream_id, pf->is_map, pf->is_key, pf->url);
+    char *key = rs_buf_take(&kb);
+    if (!key) return false;
+    seg_cache_evict(server, false);
+    pf->server = server;
+    pf->conn_id = c->id;
+
+    rs_seg_entry *e = seg_cache_find(server, key);
+    if (e && e->done) {
+        free(key);
+        if (!seg_result_into(pf, e)) return false;
+        pending_job_finish_item(server, c, pf);
+        pending_job_free(pf);
+        return true;
+    }
+    if (e) {
+        free(key);
+        pf->fetch_next = e->waiters;  // order doesn't matter: all are answered together
+        e->waiters = pf;
+        return true;
+    }
+
+    rs_pending_job *fetch = (rs_pending_job *)calloc(1, sizeof(*fetch));
+    e = (rs_seg_entry *)calloc(1, sizeof(*e));
+    if (!fetch || !e) { free(fetch); free(e); free(key); return false; }
+    fetch->kind = RS_PENDING_ITEM;
+    fetch->stream_id = rs_strdup(pf->stream_id);
+    fetch->url = rs_strdup(pf->url);
+    fetch->proxy = pf->proxy ? rs_strdup(pf->proxy) : NULL;
+    fetch->headers = pf->headers ? rs_strdup(pf->headers) : NULL;
+    fetch->downloader = pf->downloader ? rs_strdup(pf->downloader) : NULL;
+    fetch->downloader_params = pf->downloader_params ? rs_strdup(pf->downloader_params) : NULL;
+    fetch->force_ipv6 = pf->force_ipv6;
+    fetch->rotate_proxies = pf->rotate_proxies;
+    fetch->source_policy = pf->source_policy;
+    fetch->is_map = pf->is_map;
+    fetch->is_key = pf->is_key;
+    fetch->media_seconds = pf->media_seconds;
+    fetch->shared_key = rs_strdup(key);
+    e->key = key;
+    e->waiters = pf;
+    pf->fetch_next = NULL;
+    e->next = server->seg_cache;
+    server->seg_cache = e;
+    if (!fetch->stream_id || !fetch->url || !fetch->shared_key ||
+        !pending_job_dispatch(server, server->c, fetch)) {
+        e->waiters = NULL;  // pf goes back to the caller
+        seg_cache_unlink(server, e);
+        seg_entry_free(server, e);
+        pending_job_free(fetch);
+        return false;
+    }
+    return true;
+}
+
+// The shared fetch finished (poll thread): keep the bytes and answer everyone
+// waiting. A failed fetch is not cached — each waiter gets the error, and the
+// next request for that segment tries again.
+static void seg_cache_complete(restream_server_t *server, rs_pending_job *fetch) {
+    rs_seg_entry *e = seg_cache_find(server, fetch->shared_key);
+    if (!e) return;  // cannot happen: in-flight entries are never evicted
+    bool ok = fetch->rc == 0 && fetch->body && (fetch->status == 0 || (fetch->status >= 200 && fetch->status < 300));
+    rs_pending_job *waiters = e->waiters;
+    e->waiters = NULL;
+    if (ok) {
+        // Counted once, here — not once per viewer — and before the fields
+        // below move out of `fetch`.
+        rs_metrics_record_input(server->metrics, fetch->stream_id, (long long)fetch->body_len);
+        record_delivery_speed(server, fetch);
+        e->done = true;
+        e->done_at = now_ms() / 1000.0;
+        e->body = fetch->body; fetch->body = NULL;
+        e->body_len = fetch->body_len;
+        e->content_type = fetch->content_type; fetch->content_type = NULL;
+        e->url = fetch->url; fetch->url = NULL;
+        e->status = fetch->status;
+        server->seg_cache_bytes += e->body_len;
+    } else {
+        log_record(server, fetch->stream_id, "error", fetch->is_map ? "downloadInit" : "downloadSegment",
+                   fetch->url, 0, -1, fetch->err[0] ? fetch->err : "fetch failed");
+        seg_cache_unlink(server, e);
+    }
+    while (waiters) {
+        rs_pending_job *w = waiters;
+        waiters = w->fetch_next;
+        w->fetch_next = NULL;
+        if (!ok || !seg_result_into(w, e)) {
+            struct mg_connection *c = open_conn_by_id(server, w->conn_id);
+            if (c) reply_error(c, 502, fetch->err[0] ? fetch->err : "Segment fetch failed.");
+            pending_job_free(w);
+            continue;
+        }
+        seg_cache_finish_waiter(server, w);
+    }
+    if (!ok) seg_entry_free(server, e);
+    else seg_cache_evict(server, false);
+}
+
 // Folds one fetched segment into its rendition's delivery speed: seconds of
 // media per second spent fetching it. Keyed by the segment's upstream
 // directory, because audio and video arrive from different playlists and the
@@ -5507,8 +5724,10 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
     // What came off the wire, before decryption changes the length. This is the
     // proxy path's contribution to the inbound figure; the live engine reports
     // its own downloads through rs_live_drain_ingest.
-    rs_metrics_record_input(server->metrics, pf->stream_id, (long long)pf->body_len);
-    record_delivery_speed(server, pf);
+    if (!pf->from_cache) {
+        rs_metrics_record_input(server->metrics, pf->stream_id, (long long)pf->body_len);
+        record_delivery_speed(server, pf);
+    }
 
     if (pf->decrypt) {
         size_t new_len = 0;
@@ -5885,6 +6104,14 @@ static void pending_job_finish(restream_server_t *server, struct mg_connection *
         return;
     }
 
+    // The shared fetch for a cached segment arrives on the listening
+    // connection, which has nothing to reply to: hand it to every viewer
+    // waiting on that segment instead.
+    if (pf->shared_key) {
+        seg_cache_complete(server, pf);
+        pending_job_free(pf);
+        return;
+    }
     if (pending_source_finish(server, c, pf)) return;
     switch (pf->kind) {
     case RS_PENDING_PLAYLIST: pending_job_finish_playlist(c, pf); break;
@@ -6133,6 +6360,14 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     // the requested slice — but never for a to-be-decrypted item: CENC needs the
     // whole segment, so a ranged fetch would corrupt it.
     pf->range = decrypt ? NULL : header_dup(hm, "Range");
+    // "bytes=0-" asks for the whole object (ffmpeg sends it on every request),
+    // so treat it as no range at all: answered with a plain 200, which HTTP
+    // allows, and shareable through the segment cache like any other.
+    if (pf->range) {
+        const char *r = pf->range;
+        while (*r == ' ') r++;
+        if (mg_casecmp(r, "bytes=0-") == 0) { free(pf->range); pf->range = NULL; }
+    }
     pf->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
     rs_provider_source_policy(provider, &pf->source_policy);
     pf->headers = effective_headers(provider, stream, is_key ? "hlsKeyHeaders" : "mediaHeaders");
@@ -6164,6 +6399,9 @@ static void serve_restream_item(restream_server_t *server, struct mg_connection 
     pf->client_ip = client_ip(server, c, hm);
     pf->playback_key_str = playback_key(hm);
 
+    // Whole-object requests share one upstream fetch per segment across every
+    // viewer. A ranged request asks for its own slice, so it goes on its own.
+    if (!pf->range && seg_cache_serve(server, c, pf)) return;
     if (!pending_job_dispatch(server, c, pf)) {
         pending_job_free(pf);
         reply_error(c, 502, "Segment fetch failed.");
@@ -8384,6 +8622,7 @@ void restream_server_destroy(restream_server_t* server) {
         // them before freeing the mongoose manager and lifecycle locks.
         pending_job_wait_idle(server);
         fetch_pool_stop(server);
+        seg_cache_evict(server, true);
         rs_json_free(server->speed);
         mg_mgr_free(&server->mgr);
         // After mg_mgr_free: closing the connections closes their files,
