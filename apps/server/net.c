@@ -312,7 +312,12 @@ static void ca_bundle_probe(void) {
 static void apply_ca_bundle(CURL *curl) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, ca_bundle_probe);
-    if (g_ca_bundle) curl_easy_setopt(curl, CURLOPT_CAINFO, g_ca_bundle);
+    if (!g_ca_bundle) return;
+    curl_easy_setopt(curl, CURLOPT_CAINFO, g_ca_bundle);
+    // An https:// proxy is verified separately and does not inherit CAINFO;
+    // without this it falls back to Alpine's compiled-in path and every fetch
+    // through the proxy fails with "Problem with the SSL CA cert".
+    curl_easy_setopt(curl, CURLOPT_PROXY_CAINFO, g_ca_bundle);
 }
 #else
 static void apply_ca_bundle(CURL *curl) { (void)curl; }
