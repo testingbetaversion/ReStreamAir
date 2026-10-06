@@ -4564,20 +4564,30 @@ static void stream_start_add_initparse_field(rs_drm_challenge *ch,
     }
 }
 
+// How one key-resolution attempt ended (see stream_start_resolve_all_keys).
+enum {
+    RS_KEYS_OK = 0,           // keys acquired, or cached keys already cover every KID
+    RS_KEYS_NOT_NEEDED = 1,   // the source carries no DRM
+    RS_KEYS_NO_MANIFEST = -1, // this URL could not be fetched; nothing was licensed
+    RS_KEYS_CDM_FAILED = -2,  // DRM found, but the cdm action gave no usable keys
+};
+#define RS_DRM_WIDEVINE 1u
+#define RS_DRM_PLAYREADY 2u
+
 // Asks the script for clear keys: scrape the manifest for every scrap of DRM
-// it advertises, give the `pssh` hook first refusal on the box, then run `cdm`.
-// Best-effort — any failure logs and leaves the keys the operator typed (which
-// may be none), because a start that aborts here just restart-loops.
-static void stream_start_resolve_keys(restream_server_t *server, const char *sid,
-                                      rs_stream_start *st, const char *manifest_url) {
+// it advertises, give the `pssh` hook first refusal on the box, then run `cdm`
+// as `cdm_type`. `*systems` reports which DRM systems the manifest carried a
+// PSSH for, so the caller can retry as the other one.
+static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
+                                     rs_stream_start *st, const char *manifest_url,
+                                     const char *cdm_type, unsigned *systems) {
+    *systems = 0;
     size_t text_len = 0;
     char *text = stream_start_fetch(st, manifest_url, &text_len);
     if (!text) {
-        // Nothing to inspect, so nothing to license. Start with whatever keys
-        // the stream already has; the engine reports the fetch failure itself.
         log_record(server, sid, "warn", "cdm", manifest_url, 0, -1,
-                   "could not fetch the manifest to check it for DRM — starting with the stored keys");
-        return;
+                   "could not fetch the manifest to check it for DRM");
+        return RS_KEYS_NO_MANIFEST;
     }
     log_recordf(server, sid, "debug", "cdm", manifest_url, 0, (long long)text_len,
                 "fetched the manifest for DRM discovery (%lu bytes)", (unsigned long)text_len);
@@ -4687,7 +4697,7 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
         rs_drm_challenge_free(&ch);
         free(text);
         free(variant_url);
-        return;
+        return RS_KEYS_NOT_NEEDED;
     } else {
         char *kid_list = ch.kids_count ? join_list(ch.kids, ch.kids_count, ", ") : NULL;
         log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
@@ -4717,8 +4727,10 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
         rs_drm_challenge_free(&ch);
         free(text);
         free(variant_url);
-        return;
+        return RS_KEYS_OK;
     }
+    if (ch.pssh_widevine) *systems |= RS_DRM_WIDEVINE;
+    if (ch.pssh_playready) *systems |= RS_DRM_PLAYREADY;
 
     // `pssh` hook: the script gets first refusal on the box we extracted and may
     // hand back a different one to license against. Only a real `pssh` box is
@@ -4726,9 +4738,9 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     // still wrapped in the protocol's b64: encoding, must not become the box we
     // ask for keys with.
     const char *selected_pssh = NULL;
-    if (strcasecmp(st->cdm_type, "widevine") == 0 && ch.pssh_widevine)
+    if (strcasecmp(cdm_type, "widevine") == 0 && ch.pssh_widevine)
         selected_pssh = ch.pssh_widevine;
-    else if (strcasecmp(st->cdm_type, "playready") == 0 && ch.pssh_playready)
+    else if (strcasecmp(cdm_type, "playready") == 0 && ch.pssh_playready)
         selected_pssh = ch.pssh_playready;
     else if (ch.pssh_all_count)
         selected_pssh = ch.pssh_all[0];
@@ -4781,7 +4793,7 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     int extra_n = 0;
     extra[extra_n++] = rs_script_arg("cdm", st->cdm_mode[0] ? st->cdm_mode : "external", false);
     extra[extra_n++] = rs_script_arg("challenge", "", false);
-    if (st->cdm_type[0]) extra[extra_n++] = rs_script_arg("cdmType", st->cdm_type, false);
+    if (cdm_type[0]) extra[extra_n++] = rs_script_arg("cdmType", cdm_type, false);
     if (ch.kids_count) {
         char *j = join_list(ch.kids, ch.kids_count, ",");
         extra[extra_n++] = rs_script_arg("kid", j, false);
@@ -4804,9 +4816,10 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     char *out = NULL;
     int rc = stream_start_run(server, sid, st, "cdm", extra, extra_n, 60.0, &out);
     for (int i = 0; i < extra_n; i++) free(extra[i]);
+    int result = RS_KEYS_CDM_FAILED;
     if (rc != 0) {
-        log_record(server, sid, "error", "cdm", NULL, rc, -1,
-                   "the cdm action exited non-zero — the protected stream will remain stopped");
+        log_recordf(server, sid, "error", "cdm", manifest_url, rc, -1,
+                    "the cdm action (%s) exited non-zero", cdm_type[0] ? cdm_type : "default");
         snprintf(st->err, sizeof(st->err), "The cdm action exited %d without usable keys.", rc);
     } else {
         char *pairs = rs_cdm_parse_key_output(out);
@@ -4821,6 +4834,7 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
             snprintf(st->err, sizeof(st->err),
                      "The cdm action did not return a key for every discovered KID.");
         } else if (pairs && pairs[0]) {
+            result = RS_KEYS_OK;
             free(st->keys);
             st->keys = pairs;
             size_t count = 1;
@@ -4846,6 +4860,67 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     rs_drm_challenge_free(&ch);
     free(text);
     free(variant_url);
+    return result;
+}
+
+// Keys for a protected start, trying every route before giving up: the session
+// URL and then each CDN mirror the manifest named, and for each, the configured
+// CDM type followed by any other DRM system that manifest carries a PSSH for.
+// The first attempt that yields keys (or shows there is no DRM) wins. Only when
+// a cdm action actually failed and nothing worked is the start refused; if no
+// manifest could be fetched at all, the start goes ahead on the stored keys and
+// the engine reports the fetch failure, as before.
+static void stream_start_resolve_all_keys(restream_server_t *server, const char *sid,
+                                          rs_stream_start *st, const char *source) {
+    const char *urls[64];
+    size_t nurls = 0;
+    urls[nurls++] = source;
+    for (size_t i = 0; i < rs_json_arr_len(st->cdn_urls) && nurls < 64; i++) {
+        const char *mirror = rs_json_as_str(rs_json_arr_at(st->cdn_urls, i), "");
+        bool seen = !mirror[0];
+        for (size_t j = 0; j < nurls && !seen; j++) seen = strcmp(urls[j], mirror) == 0;
+        if (!seen) urls[nurls++] = mirror;
+    }
+    static const char *const alternatives[] = {"widevine", "playready"};
+    static const unsigned alt_bits[] = {RS_DRM_WIDEVINE, RS_DRM_PLAYREADY};
+    int attempts = 0;
+    bool cdm_failed = false;
+    char last_err[sizeof(st->err)] = "";
+    for (size_t u = 0; u < nurls; u++) {
+        if (u > 0)
+            log_recordf(server, sid, "info", "cdnFallback", urls[u], 0, -1,
+                        "no keys yet — trying CDN %lu of %lu for DRM", (unsigned long)(u + 1),
+                        (unsigned long)nurls);
+        unsigned systems = 0;
+        st->err[0] = '\0';
+        int r = stream_start_resolve_keys(server, sid, st, urls[u], st->cdm_type, &systems);
+        if (r >= 0) { st->err[0] = '\0'; return; }
+        if (r == RS_KEYS_NO_MANIFEST) continue;
+        attempts++;
+        cdm_failed = true;
+        snprintf(last_err, sizeof(last_err), "%s", st->err);
+        for (size_t a = 0; a < 2; a++) {
+            if (!(systems & alt_bits[a]) || strcasecmp(st->cdm_type, alternatives[a]) == 0) continue;
+            log_recordf(server, sid, "info", "cdm", urls[u], 0, -1,
+                        "retrying the cdm action as %s", alternatives[a]);
+            st->err[0] = '\0';
+            r = stream_start_resolve_keys(server, sid, st, urls[u], alternatives[a], &systems);
+            if (r >= 0) { st->err[0] = '\0'; return; }
+            if (r != RS_KEYS_NO_MANIFEST) attempts++;
+            if (st->err[0]) snprintf(last_err, sizeof(last_err), "%s", st->err);
+        }
+    }
+    if (!cdm_failed) {
+        st->err[0] = '\0';
+        log_record(server, sid, "warn", "cdm", source, 0, -1,
+                   "no manifest could be fetched to check for DRM — starting with the stored keys");
+        return;
+    }
+    log_recordf(server, sid, "error", "cdm", NULL, 0, -1,
+                "no usable keys after %d cdm attempt(s) across %lu CDN(s) — the protected stream will remain stopped",
+                attempts, (unsigned long)nurls);
+    snprintf(st->err, sizeof(st->err), "No usable keys after %d cdm attempt(s) across %lu CDN(s): %s",
+             attempts, (unsigned long)nurls, last_err[0] ? last_err : "the cdm action failed");
 }
 
 static void stream_start_worker(restream_server_t *server, const char *sid, rs_stream_start *st) {
@@ -4876,7 +4951,7 @@ static void stream_start_worker(restream_server_t *server, const char *sid, rs_s
             return;
         }
     }
-    if (st->want_cdm && source && source[0]) stream_start_resolve_keys(server, sid, st, source);
+    if (st->want_cdm && source && source[0]) stream_start_resolve_all_keys(server, sid, st, source);
 }
 
 static rs_stream_start *stream_start_snapshot(const rs_json *provider, const rs_json *stream,
@@ -5923,9 +5998,22 @@ static void pending_job_finish_stream_start(restream_server_t *server, struct mg
     }
     const char *ignored = NULL;
     if (st->err[0]) {
+        // The manifest step may have succeeded before a later step (keys)
+        // failed. Its fresh URL and CDN list are still the right ones, so keep
+        // them on the stream — the panel shows them, and the next start and
+        // any manual retry begin from the current session, not a stale one.
+        if (st->manifest_applied) {
+            const char *apply_err = NULL;
+            rs_panel_apply_session_manifest(&server->state, pf->stream_id, st->manifest_url,
+                                            st->cdn_urls, st->cdn_headers, st->manifest_headers,
+                                            st->media_headers, st->heartbeat_seconds, &apply_err);
+        }
         // A session URL we could not refresh is fatal: there is nothing to
         // poll, and starting anyway would just restart-loop against a dead URL.
         rs_panel_set_stream_running(&server->state, pf->stream_id, false, &ignored);
+        if (st->manifest_applied && rs_state_save(&server->state) != 0)
+            log_record(server, "__panel__", "error", "streamStart", NULL, 0, -1,
+                       "could not save the session manifest of a failed start");
         log_recordf(server, "__panel__", "error", "streamStart", NULL, 0, -1,
                     "START of %s from %s failed: %s", pf->stream_id,
                     pf->client_ip ? pf->client_ip : "?", st->err);
