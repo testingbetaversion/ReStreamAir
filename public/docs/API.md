@@ -295,7 +295,7 @@ Both playlist routes also filter and can answer in JSON:
 | `type=event` / `channel` / `manual` | Only streams added that way (`manual` = created by hand). |
 | `running=1` | Only streams that are running. |
 | `q=<text>` | Only names containing the text, case-insensitive. |
-| `format=json` | `[{"name","url","provider","type","running","start","end"}]` instead of M3U; `start`/`end` (Unix seconds) only on events. |
+| `format=json` | `[{"name","url","logo","provider","type","running","start","end"}]` instead of M3U; `start`/`end` (Unix seconds) only on events. |
 
 For example, every event's name and playable link:
 
