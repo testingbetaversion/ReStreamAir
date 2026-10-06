@@ -76,6 +76,43 @@ static void check_str(const char *name, const char *actual, const char *expected
     }
 }
 
+// Provider "Default video" applied to an HLS master: first rule that keeps a
+// variant wins, I-frame variants follow it, and a rule that matches nothing
+// falls through instead of leaving the player with an empty master.
+static void test_m3u8_filter_master(void) {
+    const char *master =
+        "#EXTM3U\n"
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"pt\",URI=\"audio.m3u8\"\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=8400000,RESOLUTION=1920x1080,CODECS=\"avc1.640028,mp4a.40.2\",AUDIO=\"a\"\n"
+        "v1080.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1280x720,CODECS=\"avc1.64001f,mp4a.40.2\",AUDIO=\"a\"\n"
+        "v720.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=640x360,CODECS=\"avc1.4d401e,mp4a.40.2\",AUDIO=\"a\"\n"
+        "v360.m3u8\n"
+        "#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=300000,RESOLUTION=1920x1080,URI=\"i1080.m3u8\"\n"
+        "#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=100000,RESOLUTION=640x360,URI=\"i360.m3u8\"\n";
+    char *out = rs_m3u8_filter_master_video(master, "height<=720");
+    check("m3u8/filter: height<=720 drops 1080p", out && !strstr(out, "v1080.m3u8") && !strstr(out, "RESOLUTION=1920x1080"));
+    check("m3u8/filter: height<=720 keeps 720p and 360p", out && strstr(out, "v720.m3u8") && strstr(out, "v360.m3u8"));
+    check("m3u8/filter: keeps audio and i-frame under the cap", out && strstr(out, "audio.m3u8") && strstr(out, "i360.m3u8"));
+    rs_free(out);
+    out = rs_m3u8_filter_master_video(master, "height<=240,bandwidth<=2000000");
+    check("m3u8/filter: falls through to the next rule", out && strstr(out, "v360.m3u8") && !strstr(out, "v720.m3u8"));
+    rs_free(out);
+    out = rs_m3u8_filter_master_video(master, "height<=100");
+    check("m3u8/filter: nothing matches, nothing removed", out && strstr(out, "v1080.m3u8") && strstr(out, "v360.m3u8"));
+    rs_free(out);
+    out = rs_m3u8_filter_master_video(master, "worst");
+    check("m3u8/filter: worst keeps only the lowest", out && strstr(out, "v360.m3u8") && !strstr(out, "v720.m3u8"));
+    rs_free(out);
+    out = rs_m3u8_filter_master_video(master, "id=video_1");
+    check("m3u8/filter: dash-only rule is ignored", out && strstr(out, "v1080.m3u8"));
+    rs_free(out);
+    check("m3u8/filter: empty filter is a no-op", rs_m3u8_filter_master_video(master, "") == NULL);
+    check("m3u8/filter: media playlist is a no-op",
+          rs_m3u8_filter_master_video("#EXTM3U\n#EXTINF:5,\na.ts\n", "height<=720") == NULL);
+}
+
 static void test_metrics_connections(void) {
     rs_metrics *m = rs_metrics_create();
     rs_metrics_record(m, "stream-a", "shared-key", "10.0.0.1", "Player A", 1000);
@@ -2590,6 +2627,7 @@ int main(int argc, char **argv) {
     test_cdm_pssh();
     test_cenc_multifragment();
     test_mpegts();
+    test_m3u8_filter_master();
     test_metrics_connections();
     test_live_window();
     test_live_lag_level();

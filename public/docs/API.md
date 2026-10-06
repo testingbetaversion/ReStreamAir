@@ -362,7 +362,7 @@ backend behavior; pipeline-specific controls identify their scope in the schema.
 | `maxDownloadConcurrency` | Shared provider budget for manifest/media/probe downloaders; FFmpeg owns its internal connections. |
 | `detectJsonRedirect` | Follows recognized HTTP(S) JSON URL fields at the root or under `data`, at most five hops. Relative playlist paths resolve against the final URL. |
 | `defaultCdn` | Selects `Name`/`name` from the manifest script's `Cdn` list. An unmatched configured name fails visibly. |
-| `defaultVideo`, `defaultAudio` | Internal DASH ordered comma-separated preferences: `best`, `worst`, `id=ID`, `lang=ur`, `codec=avc`, `height<=720`, `bandwidth<=2000000`. Explicit stream selections win. |
+| `defaultVideo`, `defaultAudio` | Ordered comma-separated preferences: `best`, `worst`, `id=ID`, `lang=ur`, `codec=avc`, `height<=720`, `bandwidth<=2000000`. Internal DASH picks the first match. For HLS pass-through, `defaultVideo` limits the master playlist to the variants the first matching rule allows (`height<=720` hides everything above 720p; a rule matching nothing is skipped). Explicit stream selections win. |
 | `legacyDashParser` | Internal DASH XML recovery mode; default parsing is strict. |
 | `useDashDelay` | Honors MPD `suggestedPresentationDelay`, bounded to 120s, taking the larger of the source delay and stream/provider buffer. |
 | `ignoreDashStaticFlag` | Continues polling a static MPD. Otherwise a drained static source publishes ENDLIST. |

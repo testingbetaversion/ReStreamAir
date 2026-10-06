@@ -498,3 +498,124 @@ void rs_m3u8_probe_dispose(rs_m3u8_probe *probe) {
     free(probe->audio_tracks);
     memset(probe, 0, sizeof(*probe));
 }
+
+// --- variant limiting --------------------------------------------------------
+//
+// The provider's "Default video" rule list, applied to an HLS master: the same
+// first-match-wins preference list the DASH engine reads (height<=N,
+// bandwidth<=N, codec=X, best, worst), but as a filter on what the player may
+// choose rather than a single pick. Rules naming a DASH representation id or a
+// language say nothing about an HLS variant and are skipped.
+
+typedef struct {
+    size_t inf;   // line index of the #EXT-X-STREAM-INF or #EXT-X-I-FRAME-STREAM-INF tag
+    size_t uri;   // line index of the URI line (== inf for an I-frame tag)
+    int64_t height, bandwidth;
+    char *codecs;
+    bool iframe;
+} hls_variant_line;
+
+static bool variant_matches(const hls_variant_line *v, const char *rule, bool *usable) {
+    *usable = true;
+    if (!strncmp(rule, "height<=", 8)) return v->height > 0 && v->height <= strtoll(rule + 8, NULL, 10);
+    if (!strncmp(rule, "bandwidth<=", 11)) return v->bandwidth > 0 && v->bandwidth <= strtoll(rule + 11, NULL, 10);
+    if (!strncmp(rule, "codec=", 6)) return v->codecs && strstr(v->codecs, rule + 6);
+    if (!strcmp(rule, "best") || !strcmp(rule, "worst")) return true;
+    *usable = false;
+    return false;
+}
+
+char *rs_m3u8_filter_master_video(const char *text, const char *filter) {
+    if (!text || !filter || !filter[0] || !rs_m3u8_is_master(text)) return NULL;
+    lines l;
+    if (!split_lines(text, &l)) return NULL;
+
+    hls_variant_line *vars = (hls_variant_line *)calloc(l.count, sizeof(*vars));
+    bool *drop = (bool *)calloc(l.count, sizeof(bool));
+    char *rules = rs_strdup(filter);
+    char *out_text = NULL;
+    size_t nvars = 0, nplayable = 0;
+    if (!vars || !drop || !rules) goto done;
+
+    for (size_t i = 0; i < l.count; i++) {
+        slice t = slice_trimmed(l.items[i]);
+        bool iframe = slice_has_prefix(t, "#EXT-X-I-FRAME-STREAM-INF:");
+        if (!iframe && !slice_has_prefix(t, "#EXT-X-STREAM-INF:")) continue;
+        size_t uri = i;
+        if (!iframe) {
+            // The URI is the next non-blank, non-tag line.
+            for (uri = i + 1; uri < l.count; uri++) {
+                slice u = slice_trimmed(l.items[uri]);
+                if (u.len && u.ptr[0] != '#') break;
+            }
+            if (uri >= l.count) continue;
+        }
+        attrs a;
+        parse_attributes(t, &a);
+        int64_t width;
+        hls_variant_line *v = &vars[nvars++];
+        v->inf = i;
+        v->uri = uri;
+        v->iframe = iframe;
+        attr_resolution(&a, &width, &v->height);
+        v->bandwidth = attr_int(&a, "BANDWIDTH");
+        const char *codecs = attrs_get(&a, "CODECS");
+        v->codecs = codecs ? rs_strdup(codecs) : NULL;
+        attrs_dispose(&a);
+        if (!iframe) nplayable++;
+    }
+    if (!nplayable) goto done;
+
+    // First rule that keeps at least one playable variant wins.
+    for (char *rule = rules, *next; rule; rule = next) {
+        next = strchr(rule, ',');
+        if (next) *next++ = '\0';
+        while (*rule == ' ' || *rule == '\t') rule++;
+        char *end = rule + strlen(rule);
+        while (end > rule && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+        size_t kept = 0;
+        bool usable = false;
+        for (size_t k = 0; k < nvars; k++)
+            if (!vars[k].iframe && variant_matches(&vars[k], rule, &usable)) kept++;
+        if (!usable || !kept) continue;
+
+        bool best = !strcmp(rule, "best"), worst = !strcmp(rule, "worst");
+        int64_t pick = -1;
+        if (best || worst) {
+            for (size_t k = 0; k < nvars; k++) {
+                if (vars[k].iframe) continue;
+                if (pick < 0 || (best ? vars[k].bandwidth > pick : vars[k].bandwidth < pick)) pick = vars[k].bandwidth;
+            }
+        }
+        for (size_t k = 0; k < nvars; k++) {
+            bool keep;
+            if (best || worst) keep = !vars[k].iframe && vars[k].bandwidth == pick;
+            else keep = variant_matches(&vars[k], rule, &usable);
+            if (!keep) {
+                drop[vars[k].inf] = true;
+                drop[vars[k].uri] = true;
+            }
+        }
+        break;
+    }
+
+    {
+        rs_buf out = RS_BUF_INIT;
+        bool first = true;
+        for (size_t i = 0; i < l.count; i++) {
+            if (drop[i]) continue;
+            if (!first) rs_buf_append_char(&out, '\n');
+            rs_buf_append(&out, l.items[i].ptr, l.items[i].len);
+            first = false;
+        }
+        out_text = rs_buf_take(&out);
+    }
+
+done:
+    for (size_t k = 0; k < nvars; k++) free(vars[k].codecs);
+    free(vars);
+    free(drop);
+    free(rules);
+    lines_dispose(&l);
+    return out_text;
+}
