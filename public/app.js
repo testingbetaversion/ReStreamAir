@@ -1022,7 +1022,6 @@ function renderEditor() {
   if (form.elements.nm3u8dlreParams) {
     form.elements.nm3u8dlreParams.value = stream.nm3u8dlreParams || "";
   }
-  form.elements.useCdm.checked = Boolean(stream.useCdm);
   form.elements.sessionManifest.checked = Boolean(stream.sessionManifest);
   // null/absent override means "inherit the provider"; an array (even an empty
   // one) means this stream decides for itself.
@@ -1172,7 +1171,6 @@ function streamPayload() {
     outputTarget: form.elements.outputTarget.value,
     pipeCommand: form.elements.pipeCommand.value,
     nm3u8dlreParams: form.elements.nm3u8dlreParams?.value || "",
-    useCdm: form.elements.useCdm.checked,
     sessionManifest: form.elements.sessionManifest.checked,
     scriptOverride: form.elements.scriptOverride.value,
     scriptActionsOverride: $("#overrideScriptActions").checked
@@ -2720,25 +2718,24 @@ function logGroupHtml(group) {
 function logRowHtml(entry) {
   const time = new Date(entry.timestamp).toLocaleTimeString();
   if (logMode === "verbose") {
-    // entry.raw is JSON for worker log lines but plain text for script
-    // output (see logStore.record calls tagged "scriptOutput") — fall back
-    // to showing it as-is instead of letting JSON.parse throw and blank out
-    // the whole list over one non-JSON line.
-    let detail;
-    if (entry.raw) {
-      try {
-        detail = JSON.stringify(JSON.parse(entry.raw), null, 2);
-      } catch {
-        detail = entry.raw;
-      }
-    } else {
-      detail = JSON.stringify(entry, null, 2);
-    }
+    // Verbose: every field of the entry, laid out to read rather than as a
+    // JSON dump, with the server's debug-level detail (HTTP attempts with
+    // headers and timings, DRM discovery, playback requests) mixed in.
+    const facts = [];
+    if (entry.streamId) facts.push(["stream", entry.streamId]);
+    if (entry.status) facts.push(["status", String(entry.status)]);
+    if (entry.bytes !== undefined && entry.bytes >= 0) facts.push(["bytes", entry.bytes.toLocaleString()]);
+    if (entry.url) facts.push(["url", entry.url]);
+    const level = entry.level || "info";
     return `
-      <div class="log-row log-row-verbose ${entry.level === "error" ? "log-error" : ""}">
-        <span class="log-time">${time}</span>
-        <span class="log-event">${escapeHtml(entry.event)}</span>
-        <pre class="log-detail-verbose">${escapeHtml(detail)}</pre>
+      <div class="log-row log-row-verbose log-level-${escapeAttr(level)} ${level === "error" ? "log-error" : ""}">
+        <div class="log-verbose-head">
+          <span class="log-time">${new Date(entry.timestamp).toLocaleTimeString([], { hour12: false })}.${String(Math.floor(entry.timestamp % 1000)).padStart(3, "0")}</span>
+          <span class="log-level-badge">${escapeHtml(level)}</span>
+          <span class="log-event">${escapeHtml(entry.event)}</span>
+        </div>
+        ${facts.length ? `<dl class="log-facts">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(v)}</dd>`).join("")}</dl>` : ""}
+        ${entry.message ? `<pre class="log-detail-verbose">${escapeHtml(entry.message)}</pre>` : ""}
       </div>
     `;
   }
@@ -2776,9 +2773,19 @@ async function loadLogs() {
   $("#logStreamFilter").innerHTML = `<option value="">All streams</option>${panelOption}${options.join("")}${scriptOptions.join("")}`;
   $("#logLevelFilter").value = logLevelFilter;
   try {
-    const params = new URLSearchParams({ limit: "500" });
+    const params = new URLSearchParams({ limit: logMode === "verbose" ? "2000" : "500" });
     if (streamId) params.set("streamId", streamId);
+    // Asking for verbose also keeps the server recording debug detail for the
+    // next minute; the Logs refresh timer renews that while this view is open.
+    if (logMode === "verbose") params.set("verbose", "1");
     const result = await request(`/api/logs?${params.toString()}`);
+    const banner = $("#logVerboseBanner");
+    if (banner) {
+      banner.classList.toggle("hidden", logMode !== "verbose");
+      banner.textContent = result.verbose?.forced
+        ? "Verbose: the server was started with --verbose, so debug detail is always recorded."
+        : "Verbose: recording debug detail (every HTTP request with headers and timings, DRM discovery, playback requests) while this view is open. Recording stops a minute after you leave.";
+    }
 
     const allEntries = result.entries || [];
     const allGroups = groupLogEntries(allEntries);
@@ -3516,7 +3523,7 @@ $("#showDecryptionKeysBtn").addEventListener("click", () => {
 $("#showScriptingBtn").addEventListener("click", () => {
   const group = $("#scriptingGroup");
   group.classList.toggle("hidden");
-  if (!group.classList.contains("hidden")) $("#streamForm").elements.useCdm.focus();
+  if (!group.classList.contains("hidden")) $("#streamForm").elements.sessionManifest.focus();
 });
 $("#closeProviderSettingsBtn").addEventListener("click", closeProviderSettingsDialog);
 $("#providerSettingsDialog").addEventListener("click", (event) => {

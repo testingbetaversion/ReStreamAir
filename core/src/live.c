@@ -11,6 +11,7 @@
 //   6. the public API
 
 #include "rs_live.h"
+#include "restream.h"
 
 #include "rs_audio_delay.h"
 #include "rs_cenc.h"
@@ -892,6 +893,7 @@ static bool pend_has_waiting_locked(live_rep *rep) {
 // a slot free for every other rendition that has work.
 static void *download_main(void *arg) {
     live_stream *st = (live_stream *)arg;
+    restream_log_set_stream(st->id);
 
     for (;;) {
         pthread_mutex_lock(&st->mu);
@@ -1722,6 +1724,7 @@ static void commit_one(live_rep *rep, const cfg_snap *cfg, pend_item *it,
 static void *writer_main(void *arg) {
     live_rep *rep = (live_rep *)arg;
     live_stream *st = rep->owner;
+    restream_log_set_stream(st->id);  // file this thread's HTTP debug lines under the stream
 
     // Throughput accounting over a reporting window, not over a poll: the
     // number that decides whether playback survives is media published per
@@ -2231,6 +2234,7 @@ static void stream_stop_pool(live_stream *st) {
 
 static void *director_main(void *arg) {
     live_stream *st = (live_stream *)arg;
+    restream_log_set_stream(st->id);
     lg(st, "info", "liveStart", NULL, 0, -1, "live DASH engine started");
 
     size_t pool = stream_start_pool(st);

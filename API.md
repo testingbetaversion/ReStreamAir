@@ -229,7 +229,7 @@ if (wasRunning) await api(`/api/streams/${encodeURIComponent(stream.id)}/start`,
 |---|---|
 | `GET /api/state` | `200` full configuration view described below. |
 | `GET /api/events[?intervalMs=N]` | `200 text/event-stream`; monitoring snapshots, not configuration state or lifecycle notifications. See [EVENTS.md](EVENTS.md). |
-| `GET /api/logs[?streamId=ID&limit=150]` | `200 {"entries":[…],"availableDates":[]}`; newest first. |
+| `GET /api/logs[?streamId=ID&limit=150&verbose=1]` | `200 {"entries":[…],"availableDates":[]}`; newest first. `verbose=1` adds `debug` entries and a `verbose` object, and keeps debug capture on for 60 s ([verbose logging](EVENTS.md#verbose-debug-logging)). |
 | `DELETE /api/logs[?streamId=ID]` | Clear matching visible history, return the same log envelope. Omit ID to clear all logs. |
 | `GET /ping` | `200 {"status":"ok","build":"…"}`; binary build date/time, no authentication. |
 
@@ -258,7 +258,7 @@ PATCH operation, event replay cursor, or API version prefix. Tolerate additional
 fields and missing optional fields. Do not modify `state.json` while running.
 
 Log `limit` defaults to 150 for omitted/nonpositive values and is capped at
-20000. `streamId` omitted/empty means all, `__panel__` means management activity,
+40000 (20000 normal entries plus, with `verbose=1`, 20000 debug entries). `streamId` omitted/empty means all, `__panel__` means management activity,
 and `script:<providerId>` means provider-script output. These are exact filters;
 level, text and date filtering are client-side. See [log schema](EVENTS.md#logs).
 
@@ -412,7 +412,8 @@ across PUT; it is not writable through the ordinary editor route.
 | `cdnUrls` | HTTP(S) URL string array, `[]`. Invalid entries are dropped. |
 | `cdnHeaders` | Session output: per-CDN manifest/media headers keyed by manifest URL. Populated by the manifest script; preserved on editor saves. |
 | `directSource` | Boolean, `false`; redirect playback to source. |
-| `useCdm`, `sessionManifest` | Booleans, `false`; enable script key/session-manifest workflows. |
+| `sessionManifest` | Boolean, `false`; run the script's `manifest` action on every start for a fresh source. |
+| `useCdm` | Boolean, `false`. Legacy and no longer needed: DRM is detected on every start whenever the script declares `cdm` ([DRM on start](EVENTS.md#drm-on-start)). |
 | `scriptParams`, `scriptOverride` | Strings, `""`; flat `key=value` arguments and optional server-side script path override. |
 | `scriptActionsOverride` | `null` inherits provider actions; string array overrides them; `[]` disables all stream script actions. |
 | `heartbeatEnabled`, `heartbeatSeconds` | Boolean `true`; integer seconds default 0, minimum 0. Stored provider-session metadata, separate from SSE keepalives. No periodic heartbeat scheduler is wired in this C server. |
@@ -494,7 +495,9 @@ Actions must be declared by the provider or stream. Known actions and their
 inputs/outputs are in [SCRIPTING.md](SCRIPTING.md). `downloadinit` and
 `downloadmedia` are reserved and rejected. Direct `/script/run` does not
 recreate the complete playback pipeline. Start is the route that runs a session
-manifest, discovers DRM and obtains missing keys as necessary.
+manifest (if enabled), then, when `cdm` is declared, checks the manifest for
+DRM and runs `cdm` only for KIDs the stored keys do not cover. A clear manifest
+plays without `cdm`.
 
 A script's nonzero exit code may still return **HTTP 200** with `exitCode != 0`;
 check both HTTP status and exitCode. `channels`/`events` parse stdout and import
@@ -504,9 +507,12 @@ stored for the EPG route. This is a long-running HTTP request, not a `202` job
 with a job ID. While waiting, poll
 `/api/logs?streamId=script%3A<providerId>&limit=500` for progress.
 
-`events` catalogue imports are unrelated to `GET /api/events`. Imported event
-windows are metadata; they do not schedule recording or automatically start or
-stop a stream. See [scheduled event contract](EVENTS.md#scheduled-provider-events).
+`events` catalogue imports are unrelated to `GET /api/events`. Imported events
+are streams with `sourceType: "event"`. Provider options can refresh the
+catalogue periodically, autostart events inside their window and remove
+finished ones; recording is not implemented. See
+[what the server does with events](EVENTS.md#what-the-server-does-with-events)
+and [playing an event with authentication](EVENTS.md#playing-an-event-with-authentication).
 
 ## Accounts and playback keys
 

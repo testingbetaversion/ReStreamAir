@@ -13,6 +13,8 @@
 #include "rs_json.h"
 #include "rs_url.h"
 #include "rs_thread.h"
+#include "restream.h"
+#include <stdarg.h>
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
@@ -56,12 +58,91 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
     return incoming;
 }
 
-// Captures the Content-Range response header (libcurl has no getinfo for it).
+// --- verbose (debug) logging ---------------------------------------------------
+//
+// With verbose logging on, every attempt is logged in full: request headers,
+// proxy, response status and headers, and libcurl's timing breakdown. Secrets
+// in headers and proxy URLs are masked; everything else is shown as sent.
+
+static double net_now(void);
+
+static void dbg_appendf(http_buf *b, const char *fmt, ...) {
+    char tmp[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    size_t len = (size_t)n < sizeof(tmp) ? (size_t)n : sizeof(tmp) - 1;
+    if (b->len + len + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 1024;
+        while (cap < b->len + len + 1) cap *= 2;
+        char *grown = (char *)realloc(b->data, cap);
+        if (!grown) return;
+        b->data = grown;
+        b->cap = cap;
+    }
+    memcpy(b->data + b->len, tmp, len);
+    b->len += len;
+    b->data[b->len] = '\0';
+}
+
+static bool dbg_secret_header(const char *name, size_t len) {
+    static const char *const secret[] = {
+        "authorization", "proxy-authorization", "cookie", "set-cookie",
+        "x-api-key", "x-auth-token", "x-access-token",
+    };
+    for (size_t i = 0; i < sizeof(secret) / sizeof(secret[0]); i++)
+        if (strlen(secret[i]) == len && strncasecmp(name, secret[i], len) == 0) return true;
+    return false;
+}
+
+// Appends "  Name: value" lines from CRLF/LF-separated header text, masking
+// the values of credential-bearing headers.
+static void dbg_append_headers(http_buf *b, const char *headers) {
+    const char *p = headers;
+    while (p && *p) {
+        const char *eol = p + strcspn(p, "\r\n");
+        const char *line = p;
+        while (line < eol && (*line == ' ' || *line == '\t')) line++;
+        if (line < eol) {
+            const char *colon = memchr(line, ':', (size_t)(eol - line));
+            if (colon && dbg_secret_header(line, (size_t)(colon - line))) {
+                const char *v = colon + 1;
+                while (v < eol && *v == ' ') v++;
+                dbg_appendf(b, "  %.*s: <masked, %d chars>\n", (int)(colon - line), line, (int)(eol - v));
+            } else {
+                dbg_appendf(b, "  %.*s\n", (int)(eol - line), line);
+            }
+        }
+        p = eol;
+        while (*p == '\r' || *p == '\n') p++;
+    }
+}
+
+// "http://user:pass@host:port" -> "http://<masked>@host:port".
+static void dbg_append_proxy(http_buf *b, const char *proxy) {
+    const char *at = strrchr(proxy, '@');
+    const char *scheme = strstr(proxy, "://");
+    if (at) dbg_appendf(b, "proxy: %.*s<masked>%s\n",
+                        scheme && scheme < at ? (int)(scheme + 3 - proxy) : 0, proxy, at);
+    else dbg_appendf(b, "proxy: %s\n", proxy);
+}
+
+typedef struct {
+    char **content_range;  // NULL when the caller did not ask for it
+    http_buf *headers;     // NULL unless verbose logging is on
+} header_sink;
+
+// Captures the Content-Range response header (libcurl has no getinfo for it),
+// and every response header line when verbose logging wants them.
 static size_t header_cb(char *buffer, size_t size, size_t nitems, void *userdata) {
-    char **content_range = (char **)userdata;
+    header_sink *sink = (header_sink *)userdata;
     size_t len = size * nitems;
+    if (sink->headers && sink->headers->len < 16384) dbg_appendf(sink->headers, "%.*s", (int)len, buffer);
+    char **content_range = sink->content_range;
     const char *prefix = "content-range:";
-    if (len > strlen(prefix) && strncasecmp(buffer, prefix, strlen(prefix)) == 0) {
+    if (content_range && len > strlen(prefix) && strncasecmp(buffer, prefix, strlen(prefix)) == 0) {
         const char *value = buffer + strlen(prefix);
         size_t vlen = len - strlen(prefix);
         while (vlen > 0 && (*value == ' ' || *value == '\t')) { value++; vlen--; }
@@ -334,6 +415,52 @@ static char *net_token(char **cursor, const char *delimiters) {
 
 // One transfer on the calling thread's handle. `force_http11` is set by the
 // caller when retrying after an HTTP/2 framing error.
+static void log_attempt(CURL *curl, const char *url, const char *proxy, const char *headers,
+                        const char *range, bool force_http11, CURLcode rc,
+                        const http_buf *response_headers, size_t body_len) {
+    http_buf m = {NULL, 0, 0};
+    long code = 0, version = 0, redirects = 0, connects = 0;
+    curl_off_t dns = 0, connect = 0, tls = 0, ttfb = 0, total = 0;
+    char *ip = NULL, *eff = NULL;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &version);
+    curl_easy_getinfo(curl, CURLINFO_REDIRECT_COUNT, &redirects);
+    curl_easy_getinfo(curl, CURLINFO_NUM_CONNECTS, &connects);
+    curl_easy_getinfo(curl, CURLINFO_NAMELOOKUP_TIME_T, &dns);
+    curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME_T, &connect);
+    curl_easy_getinfo(curl, CURLINFO_APPCONNECT_TIME_T, &tls);
+    curl_easy_getinfo(curl, CURLINFO_STARTTRANSFER_TIME_T, &ttfb);
+    curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME_T, &total);
+    curl_easy_getinfo(curl, CURLINFO_PRIMARY_IP, &ip);
+    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff);
+    const char *ver = version == CURL_HTTP_VERSION_1_0 ? "HTTP/1.0"
+                    : version == CURL_HTTP_VERSION_1_1 ? "HTTP/1.1"
+                    : version == CURL_HTTP_VERSION_2_0 ? "HTTP/2" : "HTTP";
+    dbg_appendf(&m, "GET %s\n", url);
+    if (range && range[0]) dbg_appendf(&m, "range: %s\n", range);
+    if (proxy && proxy[0]) dbg_append_proxy(&m, proxy);
+    if (force_http11) dbg_appendf(&m, "forced HTTP/1.1 (host refused HTTP/2 earlier)\n");
+    dbg_appendf(&m, "request headers:\n  User-Agent: ReStreamAir/1.0 (unless overridden below)\n");
+    if (headers && headers[0]) dbg_append_headers(&m, headers);
+    if (rc != CURLE_OK)
+        dbg_appendf(&m, "result: %s (curl error %d)\n", curl_easy_strerror(rc), (int)rc);
+    else
+        dbg_appendf(&m, "result: %s %ld, %lu body bytes\n", ver, code, (unsigned long)body_len);
+    if (eff && strcmp(eff, url) != 0) dbg_appendf(&m, "final URL after %ld redirect(s): %s\n", redirects, eff);
+    dbg_appendf(&m, "remote: %s, %s connection\n", ip && ip[0] ? ip : "?", connects ? "new" : "reused");
+    dbg_appendf(&m, "timing (ms): dns %.1f, connect %.1f, tls %.1f, first byte %.1f, total %.1f\n",
+                (double)dns / 1000.0, (double)connect / 1000.0, (double)tls / 1000.0,
+                (double)ttfb / 1000.0, (double)total / 1000.0);
+    if (response_headers && response_headers->len) {
+        dbg_appendf(&m, "response headers:\n");
+        dbg_append_headers(&m, response_headers->data);
+    }
+    if (m.len && m.data[m.len - 1] == '\n') m.data[--m.len] = '\0';
+    restream_debug_log("httpFetch", url, code, rc == CURLE_OK ? (long long)body_len : -1,
+                       m.data ? m.data : url);
+    free(m.data);
+}
+
 static int fetch_once(CURL *curl, const char *url, const char *proxy, const char *headers,
                       const char *range, bool force_http11, int force_ipv6, long timeout_ms,
                       int (*should_cancel)(void *, size_t), void *cancel_ctx,
@@ -416,12 +543,22 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
         curl_easy_setopt(curl, CURLOPT_RANGE, spec);
     }
     char *captured_range = NULL;
-    if (content_range) {
+    bool debug = restream_debug_enabled();
+    http_buf response_headers = {NULL, 0, 0};
+    header_sink sink = {content_range ? &captured_range : NULL, debug ? &response_headers : NULL};
+    if (content_range || debug) {
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
-        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &captured_range);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &sink);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, NULL);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, NULL);
     }
 
     CURLcode rc = curl_easy_perform(curl);
+    if (debug) {
+        log_attempt(curl, url, proxy, headers, range, force_http11, rc, &response_headers, buf.len);
+        free(response_headers.data);
+    }
     if (active_policy && active_policy->use_cookies) {
         curl_easy_setopt(curl, CURLOPT_COOKIELIST, "FLUSH");
         curl_easy_setopt(curl, CURLOPT_COOKIEJAR, NULL);
@@ -823,8 +960,23 @@ static int fetch_through_one_proxy(const char *url, const char *proxy,
         internal = true;
     if (active_policy && active_policy->use_cookies) internal = true;
     if (!internal) {
+        double started = restream_debug_enabled() ? net_now() : 0;
         int rc = fetch_external(downloader, dl_params, url, proxy, headers, range, force_ipv6,
                                 out, out_len, status, content_type, content_range, effective_url, errbuf, errbuf_len);
+        if (started > 0) {
+            http_buf m = {NULL, 0, 0};
+            dbg_appendf(&m, "GET %s via %s%s%s\n", url, downloader,
+                        dl_params && dl_params[0] ? " " : "", dl_params ? dl_params : "");
+            if (range && range[0]) dbg_appendf(&m, "range: %s\n", range);
+            if (proxy && proxy[0]) dbg_append_proxy(&m, proxy);
+            if (headers && headers[0]) { dbg_appendf(&m, "request headers:\n"); dbg_append_headers(&m, headers); }
+            if (rc == -2) dbg_appendf(&m, "result: %s is not installed, falling back to libcurl", downloader);
+            else if (rc != 0) dbg_appendf(&m, "result: failed: %s", errbuf);
+            else dbg_appendf(&m, "result: HTTP %ld, %lu bytes", status ? *status : 0L, (unsigned long)*out_len);
+            dbg_appendf(&m, "\ntotal %.1f ms", (net_now() - started) * 1000.0);
+            restream_debug_log("httpFetch", url, status ? *status : 0, rc == 0 ? (long long)*out_len : -1, m.data);
+            free(m.data);
+        }
         if (rc != -2) return rc;  // -2 = tool missing → fall through to libcurl
     }
     return fetch_libcurl(url, proxy, headers, range, force_ipv6, out, out_len, status, content_type,

@@ -266,7 +266,8 @@ where possible; browser/proxy concurrent-connection limits still apply.
 }
 ```
 
-`timestamp` is Unix epoch **milliseconds**. `level` is `info` or `error`;
+`timestamp` is Unix epoch **milliseconds**. `level` is `info`, `warn`, `error`,
+or `debug` (verbose only, below);
 `streamId` and `event` are strings. `message`, `url`, `status`, `bytes` are
 optional. `status` is usually an HTTP status, but script/installer events may
 use it for a process result; zero is omitted. `bytes` is omitted when no count
@@ -286,6 +287,33 @@ empty. `DELETE /api/logs?streamId=…` hides previous history for that ID;
 | Real stream ID | That stream's engine/playback activity and startup script work. |
 | `script:<providerId>` | Direct provider script calls and catalogue imports. |
 | `ffmpeg-install` | Installer start/output/exit. |
+
+### Verbose (debug) logging
+
+`GET /api/logs?verbose=1` also returns `debug` entries, merged into the same
+newest-first list, plus `"verbose":{"active":true,"forced":false}`. Debug
+entries are only **recorded** while verbose logging is on:
+
+- **Panel / API:** each `verbose=1` read turns it on for the next 60 seconds.
+  The Logs view's *Verbose* mode re-reads every few seconds, so capture runs
+  while that view is open and stops about a minute after it is closed.
+- **`--verbose`:** always on (`forced: true`), together with mongoose's own
+  trace output on stderr.
+
+Debug entries go to their own 20000-entry ring, so they never push normal
+entries out, and they never trigger webhooks. With `verbose=1`, `limit` may be
+up to 40000. What is added:
+
+| Event | Detail (in `message`) |
+|---|---|
+| `httpFetch` | One per upstream HTTP attempt, filed under the stream it was made for: URL, range, proxy, request headers, HTTP version and status, body bytes, final URL after redirects, remote IP, new or reused connection, timings (DNS, connect, TLS, first byte, total) and response headers. External downloaders (curl/wget/aria2) log the tool, result and total time. |
+| `playRequest` | One per playback request: method and path, client IP, player User-Agent, Range, and how it authenticated (`?key=`, Bearer, none, internal feed) → allowed/rejected. |
+| `cdm` | DRM discovery: manifest size, every PSSH box (base64) and which system it belongs to, key URIs, and which KIDs the CDM returned. |
+
+Values of `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`,
+`X-Api-Key`, `X-Auth-Token` and `X-Access-Token` headers, proxy passwords,
+playback keys and clear key values are masked in debug entries. Script
+stdout/stderr (`scriptOutput`) is still logged as is, at any level.
 
 ### Event name reference
 
@@ -315,6 +343,10 @@ individual events may be info or error depending on the outcome.
 | `directOpen`, `directSlow`, `download` | fMP4 direct playback or buffered downloads. |
 | `tsOpen`, `tsMuxTrack`, `tsMuxReady`, `tsMuxStalled`, `tsMuxRecovered`, `tsResync` | Continuous MPEG-TS muxing and recovery. |
 | `webhookDelivery` | Background webhook delivery failure; does not recursively trigger another webhook. |
+| `scheduledStart`, `scheduledRestart`, `providerRestart`, `eventRemoved` | Provider scheduler: autostart, timed restart, restart policy, finished-event cleanup. |
+| `fileQueueFull`, `fileOpenTimeout` | Served-file limits: requests answered 503 because too many files were open, and viewers disconnected for holding a file too long (see `--max-open-files`). |
+| `verboseLogging` | Verbose (debug) capture switched on. |
+| `httpFetch`, `playRequest` | Debug only; see [Verbose logging](#verbose-debug-logging). |
 
 Logs may contain source URLs, headers, provider credentials and subprocess
 output. Give management read access only to trusted operators.
@@ -349,7 +381,7 @@ The provider script prints an object containing an `Events` array to stdout:
 | `ScriptParams` | `scriptParams`; flat `key=value` arguments passed to stream actions. |
 | `ManifestScript` | Legacy alias for ScriptParams; ScriptParams wins if both exist. |
 | `SessionManifest` | `sessionManifest`, boolean default false. |
-| `UseCdm`, `CdmType` | `useCdm` boolean false, `cdmType` string empty by default. |
+| `UseCdm`, `CdmType` | `useCdm` boolean false (legacy: DRM is now detected automatically, see below), `cdmType` string empty by default. |
 | `Video`, `Audio` | `scriptVideoSelector`, `scriptAudioSelector` strings. |
 | `OnDemand`, `SpeedUp`, `Autostart`, `RecordEvent` | Corresponding lower-camel-case booleans, default false. |
 | `Start`, `End` | `scriptStart`, `scriptEnd`: numeric Unix epoch **seconds**, or null if omitted/nonnumeric. |
@@ -364,12 +396,112 @@ a session-manifest script or edit the source URL before starting playback.
 Arbitrary extra catalogue fields, including a direct `Url`, are not an editor
 settings replacement.
 
-These fields are stored/displayed metadata. The C server does not schedule
-Start/Stop from the event window, automatically record `RecordEvent`, or run a
-periodic provider-event import. An external scheduler should call the import,
-select `state.providers[].streams` with `sourceType === "event"`, interpret the
-seconds-based time window, and invoke the normal Start/Stop routes as needed.
-SSE/Logs refresh settings do not trigger catalogue imports.
+### What the server does with events
+
+Events are ordinary streams with `sourceType: "event"`, so everything that
+works for a channel works for an event. On top of that, these provider options
+(Provider settings → *Behaviour* and *Events and timing*, or the provider's
+`options` object over the API) run on the server's one-second maintenance
+timer, with or without the panel open:
+
+| Provider option | Effect |
+|---|---|
+| `autoRefreshEvents` + `eventsRefreshSeconds` (default 3600) | Re-runs the `events` action every period and re-imports its output. Requires a provider script that declares `events`. Skipped while another script job for the provider is running. |
+| `maxEventsCount` | Caps how many valid events one import processes (0 = unlimited). |
+| `reuseEventIndex` | A new event may take over the stream ID of a stopped, ended event, so a player's saved URL keeps working. The old source and keys are cleared. |
+| `sequentialAutostartPeriodSeconds`, `randomAutostartPeriodSeconds` | Every period, start one stopped stream that has `autostart: true` **and** is inside its window (`scriptStart <= now < scriptEnd`; a missing bound is open). Sequential walks the provider in order; random picks one. |
+| `autoRemoveFinishedEvents` | Once `scriptEnd` has passed, stop the event and delete it. Events without an end are kept. |
+| `autoRestartPeriodSeconds`, `restartDelaySeconds`, `noRestartOnError`, `restartFinishedBroadcast` | The usual restart policy, applied to running events like any other stream. |
+
+Not done automatically: starting an event at exactly `scriptStart` (autostart
+runs on its period, so set a short period such as 60 s if that matters),
+stopping one at `scriptEnd` without deleting it, and `RecordEvent` recording.
+An external scheduler can do those with the normal start/stop routes.
+
+Scheduler activity is logged as `scheduledStart`, `scheduledRestart`,
+`providerRestart` and `eventRemoved`; imports as `scriptImport` under
+`script:<providerId>`.
+
+### Playing an event, with authentication
+
+Two separate credentials are involved:
+
+- **Panel account** (username/password): management API calls such as
+  importing and starting. Viewers can read; only admins can start/stop.
+- **Playback key**: needed by the player for `/play/…`, `/restream/…`,
+  `/direct/…`, `/download/…` and Xtream. Playback is open to anyone until the
+  first key is created, so create one before exposing the server.
+
+```sh
+base=http://127.0.0.1:8787
+auth='admin:your-panel-password'          # panel account, HTTP Basic
+pid=prov_example                          # provider ID from /api/state
+
+# 1. Import (or refresh) the event catalogue from the provider script.
+curl --fail-with-body --user "$auth" -X POST "$base/api/providers/$pid/script/events"
+
+# 2. List the imported events with their window (epoch seconds).
+curl -s --user "$auth" "$base/api/state" | jq -r --arg pid "$pid" '
+  .providers[] | select(.id == $pid) | .streams[]
+  | select(.sourceType == "event")
+  | [.id, .name, .scriptStart, .scriptEnd, .status] | @tsv'
+
+# 3. Start one. With a session-manifest script this runs `manifest`; if the
+#    script declares `cdm`, the server then checks the manifest for DRM and
+#    gets keys (see "DRM on start" below). The reply comes when it is ready.
+sid=stream_example
+curl --fail-with-body --user "$auth" -X POST "$base/api/streams/$sid/start"
+
+# 4. Create a playback key once (admin), and note its "key" value.
+curl --fail-with-body --user "$auth" -H 'Content-Type: application/json' \
+  -d '{"label":"living-room"}' "$base/api/keys"
+key=the-generated-key
+```
+
+The player then uses any one of these forms; all use the same key:
+
+| Player | URL / credentials |
+|---|---|
+| Any HLS player (VLC, mpv, IPTV app, Safari) | `$base/play/$sid/index.m3u8?key=$key` — the key is carried into every rewritten child playlist and segment URL. |
+| Player that can send headers (hls.js, ffmpeg, curl) | `$base/play/$sid/index.m3u8` with `Authorization: Bearer $key` on **every** request, child playlists and segments included. |
+| Xtream Codes app | Server `$base`, username = the key's **label** (`living-room`), password = the key. Events appear in the live list under their provider's category. |
+| M3U playlist | `$base/get.php?username=living-room&password=$key&type=m3u_plus&output=m3u8` |
+
+```sh
+# Check it plays: expect 200 and an #EXTM3U playlist. A 503 with Retry-After
+# means the first segments are still buffering — players retry by themselves.
+curl -i "$base/play/$sid/index.m3u8?key=$key"
+ffplay -headers "Authorization: Bearer $key"$'\r\n' "$base/play/$sid/index.m3u8"
+```
+
+Responses to expect: `401` = missing or wrong playback key (logged as
+`playbackDenied` under `__panel__`); `404` = stream stopped or unknown, so
+start it first or enable autostart; `503` + `Retry-After` = warming up.
+
+Browser players (hls.js) that use Bearer headers need `xhrSetup` to add the
+header to every request; the `?key=` form needs nothing extra. See
+[API.md → Playback and Xtream](API.md#playback-and-xtream).
+
+### DRM on start
+
+If the stream's script (provider script or per-stream override) declares a
+`cdm` action, **every** start checks the source for DRM. You don't need to set
+anything per stream:
+
+1. `manifest` runs first if the stream uses a session manifest, giving a fresh URL.
+2. The server fetches that manifest and looks for DRM in it, in its first HLS
+   media playlist and in the init segment: Widevine/PlayReady PSSH boxes,
+   `default_KID`s and HLS key URIs.
+3. If there is no DRM, the stream starts as is (logged as `cdm`: *no DRM in
+   the manifest … playing without the CDM*).
+4. If there is DRM and the stored keys already cover every KID, they are reused.
+   Otherwise `cdm` runs with `kid=`, `pssh=`, `psshAll=`, `psshWidevine=`,
+   `psshPlayReady=`, `keyUri=` and `cdmType=`. The returned keys are stored, then
+   the stream starts.
+
+If `cdm` fails or does not cover every KID, the start fails with that reason.
+The legacy `useCdm` / `UseCdm` flag is no longer needed and is ignored for this
+decision. The script protocol is in [SCRIPTING.md](SCRIPTING.md).
 
 ## Outgoing error webhooks
 

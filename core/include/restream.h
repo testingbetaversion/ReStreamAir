@@ -69,6 +69,20 @@ const char* restream_server_stored_bind(const restream_server_t* server);
 // false, the default once main sets it) or restores the full trace (true).
 void restream_server_set_verbose(bool verbose);
 
+// Verbose (debug-level) logging. Debug entries are recorded only while verbose
+// logging is on — always with --verbose, otherwise while someone has the Logs
+// view's Verbose mode open (GET /api/logs?verbose=1) — and go to a ring of their
+// own so they never push normal entries out.
+//
+// restream_log_set_stream names the stream the calling thread is working for;
+// later restream_debug_log calls on that thread are filed under it ("" or NULL
+// files them under the panel). restream_debug_enabled is a cheap check to skip
+// building a message nobody will see. All three are thread-safe.
+void restream_log_set_stream(const char *stream_id);
+bool restream_debug_enabled(void);
+void restream_debug_log(const char *event, const char *url, long status, long long bytes,
+                        const char *message);
+
 // Bounds on the files the server holds open while viewers download them
 // (segments, playlists, panel assets). At most `max_open` are open at once and
 // further requests wait in a queue for up to `queue_timeout_s` before a 503;

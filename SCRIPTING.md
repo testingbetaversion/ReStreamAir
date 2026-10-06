@@ -235,13 +235,15 @@ The server stores the heartbeat interval but does not run a periodic heartbeat s
 | `initparse` | `url`, `init` (plain base64 of the init segment, no `b64:` prefix) | JSON with any of `kid`/`kids` and `pssh`/`psshAll`/`psshWidevine`/`psshPlayReady`, each a string or an array. |
 | `cdm` | KIDs, PSSH values, key URI, CDM type | Clear keys as `KID:KEY` lines or JSON. |
 
-On every start of a stream that has **DRM keys via script** ticked, ReStreamAir first runs `manifest`, then searches the fresh manifest, its first HLS media playlist and the init segment for every KID, PSSH box and HLS key URI. If the stored clear keys already cover every discovered KID, they are reused and `cdm` is skipped. A missing or changed KID—or DRM input with no identifiable KID—runs `cdm` and passes `kid=`, `pssh=`, `psshAll=`, `psshWidevine=`, `psshPlayReady=` and `keyUri=`, along with `cdm=external`, the stream's `cdmType=` and its script params. The returned pairs replace the active decryption keys. For Widevine/PlayReady HLS, the rewritten playlist removes the DRM key tag and routes its fMP4 init and media fragments through server-side CENC decryption.
+DRM is detected automatically, so there is nothing to tick per stream. On every start of a stream whose script declares `cdm`, ReStreamAir first runs `manifest` (if the stream uses a session manifest), then searches the fresh manifest, its first HLS media playlist and the init segment for every KID, PSSH box and HLS key URI. If the stored clear keys already cover every discovered KID, they are reused and `cdm` is skipped. A missing or changed KID—or DRM input with no identifiable KID—runs `cdm` and passes `kid=`, `pssh=`, `psshAll=`, `psshWidevine=`, `psshPlayReady=` and `keyUri=`, along with `cdm=external`, the stream's `cdmType=` and its script params. The returned pairs replace the active decryption keys. For Widevine/PlayReady HLS, the rewritten playlist removes the DRM key tag and routes its fMP4 init and media fragments through server-side CENC decryption.
 
 PSSH is looked for in three places, in order:
 
 1. the manifest — `cenc:pssh` in an MPD, a Widevine `EXT-X-KEY` in a playlist;
 2. the initialization segment, fetched when the manifest carried no box, and scanned for `pssh` boxes and `tenc` default KIDs;
 3. built from the KIDs, when the source only ever names one — a version 0 Widevine box whose `WidevinePsshData` carries the key ids, the same box `pywidevine`'s `PSSH.new(key_ids=…)` round-trips.
+
+If none of those places has any DRM (no PSSH, KID or key URI), the source is clear: `cdm` is not run and the stream starts normally. The `UseCdm` field in channel/event output is accepted but no longer needed.
 
 No `pywidevine` (or any other Python) is involved: the box is assembled in C. ReStreamAir still has no CDM of its own — the script performs the licence exchange and returns clear keys.
 

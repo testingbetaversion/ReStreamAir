@@ -305,6 +305,7 @@ docker run -d --name restreamair \
 --refresh-web     refresh the cached panel files
 --web-ref REF     fetch panel files from a tag, branch, or commit
 --no-download     never download panel files
+--verbose         always record debug logs (otherwise only while Logs → Verbose is open)
 --max-open-files N      files held open for viewers at once (default: a quarter of `ulimit -n`)
 --file-queue-timeout S  seconds a request waits for a free slot before a 503 (default 15)
 --file-open-timeout S   seconds a viewer may hold a file open before it is disconnected (default 60)

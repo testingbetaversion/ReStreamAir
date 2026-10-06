@@ -90,6 +90,7 @@ jobs:
           python3 scripts/provider-options-smoke.py --binary "$BIN"
           python3 scripts/provider-engine-smoke.py --binary "$BIN"
           python3 scripts/manifest-recovery-smoke.py --binary "$BIN"
+          python3 scripts/drm-verbose-smoke.py --binary "$BIN"
           node scripts/panel-playback-smoke.js
           python3 scripts/hls-buffer-smoke.py --binary "$BIN" --multi
 
@@ -274,6 +275,7 @@ jobs:
           python3 scripts/api-smoke.py --binary build-asan/restreamair-server
           python3 scripts/provider-options-smoke.py --binary build-asan/restreamair-server
           python3 scripts/provider-engine-smoke.py --binary build-asan/restreamair-server
+          python3 scripts/drm-verbose-smoke.py --binary build-asan/restreamair-server
 
   # A MinGW cross-build, which catches a POSIX-ism reaching a Windows path in a
   # couple of minutes on a Linux runner — and keeps the core honest about being

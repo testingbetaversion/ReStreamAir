@@ -267,8 +267,7 @@
                 <p class="field-hint sub">Fetch a fresh source URL (+ CDNs, headers, heartbeat) from the script's <code>manifest</code> action on every start.</p>
               </div>
               <div class="script-toggle">
-                <label class="check"><input name="useCdm" type="checkbox"> DRM keys via script</label>
-                <p class="field-hint sub">Parse the manifest &amp; init for all DRM (Widevine/PlayReady PSSH, KIDs) and send it to the <code>cdm</code> action, which returns clear keys. Nothing to pick — everything found is forwarded.</p>
+                <p class="field-hint sub"><b>DRM is detected automatically.</b> When the script declares a <code>cdm</code> action, every start fetches the manifest (after <code>manifest</code>, if enabled) and checks it, its media playlist and init segment for Widevine/PlayReady PSSH and KIDs. DRM found → stored keys are reused if they cover every KID, otherwise <code>cdm</code> is asked for clear keys, then playback starts. No DRM → it just plays.</p>
               </div>
               <div class="script-toggle">
                 <label class="check"><input name="heartbeatEnabled" type="checkbox"> Heartbeat</label>
@@ -462,7 +461,7 @@
               <h3>Logs</h3>
               <div class="actions">
                 <select id="logStreamFilter"><option value="">All streams</option></select>
-                <select id="logLevelFilter"><option value="">All levels</option><option value="error">Errors only</option></select>
+                <select id="logLevelFilter"><option value="">All levels</option><option value="error">Errors only</option><option value="warn">Warnings only</option><option value="debug">Debug only (Verbose)</option></select>
                 <div class="log-mode-toggle">
                   <button type="button" class="log-mode-btn active" data-mode="normal">Normal</button>
                   <button type="button" class="log-mode-btn" data-mode="verbose">Verbose</button>
@@ -473,6 +472,7 @@
                 <button id="clearLogsBtn" class="ghost danger-ghost" type="button" title="Clear the selected stream's logs"><span data-icon="trash"></span>Clear</button>
               </div>
             </div>
+            <div id="logVerboseBanner" class="log-verbose-banner hidden"></div>
             <div id="logList" class="log-list empty-state">No log entries yet — start a stream to see fetch/download activity here.</div>
           </div>
         </section>
@@ -691,7 +691,7 @@ channel=101</pre>
                   <tr><td><code>channels</code>, <code>events</code></td><td>Load channels / events</td><td><code>{"Channels":[…]}</code> or <code>{"Events":[…]}</code></td></tr>
                   <tr><td><code>epg</code></td><td>Load EPG</td><td>XMLTV or JSON, stored as-is.</td></tr>
                   <tr><td><code>manifest</code></td><td>Every start with <b>Session manifest</b> ticked, and when all sources fail</td><td><code>ManifestUrl</code>, <code>Cdn</code>, <code>Headers</code>, <code>Heartbeat</code></td></tr>
-                  <tr><td><code>initparse</code>, <code>pssh</code>, <code>cdm</code></td><td>Every start with <b>DRM keys via script</b> ticked, when keys are needed</td><td>KIDs/PSSH, a replacement PSSH, or clear keys</td></tr>
+                  <tr><td><code>initparse</code>, <code>pssh</code>, <code>cdm</code></td><td>Every start, when the manifest has DRM whose KIDs the stored keys do not cover (detected automatically)</td><td>KIDs/PSSH, a replacement PSSH, or clear keys</td></tr>
                   <tr><td><code>start</code>, <code>stop</code>, <code>heartbeat</code>, <code>url</code>, <code>downloadmanifest</code></td><td>Only when run by hand from the panel or API. Playback doesn't call them yet.</td><td>Exit code; <code>url</code> prints <code>{"Url":"…"}</code>, <code>downloadmanifest</code> prints the manifest or <code>{"ManifestContent":"…"}</code></td></tr>
                 </table>
 
@@ -758,7 +758,7 @@ python3 provider.py action=manifest sessiondir=/tmp/rs id=stream_test url= chann
               <article id="help-logs" class="help-card">
                 <h3>Monitoring &amp; logs</h3>
                 <p>The <b>Server</b> view streams live over SSE: input vs output bandwidth (per stream and all-time), active viewers per stream, host CPU/memory/disk, and one searchable row per playback connection.</p>
-                <p>The <b>Logs</b> view shows what each worker is doing, <b>newest first</b>, polled at the configured Logs interval (2s by default) only while it's open. Filter by stream, level or run date, toggle Verbose for raw JSON, or jump straight to one stream's logs from the icon on its card. Script runs stay in terminal form in either mode, with the complete command and live stdout/stderr shown one line at a time. Per-stream <b>Clear</b> hides everything logged so far for that stream while leaving new activity visible.</p>
+                <p>The <b>Logs</b> view shows what each worker is doing, <b>newest first</b>, polled at the configured Logs interval (2s by default) only while it's open. Filter by stream, level or run date, toggle Verbose for full debug detail (HTTP requests with headers and timings, DRM discovery, playback requests), or jump straight to one stream's logs from the icon on its card. Script runs stay in terminal form in either mode, with the complete command and live stdout/stderr shown one line at a time. Per-stream <b>Clear</b> hides everything logged so far for that stream while leaving new activity visible.</p>
                 <table class="help-table">
                   <tr><th>Event</th><th>Means</th></tr>
                   <tr><td><code>manifest</code></td><td>A manifest poll, with the URL that answered it.</td></tr>
