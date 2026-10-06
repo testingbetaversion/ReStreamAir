@@ -57,9 +57,15 @@
 // lines an hour per stream, so the ring has to be deep enough to still hold
 // something useful from before whatever the user is currently investigating.
 #define RS_LOG_CAP 20000
+// Debug entries (level "debug") live in a ring of their own so a verbose session
+// — one line per HTTP attempt, with headers and timings — cannot push the normal
+// history out. They are only recorded while verbose logging is on: forced by
+// --verbose, or leased for RS_DEBUG_LEASE_MS by each /api/logs?verbose=1 read.
+#define RS_DEBUG_LOG_CAP 20000
+#define RS_DEBUG_LEASE_MS 60000.0
 typedef struct {
     double ts_ms;     // milliseconds since the epoch (what the UI's Date() wants)
-    char *level;      // "info" | "error"
+    char *level;      // "info" | "warn" | "error" | "debug"
     char *sid;        // stream id / "__panel__" / "script:<id>"
     char *event;
     char *message;    // optional detail
@@ -151,6 +157,10 @@ struct restream_server {
     size_t log_head;        // next write slot
     size_t log_count;       // entries in use (<= RS_LOG_CAP)
     rs_log_clear_entry *log_clears; // per-sid "cleared before" cutoffs; guarded by log_mu
+    rs_log_entry *debug_ring;       // RS_DEBUG_LOG_CAP entries; guarded by log_mu
+    size_t debug_head;
+    size_t debug_count;
+    double debug_until_ms;          // verbose lease from /api/logs?verbose=1; guarded by log_mu
     pthread_mutex_t log_mu; // the live engine's worker threads write here too
     pthread_mutex_t webhook_mu;
     pthread_cond_t webhook_cv;
@@ -599,12 +609,53 @@ static bool log_always(const char *event) {
 static void log_lock(restream_server_t *s)   { pthread_mutex_lock(&s->log_mu); }
 static void log_unlock(restream_server_t *s) { pthread_mutex_unlock(&s->log_mu); }
 
+static bool g_verbose_forced;  // --verbose: record debug entries unconditionally
+
+static bool debug_active_locked(restream_server_t *s) {
+    return g_verbose_forced || (s->debug_ring && now_ms() < s->debug_until_ms);
+}
+
+static void log_entry_dispose(rs_log_entry *e) {
+    free(e->level); free(e->sid); free(e->event); free(e->message); free(e->url);
+    memset(e, 0, sizeof(*e));
+}
+
+static void log_entry_fill(rs_log_entry *e, const char *sid, const char *level, const char *event,
+                           const char *url, long status, long long bytes, const char *message) {
+    e->ts_ms = now_ms();
+    e->level = rs_strdup(level ? level : "info");
+    e->sid = rs_strdup(sid ? sid : "__panel__");
+    e->event = rs_strdup(event ? event : "");
+    e->message = message ? rs_strdup(message) : NULL;
+    e->url = url ? rs_strdup(url) : NULL;
+    e->status = status;
+    e->bytes = bytes;
+}
+
+// Debug entries: no de-duplication (repeats are the point when tracing a
+// retry loop) and no webhooks. Dropped outright while verbose is off.
+static void log_record_debug(restream_server_t *s, const char *sid, const char *event,
+                             const char *url, long status, long long bytes, const char *message) {
+    log_lock(s);
+    if (!debug_active_locked(s)) { log_unlock(s); return; }
+    rs_log_entry *e = &s->debug_ring[s->debug_head];
+    if (s->debug_count == RS_DEBUG_LOG_CAP) log_entry_dispose(e);
+    log_entry_fill(e, sid, "debug", event, url, status, bytes, message);
+    s->debug_head = (s->debug_head + 1) % RS_DEBUG_LOG_CAP;
+    if (s->debug_count < RS_DEBUG_LOG_CAP) s->debug_count++;
+    log_unlock(s);
+}
+
 // Records one log entry (ring buffer overwrites the oldest). url/message may be
 // NULL; status 0 and bytes -1 mean "absent". Never blocks on I/O, and is safe to
 // call from the live engine's worker threads.
 static void log_record(restream_server_t *s, const char *sid, const char *level,
                        const char *event, const char *url, long status, long long bytes,
                        const char *message) {
+    if (level && strcmp(level, "debug") == 0) {
+        log_record_debug(s, sid, event, url, status, bytes, message);
+        return;
+    }
     log_lock(s);
     // Collapse only an exact repeat inside one second, which exists purely to
     // stop a pathological retry loop from filling the ring in a few seconds.
@@ -627,18 +678,9 @@ static void log_record(restream_server_t *s, const char *sid, const char *level,
         }
     }
     rs_log_entry *e = &s->log_ring[s->log_head];
-    if (s->log_count == RS_LOG_CAP) {
-        // Overwriting the oldest live entry — free its strings first.
-        free(e->level); free(e->sid); free(e->event); free(e->message); free(e->url);
-    }
-    e->ts_ms = now_ms();
-    e->level = rs_strdup(level ? level : "info");
-    e->sid = rs_strdup(sid ? sid : "__panel__");
-    e->event = rs_strdup(event ? event : "");
-    e->message = message ? rs_strdup(message) : NULL;
-    e->url = url ? rs_strdup(url) : NULL;
-    e->status = status;
-    e->bytes = bytes;
+    // Overwriting the oldest live entry — free its strings first.
+    if (s->log_count == RS_LOG_CAP) log_entry_dispose(e);
+    log_entry_fill(e, sid, level, event, url, status, bytes, message);
     s->log_head = (s->log_head + 1) % RS_LOG_CAP;
     if (s->log_count < RS_LOG_CAP) s->log_count++;
     log_unlock(s);
@@ -657,6 +699,43 @@ static void log_recordf(restream_server_t *s, const char *sid, const char *level
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
     log_record(s, sid, level, event, url, status, bytes, msg);
+}
+
+// --- verbose (debug) logging for code outside this file ----------------------
+//
+// The HTTP client (apps/server/net.c) and the live engine's threads have no
+// server pointer or stream id at hand. The server registers itself here, and a
+// worker thread names the stream it is working for, so their debug lines land
+// under that stream in Logs.
+
+#ifdef _MSC_VER
+#define RS_THREAD_LOCAL __declspec(thread)
+#else
+#define RS_THREAD_LOCAL _Thread_local
+#endif
+
+static restream_server_t *g_debug_server;
+static RS_THREAD_LOCAL char t_log_stream[160];
+
+void restream_log_set_stream(const char *stream_id) {
+    snprintf(t_log_stream, sizeof(t_log_stream), "%s", stream_id ? stream_id : "");
+}
+
+bool restream_debug_enabled(void) {
+    restream_server_t *s = g_debug_server;
+    if (!s) return false;
+    if (g_verbose_forced) return true;
+    log_lock(s);
+    bool on = debug_active_locked(s);
+    log_unlock(s);
+    return on;
+}
+
+void restream_debug_log(const char *event, const char *url, long status, long long bytes,
+                        const char *message) {
+    restream_server_t *s = g_debug_server;
+    if (!s) return;
+    log_record_debug(s, t_log_stream[0] ? t_log_stream : "__panel__", event, url, status, bytes, message);
 }
 
 // The live engine's log sink. Called from its worker threads, which is why
@@ -754,37 +833,66 @@ static double log_clear_cutoff(restream_server_t *s, const char *sid) {
 // frontend renders top-to-bottom and expects the newest entry first — see
 // loadLogs()/groupLogEntries() in app.js), keeping at most `limit` of the
 // newest that match `sid` (NULL/"" = all).
-static rs_json *log_view(restream_server_t *s, const char *sid, int limit) {
+static bool log_entry_visible(restream_server_t *s, const rs_log_entry *e, const char *sid) {
+    if (sid && sid[0] && strcmp(sid, e->sid) != 0) return false;
+    double cutoff = log_clear_cutoff(s, e->sid);
+    return !(cutoff > 0 && e->ts_ms < cutoff);
+}
+
+static rs_json *log_entry_json(const rs_log_entry *e) {
+    rs_json *o = rs_json_new_obj();
+    rs_json_obj_set(o, "timestamp", rs_json_new_num(e->ts_ms));
+    rs_json_obj_set_str(o, "level", e->level);
+    rs_json_obj_set_str(o, "streamId", e->sid);
+    rs_json_obj_set_str(o, "event", e->event);
+    if (e->url) rs_json_obj_set_str(o, "url", e->url);
+    if (e->message) rs_json_obj_set_str(o, "message", e->message);
+    if (e->status) rs_json_obj_set_int(o, "status", e->status);
+    if (e->bytes >= 0) rs_json_obj_set_int(o, "bytes", e->bytes);
+    return o;
+}
+
+// With include_debug the debug ring is merged in by timestamp, so a verbose
+// view reads as one timeline rather than two lists.
+static rs_json *log_view_ex(restream_server_t *s, const char *sid, int limit, bool include_debug) {
     rs_json *entries = rs_json_new_arr();
     if (limit <= 0) limit = 150;
-    if (limit > RS_LOG_CAP) limit = RS_LOG_CAP;
+    if (limit > RS_LOG_CAP + RS_DEBUG_LOG_CAP) limit = RS_LOG_CAP + RS_DEBUG_LOG_CAP;
     int n = 0;
     log_lock(s);
-    // Walk newest→oldest; the ring already stores them that way relative to
-    // log_head, so pushing in this order needs no separate reverse pass.
-    for (size_t i = 0; i < s->log_count && n < limit; i++) {
-        size_t idx = (s->log_head + RS_LOG_CAP - 1 - i) % RS_LOG_CAP;
-        rs_log_entry *e = &s->log_ring[idx];
-        if (sid && sid[0] && strcmp(sid, e->sid) != 0) continue;
-        double cutoff = log_clear_cutoff(s, e->sid);
-        if (cutoff > 0 && e->ts_ms < cutoff) continue;
-        rs_json *o = rs_json_new_obj();
-        rs_json_obj_set(o, "timestamp", rs_json_new_num(e->ts_ms));
-        rs_json_obj_set_str(o, "level", e->level);
-        rs_json_obj_set_str(o, "streamId", e->sid);
-        rs_json_obj_set_str(o, "event", e->event);
-        if (e->url) rs_json_obj_set_str(o, "url", e->url);
-        if (e->message) rs_json_obj_set_str(o, "message", e->message);
-        if (e->status) rs_json_obj_set_int(o, "status", e->status);
-        if (e->bytes >= 0) rs_json_obj_set_int(o, "bytes", e->bytes);
-        rs_json_arr_push(entries, o);
+    bool debug_on = debug_active_locked(s);
+    size_t debug_count = include_debug && s->debug_ring ? s->debug_count : 0;
+    // Walk both rings newest→oldest; each already stores entries that way
+    // relative to its head, so taking the newer of the two fronts each step
+    // yields the merged newest-first order the panel expects.
+    size_t i = 0, j = 0;
+    while (n < limit && (i < s->log_count || j < debug_count)) {
+        const rs_log_entry *a = i < s->log_count
+            ? &s->log_ring[(s->log_head + RS_LOG_CAP - 1 - i) % RS_LOG_CAP] : NULL;
+        const rs_log_entry *b = j < debug_count
+            ? &s->debug_ring[(s->debug_head + RS_DEBUG_LOG_CAP - 1 - j) % RS_DEBUG_LOG_CAP] : NULL;
+        const rs_log_entry *e;
+        if (a && (!b || a->ts_ms >= b->ts_ms)) { e = a; i++; }
+        else { e = b; j++; }
+        if (!log_entry_visible(s, e, sid)) continue;
+        rs_json_arr_push(entries, log_entry_json(e));
         n++;
     }
     log_unlock(s);
     rs_json *out = rs_json_new_obj();
     rs_json_obj_set(out, "entries", entries);
     rs_json_obj_set(out, "availableDates", rs_json_new_arr());
+    if (include_debug) {
+        rs_json *verbose = rs_json_new_obj();
+        rs_json_obj_set_bool(verbose, "active", debug_on);
+        rs_json_obj_set_bool(verbose, "forced", g_verbose_forced);
+        rs_json_obj_set(out, "verbose", verbose);
+    }
     return out;
+}
+
+static rs_json *log_view(restream_server_t *s, const char *sid, int limit) {
+    return log_view_ex(s, sid, limit, false);
 }
 
 // sid NULL/"" empties the ring outright. Otherwise (the panel's per-stream
@@ -801,6 +909,8 @@ static void log_clear(restream_server_t *s, const char *sid) {
             memset(e, 0, sizeof(*e));
         }
         s->log_count = 0; s->log_head = 0;
+        for (size_t i = 0; s->debug_ring && i < RS_DEBUG_LOG_CAP; i++) log_entry_dispose(&s->debug_ring[i]);
+        s->debug_count = 0; s->debug_head = 0;
         while (s->log_clears) {
             rs_log_clear_entry *next = s->log_clears->next;
             free(s->log_clears->sid);
@@ -1627,11 +1737,27 @@ static void maintenance_tick(void *arg) {
 // The Logs view. Everything the server does lands in the ring buffer — panel
 // access, auth, stream start/stop, and every poll, download, decrypt,
 // discontinuity and prune the live engine performs.
+//
+// ?verbose=1 also returns debug entries, and keeps recording them for another
+// RS_DEBUG_LEASE_MS: the panel re-reads Logs every few seconds while its
+// Verbose view is open, so debug capture follows that view and stops on its
+// own a minute after the last reader leaves.
 static void handle_logs(restream_server_t *s, struct mg_connection *c, struct mg_http_message *hm) {
-    char sid[160] = {0}, lim[32] = {0};
+    char sid[160] = {0}, lim[32] = {0}, verbose[8] = {0};
     mg_http_get_var(&hm->query, "streamId", sid, sizeof(sid));
     mg_http_get_var(&hm->query, "limit", lim, sizeof(lim));
-    reply_json(c, 200, log_view(s, sid, lim[0] ? atoi(lim) : 150), NULL);
+    mg_http_get_var(&hm->query, "verbose", verbose, sizeof(verbose));
+    bool want_debug = !strcmp(verbose, "1") || !strcmp(verbose, "true");
+    if (want_debug) {
+        log_lock(s);
+        bool was_active = debug_active_locked(s);
+        if (s->debug_ring) s->debug_until_ms = now_ms() + RS_DEBUG_LEASE_MS;
+        log_unlock(s);
+        if (!was_active)
+            log_record(s, "__panel__", "info", "verboseLogging", NULL, 0, -1,
+                       "verbose logging on: recording debug detail while the Verbose view is open");
+    }
+    reply_json(c, 200, log_view_ex(s, sid, lim[0] ? atoi(lim) : 150, want_debug), NULL);
 }
 
 // Dispatches /api/*. Returns true if it handled the request.
@@ -4182,9 +4308,14 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
     size_t text_len = 0;
     char *text = stream_start_fetch(st, manifest_url, &text_len);
     if (!text) {
+        // Nothing to inspect, so nothing to license. Start with whatever keys
+        // the stream already has; the engine reports the fetch failure itself.
         log_record(server, sid, "warn", "cdm", manifest_url, 0, -1,
-                   "could not fetch the manifest to read its DRM — asking for keys without it");
+                   "could not fetch the manifest to check it for DRM — starting with the stored keys");
+        return;
     }
+    log_recordf(server, sid, "debug", "cdm", manifest_url, 0, (long long)text_len,
+                "fetched the manifest for DRM discovery (%lu bytes)", (unsigned long)text_len);
 
     rs_drm_challenge ch;
     memset(&ch, 0, sizeof(ch));
@@ -4285,10 +4416,9 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
                     (unsigned long)ch.kids_count);
 
     if (rs_drm_challenge_is_empty(&ch)) {
-        log_record(server, sid, "error", "cdm", manifest_url, 0, -1,
-                   "no KIDs, PSSH or key URIs found — refusing to call CDM without DRM input");
-        snprintf(st->err, sizeof(st->err),
-                 "Could not find a KID or PSSH in the session manifest or its media/init data.");
+        // A clear source: nothing for the CDM to do, so play it as it is.
+        log_record(server, sid, "info", "cdm", manifest_url, 0, -1,
+                   "no DRM in the manifest, media playlist or init segment — playing without the CDM");
         rs_drm_challenge_free(&ch);
         free(text);
         free(variant_url);
@@ -4300,6 +4430,14 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
                     kid_list ? kid_list : "", (unsigned long)ch.pssh_all_count,
                     (unsigned long)ch.key_uris_count);
         free(kid_list);
+        for (size_t i = 0; i < ch.pssh_all_count; i++)
+            log_recordf(server, sid, "debug", "cdm", NULL, 0, -1, "PSSH box %lu/%lu%s: %s",
+                        (unsigned long)(i + 1), (unsigned long)ch.pssh_all_count,
+                        ch.pssh_all[i] == ch.pssh_widevine ? " (Widevine)"
+                        : ch.pssh_all[i] == ch.pssh_playready ? " (PlayReady)" : "",
+                        ch.pssh_all[i]);
+        for (size_t i = 0; i < ch.key_uris_count; i++)
+            log_record(server, sid, "debug", "cdm", ch.key_uris[i], 0, -1, "key URI advertised by the source");
     }
 
     // This check deliberately happens after manifest, HLS variant and init
@@ -4424,6 +4562,12 @@ static void stream_start_resolve_keys(restream_server_t *server, const char *sid
             for (const char *p = pairs; *p; p++) if (*p == '\n') count++;
             log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
                         "acquired %lu clear key(s) from the script", (unsigned long)count);
+            // Which KIDs came back, never the key values themselves.
+            rs_cenc_keys returned = rs_cenc_parse_keys(pairs);
+            for (size_t i = 0; i < returned.count; i++)
+                log_recordf(server, sid, "debug", "cdm", NULL, 0, -1, "key %lu: KID %s (key value masked)",
+                            (unsigned long)(i + 1), returned.kids[i]);
+            rs_cenc_keys_free(&returned);
         } else {
             free(pairs);
             log_record(server, sid, "error", "cdm", NULL, 0, -1,
@@ -4655,6 +4799,7 @@ static void pending_source_fetch(rs_pending_job *pf) {
 static void *pending_job_worker(void *arg) {
     rs_pending_job *pf = (rs_pending_job *)arg;
     restream_server_t *server = pf->server;
+    restream_log_set_stream(pf->stream_id);
 
     switch (pf->kind) {
     case RS_PENDING_BUFFER: {
@@ -5222,6 +5367,17 @@ static void pending_job_finish_stream_start(restream_server_t *server, struct mg
     reply_json(c, 200, view, NULL);
 }
 
+// DRM is detected, not configured: whenever the stream's script declares a
+// `cdm` action, every start fetches the (fresh) manifest and inspects it, its
+// first media playlist and its init segment. DRM found → stored keys are
+// reused if they cover every KID, otherwise `cdm` runs; no DRM → it plays as
+// is. Manifests rotate URLs and KIDs, so this runs on every start. The legacy
+// per-stream `useCdm` flag is no longer needed for this.
+static bool stream_wants_drm_discovery(const rs_json *provider, const rs_json *stream) {
+    return rs_panel_script_action_allowed(provider, stream, "cdm") &&
+           rs_panel_effective_script_path(provider, stream)[0];
+}
+
 // Builds the job for a script-driven start and hands it to a worker. Returns
 // true when it has taken the reply over; false means this stream needs nothing
 // from its script and the plain synchronous start should run instead.
@@ -5235,12 +5391,7 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
 
     bool want_manifest = rs_json_obj_bool(stream, "sessionManifest", false)
         && rs_panel_script_action_allowed(provider, stream, "manifest");
-    // Script-backed DRM enters discovery on every start because manifests can
-    // rotate their URL and KIDs. The worker inspects the manifest/media/init
-    // data first and reuses stored keys when every discovered KID is covered;
-    // only a missing or changed KID actually launches the CDM action.
-    bool want_cdm = rs_json_obj_bool(stream, "useCdm", false)
-        && rs_panel_script_action_allowed(provider, stream, "cdm");
+    bool want_cdm = stream_wants_drm_discovery(provider, stream);
     if (!want_manifest && !want_cdm) return false;
 
     const char *script = rs_panel_effective_script_path(provider, stream);
@@ -5267,9 +5418,9 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
     pf->start = st;
 
     const char *start_plan = want_manifest && want_cdm
-        ? "start: running manifest then DRM discovery (CDM only if cached keys do not cover the KIDs)"
+        ? "start: running manifest, then checking it for DRM (CDM only for DRM whose KIDs the stored keys do not cover)"
         : (want_manifest ? "start: running manifest"
-                         : "start: running DRM discovery (CDM only if cached keys do not cover the KIDs)");
+                         : "start: checking the manifest for DRM (CDM only for DRM whose KIDs the stored keys do not cover)");
     log_record(s, stream_id, "info", "scriptManifest", NULL, 0, -1, start_plan);
     if (!pending_job_dispatch(s, c, pf)) {
         pending_job_free(pf);
@@ -5323,8 +5474,7 @@ static bool pending_source_finish(restream_server_t *server, struct mg_connectio
         return false;
     }
     pf->start = stream_start_snapshot(provider, stream, true,
-        pf->kind == RS_PENDING_PLAYLIST && rs_json_obj_bool(stream, "useCdm", false) &&
-        rs_panel_script_action_allowed(provider, stream, "cdm"));
+        pf->kind == RS_PENDING_PLAYLIST && stream_wants_drm_discovery(provider, stream));
     if (!pf->start) return false;
     rs_json_obj_set(timer, "manifestRefreshAt", rs_json_new_num(now));
     log_record(server, pf->stream_id, "info", "manifestRefresh", NULL, 0, -1,
@@ -7260,6 +7410,36 @@ static bool serve_pipeline_hls(restream_server_t *server, struct mg_connection *
 
 // Playback routes. Direct-source streams redirect; internal HLS/DASH is
 // proxied live, while resident FFmpeg HLS is served from its scoped runtime dir.
+// Verbose only: one line per playback request, filed under its stream, with
+// what a "why won't it play" question needs — client, player, range, how it
+// authenticated. The key itself is never logged.
+static void log_playback_request(restream_server_t *server, struct mg_connection *c,
+                                 struct mg_http_message *hm, const char *key,
+                                 bool feed, bool allowed) {
+    if (!restream_debug_enabled()) return;
+    char sid[160] = "__panel__";
+    struct mg_str caps[3];
+    if (mg_match(hm->uri, mg_str("/*/*/#"), caps) || mg_match(hm->uri, mg_str("/*/*"), caps)) {
+        int n = (int)caps[1].len;
+        const char *dot = memchr(caps[1].buf, '.', caps[1].len);  // /direct/<id>.ts
+        if (dot) n = (int)(dot - caps[1].buf);
+        if (n > 0 && n < (int)sizeof(sid)) snprintf(sid, sizeof(sid), "%.*s", n, caps[1].buf);
+    }
+    char *ip = client_ip(server, c, hm);
+    char *ua = header_dup(hm, "User-Agent");
+    char *range = header_dup(hm, "Range");
+    const char *auth = feed ? "internal pipeline feed"
+        : !(key && key[0]) ? "no playback key"
+        : mg_http_var(hm->query, mg_str("key")).len > 0 ? "playback key in ?key="
+        : "playback key in Authorization: Bearer";
+    log_recordf(server, sid, "debug", "playRequest", NULL, allowed ? 0 : 401, -1,
+                "%.*s %.*s\nclient: %s\nplayer: %s\nrange: %s\nauth: %s → %s",
+                (int)hm->method.len, hm->method.buf, (int)hm->uri.len, hm->uri.buf, ip,
+                ua && ua[0] ? ua : "(none)", range && range[0] ? range : "(none)",
+                auth, allowed ? "allowed" : "rejected");
+    rs_free(ip); free(ua); free(range);
+}
+
 static bool handle_playback(restream_server_t *server, struct mg_connection *c,
                             struct mg_http_message *hm) {
     bool is_source = mg_match(hm->uri, mg_str("/source/*"), NULL);
@@ -7273,6 +7453,7 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
     char *key = playback_key(hm);
     bool feed = is_pipeline_feed(server, c, key);
     bool allowed = feed || rs_panel_playback_allowed(&server->state, key);
+    log_playback_request(server, c, hm, key, feed, allowed);
     if (!allowed) {
         char *ip = client_ip(server, c, hm);
         log_recordf(server, "__panel__", "error", "playbackDenied", NULL, 401, -1,
@@ -7597,6 +7778,8 @@ restream_server_t* restream_server_create(void) {
     pthread_mutex_init(&server->log_mu, NULL);
     pthread_mutex_init(&server->webhook_mu, NULL);
     pthread_cond_init(&server->webhook_cv, NULL);
+    // NULL only on OOM, which just leaves verbose logging unavailable.
+    server->debug_ring = (rs_log_entry *)calloc(RS_DEBUG_LOG_CAP, sizeof(rs_log_entry));
     // The engine needs both hooks; without them (a core-only build registers
     // neither) it stays NULL and the DASH routes report that honestly instead
     // of half-working. The C++ app registers them before calling this.
@@ -7619,10 +7802,12 @@ restream_server_t* restream_server_create(void) {
         pthread_mutex_destroy(&server->log_mu);
         pthread_mutex_destroy(&server->webhook_mu);
         pthread_cond_destroy(&server->webhook_cv);
+        free(server->debug_ring);
         free(server);
         return NULL;
     }
     webhook_rebuild_targets(server);
+    g_debug_server = server;
     if (g_webhook_handler && pthread_create(&server->webhook_thread, NULL, webhook_worker, server) == 0)
         server->webhook_thread_started = true;
     // Resume the sessions the previous run persisted, so a restart (or a switch
@@ -7675,6 +7860,7 @@ void restream_server_set_web_root(restream_server_t* server, const char* path) {
 }
 
 void restream_server_set_verbose(bool verbose) {
+    g_verbose_forced = verbose;
     mg_log_set(verbose ? MG_LL_DEBUG : MG_LL_ERROR);
 }
 
@@ -7811,7 +7997,9 @@ void restream_server_destroy(restream_server_t* server) {
         rs_sysstats_destroy(server->sysstats);
         rs_metrics_destroy(server->metrics);
         if (server->logo_cache) rs_logo_cache_destroy(server->logo_cache);
+        if (g_debug_server == server) g_debug_server = NULL;
         log_clear(server, "");  // frees ring-buffer strings
+        free(server->debug_ring);
         pthread_mutex_destroy(&server->pending_mu);
         pthread_cond_destroy(&server->pending_cv);
         pthread_mutex_destroy(&server->logo_mu);
