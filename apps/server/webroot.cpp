@@ -58,6 +58,7 @@ const char *const kFallbackFiles[] = {
     "index.html", "app.js", "styles.css", "sw.js", "manifest.webmanifest",
     "hls.min.js", "icons/icon-192.png", "icons/icon-512.png",
     "icons/icon-maskable-512.png",
+    "docs/README.md", "docs/API.md", "docs/EVENTS.md", "docs/SCRIPTING.md",
 };
 
 bool is_dir(const std::string &path) {

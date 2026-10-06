@@ -1,0 +1,351 @@
+# ReStreamAir
+
+ReStreamAir turns live DASH (`.mpd`) and HLS (`.m3u8`) sources into stable HLS playback URLs. It can download, buffer, decrypt, and remux streams without transcoding, then serve them to VLC, IPTV apps, browsers, or another service.
+
+It is one C/C++ server with a built-in web panel and HTTP API. No JavaScript or Python runtime is required by the server. Provider scripts are optional and only needed for sources that require custom login, channel discovery, short-lived URLs, or external key handling.
+
+## Screenshots
+
+![ReStreamAir panel](images/image.png)
+![ReStreamAir stream editor](<images/Screenshot 2026-08-27 at 1.06.58 AM.png>)
+![ReStreamAir providers](images/2.png)
+![ReStreamAir monitoring](images/3.png)
+![ReStreamAir settings](images/4.png)
+
+## Quick start
+
+Build and run:
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+./build/restreamair-server --port 8787 --bind 0.0.0.0 --root public
+```
+
+Open `http://localhost:8787`, create the first admin account, then:
+
+1. Create a provider.
+2. Add a stream and paste its `.mpd` or `.m3u8` URL.
+3. Let the source probe finish.
+4. Press **Start**.
+5. Copy `/play/<stream-id>/index.m3u8` into your player.
+
+A DASH stream may return `503 Retry-After` for a few seconds while its first segments are buffered. Players normally retry automatically.
+
+## What the main objects mean
+
+- A **provider** groups streams that share network settings, credentials, a webhook, or a provider script.
+- A **stream** is one channel or event with its own source, quality selection, buffering, headers, decryption, and output settings.
+- A **panel account** signs into the management UI and HTTP API.
+- A **playback API key** protects viewing URLs and can be used as an Xtream Codes login (label = username, key = password). It does not grant panel access.
+- A **provider script** handles source-specific work such as login or refreshing an expiring manifest URL.
+
+## Web panel
+
+The top navigation contains:
+
+- **Providers** — create providers, edit shared settings, import/export configurations, and run provider scripts.
+- **All Streams** — find, start, stop, edit, or delete streams across providers.
+- **Server** and **Monitoring** — host health, bandwidth, active viewers, and connections.
+- **Logs** — control-plane, script, manifest, segment, proxy, and pipeline events.
+- **API Keys** — create or revoke playback keys.
+- **Settings** — server bind settings, panel accounts, FFmpeg status, and service controls.
+- **Help** — short explanations and examples available inside the application.
+
+Each view has a stable URL such as `/providers`, `/streams`, `/monitoring`, `/logs`, and `/settings`. Provider and stream filters are kept in the query string, so views can be bookmarked.
+
+## Stream setup
+
+Paste a source URL into the stream editor. ReStreamAir probes it using the configured proxy and manifest headers, detects DASH or HLS, lists video/audio tracks, and reports DRM KIDs found in DASH init segments.
+
+The most useful controls are:
+
+| Setting | Purpose |
+|---|---|
+| Playlist count | Segments advertised to the player. Minimum 3. |
+| HLS segment | Approximate output segment duration. Ten seconds is a good default. |
+| Keep count | Old segments retained for players that fall behind. |
+| Download ahead | How far the engine prefetches. |
+| Parallel downloads | Origin media connections shared across the stream's renditions. |
+| Poll seconds | How often a live MPD is refreshed. |
+| Playout buffer | Extra delay used to ride through short origin outages. |
+| Audio delay | Positive or negative lip-sync correction in milliseconds. |
+| Allow static MPD | Permit VOD/offline DASH manifests. |
+
+Selecting multiple video qualities produces an HLS master playlist. The stream URL stays the same.
+
+## Input and output modes
+
+The internal remuxer is the default and does not need FFmpeg. It supports live DASH-to-HLS and HLS passthrough, buffering, CENC clear-key decryption, and HLS AES-128 decryption.
+
+For HLS downloaded and served entirely by this server, select **Input/output
+pipeline → Buffered HLS · download on first viewer**, save, and press **Start**.
+Start arms the stream. The first viewer starts a shared FFmpeg downloader;
+selected video qualities and audio tracks are copied into a rolling disk buffer
+without re-encoding. All viewers read the local segments. Downloading stops
+after 30 seconds without viewer requests and restarts with a fresh buffer when
+someone returns. FFmpeg must be installed. Initial playback can take a few
+seconds while the buffer fills. The first playlist request waits up to 20 seconds;
+if the source is still unavailable, it returns 503 and the logs explain why.
+Playlist count and HLS segment duration control this buffer; the other DASH
+buffer controls do not apply. With no track selection, the first video and
+audio track are used.
+
+HLS proxy playlists and source probes try the configured CDNs in order after
+an upstream failure, including 403. Once all fail, a stream with Session
+manifest enabled runs its manifest action once and retries the fresh sources.
+Refresh has a 60-second cooldown to avoid repeated script launches. Logs show
+`cdnFallback` and `manifestRefresh`; a provider outage can still make every
+fresh URL fail. Once refresh starts, it finishes and saves the new session even
+if the requesting player disconnects, provided the stream has not changed.
+CDN-specific headers returned by the script follow that CDN's
+playlists and segments.
+
+The optional [DLive scripts](scripts/providers/dlive/README.md) return shortly
+after the first resolved HLS URL, retaining alternatives completed within a
+one-second grace period. Install both Python files together. Use `fast=0` in
+stream script parameters to wait for all players and retain the full CDN list.
+
+FFmpeg modes run a supervised resident process for inputs or outputs that need it. Program-pipe mode runs a producer and sends its stdout to FFmpeg. The command is argv-based; shell syntax only works when you explicitly invoke a shell.
+
+Some modes shown by the panel are reserved but not fully wired. In particular, N_m3u8DL-RE resident integration and some external output modes may return `501` or an explanatory start error.
+
+## Playback URLs
+
+The canonical URL is:
+
+```text
+/play/<stream-id>/index.m3u8
+```
+
+Other useful routes:
+
+| Route | Use |
+|---|---|
+| `/restream/<id>/<generated-filename>` | Internal media URLs emitted by playlists. |
+| `/direct/<id>` | Never-ending raw fMP4 tail. |
+| `/direct/<id>.ts` | Never-ending muxed MPEG-TS tail. |
+| `/download/<id>/<representation>` | Download the media currently buffered in memory. |
+| `/source/<id>` | Redirect to the current source URL. |
+| `/api/playlist.m3u8` | Export all streams as M3U. |
+| `/api/providers/<id>/playlist.m3u8` | Export one provider as M3U. |
+| `/player_api.php?username=...&password=...` | Xtream Codes-compatible live-TV API. |
+| `/get.php?username=...&password=...&type=m3u_plus` | Credentialed Xtream M3U export. |
+| `/xmltv.php?username=...&password=...` | Xtream XMLTV channel metadata. |
+| `/ping` | Unauthenticated health check. |
+
+When at least one playback key exists, pass it as `?key=<key>` or `Authorization: Bearer <key>`. With no playback keys, viewing URLs are open to anyone who can reach the server.
+
+The player's **Playback user** selector controls the complete M3U8 URL, the
+embedded player, copied links and panel playlist exports. Generating an API key
+selects that new user automatically. The choice is remembered in this browser;
+revoking it selects a remaining key, or open playback if none remain.
+
+Each entry in **API Keys** shows its Xtream server, username (label), password
+(key), and a complete **M3U playlist URL** with a Copy button. This `/get.php`
+URL uses that specific account and works without a panel login. It lists all
+configured channels; each stream still needs a working source and must be
+started before playback. Xtream login success does not prove the source is online.
+
+## HTTP management API
+
+Every server-side action in the panel uses the public HTTP API. Automation does not need to click or imitate the UI.
+
+Use a panel admin account with HTTP Basic authentication:
+
+```bash
+base=http://127.0.0.1:8787
+auth='admin:your-panel-password'
+
+curl --fail-with-body --user "$auth" "$base/api/state"
+```
+
+`/api/state` returns provider and stream IDs. Use those IDs in action routes:
+
+```bash
+stream_id=stream_...
+
+curl --fail-with-body --user "$auth" -X POST \
+  "$base/api/streams/$stream_id/start"
+
+curl --fail-with-body --user "$auth" -X POST \
+  "$base/api/streams/$stream_id/stop"
+```
+
+Viewer accounts can read management data but receive `403` for writes. Playback API keys cannot access `/api/*`.
+
+See [API.md](API.md) for request/response fields, authentication, browser examples, provider/stream CRUD, probing, imports/exports, accounts, settings, service tools, and playback. [EVENTS.md](EVENTS.md) covers live SSE payloads, reconnecting browser clients, log events, scheduled provider events, and outgoing webhooks.
+
+CORS allows every website origin. External browser clients send explicit Basic authentication with `credentials: "omit"`; playback uses separate keys. Use streaming `fetch` for cross-origin SSE because native EventSource cannot set an Authorization header.
+
+**Settings → Refresh intervals** controls monitoring snapshots, panel state, logs, and script/install progress independently. Values are milliseconds: `100`–`3600000`, or `0` to pause automatic updates. Settings persist across restarts and apply without restarting. An external subscriber can choose its own rate with `/api/events?intervalMs=1500`. Source manifest `pollInterval` remains a separate seconds-based setting.
+
+## Provider scripts
+
+Use a provider script only when the source needs custom behavior. Common actions are:
+
+| Action | Purpose |
+|---|---|
+| `login` / `pair` | Create a provider session. |
+| `channels` / `events` | Return streams to import. |
+| `epg` | Return guide data. |
+| `manifest` | Return a fresh source URL and headers. Runs on every start of a session-manifest stream. |
+| `start` / `stop` / `heartbeat` | Manage a source-side session. |
+| `url`, `downloadmanifest`, `pssh`, `initparse` | Adjust pipeline inputs. |
+| `cdm` | Return clear `KID:KEY` pairs from an external key workflow. Runs on every start, after `manifest`. |
+
+Only the actions ticked for a provider are ever invoked, and `cdm` is given every KID and PSSH box ReStreamAir can find — in the manifest, in the initialization segment, or built from the KIDs when the source names no box at all.
+
+Scripts receive flat `key=value` arguments and print text or JSON. ReStreamAir supplies a durable directory at `runtime/sessions/<provider-id>/`; **Clear session** recursively deletes it.
+
+Start with the short working example in [SCRIPTING.md](SCRIPTING.md#five-minute-example). That guide also shows how to call script actions over HTTP.
+
+## Decryption
+
+For DASH CENC, enter one or more `KID:KEY` hex pairs. A single pair is used for all samples; multiple pairs are matched by KID. Full-sample `cenc`/AES-CTR is supported. `cbcs` pattern encryption is not.
+
+For HLS AES-128, enter the key and optional IV. If the IV is blank, the media sequence number is used as required by HLS.
+
+ReStreamAir does not contain Widevine, PlayReady, or FairPlay CDMs. A provider script may integrate an external authorized key workflow and return clear keys, but ReStreamAir itself does not acquire licenses.
+
+## Authentication and security
+
+Panel accounts have two roles:
+
+- **Admin** — full management access.
+- **Viewer** — read-only panel and API access.
+
+Passwords are stored as PBKDF2-HMAC-SHA256 hashes. Session tokens are stored as SHA-256 hashes and survive restarts. Repeated failed sign-ins are throttled per username and client address. The last admin cannot be deleted.
+
+The built-in server is plain HTTP. Use a TLS-terminating reverse proxy when traffic leaves a trusted network. Configure **Trusted proxies** so ReStreamAir can safely use forwarded client addresses and HTTPS status; untrusted forwarded headers are ignored.
+
+`state.json` contains provider-script account passwords, playback keys, and session hashes. Keep it private and back it up securely.
+
+## Install and deploy
+
+### Download a release
+
+Every release is a `.zip` holding the executable, `public/`, and the docs.
+Unpack it and run it — there is nothing to install first:
+
+```bash
+unzip restreamair-v1.1.0-linux-x86_64.zip
+cd restreamair-v1.1.0-linux-x86_64
+chmod +x restreamair          # only if your unzip tool dropped the flag
+./restreamair -p 1234
+```
+
+The Linux build is statically linked against musl, so it depends on no system
+libraries at all — not libcurl, not libxml2, not a particular glibc. It runs the
+same on a current distro and on one old enough that a normally linked binary
+would refuse to start with `version GLIBC_2.38 not found`. It still trusts the
+host's own CA certificates: the trust store is located at startup, so `curl`
+working on the box means upstream HTTPS works here too.
+
+### Build requirements
+
+- CMake 3.16+
+- A C11/C++17 compiler
+- libcurl development files
+- libxml2 development files
+
+Debian/Ubuntu:
+
+```bash
+sudo apt-get install -y cmake build-essential libcurl4-openssl-dev libxml2-dev
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+macOS needs Xcode Command Line Tools plus `brew install libxml2 pkg-config`. Windows builds use the repository's vcpkg manifest.
+
+### Checks after building
+
+Building compiles the application. Tests are separate and check behavior with
+local fixtures, without using your provider accounts or live channels.
+The manual **Build** workflow uses this reduced default set:
+
+| Check | Why it remains / where it runs |
+|---|---|
+| CTest `selftest` | Parsing, crypto, command generation, state and platform process/thread behavior. Runs on each supported OS. |
+| CTest `provider_runtime` | Provider session isolation, concurrency, timeouts and downloader policy. Runs on each supported OS. |
+| `api-smoke.py` | Real HTTP server: UI serving, login, playback authorization, keys, permissions and persistence. Once on Linux. |
+| `provider-options-smoke.py` | Provider options survive API saves and affect runtime configuration. Once on Linux. |
+| `provider-engine-smoke.py` | Real downloader/engine behavior against local sources. Once on Linux. |
+| `manifest-recovery-smoke.py` | 403 CDN fallback, fresh manifests/headers, cooldown and stale-request protection. Once on Linux. |
+| `panel-playback-smoke.js` | The panel includes playback keys only on local playback links. Once on Linux. |
+| `hls-buffer-smoke.py --multi` | First viewer starts downloading; selected qualities/audio are served locally; viewers share a worker; idle stops it. Once on Linux, with FFmpeg. |
+| Native/package smoke checks | macOS/Windows binaries launch; Windows needs no third-party DLLs; the separate static Linux artifact starts on an older distro. These check the binaries being shipped. |
+
+**Full checks** defaults off. Enabling it additionally runs ASan/UBSan memory
+checks and a MinGW cross-build. Ordinary edits need only a build and the tests
+for the changed behavior; the HTTP suites are no longer repeated on all three
+operating systems. The standalone DLive `test_fast.py` is an offline timing
+check to run when changing those optional scripts; it is not part of core CI.
+
+### Docker
+
+```bash
+docker build -t restreamair .
+docker run -d --name restreamair \
+  -p 8787:8787 \
+  -v restreamair-data:/data \
+  restreamair
+```
+
+`docker-compose.yml` and `deploy/Caddyfile` provide a persistent deployment with TLS proxying. `deploy/restreamair.service` is the systemd unit template.
+
+### Server options
+
+```text
+--port N          listening port
+--bind ADDRESS    listening address
+--root DIR        panel public/ directory
+--refresh-web     refresh the cached panel files
+--web-ref REF     fetch panel files from a tag, branch, or commit
+--no-download     never download panel files
+--verbose         always record debug logs (otherwise only while Logs → Verbose is open)
+--max-open-files N      files held open for viewers at once (default: a quarter of `ulimit -n`)
+--file-queue-timeout S  seconds a request waits for a free slot before a 503 (default 15)
+--file-open-timeout S   seconds a viewer may hold a file open before it is disconnected (default 60)
+```
+
+Saved port and bind settings apply after restart. Command-line values take precedence.
+
+Files served to viewers (FFmpeg HLS segments and playlists, panel assets) stay open until the client has downloaded them. To avoid `Too many open files`, the server raises its soft descriptor limit to the hard limit at startup, keeps at most `--max-open-files` served files open, and queues further requests until a slot frees up. A client that stops reading is disconnected after `--file-open-timeout`, releasing its file. Busy replies and timeouts appear in Logs as `fileQueueFull` and `fileOpenTimeout`.
+
+## Data layout
+
+All mutable data is relative to the working directory:
+
+- `state.json` — configuration, accounts, keys, sessions, and totals.
+- `runtime/sessions/<provider-id>/` — provider-script session data.
+- `runtime/ffmpeg/<stream-id>/` — resident FFmpeg HLS output when used.
+- `logs/` — persisted logs where enabled.
+- `logo-cache.json` or `logos.json` — logo lookup cache.
+
+Internal live segments are held in bounded memory, not written to disk.
+
+## Troubleshooting
+
+- **`/play` stays at 503:** open Logs and check the manifest fetch or pipeline start.
+- **Players request missing segments:** raise Keep count and possibly Playlist count.
+- **Origin returns 403/429:** inspect the logged response, reduce poll frequency or parallel downloads, and verify headers/proxy/account limits.
+- **No picture after downloading:** verify the stream's KID/key pair and confirm the encryption mode is `cenc`, not `cbcs`.
+- **Audio is out of sync:** adjust Audio delay in the stream editor.
+- **`Too many open files` or `fileQueueFull` in Logs:** raise the hard limit (`LimitNOFILE=` in the systemd unit, `ulimit -Hn`, or Docker's `--ulimit nofile=`), or set `--max-open-files` explicitly.
+- **Static MPD is rejected:** enable Allow offline/static MPD.
+- **A panel action fails from automation:** use `--fail-with-body`; API errors return `{"error":"..."}`.
+
+## Architecture
+
+- `restream_base` contains portable parsing, crypto, state, process, and panel logic.
+- `restream_core` contains the HTTP server, live engine, metrics, logs, and playback routing.
+- `restreamair-server` registers platform/network handlers and serves the panel.
+- `restream_selftest` runs deterministic core tests.
+- `scripts/api-smoke.py` starts a real server and tests the management and playback APIs end to end.
+
+## License
+
+See [LICENSE](LICENSE).
