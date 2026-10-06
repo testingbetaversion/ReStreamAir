@@ -26,8 +26,9 @@ See [SCRIPTING.md](SCRIPTING.md) for the provider subprocess protocol.
 | Surface | Authentication |
 |---|---|
 | `/api/*` management | Panel username/password in an explicit HTTP Basic header, `?auth=username:password` (or its base64) in the URL, or a panel session cookie. |
+| `/api/playlist.m3u8`, `/api/providers/<id>/playlist.m3u8`, `/api/events` (GET) | Also a key with **API access**, as `Authorization: Bearer …` or `?key=…`. |
 | `/api/auth/*` | Public setup/login/status/logout routes, described below. |
-| Playback | Playback key in `?key=…` or `Authorization: Bearer …`. Open when no playback keys exist. |
+| Playback | Playback key in `?key=…` or `Authorization: Bearer …`. Open when no playback keys exist; once keys exist, expired ones are refused. |
 | Xtream | Playback key label as `username`, key value as `password`. |
 | `/ping`, panel assets, `OPTIONS` | Public. |
 
@@ -36,7 +37,21 @@ provider export, which requires an admin. Non-GET management requests from
 viewers return `403`. Read access includes sensitive configuration and playback
 keys: a viewer is a trusted operator, not an untrusted playback customer.
 
-Playback keys do not authenticate management requests. Basic authentication is
+Playback keys do not authenticate management requests, with one exception: a
+key created (or updated) with `"api": true` may read the playlists and
+`/api/events` — GET only, nothing else. Any other route answers `403` for it, so
+it never exposes `/api/state` (provider passwords, proxy credentials, other
+keys). Send it as `Authorization: Bearer <key>`, which keeps it out of URLs and
+logs; `?key=<key>` works for clients that cannot set headers. Playlists fetched
+this way carry that same key in their play links. Every key may also expire
+(`expiresInHours`); after that it stops working for playback, Xtream and the
+API alike.
+
+```sh
+curl -H "Authorization: Bearer rsa_…" "$base/api/playlist.m3u8?type=event&format=json"
+```
+
+Basic authentication is
 checked per request, shares the login failure throttle, and creates no session.
 If an Authorization header is present, it takes precedence over cookies; invalid
 explicit credentials do not fall back to a cookie. Use HTTPS outside a trusted
@@ -554,8 +569,9 @@ and [playing an event with authentication](EVENTS.md#playing-an-event-with-authe
 | `GET /api/users` | `{"users":[…]}`. |
 | `POST /api/users` | `{"username":"watcher","password":"8-or-more-characters","role":"viewer"}`; same users envelope. Role defaults to admin. |
 | `DELETE /api/users/<id>` | Same users envelope. Final admin cannot be removed. |
-| `GET /api/keys` | `{"keys":[…]}`. |
-| `POST /api/keys` | `{"label":"living-room"}`; same keys envelope including generated key. |
+| `GET /api/keys` | `{"keys":[…]}`; each key has `api`, `expiresAt` (ISO time or null) and `expired`. |
+| `POST /api/keys` | `{"label":"living-room","expiresInHours":720,"api":false}`; only `label` is needed (`expiresInHours` 0 or absent = never). Same keys envelope including generated key. |
+| `PUT /api/keys/<id>` | Any of `label`, `api`, `expiresInHours` (hours from now; 0 removes the expiry). Same keys envelope. |
 | `DELETE /api/keys/<id>` | Same keys envelope. Revokes playback credentials. |
 
 User fields: `id`, `username`, `role`, `createdAt` (ISO 8601 UTC). Password hashes

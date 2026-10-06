@@ -119,6 +119,14 @@ size_t rs_panel_admin_count(const rs_state *st);
 
 int rs_panel_create_key(rs_state *st, const rs_json *body, const char **err);
 int rs_panel_delete_key(rs_state *st, const char *id, const char **err);
+// Partial update: label, api (bool), expiresInHours (0 = never). Same fields
+// are accepted on create.
+int rs_panel_update_key(rs_state *st, const char *id, const rs_json *body, const char **err);
+// False once a key's expiresAt has passed (keys without one never expire).
+bool rs_panel_key_active(const rs_json *key);
+// The key matching `provided_key` if it is active and marked for API access
+// (read-only playlists and events), else NULL.
+const rs_json *rs_panel_api_key(const rs_state *st, const char *provided_key);
 
 // A name slug, exposed for tests. Alphanumeric runs joined by single dashes,
 // lowercased — matches PanelServer.slugify.

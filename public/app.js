@@ -912,7 +912,9 @@ function selectedPlaybackKey() {
     try { selectedPlaybackKeyId = localStorage.getItem("restreamair-playback-key-id") || ""; }
     catch { selectedPlaybackKeyId = ""; }
   }
-  const keys = (state.apiKeys || []).filter((entry) => entry.key);
+  // An expired key can't play anything, so it is never chosen for the panel's
+  // own players — not even when it was selected before it expired.
+  const keys = (state.apiKeys || []).filter((entry) => entry.key && !entry.expired);
   const key = keys.find((entry) => entry.id === selectedPlaybackKeyId) || keys[keys.length - 1] || null;
   if ((key?.id || "") !== selectedPlaybackKeyId) rememberPlaybackKey(key?.id);
   return key;
@@ -2760,8 +2762,10 @@ function renderKeys() {
     row.innerHTML = `
       <div class="key-top">
         <strong>${escapeHtml(key.label)}</strong>
+        ${key.api ? '<span class="badge">API</span>' : ""}
+        <span class="badge ${key.expired ? "danger-badge" : ""}">${escapeHtml(keyExpiryText(key))}</span>
         <div class="actions">
-          <button type="button" class="ghost" data-use-key ${selectedPlaybackKey()?.id === key.id ? "disabled" : ""}>${selectedPlaybackKey()?.id === key.id ? "Selected for playback" : "Use this user"}</button>
+          <button type="button" class="ghost" data-use-key ${selectedPlaybackKey()?.id === key.id || key.expired ? "disabled" : ""}>${selectedPlaybackKey()?.id === key.id ? "Selected for playback" : key.expired ? "Expired" : "Use this user"}</button>
           <button type="button" class="danger" data-revoke-key><span data-icon="trash"></span>Revoke</button>
         </div>
       </div>
@@ -2772,7 +2776,25 @@ function renderKeys() {
         <button type="button" class="ghost" data-copy-playlist>Copy M3U URL</button>
       </div>
       <div class="key-meta">${key.requests || 0} requests · ${formatBytes(key.bytes || 0)} · last seen ${key.lastSeenAt ? new Date(key.lastSeenAt).toLocaleString() : "never"}</div>
+      <div class="actions key-settings">
+        <select data-key-expiry aria-label="Change expiry">
+          <option value="">Change expiry…</option>
+          <option value="0">Never expires</option>
+          <option value="1">1 hour from now</option>
+          <option value="24">1 day from now</option>
+          <option value="168">7 days from now</option>
+          <option value="720">30 days from now</option>
+          <option value="2160">90 days from now</option>
+          <option value="8760">1 year from now</option>
+        </select>
+        <label class="inline-check"><input type="checkbox" data-key-api ${key.api ? "checked" : ""}>API access (playlists &amp; events, read-only)</label>
+      </div>
     `;
+    row.querySelector("[data-key-expiry]").addEventListener("change", (event) => {
+      if (event.currentTarget.value === "") return;
+      updateKey(key.id, { expiresInHours: Number(event.currentTarget.value) });
+    });
+    row.querySelector("[data-key-api]").addEventListener("change", (event) => updateKey(key.id, { api: event.currentTarget.checked }));
     row.querySelector("[data-revoke-key]").addEventListener("click", () => revokeKey(key.id));
     row.querySelector("[data-use-key]").addEventListener("click", () => selectPlaybackUser(key.id));
     row.querySelector("[data-copy-playlist]").addEventListener("click", async (event) => {
@@ -2783,6 +2805,17 @@ function renderKeys() {
     list.appendChild(row);
   }
   applyIcons(list);
+}
+
+function keyExpiryText(key) {
+  if (!key.expiresAt) return "Never expires";
+  const at = new Date(key.expiresAt).toLocaleString();
+  return key.expired ? `Expired ${at}` : `Expires ${at}`;
+}
+
+async function updateKey(id, changes) {
+  try { applyKeyList(await request(`/api/keys/${id}`, { method: "PUT", body: JSON.stringify(changes) })); }
+  catch (error) { alert(`Couldn't update key: ${error.message || error}`); }
 }
 
 async function revokeKey(id) {
@@ -2796,7 +2829,14 @@ $("#keyForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
   try {
-    applyKeyList(await request("/api/keys", { method: "POST", body: JSON.stringify({ label: form.elements.label.value }) }), true);
+    applyKeyList(await request("/api/keys", {
+      method: "POST",
+      body: JSON.stringify({
+        label: form.elements.label.value,
+        expiresInHours: Number(form.elements.expiresInHours.value) || 0,
+        api: form.elements.api.checked,
+      }),
+    }), true);
     form.reset();
   } catch (error) { alert(`Couldn't generate key: ${error.message || error}`); }
 });

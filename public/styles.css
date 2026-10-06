@@ -1284,6 +1284,16 @@ pre {
   font-size: 12px;
 }
 
+/* Label, then the API/expiry badges beside it, actions pushed right. */
+.key-row .key-top { justify-content: flex-start; }
+.key-row .key-top > .actions { margin-left: auto; }
+.badge.danger-badge { color: var(--danger); }
+.key-settings { flex-wrap: wrap; align-items: center; }
+.key-settings select { width: auto; font-size: 12px; padding: 4px 8px; }
+.inline-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; margin: 0; white-space: nowrap; cursor: pointer; }
+.inline-check input { margin: 0; width: auto; }
+#keyForm select { width: auto; }
+
 /* Skeleton loading */
 
 .skeleton {

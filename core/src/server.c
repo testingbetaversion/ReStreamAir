@@ -275,6 +275,7 @@ static void provider_maintenance(restream_server_t *s);
 static void backup_tick(restream_server_t *s);
 static double stream_delivery_speed(restream_server_t *server, const char *stream_id);
 static void speed_prune(restream_server_t *server);
+static char *playback_key(struct mg_http_message *hm);
 struct rs_seg_entry;
 static void seg_cache_complete(restream_server_t *server, rs_pending_job *fetch);
 static bool seg_cache_serve(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf);
@@ -2179,14 +2180,19 @@ static bool ci_contains(const char *haystack, const char *needle) {
 }
 
 // `only_provider` NULL exports every provider; otherwise just that one.
+// `auth_key` is the API key the caller authenticated with, if any: its play
+// links then carry that key rather than whichever key happens to be first.
 static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
-                               struct mg_http_message *hm, const char *only_provider) {
-    char *key = query_var(hm, "key");
+                               struct mg_http_message *hm, const char *only_provider,
+                               const char *auth_key) {
+    char *key = auth_key && auth_key[0] ? rs_strdup(auth_key) : query_var(hm, "key");
     const rs_json *keys = rs_json_obj_get(s->state.root, "apiKeys");
     if (key && !rs_panel_playback_allowed(&s->state, key)) {
-        free(key); reply_error(c, 400, "The selected playback key is invalid or revoked."); return;
+        free(key); reply_error(c, 400, "The selected playback key is invalid, expired or revoked."); return;
     }
-    if (!key && rs_json_arr_len(keys)) key = rs_strdup(rs_json_obj_str(rs_json_arr_at(keys, 0), "key", ""));
+    for (size_t i = 0; !key && i < rs_json_arr_len(keys); i++)
+        if (rs_panel_key_active(rs_json_arr_at(keys, i)))
+            key = rs_strdup(rs_json_obj_str(rs_json_arr_at(keys, i), "key", ""));
     char *encoded_key = key && key[0] ? query_encode(key) : NULL;
     free(key);
     char *host = request_host(hm);
@@ -2466,6 +2472,31 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     // Everything past here needs a signed-in account.
     int retry_after = 0;
     char *user = current_user(s, c, hm, &retry_after);
+    // An API key (Authorization: Bearer <key>, or ?key=) marked for API access
+    // reads the playlists and the monitoring stream, and nothing else: not
+    // /api/state, which carries provider passwords and every other key, and
+    // never a change. Expired keys are refused like unknown ones.
+    if (!user && retry_after == 0 && method_is(hm, "GET")) {
+        char *provided = playback_key(hm);
+        const rs_json *api_key = rs_panel_api_key(&s->state, provided);
+        if (api_key) {
+            bool all = mg_match(hm->uri, mg_str("/api/playlist.m3u8"), NULL);
+            bool one = mg_match(hm->uri, mg_str("/api/providers/*/playlist.m3u8"), NULL);
+            bool events = mg_match(hm->uri, mg_str("/api/events"), NULL);
+            if (all || one) {
+                char *provider_id = one ? capture(hm, "/api/providers/*/playlist.m3u8") : NULL;
+                serve_m3u_playlist(s, c, hm, provider_id, provided);
+                free(provider_id);
+            } else if (events) {
+                handle_events(s, c, hm);
+            } else {
+                reply_error(c, 403, "This API key can read the playlists and /api/events only.");
+            }
+            free(provided);
+            return true;
+        }
+        free(provided);
+    }
     if (!user) {
         if (retry_after > 0) {
             char headers[80];
@@ -2704,12 +2735,12 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
 
     // --- M3U export, provider export/import, EPG ---
     if (mg_match(hm->uri, mg_str("/api/playlist.m3u8"), NULL) && method_is(hm, "GET")) {
-        serve_m3u_playlist(s, c, hm, NULL);
+        serve_m3u_playlist(s, c, hm, NULL, NULL);
         return true;
     }
     if (mg_match(hm->uri, mg_str("/api/providers/*/playlist.m3u8"), NULL) && method_is(hm, "GET")) {
         char *provider_id = capture(hm, "/api/providers/*/playlist.m3u8");
-        serve_m3u_playlist(s, c, hm, provider_id);
+        serve_m3u_playlist(s, c, hm, provider_id, NULL);
         free(provider_id);
         return true;
     }
@@ -2946,6 +2977,18 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         reply_json(c, 200, rs_panel_keys_view(&s->state), NULL);
         return true;
     }
+    if (mg_match(hm->uri, mg_str("/api/keys/*"), NULL) && method_is(hm, "PUT")) {
+        char *id = capture(hm, "/api/keys/*");
+        rs_json *body = parse_body(hm);
+        const char *err = NULL;
+        int rc = rs_panel_update_key(&s->state, id, body, &err);
+        rs_json_free(body);
+        free(id);
+        if (rc != 0) { reply_error(c, -rc, err); return true; }
+        if (rs_state_save(&s->state) != 0) { reply_error(c, 500, "Could not save state."); return true; }
+        reply_json(c, 200, rs_panel_keys_view(&s->state), NULL);
+        return true;
+    }
     if (mg_match(hm->uri, mg_str("/api/keys/*"), NULL) && method_is(hm, "DELETE")) {
         char *id = capture(hm, "/api/keys/*");
         const char *err = NULL;
@@ -3145,7 +3188,8 @@ static const rs_json *xc_account(const rs_state *st, const char *username,
     for (size_t i = 0; i < rs_json_arr_len(keys); i++) {
         const rs_json *key = rs_json_arr_at(keys, i);
         if (strcmp(rs_json_obj_str(key, "label", ""), username) == 0 &&
-            strcmp(rs_json_obj_str(key, "key", ""), password) == 0) return key;
+            strcmp(rs_json_obj_str(key, "key", ""), password) == 0)
+            return rs_panel_key_active(key) ? key : NULL;
     }
     return NULL;
 }
