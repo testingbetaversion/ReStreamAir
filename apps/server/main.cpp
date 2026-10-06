@@ -9,6 +9,10 @@
 #include <cstring>
 #include <string>
 
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
+
 #include <curl/curl.h>
 
 #include "net.h"
@@ -41,6 +45,11 @@ void print_usage(const char *program) {
                  "  --web-ref REF     branch, tag or commit to fetch the front-end from (default main)\n"
                  "  --no-download     never fetch; use public/ or an existing cache only\n"
                  "  --verbose         full mongoose trace logging (default: errors only)\n"
+                 "  --max-open-files N      files held open for viewers at once; more requests\n"
+                 "                          wait in a queue (default: a quarter of `ulimit -n`)\n"
+                 "  --file-queue-timeout S  seconds a queued request waits before a 503 (default 15)\n"
+                 "  --file-open-timeout S   seconds a viewer may hold a file open before its\n"
+                 "                          connection is closed (default 60)\n"
                  "  -h, --help        this message\n",
                  program);
 }
@@ -52,6 +61,35 @@ bool needs_value(const char *arg, int index, int argc, const char *flag) {
     }
     (void)arg;
     return true;
+}
+
+// Parses a positive count for one of the file-limit flags.
+bool parse_count(const char *flag, const char *value, unsigned long max, unsigned long *out) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(value, &end, 10);
+    if (!end || *end || n == 0 || n > max || value[0] == '-') {
+        std::fprintf(stderr, "restreamair-server: invalid %s '%s'\n", flag, value);
+        return false;
+    }
+    *out = n;
+    return true;
+}
+
+// Linux defaults the soft descriptor limit to 1024 even where the hard limit
+// is far higher; every viewer costs a socket plus the file it is downloading,
+// so take what the system allows before anything sizes itself off it.
+void raise_fd_limit() {
+#ifndef _WIN32
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rlim_t wanted = rl.rlim_max;
+#ifdef __APPLE__
+        if (wanted > OPEN_MAX) wanted = OPEN_MAX;  // macOS refuses more than OPEN_MAX
+#endif
+        rl.rlim_cur = wanted;
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
+#endif
 }
 
 }  // namespace
@@ -170,6 +208,7 @@ int main(int argc, char **argv) {
     // setting is honoured, so the promise the UI makes is now kept.
     bool port_from_argv = false;
     bool bind_from_argv = false;
+    unsigned long max_open_files = 0, file_queue_timeout = 0, file_open_timeout = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -204,6 +243,15 @@ int main(int argc, char **argv) {
             web.no_download = true;
         } else if (std::strcmp(arg, "--verbose") == 0) {
             verbose = true;
+        } else if (std::strcmp(arg, "--max-open-files") == 0) {
+            if (!needs_value(arg, i, argc, arg)) return 2;
+            if (!parse_count(arg, argv[++i], 1000000, &max_open_files)) return 2;
+        } else if (std::strcmp(arg, "--file-queue-timeout") == 0) {
+            if (!needs_value(arg, i, argc, arg)) return 2;
+            if (!parse_count(arg, argv[++i], 86400, &file_queue_timeout)) return 2;
+        } else if (std::strcmp(arg, "--file-open-timeout") == 0) {
+            if (!needs_value(arg, i, argc, arg)) return 2;
+            if (!parse_count(arg, argv[++i], 86400, &file_open_timeout)) return 2;
         } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -215,6 +263,7 @@ int main(int argc, char **argv) {
     }
 
     restream_server_set_verbose(verbose);
+    raise_fd_limit();
 
     // Enable source auto-detect (/api/probe): libcurl for the fetch, libxml2 for
     // MPD parsing. Both are initialised once here; the handler lives in probe.c.
@@ -253,6 +302,8 @@ int main(int argc, char **argv) {
     if (!web_root.empty()) {
         restream_server_set_web_root(server, web_root.c_str());
     }
+    restream_server_set_file_limits(server, max_open_files, static_cast<unsigned>(file_queue_timeout),
+                                    static_cast<unsigned>(file_open_timeout));
     // Honour the panel's stored settings unless the command line overrode them.
     if (!port_from_argv) {
         if (uint16_t stored = restream_server_stored_port(server)) port = stored;

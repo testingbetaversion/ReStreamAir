@@ -69,6 +69,14 @@ const char* restream_server_stored_bind(const restream_server_t* server);
 // false, the default once main sets it) or restores the full trace (true).
 void restream_server_set_verbose(bool verbose);
 
+// Bounds on the files the server holds open while viewers download them
+// (segments, playlists, panel assets). At most `max_open` are open at once and
+// further requests wait in a queue for up to `queue_timeout_s` before a 503;
+// a file held open longer than `open_timeout_s` has its connection closed.
+// 0 keeps a field's default (max_open: a quarter of RLIMIT_NOFILE; 15 s; 60 s).
+void restream_server_set_file_limits(restream_server_t *server, size_t max_open,
+                                     unsigned queue_timeout_s, unsigned open_timeout_s);
+
 typedef char *(*restream_epg_fn)(const char *xml, size_t len, int offset_minutes, char *err, size_t errlen);
 void restream_server_set_epg_handler(restream_epg_fn handler);
 

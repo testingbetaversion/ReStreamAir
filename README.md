@@ -305,9 +305,14 @@ docker run -d --name restreamair \
 --refresh-web     refresh the cached panel files
 --web-ref REF     fetch panel files from a tag, branch, or commit
 --no-download     never download panel files
+--max-open-files N      files held open for viewers at once (default: a quarter of `ulimit -n`)
+--file-queue-timeout S  seconds a request waits for a free slot before a 503 (default 15)
+--file-open-timeout S   seconds a viewer may hold a file open before it is disconnected (default 60)
 ```
 
 Saved port and bind settings apply after restart. Command-line values take precedence.
+
+Files served to viewers (FFmpeg HLS segments and playlists, panel assets) stay open until the client has downloaded them. To avoid `Too many open files`, the server raises its soft descriptor limit to the hard limit at startup, keeps at most `--max-open-files` served files open, and queues further requests until a slot frees up. A client that stops reading is disconnected after `--file-open-timeout`, releasing its file. Busy replies and timeouts appear in Logs as `fileQueueFull` and `fileOpenTimeout`.
 
 ## Data layout
 
@@ -328,6 +333,7 @@ Internal live segments are held in bounded memory, not written to disk.
 - **Origin returns 403/429:** inspect the logged response, reduce poll frequency or parallel downloads, and verify headers/proxy/account limits.
 - **No picture after downloading:** verify the stream's KID/key pair and confirm the encryption mode is `cenc`, not `cbcs`.
 - **Audio is out of sync:** adjust Audio delay in the stream editor.
+- **`Too many open files` or `fileQueueFull` in Logs:** raise the hard limit (`LimitNOFILE=` in the systemd unit, `ulimit -Hn`, or Docker's `--ulimit nofile=`), or set `--max-open-files` explicitly.
 - **Static MPD is rejected:** enable Allow offline/static MPD.
 - **A panel action fails from automation:** use `--fail-with-body`; API errors return `{"error":"..."}`.
 

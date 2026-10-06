@@ -84,6 +84,7 @@ endif()
 add_library(restream_core STATIC
     core/src/server.c
     core/src/live.c
+    core/src/file_gate.c
     core/deps/mongoose.c
 )
 target_include_directories(restream_core PUBLIC core/include PRIVATE core/deps)
@@ -94,7 +95,7 @@ target_link_libraries(restream_core PUBLIC restream_base)
 find_package(Threads REQUIRED)
 target_link_libraries(restream_core PUBLIC Threads::Threads)
 # Warnings apply to our source only; mongoose is vendored and compiles as-is.
-set_source_files_properties(core/src/server.c core/src/live.c PROPERTIES COMPILE_OPTIONS "${RS_WARNINGS}")
+set_source_files_properties(core/src/server.c core/src/live.c core/src/file_gate.c PROPERTIES COMPILE_OPTIONS "${RS_WARNINGS}")
 if(WIN32)
     # 0x0601 (Windows 7) is the floor for the APIs the tree uses: SRWLOCK and
     # CONDITION_VARIABLE in rs_thread.h, and the PROC_THREAD_ATTRIBUTE_HANDLE_LIST
