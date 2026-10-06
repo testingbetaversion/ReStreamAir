@@ -5400,8 +5400,12 @@ static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job 
     bool server_decrypts_hls = decrypts_cenc || (pf->hls_key && pf->hls_key[0] != '\0');
     char *rewritten;
     if (rs_m3u8_is_master(pf->body)) {
-        rewritten = rs_m3u8_rewrite_master(pf->body, pf->url, server_decrypts_hls,
+        // The provider's "Default video" rules cap which variants a player may
+        // pick (height<=720 and the like); with no rule this is a no-op.
+        char *limited = rs_m3u8_filter_master_video(pf->body, pf->source_policy.video_filter);
+        rewritten = rs_m3u8_rewrite_master(limited ? limited : pf->body, pf->url, server_decrypts_hls,
                                            master_transform, &ctx);
+        rs_free(limited);
     } else {
         // With a configured clear key the server decrypts each segment. Strip
         // EXT-X-KEY so the player does not decrypt the clear bytes a second

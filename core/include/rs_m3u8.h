@@ -41,6 +41,14 @@ typedef char *(*rs_m3u8_transform_fn)(void *userdata, const char *absolute_uri,
 char *rs_m3u8_rewrite(const char *text, const char *base_url, bool drop_key,
                       rs_m3u8_transform_fn transform, void *userdata);
 
+// Limits which variants of a master playlist a player may choose, using the
+// provider "Default video" rule list (comma-separated, first rule that keeps
+// at least one variant wins): height<=N, bandwidth<=N, codec=X, best, worst.
+// If no rule keeps anything, nothing is removed. I-frame variants follow the
+// same rule. Returns a new string (rs_free), or NULL when `text` is not a
+// master, `filter` is empty, or on allocation failure — use the original then.
+char *rs_m3u8_filter_master_video(const char *text, const char *filter);
+
 typedef char *(*rs_m3u8_master_transform_fn)(void *userdata, const char *absolute_uri);
 
 // Rewrites a master playlist's variant and audio-track URIs. When
