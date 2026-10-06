@@ -3160,6 +3160,14 @@ function openHelpDoc(name, anchor = "") {
   else { syncUrl("help"); renderHelpDoc(); }
 }
 
+// The reference docs are written for any install, so their examples name a
+// placeholder server. Shown inside the panel, the reader's own server is known:
+// swap it in so copied commands work as they are.
+const DOC_PLACEHOLDER_SERVERS = /https?:\/\/(?:your-server:1234|streams\.example\.com|127\.0\.0\.1:8787|localhost:8787)/g;
+function withThisServer(markdown) {
+  return markdown.replace(DOC_PLACEHOLDER_SERVERS, location.origin);
+}
+
 async function renderHelpDoc() {
   const cards = $("#helpCards");
   const docEl = $("#helpDoc");
@@ -3189,7 +3197,7 @@ async function renderHelpDoc() {
       if (docEl.dataset.doc !== helpDoc) return;  // switched while loading
       docEl.innerHTML = `<div class="help-doc-bar"><span>${escapeHtml(meta.file)}</span>` +
         `<a href="${HELP_REPO_URL}${meta.file}" target="_blank" rel="noopener">View on GitHub</a></div>` +
-        renderMarkdown(text);
+        renderMarkdown(withThisServer(text));
     } catch (error) {
       docEl.dataset.doc = "";
       docEl.innerHTML = `<p class="help-note">Could not load ${escapeHtml(meta.file)} (${escapeHtml(error.message || error)}). ` +
@@ -3378,7 +3386,12 @@ async function loadSettingsView() {
     }
     $("#portForm").elements.bindAddress.value = settings.bindAddress || "";
     $("#portForm").elements.trustedProxies.value = settings.trustedProxies || "";
+    if (settings.backupHours !== undefined) {
+      $("#backupForm").elements.backupHours.value = settings.backupHours;
+      $("#backupForm").elements.backupKeep.value = settings.backupKeep;
+    }
   } catch (error) { /* ignore */ }
+  await refreshBackupList();
   await refreshServiceStatus();
   await refreshSettingsFfmpegStatus();
   await refreshUserList();
@@ -3529,6 +3542,52 @@ $("#portForm").addEventListener("submit", async (event) => {
     }),
   });
   $("#viewMeta").textContent = "Saved — restart the server for it to take effect.";
+});
+
+function renderBackupList(backups) {
+  const list = $("#backupList");
+  if (!backups.length) { list.textContent = "No backups yet."; return; }
+  const shown = backups.slice(0, 10).map((b) =>
+    `<div><code>${escapeHtml(b.name)}</code> · ${escapeHtml(new Date(b.time * 1000).toLocaleString())} · ${escapeHtml(formatBytes(b.bytes))}</div>`);
+  list.innerHTML = `${shown.join("")}${backups.length > 10 ? `<div>…and ${backups.length - 10} older</div>` : ""}`;
+}
+
+// An older server has no /api/backups; the section then just says so.
+async function refreshBackupList() {
+  try {
+    renderBackupList((await request("/api/backups")).backups || []);
+  } catch (error) {
+    $("#backupList").textContent = error.status === 404 ? "This server version does not support backups yet." : "";
+  }
+}
+
+$("#backupForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const status = $("#backupStatus");
+  try {
+    await request("/api/settings", {
+      method: "POST",
+      body: JSON.stringify({
+        backupHours: Number(form.elements.backupHours.value),
+        backupKeep: Number(form.elements.backupKeep.value),
+      }),
+    });
+    status.textContent = "Saved — backup schedule applied.";
+  } catch (error) {
+    status.textContent = `Could not save: ${error.message}`;
+  }
+});
+
+$("#backupNowBtn").addEventListener("click", async () => {
+  const status = $("#backupStatus");
+  try {
+    const result = await request("/api/backups", { method: "POST", body: "{}" });
+    status.textContent = `Backed up to backups/${result.name}.`;
+    renderBackupList(result.backups || []);
+  } catch (error) {
+    status.textContent = `Backup failed: ${error.message}`;
+  }
 });
 
 $("#refreshForm").addEventListener("submit", async (event) => {

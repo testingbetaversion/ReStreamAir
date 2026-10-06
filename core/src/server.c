@@ -143,6 +143,7 @@ struct restream_server {
     // browser. The one-second timer performs it instead, by which point mongoose
     // has flushed the response and the operator has seen it succeed.
     bool restart_pending;
+    long long last_backup_s;  // newest backup's time; -1 until read from disk
     unsigned long long next_start_token;
     rs_json *provider_timers; // event-loop-owned scheduling state, never persisted
     rs_live *live;          // background DASH->HLS engines, one per running stream
@@ -194,6 +195,17 @@ static const struct { const char *name; uint32_t fallback; } refresh_fields[] = 
     {"logsRefreshMs", 2000}, {"activityRefreshMs", 1000},
 };
 
+// Periodic state.json backups (see rs_state_backup). They land in backups/
+// beside state.json, which is the working directory.
+#define RS_BACKUP_DIR "backups"
+#define RS_BACKUP_HOURS_DEFAULT 24
+#define RS_BACKUP_KEEP_DEFAULT 14
+
+static long long backup_setting(restream_server_t *s, const char *name, long long fallback) {
+    const rs_json *settings = rs_json_obj_get(s->state.root, "settings");
+    return (long long)rs_json_obj_num(settings, name, (double)fallback);
+}
+
 static bool valid_refresh_ms(double value) {
     return isfinite(value) && (value == 0 ||
         (value >= RS_REFRESH_MIN_MS && value <= RS_REFRESH_MAX_MS && (double)(uint32_t)value == value));
@@ -238,6 +250,8 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
 static void pipeline_stop_stream(const char *stream_id);
 static void live_sync_all(restream_server_t *s);
 static void provider_maintenance(restream_server_t *s);
+static void backup_tick(restream_server_t *s);
+static int backup_now(restream_server_t *s, char *name, size_t name_cap);
 static int clear_provider_session(const char *provider_id);
 static bool provider_job_busy(restream_server_t *s, const rs_json *provider);
 static rs_json *provider_timer(restream_server_t *s, const char *id);
@@ -1441,6 +1455,9 @@ static rs_json *settings_view(restream_server_t *s) {
                     rs_json_new_str(rs_json_as_str(rs_json_obj_get(settings, "bindAddress"), "")));
     rs_json_obj_set(out, "trustedProxies",
                     rs_json_new_str(rs_json_as_str(rs_json_obj_get(settings, "trustedProxies"), "")));
+    rs_json_obj_set_int(out, "backupHours", backup_setting(s, "backupHours", RS_BACKUP_HOURS_DEFAULT));
+    rs_json_obj_set_int(out, "backupKeep", backup_setting(s, "backupKeep", RS_BACKUP_KEEP_DEFAULT));
+    rs_json_obj_set_int(out, "lastBackup", s->last_backup_s > 0 ? s->last_backup_s : 0);
     return out;
 }
 
@@ -1477,8 +1494,26 @@ static void handle_settings_update(restream_server_t *s, struct mg_connection *c
         reply_error(c, 400, "trustedProxies must contain addresses, CIDR blocks, loopback, private or any.");
         return;
     }
+    static const struct { const char *name; double max; const char *message; } backup_fields[] = {
+        {"backupHours", 24 * 365, "backupHours must be 0 (off) or a whole number of hours."},
+        {"backupKeep", 10000, "backupKeep must be 0 (keep all) or a whole number of backups."},
+    };
+    for (size_t i = 0; i < sizeof(backup_fields) / sizeof(backup_fields[0]); i++) {
+        const rs_json *value = rs_json_obj_get(body, backup_fields[i].name);
+        double v = rs_json_as_num(value, -1);
+        if (value && (rs_json_type_of(value) != RS_JSON_NUM || v < 0 || v > backup_fields[i].max ||
+                      v != (double)(long long)v)) {
+            rs_json_free(body);
+            reply_error(c, 400, backup_fields[i].message);
+            return;
+        }
+    }
     rs_json *settings = rs_json_clone(rs_state_settings(&s->state));
     if (!settings) { rs_json_free(body); reply_error(c, 500, "Out of memory."); return; }
+    for (size_t i = 0; i < sizeof(backup_fields) / sizeof(backup_fields[0]); i++) {
+        const rs_json *value = rs_json_obj_get(body, backup_fields[i].name);
+        if (value) rs_json_obj_set_int(settings, backup_fields[i].name, (long long)rs_json_as_num(value, 0));
+    }
     for (size_t i = 0; i < sizeof(refresh_fields) / sizeof(refresh_fields[0]); i++) {
         const rs_json *value = rs_json_obj_get(body, refresh_fields[i].name);
         if (value) rs_json_obj_set_int(settings, refresh_fields[i].name, (long long)rs_json_as_num(value, 0));
@@ -1514,7 +1549,7 @@ static void handle_settings_update(restream_server_t *s, struct mg_connection *c
     }
     rs_json_free(previous);
     rs_json *out = settings_view(s);
-    rs_json_obj_set_str(out, "note", "Refresh intervals and trusted proxies apply immediately; port and bind address apply after restart.");
+    rs_json_obj_set_str(out, "note", "Refresh intervals, trusted proxies and backups apply immediately; port and bind address apply after restart.");
     reply_json(c, 200, out, NULL);
 }
 
@@ -1640,6 +1675,14 @@ static void handle_events(restream_server_t *s, struct mg_connection *c, struct 
         sub.override_interval = true;
         sub.interval_ms = (uint32_t)value;
     }
+    // ?format=json: one snapshot as an ordinary JSON reply, for clients that
+    // poll (or a link opened in a browser) rather than hold a stream open.
+    char format[16];
+    if (mg_http_get_var(&hm->query, "format", format, sizeof(format)) > 0 &&
+        strcmp(format, "json") == 0) {
+        reply_json(c, 200, build_metrics(s), NULL);
+        return;
+    }
     // Unnamed SSE messages preserve existing EventSource.onmessage clients.
     mg_printf(c, "HTTP/1.1 200 OK\r\n" RS_CORS_HEADERS
                  "Content-Type: text/event-stream\r\n"
@@ -1742,6 +1785,7 @@ static void maintenance_tick(void *arg) {
             log_record(s, "__panel__", "error", "serviceRestart", NULL, 0, -1,
                        err[0] ? err : "the restart could not be handed to systemd");
     }
+    backup_tick(s);
     rs_metrics_prune(s->metrics);  // expire stale clients/rate windows every tick
     collect_ingest(s);
     provider_maintenance(s);
@@ -2078,6 +2122,17 @@ static void m3u_attr_append(rs_buf *out, const char *text) {
     }
 }
 
+// Case-insensitive ASCII substring test, for the playlist's ?q= filter.
+static bool ci_contains(const char *haystack, const char *needle) {
+    size_t n = strlen(needle);
+    for (const char *h = haystack; *h; h++) {
+        size_t i = 0;
+        while (i < n && h[i] && tolower((unsigned char)h[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == n) return true;
+    }
+    return n == 0;
+}
+
 // `only_provider` NULL exports every provider; otherwise just that one.
 static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
                                struct mg_http_message *hm, const char *only_provider) {
@@ -2095,6 +2150,20 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
     bool found = only_provider == NULL;
     const char *filename = "restreamair-all";
 
+    // Filters, all optional: ?type=event|channel|manual (how the stream was
+    // added; "manual" is an empty sourceType), ?running=1, ?q=<name substring,
+    // case-insensitive>. ?format=json swaps the M3U for a plain list of
+    // {name, url, provider, type, running, start, end}.
+    char *type_filter = query_var(hm, "type");
+    char *running_filter = query_var(hm, "running");
+    char *name_filter = query_var(hm, "q");
+    char *format = query_var(hm, "format");
+    bool only_running = running_filter && (strcmp(running_filter, "1") == 0 || strcmp(running_filter, "true") == 0);
+    bool as_json = format && strcmp(format, "json") == 0;
+    free(running_filter);
+    free(format);
+    rs_json *list = as_json ? rs_json_new_arr() : NULL;
+
     rs_buf body = RS_BUF_INIT;
     rs_buf_append_str(&body, "#EXTM3U\n");
     for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
@@ -2110,6 +2179,31 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
             const rs_json *stream = rs_json_arr_at(streams, j);
             const char *id = rs_json_obj_str(stream, "id", "");
             const char *name = rs_json_obj_str(stream, "name", "");
+            const char *source_type = rs_json_obj_str(stream, "sourceType", "");
+            bool running = strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0;
+            if (type_filter && type_filter[0] &&
+                strcmp(source_type[0] ? source_type : "manual", type_filter) != 0) continue;
+            if (only_running && !running) continue;
+            if (name_filter && name_filter[0] && !ci_contains(name, name_filter)) continue;
+            if (list) {
+                rs_buf url = RS_BUF_INIT;
+                rs_buf_appendf(&url, "%s%s/play/%s/index.m3u8", scheme, host, id);
+                if (encoded_key) rs_buf_appendf(&url, "?key=%s", encoded_key);
+                char *url_text = rs_buf_take(&url);
+                rs_json *item = rs_json_new_obj();
+                rs_json_obj_set_str(item, "name", name);
+                rs_json_obj_set_str(item, "url", url_text ? url_text : "");
+                rs_json_obj_set_str(item, "provider", provider_name);
+                rs_json_obj_set_str(item, "type", source_type[0] ? source_type : "manual");
+                rs_json_obj_set(item, "running", rs_json_new_bool(running));
+                long long start = (long long)rs_json_obj_num(stream, "scriptStart", 0);
+                long long end = (long long)rs_json_obj_num(stream, "scriptEnd", 0);
+                if (start) rs_json_obj_set_int(item, "start", start);
+                if (end) rs_json_obj_set_int(item, "end", end);
+                rs_json_arr_push(list, item);
+                rs_free(url_text);
+                continue;
+            }
             const char *logo = rs_json_obj_str(stream, "logo", "");
             if (!logo[0]) logo = provider_logo;
             // tvg-id is what binds a guide entry to this channel; without it the
@@ -2143,6 +2237,14 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
     }
     free(host);
     free(encoded_key);
+    free(type_filter);
+    free(name_filter);
+    if (list) {
+        rs_buf_dispose(&body);
+        if (!found) { rs_json_free(list); reply_error(c, 404, "Provider not found."); return; }
+        reply_json(c, 200, list, NULL);
+        return;
+    }
 
     char *text = rs_buf_take(&body);
     if (!found) { rs_free(text); reply_error(c, 404, "Provider not found."); return; }
@@ -2345,6 +2447,22 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     }
     if (mg_match(hm->uri, mg_str("/api/settings"), NULL) && method_is(hm, "POST")) {
         handle_settings_update(s, c, hm); return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/backups"), NULL) && method_is(hm, "GET")) {
+        rs_json *out = rs_json_new_obj();
+        rs_json_obj_set_str(out, "dir", RS_BACKUP_DIR);
+        rs_json_obj_set(out, "backups", rs_state_list_backups(RS_BACKUP_DIR));
+        reply_json(c, 200, out, NULL);
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/backups"), NULL) && method_is(hm, "POST")) {
+        char name[64];
+        if (backup_now(s, name, sizeof(name)) != 0) { reply_error(c, 500, "Could not write the backup."); return true; }
+        rs_json *out = rs_json_new_obj();
+        rs_json_obj_set_str(out, "name", name);
+        rs_json_obj_set(out, "backups", rs_state_list_backups(RS_BACKUP_DIR));
+        reply_json(c, 200, out, NULL);
+        return true;
     }
     if (mg_match(hm->uri, mg_str("/api/events"), NULL) && method_is(hm, "GET")) {
         handle_events(s, c, hm); return true;
@@ -6320,6 +6438,36 @@ static void scheduled_stream_start(restream_server_t *s, const char *id, const c
     rs_state_save(&s->state);
 }
 
+// Takes a backup now. The saved file is what gets copied, so this reflects the
+// last successful save, which every panel mutation makes before replying.
+static int backup_now(restream_server_t *s, char *name, size_t name_cap) {
+    int keep = (int)backup_setting(s, "backupKeep", RS_BACKUP_KEEP_DEFAULT);
+    if (rs_state_backup(&s->state, RS_BACKUP_DIR, keep, name, name_cap) != 0) {
+        log_record(s, "__panel__", "error", "stateBackup", NULL, 0, -1,
+                   "could not write a backup of state.json into " RS_BACKUP_DIR "/");
+        return -1;
+    }
+    s->last_backup_s = (long long)time(NULL);
+    log_recordf(s, "__panel__", "info", "stateBackup", NULL, 0, -1,
+                "state.json backed up to " RS_BACKUP_DIR "/%s", name);
+    return 0;
+}
+
+// Once a minute is plenty for an interval measured in hours. The newest file
+// on disk seeds the clock, so a restart doesn't take an extra backup.
+static void backup_tick(restream_server_t *s) {
+    static long long next_check = 0;
+    long long now = (long long)time(NULL);
+    if (now < next_check) return;
+    next_check = now + 60;
+    long long hours = backup_setting(s, "backupHours", RS_BACKUP_HOURS_DEFAULT);
+    if (hours <= 0) return;
+    if (s->last_backup_s < 0) s->last_backup_s = rs_state_last_backup_time(RS_BACKUP_DIR);
+    if (now - s->last_backup_s < hours * 3600) return;
+    char name[64];
+    if (backup_now(s, name, sizeof(name)) != 0) s->last_backup_s = now;  // retry next interval, not every minute
+}
+
 static void provider_maintenance(restream_server_t *s) {
     // Unlink finished background work under the lifecycle lock, then apply its
     // results without the lock. Workers never touch the state DOM.
@@ -7825,6 +7973,7 @@ restream_server_t* restream_server_create(void) {
     server->sysstats = rs_sysstats_create();
     server->metrics = rs_metrics_create();
     server->pending_head = NULL;
+    server->last_backup_s = -1;
     server->pending_workers = 0;
     pthread_mutex_init(&server->pending_mu, NULL);
     pthread_cond_init(&server->pending_cv, NULL);
