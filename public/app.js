@@ -136,7 +136,11 @@ async function request(path, options = {}) {
     throw new Error("Sign-in required.");
   }
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(payload.error || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
   return payload;
 }
 
@@ -491,6 +495,18 @@ let streamsGridTypeFilter = "";
 let streamsGridSearchQuery = "";
 let streamsGridRunningOnly = false;
 let streamsGridOrderKey = "";
+// Ticked cards. Bulk actions apply to these when any are ticked, otherwise to
+// everything the filters show. Ids of streams that no longer exist are pruned
+// on every render.
+const streamsGridSelected = new Set();
+let streamsGridPage = 0;
+// 0 means "All".
+let streamsGridPageSize = (() => {
+  try {
+    const stored = localStorage.getItem("restreamair-grid-page-size");
+    return stored !== null && Number.isFinite(Number(stored)) ? Number(stored) : 100;
+  } catch { return 100; }
+})();
 
 // Update just the live/changing parts of an already-rendered stream card, so
 // the auto-refresh doesn't rebuild (and visually jump) the whole grid.
@@ -507,6 +523,10 @@ function updateStreamCardDynamic(card, stream) {
     stats[1].textContent = `↓ ${formatBytesPerSecond((stream.inputBandwidth || {}).bytesPerSecond)}`;
     stats[2].textContent = `↑ ${formatBytesPerSecond((stream.bandwidth || {}).bytesPerSecond)}`;
   }
+  const selected = streamsGridSelected.has(stream.id);
+  card.classList.toggle("selected", selected);
+  const box = card.querySelector(".stream-select input");
+  if (box) box.checked = selected;
   const toggle = card.querySelector('[data-action="toggle"]');
   if (toggle) {
     toggle.className = stream.running ? "danger" : "success";
@@ -545,29 +565,85 @@ function filteredStreamRows() {
 
 // Enable/disable the bulk buttons to match what the filtered set can do, and
 // reflect the running-only toggle's state.
+// What the bulk buttons act on: the ticked cards that the filters still show,
+// or — with nothing ticked — everything the filters show.
+function bulkTargetRows() {
+  const rows = filteredStreamRows();
+  if (!streamsGridSelected.size) return rows;
+  return rows.filter(({ stream }) => streamsGridSelected.has(stream.id));
+}
+
 function updateBulkActionBar(rows) {
-  const anyStopped = rows.some(({ stream }) => !stream.running);
-  const anyRunning = rows.some(({ stream }) => stream.running);
+  const selecting = streamsGridSelected.size > 0;
+  const targets = selecting ? rows.filter(({ stream }) => streamsGridSelected.has(stream.id)) : rows;
+  const anyStopped = targets.some(({ stream }) => !stream.running);
+  const anyRunning = targets.some(({ stream }) => stream.running);
+  const label = (button, verb) => {
+    if (!button) return;
+    button.innerHTML = `<span data-icon="${button.dataset.iconName}"></span>${verb} ${selecting ? `selected (${targets.length})` : "all"}`;
+    applyIcons(button);
+  };
   const startAll = $("#gridStartAllBtn");
   const stopAll = $("#gridStopAllBtn");
   const deleteAll = $("#gridDeleteAllBtn");
   const runningOnly = $("#gridRunningOnlyBtn");
+  label(startAll, "Start");
+  label(stopAll, "Stop");
+  label(deleteAll, "Delete");
   if (startAll) startAll.disabled = !anyStopped;
   if (stopAll) stopAll.disabled = !anyRunning;
-  if (deleteAll) deleteAll.disabled = rows.length === 0;
+  if (deleteAll) deleteAll.disabled = targets.length === 0;
   if (runningOnly) runningOnly.classList.toggle("active", streamsGridRunningOnly);
+  $("#gridClearSelectionBtn")?.classList.toggle("hidden", !selecting);
 }
 
-// Run one action over every filtered stream, then re-render once. Bulk calls go
-// sequentially so the shared state.json write path isn't racing itself.
+// Stop and delete go to the server as one batch (one state.json write). An
+// older server without /api/streams/bulk answers 404, and then this falls back
+// to one request per stream — the panel front-end updates itself from GitHub,
+// so it can be newer than the binary serving it.
+async function bulkStreamRequest(kind, rows) {
+  const ids = rows
+    .filter(({ stream }) => kind === "delete" || stream.running)
+    .map(({ stream }) => stream.id);
+  if (!ids.length) return null;
+  try {
+    return await request("/api/streams/bulk", { method: "POST", body: JSON.stringify({ action: kind, ids }) });
+  } catch (error) {
+    if (error.status !== 404 && error.status !== 405) throw error;
+    return undefined;
+  }
+}
+
+// Run one action over the targeted streams, then re-render once. Per-stream
+// calls go sequentially so the shared state.json write path isn't racing itself.
 async function bulkStreamAction(kind) {
-  const rows = filteredStreamRows();
+  const rows = bulkTargetRows();
   if (kind === "delete") {
     if (!rows.length) return;
     if (!confirm(`Delete ${rows.length} stream${rows.length === 1 ? "" : "s"}? This stops them and removes their configuration. This cannot be undone.`)) return;
   }
-  let count = 0;
   stateMutationEpoch++;
+  if (kind !== "start") {
+    try {
+      const fresh = await bulkStreamRequest(kind, rows);
+      if (fresh !== undefined) {
+        if (fresh) state = fresh;
+        stateMutationEpoch++;
+        if (kind === "delete") {
+          for (const { stream } of rows) streamsGridSelected.delete(stream.id);
+          selectedStreamId = null; lastEditorStreamId = null;
+        }
+        render();
+        return;
+      }
+    } catch (error) {
+      stateMutationEpoch++;
+      $("#streamsGridImportStatus").classList.remove("hidden");
+      $("#streamsGridImportStatus").textContent = `${kind} failed: ${error.message || error}`;
+      return;
+    }
+  }
+  let count = 0;
   // Starting many DASH engines simultaneously creates every director, poller,
   // writer and download pool in one spike. Serialize bulk operations; the UI
   // already promised this behavior and it keeps the panel event loop responsive.
@@ -588,9 +664,58 @@ async function bulkStreamAction(kind) {
   }
   if (count > 0) state = await request("/api/state");
   stateMutationEpoch++;
-  
-  if (kind === "delete") { selectedStreamId = null; lastEditorStreamId = null; }
+
+  if (kind === "delete") {
+    for (const { stream } of rows) streamsGridSelected.delete(stream.id);
+    selectedStreamId = null; lastEditorStreamId = null;
+  }
   render();
+}
+
+// Page controls plus the "select this page" box, which reflects whether every
+// card on the current page is ticked.
+function renderStreamsGridPager(pageCount, pageRows) {
+  const pager = $("#streamsGridPager");
+  if (pager) {
+    pager.classList.toggle("hidden", pageCount <= 1);
+    $("#streamsGridPageLabel").textContent = `Page ${streamsGridPage + 1} of ${pageCount}`;
+    $("#streamsGridPrevBtn").disabled = streamsGridPage <= 0;
+    $("#streamsGridNextBtn").disabled = streamsGridPage >= pageCount - 1;
+  }
+  const sizeSelect = $("#streamsGridPageSize");
+  if (sizeSelect) sizeSelect.value = String(streamsGridPageSize);
+  const pageBox = $("#gridSelectPageBox");
+  if (pageBox) {
+    const ticked = pageRows.filter(({ stream }) => streamsGridSelected.has(stream.id)).length;
+    pageBox.checked = pageRows.length > 0 && ticked === pageRows.length;
+    pageBox.indeterminate = ticked > 0 && ticked < pageRows.length;
+    pageBox.disabled = pageRows.length === 0;
+  }
+}
+
+// The cards on screen right now, in order.
+function streamsGridPageRows() {
+  const ids = new Set([...$("#streamsGrid").querySelectorAll(".stream-grid-card")].map((card) => card.dataset.streamId));
+  return filteredStreamRows().filter(({ stream }) => ids.has(stream.id));
+}
+
+// After a tick changes: refresh the bar, the count and the page box without
+// rebuilding the cards.
+function renderStreamsGridSelectionChrome() {
+  const filteredRows = filteredStreamRows();
+  updateBulkActionBar(filteredRows);
+  const total = state.providers.reduce((sum, provider) => sum + provider.streams.length, 0);
+  $("#streamsGridCount").textContent = total
+    ? `${filteredRows.length} of ${total} stream${total === 1 ? "" : "s"}${streamsGridSelected.size ? ` · ${streamsGridSelected.size} selected` : ""}`
+    : "";
+  const pageCount = streamsGridPageSize > 0 ? Math.max(1, Math.ceil(filteredRows.length / streamsGridPageSize)) : 1;
+  renderStreamsGridPager(pageCount, streamsGridPageRows());
+  for (const card of $("#streamsGrid").querySelectorAll(".stream-grid-card")) {
+    const selected = streamsGridSelected.has(card.dataset.streamId);
+    card.classList.toggle("selected", selected);
+    const box = card.querySelector(".stream-select input");
+    if (box) box.checked = selected;
+  }
 }
 
 function renderStreamsGrid() {
@@ -614,22 +739,33 @@ function renderStreamsGrid() {
   $("#gridProviderSettingsBtn").classList.toggle("hidden", !filteredProvider);
 
   const allRows = state.providers.flatMap((provider) => provider.streams.map((stream) => ({ provider, stream })));
-  const rows = filteredStreamRows();
+  const filteredRows = filteredStreamRows();
+  const liveIds = new Set(allRows.map(({ stream }) => stream.id));
+  for (const id of [...streamsGridSelected]) if (!liveIds.has(id)) streamsGridSelected.delete(id);
 
-  // Bulk actions and the running-only toggle operate on this same filtered set.
-  updateBulkActionBar(rows);
+  // Bulk actions and the running-only toggle operate on this same filtered set
+  // (all pages of it, or the ticked part of it).
+  updateBulkActionBar(filteredRows);
+
+  const pageSize = streamsGridPageSize > 0 ? streamsGridPageSize : filteredRows.length || 1;
+  const pageCount = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+  streamsGridPage = Math.min(Math.max(0, streamsGridPage), pageCount - 1);
+  const rows = filteredRows.slice(streamsGridPage * pageSize, (streamsGridPage + 1) * pageSize);
+  renderStreamsGridPager(pageCount, rows);
 
   $("#streamsGridCount").textContent = allRows.length
-    ? `${rows.length} of ${allRows.length} stream${allRows.length === 1 ? "" : "s"}`
+    ? `${filteredRows.length} of ${allRows.length} stream${allRows.length === 1 ? "" : "s"}${streamsGridSelected.size ? ` · ${streamsGridSelected.size} selected` : ""}`
     : "";
   if (!allRows.length) {
     container.className = "stream-grid empty-state";
     container.textContent = "No streams yet — create a provider and add one.";
+    streamsGridOrderKey = "";
     return;
   }
   if (!rows.length) {
     container.className = "stream-grid empty-state";
     container.textContent = "No streams match your filters.";
+    streamsGridOrderKey = "";
     return;
   }
   container.className = "stream-grid";
@@ -651,10 +787,13 @@ function renderStreamsGrid() {
     const inputBandwidth = stream.inputBandwidth || {};
     const card = document.createElement("div");
     card.className = "stream-grid-card";
+    card.dataset.streamId = stream.id;
+    card.classList.toggle("selected", streamsGridSelected.has(stream.id));
     const eventWindow = stream.sourceType === "event" && stream.scriptStart
       ? `${new Date(stream.scriptStart * 1000).toLocaleString()}${stream.scriptEnd ? ` – ${new Date(stream.scriptEnd * 1000).toLocaleTimeString()}` : ""}`
       : "";
     card.innerHTML = `
+      <label class="stream-select" title="Select for bulk actions"><input type="checkbox" ${streamsGridSelected.has(stream.id) ? "checked" : ""}></label>
       <div class="provider-tag">${escapeHtml(provider.name)}${stream.sourceType ? ` · <span class="source-type-tag">${stream.sourceType}</span>` : ""}</div>
       <div class="stream-logo-hero">
         <span class="provider-logo">${stream.logo ? `<img src="${escapeAttr(stream.logo)}" alt="">` : escapeHtml(stream.name.slice(0, 1).toUpperCase())}</span>
@@ -686,6 +825,14 @@ function renderStreamsGrid() {
       selectedStreamId = stream.id;
       renderEditor();
       openStreamEditorDialog();
+    });
+    const selectBox = card.querySelector(".stream-select");
+    selectBox.addEventListener("click", (event) => event.stopPropagation());
+    selectBox.querySelector("input").addEventListener("change", (event) => {
+      if (event.currentTarget.checked) streamsGridSelected.add(stream.id);
+      else streamsGridSelected.delete(stream.id);
+      card.classList.toggle("selected", event.currentTarget.checked);
+      renderStreamsGridSelectionChrome();
     });
     card.querySelector('[data-action="copyurl"]').addEventListener("click", async (event) => {
       event.stopPropagation();
@@ -2893,6 +3040,7 @@ $("#providerSearch").addEventListener("input", (event) => {
 });
 $("#streamsGridProviderFilter").addEventListener("change", (event) => {
   streamsGridProviderId = event.currentTarget.value;
+  streamsGridPage = 0;
   renderStreamsGrid();
   // The provider filter is part of this view's address; replace rather than
   // push so flicking through providers does not fill up the back button.
@@ -2900,14 +3048,17 @@ $("#streamsGridProviderFilter").addEventListener("change", (event) => {
 });
 $("#streamsGridTypeFilter").addEventListener("change", (event) => {
   streamsGridTypeFilter = event.currentTarget.value;
+  streamsGridPage = 0;
   renderStreamsGrid();
 });
 $("#streamsGridSearch").addEventListener("input", (event) => {
   streamsGridSearchQuery = event.currentTarget.value;
+  streamsGridPage = 0;
   renderStreamsGrid();
 });
 $("#gridRunningOnlyBtn").addEventListener("click", () => {
   streamsGridRunningOnly = !streamsGridRunningOnly;
+  streamsGridPage = 0;
   renderStreamsGrid();
 });
 $("#updateBannerDismiss")?.addEventListener("click", () => {
@@ -2917,6 +3068,25 @@ $("#updateBannerDismiss")?.addEventListener("click", () => {
 $("#gridStartAllBtn").addEventListener("click", () => bulkStreamAction("start"));
 $("#gridStopAllBtn").addEventListener("click", () => bulkStreamAction("stop"));
 $("#gridDeleteAllBtn").addEventListener("click", () => bulkStreamAction("delete"));
+$("#gridSelectPageBox").addEventListener("change", (event) => {
+  for (const { stream } of streamsGridPageRows()) {
+    if (event.currentTarget.checked) streamsGridSelected.add(stream.id);
+    else streamsGridSelected.delete(stream.id);
+  }
+  renderStreamsGridSelectionChrome();
+});
+$("#gridClearSelectionBtn").addEventListener("click", () => {
+  streamsGridSelected.clear();
+  renderStreamsGridSelectionChrome();
+});
+$("#streamsGridPageSize").addEventListener("change", (event) => {
+  streamsGridPageSize = Number(event.currentTarget.value) || 0;
+  try { localStorage.setItem("restreamair-grid-page-size", String(streamsGridPageSize)); } catch {}
+  streamsGridPage = 0;
+  renderStreamsGrid();
+});
+$("#streamsGridPrevBtn").addEventListener("click", () => { streamsGridPage--; renderStreamsGrid(); });
+$("#streamsGridNextBtn").addEventListener("click", () => { streamsGridPage++; renderStreamsGrid(); });
 $("#gridNewStreamBtn").addEventListener("click", () => {
   // Attach to whichever provider the grid is currently filtered to; with no
   // filter (viewing every provider's streams at once) fall back to the
