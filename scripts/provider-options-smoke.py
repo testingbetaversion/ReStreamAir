@@ -31,12 +31,13 @@ def run(binary):
             provider = next(p for p in state["providers"] if p["name"] == "Options")
             route = f"/api/providers/{provider['id']}"
             assert all(provider["options"][key] == value for key, value in options.items())
-            assert len(state["providerOptionFields"]) == 41
+            assert len(state["providerOptionFields"]) == 43
             assert all(not f["inactive"] for f in state["providerOptionFields"])
 
             for invalid in ([], None, {"scriptTimeoutSeconds": 0}, {"outputFragmentsCount": 2},
                             {"hlsFragmentDurationSeconds": 31}, {"userAgent": "agent\r\nInjected: yes"},
-                            {"noRestartOnError": "true"}, {"playbackDelaySeconds": 1.5}):
+                            {"noRestartOnError": "true"}, {"playbackDelaySeconds": 1.5},
+                            {"importInputMode": "bogus"}, {"importInputMode": "internalX"}):
                 assert client.request("PUT", route, {"name": "Must not save", "options": invalid})[0] == 400
             status, state, _ = client.json("PUT", route, {"name": "Options", "options": {"playbackDelaySeconds": 12}})
             restored = next(p for p in state["providers"] if p["id"] == provider["id"])

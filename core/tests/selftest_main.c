@@ -91,26 +91,36 @@ static void test_m3u8_filter_master(void) {
         "v360.m3u8\n"
         "#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=300000,RESOLUTION=1920x1080,URI=\"i1080.m3u8\"\n"
         "#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=100000,RESOLUTION=640x360,URI=\"i360.m3u8\"\n";
-    char *out = rs_m3u8_filter_master_video(master, "height<=720");
+    char *out = rs_m3u8_filter_master_video(master, "height<=720", false);
     check("m3u8/filter: height<=720 drops 1080p", out && !strstr(out, "v1080.m3u8") && !strstr(out, "RESOLUTION=1920x1080"));
     check("m3u8/filter: height<=720 keeps 720p and 360p", out && strstr(out, "v720.m3u8") && strstr(out, "v360.m3u8"));
     check("m3u8/filter: keeps audio and i-frame under the cap", out && strstr(out, "audio.m3u8") && strstr(out, "i360.m3u8"));
     rs_free(out);
-    out = rs_m3u8_filter_master_video(master, "height<=240,bandwidth<=2000000");
+    out = rs_m3u8_filter_master_video(master, "height<=240,bandwidth<=2000000", false);
     check("m3u8/filter: falls through to the next rule", out && strstr(out, "v360.m3u8") && !strstr(out, "v720.m3u8"));
     rs_free(out);
-    out = rs_m3u8_filter_master_video(master, "height<=100");
+    out = rs_m3u8_filter_master_video(master, "height<=100", false);
     check("m3u8/filter: nothing matches, nothing removed", out && strstr(out, "v1080.m3u8") && strstr(out, "v360.m3u8"));
     rs_free(out);
-    out = rs_m3u8_filter_master_video(master, "worst");
+    out = rs_m3u8_filter_master_video(master, "worst", false);
     check("m3u8/filter: worst keeps only the lowest", out && strstr(out, "v360.m3u8") && !strstr(out, "v720.m3u8"));
     rs_free(out);
-    out = rs_m3u8_filter_master_video(master, "id=video_1");
+    out = rs_m3u8_filter_master_video(master, "id=video_1", false);
     check("m3u8/filter: dash-only rule is ignored", out && strstr(out, "v1080.m3u8"));
     rs_free(out);
-    check("m3u8/filter: empty filter is a no-op", rs_m3u8_filter_master_video(master, "") == NULL);
+    check("m3u8/filter: empty filter is a no-op", rs_m3u8_filter_master_video(master, "", false) == NULL);
     check("m3u8/filter: media playlist is a no-op",
-          rs_m3u8_filter_master_video("#EXTM3U\n#EXTINF:5,\na.ts\n", "height<=720") == NULL);
+          rs_m3u8_filter_master_video("#EXTM3U\n#EXTINF:5,\na.ts\n", "height<=720", false) == NULL);
+    out = rs_m3u8_filter_master_video(master, "height<=720", true);
+    check("m3u8/filter: single keeps only the best under the cap",
+          out && strstr(out, "v720.m3u8") && !strstr(out, "v360.m3u8") && !strstr(out, "v1080.m3u8"));
+    check("m3u8/filter: single drops i-frame variants, keeps audio",
+          out && !strstr(out, "I-FRAME") && strstr(out, "audio.m3u8"));
+    rs_free(out);
+    out = rs_m3u8_filter_master_video(master, "", true);
+    check("m3u8/filter: single with no rule keeps the best overall",
+          out && strstr(out, "v1080.m3u8") && !strstr(out, "v720.m3u8"));
+    rs_free(out);
 }
 
 static void test_metrics_connections(void) {
@@ -1290,7 +1300,7 @@ static void test_provider_options(void) {
 
     rs_json *view = rs_panel_view(&st, "localhost");
     const rs_json *schema = rs_json_obj_get(view, "providerOptionFields");
-    check("options/screenshot-fields", rs_json_arr_len(schema) == 41);
+    check("options/screenshot-fields", rs_json_arr_len(schema) == 43);
     rs_json *defaults = rs_provider_options_merge(NULL, NULL);
     check("options/defaults-valid", rs_provider_options_valid(defaults, &err));
     rs_json_free(defaults);

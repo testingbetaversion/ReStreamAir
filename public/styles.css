@@ -1836,3 +1836,23 @@ pre {
   .provider-options-grid { grid-template-columns: minmax(0, 1fr); }
   .provider-options > summary .field-hint { display: block; margin: 4px 0 0; }
 }
+
+/* Transient notice (autosave confirmations and errors). */
+.toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 1000;
+  max-width: min(420px, calc(100vw - 40px));
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: var(--panel-solid);
+  color: var(--text);
+  box-shadow: var(--shadow-lift);
+  font-size: 13px;
+  font-weight: 600;
+}
+.toast.ok { border-color: var(--success); }
+.toast.error { border-color: var(--danger); color: var(--danger); }
+.toast.hidden { display: none; }
