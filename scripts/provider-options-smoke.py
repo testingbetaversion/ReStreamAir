@@ -31,7 +31,7 @@ def run(binary):
             provider = next(p for p in state["providers"] if p["name"] == "Options")
             route = f"/api/providers/{provider['id']}"
             assert all(provider["options"][key] == value for key, value in options.items())
-            assert len(state["providerOptionFields"]) == 44
+            assert len(state["providerOptionFields"]) == 45
             assert all(not f["inactive"] for f in state["providerOptionFields"])
 
             for invalid in ([], None, {"scriptTimeoutSeconds": 0}, {"outputFragmentsCount": 2},
