@@ -54,6 +54,9 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
 // only sets the stored status; the view reports `running` from it. -404 if the
 // stream isn't found.
 int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool running, const char **err);
+// Records why a stream's last start failed (NULL/"" clears it). Starting it
+// successfully clears it too (see rs_panel_set_stream_running).
+void rs_panel_set_stream_error(rs_state *st, const char *stream_id, const char *message);
 
 // Applies a `manifest` action's reply to a stream: the fresh source URL, its
 // CDN mirrors, and — when the script supplied them — the per-category headers

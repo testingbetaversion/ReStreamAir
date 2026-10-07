@@ -731,7 +731,7 @@ int rs_panel_update_stream(rs_state *st, const char *stream_id, const rs_json *b
     // the existing stream rather than resetting them (a PUT merges, not replaces).
     static const char *carried[] = {"sourceType", "mode", "scriptVideoSelector", "scriptAudioSelector",
                                     "onDemand", "speedUp", "autostart", "scriptStart", "scriptEnd",
-                                    "recordEvent", "cdnHeaders", "autoStarted"};
+                                    "recordEvent", "cdnHeaders", "autoStartSeen"};
     for (size_t i = 0; i < sizeof(carried) / sizeof(carried[0]); i++) {
         const rs_json *v = rs_json_obj_get(existing, carried[i]);
         if (v) rs_json_obj_set(updated, carried[i], rs_json_clone(v));
@@ -998,6 +998,13 @@ int rs_panel_set_stream_keys(rs_state *st, const char *stream_id, const char *ke
     if (!stream) { *err = "Stream not found."; return -404; }
     rs_json_obj_set_str(stream, "decryptionKeys", keys ? keys : "");
     return 0;
+}
+
+void rs_panel_set_stream_error(rs_state *st, const char *stream_id, const char *message) {
+    rs_json *stream = find_stream(st, stream_id, NULL);
+    if (!stream) return;
+    if (message && message[0]) rs_json_obj_set_str(stream, "lastError", message);
+    else rs_json_obj_set(stream, "lastError", rs_json_new_null());
 }
 
 int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool running, const char **err) {
