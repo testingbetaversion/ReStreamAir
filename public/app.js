@@ -531,6 +531,7 @@ function updateStreamCardDynamic(card, stream) {
     stats[2].textContent = `↑ ${formatBytesPerSecond((stream.bandwidth || {}).bytesPerSecond)}`;
   }
   applyRealtimeBadge(card.querySelector(".stream-realtime"), stream);
+  applyStreamError(card.querySelector(".stream-error"), stream);
   const selected = streamsGridSelected.has(stream.id);
   card.classList.toggle("selected", selected);
   const box = card.querySelector(".stream-select input");
@@ -566,6 +567,16 @@ function applyRealtimeBadge(el, stream) {
     : "Media seconds delivered per second of downloading, slowest rendition, last 30 s. Below 1× viewers will buffer.";
   el.classList.toggle("slow", engine ? value < 0.95 : value < 1);
   el.classList.toggle("tight", !engine && value >= 1 && value < 1.3);
+}
+
+// Why the last start of a stopped stream failed — the only place a start
+// nobody clicked (auto-start, a restart timer) can report it.
+function applyStreamError(el, stream) {
+  if (!el) return;
+  const message = !stream.running && stream.lastError ? String(stream.lastError) : "";
+  el.classList.toggle("hidden", !message);
+  el.textContent = message ? `Last start failed: ${message}` : "";
+  el.title = message;
 }
 
 function findStreamById(id) {
@@ -846,6 +857,7 @@ function renderStreamsGrid() {
         <span title="Served to viewers">↑ ${formatBytesPerSecond(bandwidth.bytesPerSecond)}</span>
         <span class="stream-realtime hidden" title="Media seconds delivered per second of downloading, slowest rendition, last 30 s. Below 1× viewers will buffer."></span>
       </div>
+      <div class="stream-error hidden"></div>
       <div class="actions">
         <button type="button" class="ghost mini-icon-btn" data-action="copyurl" title="Copy the HLS (m3u8) output URL"><span data-icon="copy"></span></button>
         <button type="button" class="ghost mini-icon-btn" data-action="bigplayer" title="Open big player"><span data-icon="expand"></span></button>
@@ -903,6 +915,7 @@ function renderStreamsGrid() {
       await deleteStreamId(live.id, live.name);
     });
     applyRealtimeBadge(card.querySelector(".stream-realtime"), stream);
+    applyStreamError(card.querySelector(".stream-error"), stream);
     applyIcons(card);
     container.appendChild(card);
   }

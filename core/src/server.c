@@ -4244,6 +4244,7 @@ typedef struct rs_stream_start {
     bool force_ipv6, rotate_proxies;
     bool want_manifest, want_cdm, want_pssh_hook, want_initparse;
     bool reuse_manifest;  // try the stream's saved session URL before running `manifest`
+    char script_tail[200];  // last line a failed action printed (stderr, else stdout), for the error
     char *cdm_mode, *cdm_type, *cached_keys;
     double script_timeout;
     unsigned long long token;
@@ -4379,6 +4380,21 @@ static int stream_start_run(restream_server_t *server, const char *sid,
     rs_buf_dispose(&log_ctx.stderr_line);
     log_record(server, sid, rc == 0 ? "info" : "error", "scriptEnd", NULL, rc, -1,
                rc == 0 ? "ok" : "script exited non-zero");
+    // What the script said last before failing — usually the provider's own
+    // refusal — so the stream's error can say why, not just "exited 1".
+    st->script_tail[0] = '\0';
+    for (int pass = 0; rc != 0 && pass < 2 && !st->script_tail[0]; pass++) {
+        const char *text = pass == 0 ? err_text : (out ? *out : NULL);
+        if (!text) continue;
+        const char *end = text + strlen(text);
+        while (end > text && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ')) end--;
+        const char *start = end;
+        while (start > text && start[-1] != '\n' && start[-1] != '\r') start--;
+        size_t n = (size_t)(end - start);
+        if (n >= sizeof(st->script_tail)) n = sizeof(st->script_tail) - 1;
+        memcpy(st->script_tail, start, n);
+        st->script_tail[n] = '\0';
+    }
     rs_free(err_text);
     free(action_arg);
     free(argv);
@@ -4960,7 +4976,8 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
     if (rc != 0) {
         log_recordf(server, sid, "error", "cdm", manifest_url, rc, -1,
                     "the cdm action (%s) exited non-zero", cdm_type[0] ? cdm_type : "default");
-        snprintf(st->err, sizeof(st->err), "The cdm action exited %d without usable keys.", rc);
+        snprintf(st->err, sizeof(st->err), "The cdm action exited %d without usable keys%s%s", rc,
+                 st->script_tail[0] ? ": " : ".", st->script_tail);
     } else {
         char *pairs = rs_cdm_parse_key_output(out);
         if (pairs && pairs[0] && ch.kids_count > 0
@@ -5088,7 +5105,8 @@ static void stream_start_worker(restream_server_t *server, const char *sid, rs_s
         int rc = stream_start_run(server, sid, st, "manifest", NULL, 0, 45.0, &out);
         if (rc != 0) {
             snprintf(st->err, sizeof(st->err),
-                     "The manifest action exited %d — no source URL for this session.", rc);
+                     "The manifest action exited %d — no source URL for this session%s%s", rc,
+                     st->script_tail[0] ? ": " : ".", st->script_tail);
         } else if (stream_start_parse_manifest(st, out)) {
             st->manifest_applied = true;
             source = st->manifest_url;
@@ -6178,6 +6196,10 @@ static void pending_job_finish_stream_start(restream_server_t *server, struct mg
         // A session URL we could not refresh is fatal: there is nothing to
         // poll, and starting anyway would just restart-loop against a dead URL.
         rs_panel_set_stream_running(&server->state, pf->stream_id, false, &ignored);
+        // Keep the reason on the stream: a start nobody watched (auto-start,
+        // a restart timer) has no alert to show it in.
+        rs_panel_set_stream_error(&server->state, pf->stream_id, st->err);
+        rs_state_save(&server->state);
         if (st->manifest_applied && rs_state_save(&server->state) != 0)
             log_record(server, "__panel__", "error", "streamStart", NULL, 0, -1,
                        "could not save the session manifest of a failed start");
@@ -7160,6 +7182,7 @@ static void scheduled_stream_start(restream_server_t *s, const char *id, const c
         rs_panel_set_stream_running(&s->state, id, false, &err);
         rc = -1; err = pipeline_err[0] ? pipeline_err : "Could not start scheduled stream.";
     }
+    if (rc != 0) rs_panel_set_stream_error(&s->state, id, err);
     log_record(s, id, rc == 0 ? "info" : "error", "scheduledStart", NULL, 0, -1, rc == 0 ? reason : err);
     rs_state_save(&s->state);
 }
@@ -7313,7 +7336,7 @@ static void provider_maintenance(restream_server_t *s) {
         // arrives. One start per tick (each runs the provider's scripts), and
         // never past Max streams concurrency — checked here, before any script
         // runs, since the cap is otherwise only enforced once a start finishes.
-        // `autoStarted` is set the first time the event is seen running, so a
+        // `autoStartSeen` is set the first time the event is seen running, so a
         // stream someone stops by hand is not started again.
         if (rs_provider_option_bool(provider, "autoStartEvents") && !provider_job_busy(s, provider)) {
             size_t n = rs_json_arr_len(streams);
@@ -7324,32 +7347,32 @@ static void provider_maintenance(restream_server_t *s) {
                 if (strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) continue;
                 active++;
                 if (!strcmp(rs_json_obj_str(stream, "sourceType", ""), "event") &&
-                    !rs_json_obj_bool(stream, "autoStarted", false)) {
-                    rs_json_obj_set_bool(stream, "autoStarted", true);
+                    !rs_json_obj_bool(stream, "autoStartSeen", false)) {
+                    rs_json_obj_set_bool(stream, "autoStartSeen", true);
                     changed = true;
                 }
             }
             for (size_t j = 0; j < n && (limit <= 0 || active < limit); j++) {
                 rs_json *stream = (rs_json *)rs_json_arr_at(streams, j);
                 if (strcmp(rs_json_obj_str(stream, "sourceType", ""), "event") ||
-                    rs_json_obj_bool(stream, "autoStarted", false) ||
+                    rs_json_obj_bool(stream, "autoStartSeen", false) ||
                     !strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) continue;
                 double start = rs_json_obj_num(stream, "scriptStart", 0), end = rs_json_obj_num(stream, "scriptEnd", 0);
                 if (start > now || (end > 0 && end <= now)) continue;
                 const char *id = rs_json_obj_str(stream, "id", "");
                 rs_json *stimer = provider_timer(s, id);
                 if (rs_json_obj_num(stimer, "autoStartNext", 0) > now) continue;
+                // Keep trying for as long as the event's window is open — a
+                // provider slot frees up, or the programme actually goes live —
+                // backing off so a refused event isn't hammered: Restart delay
+                // (at least 30 s), doubling per attempt, at most 10 minutes.
                 long long tries = rs_json_obj_int(stimer, "autoStartTries", 0);
-                if (tries >= 3) {
-                    rs_json_obj_set_bool(stream, "autoStarted", true);
-                    changed = true;
-                    log_record(s, id, "error", "scheduledStart", NULL, 0, -1,
-                               "auto-start events: gave up after 3 failed starts");
-                    continue;
-                }
                 double retry = (double)rs_provider_option_int(provider, "restartDelaySeconds");
+                if (retry < 30) retry = 30;
+                for (long long k = 0; k < tries && retry < 600; k++) retry *= 2;
+                if (retry > 600) retry = 600;
                 rs_json_obj_set_int(stimer, "autoStartTries", tries + 1);
-                rs_json_obj_set(stimer, "autoStartNext", rs_json_new_num(now + (retry > 30 ? retry : 30)));
+                rs_json_obj_set(stimer, "autoStartNext", rs_json_new_num(now + retry));
                 char *sid = rs_strdup(id);
                 scheduled_stream_start(s, sid, tries ? "auto-start events: retrying the start" : "auto-start events: its start time has arrived");
                 free(sid);

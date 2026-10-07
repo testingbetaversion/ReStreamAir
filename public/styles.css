@@ -1856,3 +1856,13 @@ pre {
 .toast.ok { border-color: var(--success); }
 .toast.error { border-color: var(--danger); color: var(--danger); }
 .toast.hidden { display: none; }
+
+/* A stopped stream's last start failure, one line, full text on hover. */
+.stream-error {
+  color: var(--danger);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stream-error.hidden { display: none; }
