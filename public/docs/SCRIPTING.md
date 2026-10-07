@@ -216,7 +216,7 @@ print(json.dumps({
 }))
 ```
 
-`manifest` runs on every start of a stream that has **Session manifest** ticked, before anything reads the stream's source URL. Its `ManifestUrl`, `Cdn` mirrors, `Headers` and `Heartbeat.PeriodMs` are stored on the stream, so the panel shows what the stream is really playing and every pipeline reads the live session URL. A start whose `manifest` action fails is refused rather than begun against a stale URL.
+`manifest` runs on start of a stream that has **Session manifest** ticked, before anything reads the stream's source URL — unless the stream already has a saved session URL that still answers with a manifest, in which case that session is reused and `manifest` is skipped (the provider option **Always refresh session manifest** turns the reuse off). Its `ManifestUrl`, `Cdn` mirrors, `Headers` and `Heartbeat.PeriodMs` are stored on the stream, so the panel shows what the stream is really playing and every pipeline reads the live session URL. A start whose `manifest` action fails is refused rather than begun against a stale URL.
 
 When `ManifestUrl` is empty but `Cdn` contains usable URLs, the first CDN URL
 becomes the primary source and the remaining entries stay available as mirrors.
