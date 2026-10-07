@@ -88,6 +88,44 @@ typedef struct {
 int rs_m3u8_probe_master(const char *text, const char *base_url, rs_m3u8_probe *out);
 void rs_m3u8_probe_dispose(rs_m3u8_probe *probe);
 
+// --- HLS sources for the internal engine ---------------------------------
+
+// The renditions the engine follows from a master playlist: one video variant
+// (the best the Default video rule allows) and its audio track (lang= rule,
+// else DEFAULT=YES, else the first in the variant's AUDIO group). Ids are
+// stable across polls even when URIs carry rotating tokens. audio_* are NULL
+// when the audio is muxed into the video playlist.
+typedef struct {
+    char *video_uri, *video_id, *video_codecs;
+    int64_t bandwidth, height;
+    char *audio_uri, *audio_id, *audio_codecs, *audio_lang;
+} rs_hls_pick;
+
+int rs_hls_pick_renditions(const char *master, const char *base_url, const char *video_filter,
+                           const char *audio_filter, rs_hls_pick *out);
+void rs_hls_pick_dispose(rs_hls_pick *p);
+
+typedef struct {
+    char *url;          // absolute
+    int64_t sequence;   // media sequence number — stable identity across polls
+    double duration;    // seconds (EXTINF)
+} rs_hls_segment;
+
+typedef struct {
+    char *init_url;        // EXT-X-MAP, absolute, or NULL
+    rs_hls_segment *segments;
+    size_t count;
+    double target_duration;
+    bool ended;            // EXT-X-ENDLIST
+} rs_hls_media;
+
+// Reads a media playlist into its segment window, keeping the newest `want`
+// (0 = all). Refuses byte-range playlists and whole-segment AES-128 (the engine
+// decrypts CENC fMP4 only), with the reason in err. 0 on success.
+int rs_hls_media_parse(const char *text, const char *base_url, int want, rs_hls_media *out,
+                       char *err, size_t err_len);
+void rs_hls_media_dispose(rs_hls_media *m);
+
 #ifdef __cplusplus
 }
 #endif

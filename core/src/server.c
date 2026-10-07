@@ -276,6 +276,16 @@ static void backup_tick(restream_server_t *s);
 static double stream_delivery_speed(restream_server_t *server, const char *stream_id);
 static void speed_prune(restream_server_t *server);
 static char *playback_key(struct mg_http_message *hm);
+
+// True for a stream the internal live engine runs: a DASH source on the
+// default input, or an HLS source given the "engine" input mode (the engine's
+// prefetch, decryption and MPEG-TS outputs instead of per-request pass-through).
+static bool stream_uses_engine(const rs_json *stream) {
+    const char *kind = rs_json_obj_str(stream, "kind", "mpd");
+    const char *input = rs_json_obj_str(stream, "inputMode", "internal");
+    return (!strcmp(kind, "mpd") && !strcmp(input, "internal")) ||
+           (!strcmp(kind, "m3u8") && !strcmp(input, "engine"));
+}
 struct rs_seg_entry;
 static void seg_cache_complete(restream_server_t *server, rs_pending_job *fetch);
 static bool seg_cache_serve(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf);
@@ -2241,8 +2251,7 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
                 strcmp(source_type[0] ? source_type : "manual", type_filter) != 0) continue;
             if (only_running && !running) continue;
             if (name_filter && name_filter[0] && !ci_contains(name, name_filter)) continue;
-            bool engine_stream = strcmp(rs_json_obj_str(stream, "kind", "mpd"), "mpd") == 0 &&
-                                 strcmp(rs_json_obj_str(stream, "inputMode", "internal"), "internal") == 0;
+            bool engine_stream = stream_uses_engine(stream);
             const char *playlist_name = ts_hls && engine_stream ? "ts.m3u8" : "index.m3u8";
             if (list) {
                 rs_buf url = RS_BUF_INIT;
@@ -6634,6 +6643,7 @@ static bool stream_needs_pipeline(const rs_json *stream) {
     if (!stream || rs_json_obj_bool(stream, "directSource", false)) return false;
     const char *input = rs_json_obj_str(stream, "inputMode", "internal");
     const char *output = rs_json_obj_str(stream, "outputMode", "hls");
+    if (!strcmp(input, "engine")) return strcmp(output, "hls") != 0;
     return strcmp(input, "internal") != 0 || strcmp(output, "hls") != 0;
 }
 
@@ -6860,8 +6870,7 @@ static int live_sync_stream(restream_server_t *s, const char *stream_id) {
     const rs_json *stream = rs_panel_find_stream(&s->state, stream_id);
     if (!stream) return -1;
     bool eligible = !rs_json_obj_bool(stream, "directSource", false)
-        && strcmp(rs_json_obj_str(stream, "kind", "mpd"), "mpd") == 0
-        && strcmp(rs_json_obj_str(stream, "inputMode", "internal"), "internal") == 0
+        && stream_uses_engine(stream)
         && strcmp(rs_json_obj_str(stream, "outputMode", "hls"), "hls") == 0
         && strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0;
     if (!eligible) {
@@ -8584,7 +8593,10 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
             reply_error(c, 400, "Direct/download links belong to the internal live engine. Use this FFmpeg stream's HLS play URL or configured output target.");
             return true;
         }
-        if (strcmp(rs_json_obj_str(stream, "kind", "mpd"), "m3u8") == 0) {
+        // A pass-through HLS stream has no engine output to hand out, so its
+        // direct link is the source itself. One the engine runs (input mode
+        // "engine") is served exactly like a DASH stream below.
+        if (strcmp(rs_json_obj_str(stream, "kind", "mpd"), "m3u8") == 0 && !stream_uses_engine(stream)) {
             if (is_download) {
                 free(tail);
                 reply_error(c, 400, "Buffered MP4 download is available only for live MPD streams.");
@@ -8672,7 +8684,7 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
         // engine has already downloaded and decrypted. The master lists a video
         // and (when present) an audio rendition; ?rep= selects a rendition's
         // media playlist. Segments and init flow through /proxy with live=1.
-        if (is_m3u8 && strcmp(kind, "mpd") == 0 && strcmp(input_mode, "internal") == 0) {
+        if (is_m3u8 && stream_uses_engine(stream)) {
             if (!g_dash_handler || !g_fetch_handler) { reply_error(c, 501, "DASH playback isn't in this build."); return true; }
             char *rep = query_var(hm, "rep");
             if (rep && rep[0]) serve_dash_media(server, c, hm, stream, rep);

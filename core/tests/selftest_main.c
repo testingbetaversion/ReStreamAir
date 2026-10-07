@@ -123,6 +123,48 @@ static void test_m3u8_filter_master(void) {
     rs_free(out);
 }
 
+// HLS sources for the internal engine: rendition picking from a master and
+// reading a media playlist into the engine's segment window.
+static void test_hls_engine_source(void) {
+    const char *master =
+        "#EXTM3U\n"
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"Portugues\",LANGUAGE=\"pt-BR\",DEFAULT=YES,URI=\"a/pt.m3u8?t=1\"\n"
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"SAP\",LANGUAGE=\"und\",URI=\"a/sap.m3u8?t=1\"\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=8400000,RESOLUTION=1920x1080,CODECS=\"avc1.640028,mp4a.40.2\",AUDIO=\"aac\"\n"
+        "v1080.m3u8?t=1\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1280x720,CODECS=\"avc1.64001f,mp4a.40.2\",AUDIO=\"aac\"\n"
+        "v720.m3u8?t=1\n";
+    rs_hls_pick pick;
+    check("hls-engine/pick", rs_hls_pick_renditions(master, "https://cdn.example/live/master.m3u8", "height<=720", "", &pick) == 0);
+    check_str("hls-engine/video-uri", pick.video_uri, "https://cdn.example/live/v720.m3u8?t=1");
+    check_str("hls-engine/video-id-stable", pick.video_id, "hlsv-720p-4000000");
+    check_str("hls-engine/video-codecs", pick.video_codecs, "avc1.64001f");
+    check_str("hls-engine/audio-default", pick.audio_uri, "https://cdn.example/live/a/pt.m3u8?t=1");
+    check_str("hls-engine/audio-codecs", pick.audio_codecs, "mp4a.40.2");
+    rs_hls_pick_dispose(&pick);
+    check("hls-engine/pick-lang", rs_hls_pick_renditions(master, "https://cdn.example/live/master.m3u8", "", "lang=und", &pick) == 0 &&
+          pick.audio_uri && strstr(pick.audio_uri, "sap.m3u8") && strstr(pick.video_uri, "v1080"));
+    rs_hls_pick_dispose(&pick);
+
+    const char *media =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:500\n"
+        "#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI=\"data:text/plain;base64,AAAA\",KEYFORMAT=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\"\n"
+        "#EXT-X-MAP:URI=\"init.mp4\"\n"
+        "#EXTINF:5.005,\nseg500.m4s\n#EXTINF:5.005,\nseg501.m4s\n#EXTINF:4.900,\nseg502.m4s\n";
+    rs_hls_media m;
+    char err[160];
+    check("hls-engine/media-parse", rs_hls_media_parse(media, "https://cdn.example/v/index.m3u8", 2, &m, err, sizeof(err)) == 0);
+    check("hls-engine/media-window", m.count == 2 && m.segments[0].sequence == 501 && m.segments[1].sequence == 502);
+    check_str("hls-engine/media-init", m.init_url, "https://cdn.example/v/init.mp4");
+    check("hls-engine/media-duration", m.target_duration == 6 && m.segments[1].duration > 4.89 && m.segments[1].duration < 4.91 && !m.ended);
+    rs_hls_media_dispose(&m);
+    check("hls-engine/aes128-refused",
+          rs_hls_media_parse("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:4,\na.ts\n", "https://x/y.m3u8", 0, &m, err, sizeof(err)) != 0 &&
+          strstr(err, "AES-128"));
+    check("hls-engine/ended", rs_hls_media_parse("#EXTM3U\n#EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n", "https://x/y.m3u8", 0, &m, err, sizeof(err)) == 0 && m.ended && m.count == 1);
+    rs_hls_media_dispose(&m);
+}
+
 static void test_metrics_connections(void) {
     rs_metrics *m = rs_metrics_create();
     rs_metrics_record(m, "stream-a", "shared-key", "10.0.0.1", "Player A", 1000);
@@ -2638,6 +2680,7 @@ int main(int argc, char **argv) {
     test_cenc_multifragment();
     test_mpegts();
     test_m3u8_filter_master();
+    test_hls_engine_source();
     test_metrics_connections();
     test_live_window();
     test_live_lag_level();
