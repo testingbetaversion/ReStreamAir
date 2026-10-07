@@ -317,6 +317,7 @@ Both playlist routes also filter and can answer in JSON:
 | `running=1` | Only streams that are running. |
 | `q=<text>` | Only names containing the text, case-insensitive. |
 | `format=json` | `[{"name","url","urls","logo","provider","type","running","start","end"}]` instead of M3U; `start`/`end` (Unix seconds) only on events. `urls` lists every output with the key applied: `hls` (`/play/<id>/index.m3u8`) for all streams, plus `tsHls` (`/play/<id>/ts.m3u8`) and `ts` (`/direct/<id>.ts`, continuous muxed MPEG-TS) for internal-engine DASH streams. Buffered HLS streams' `hls` is itself MPEG-TS. |
+| `links=name` | Build every link from the stream's name (its `slug`, e.g. `/direct/wta-china-open-oitavas-de-final.ts`) instead of its id. Playback routes accept either; a name two streams share keeps the id. JSON entries always carry both `id` and `slug` (null when the name is not unique). |
 | `hls=ts` | Link internal-engine (DASH) streams to their muxed MPEG-TS HLS (`/play/<id>/ts.m3u8`) instead of the fMP4 playlist. |
 
 For example, every event's name and playable link:
