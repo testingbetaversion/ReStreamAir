@@ -4226,6 +4226,7 @@ typedef struct rs_stream_start {
     rs_source_policy source_policy;
     bool force_ipv6, rotate_proxies;
     bool want_manifest, want_cdm, want_pssh_hook, want_initparse;
+    bool reuse_manifest;  // try the stream's saved session URL before running `manifest`
     char *cdm_mode, *cdm_type, *cached_keys;
     double script_timeout;
     unsigned long long token;
@@ -5047,6 +5048,24 @@ static void stream_start_resolve_all_keys(restream_server_t *server, const char 
 
 static void stream_start_worker(restream_server_t *server, const char *sid, rs_stream_start *st) {
     const char *source = st->url;
+    // A session URL from an earlier start may still be good — signed manifest
+    // URLs often live for hours. If it still answers with a manifest, use it
+    // and skip the `manifest` action: a faster start and one less request to
+    // the provider. Only when it fails is a new session fetched.
+    if (st->want_manifest && st->reuse_manifest && url_is_http(st->url)) {
+        size_t len = 0;
+        char *doc = stream_start_fetch(st, st->url, &len);
+        bool usable = doc && (strstr(doc, "#EXTM3U") || strstr(doc, "<MPD"));
+        free(doc);
+        if (usable) {
+            st->want_manifest = false;
+            log_record(server, sid, "info", "scriptManifest", st->url, 0, -1,
+                       "the saved session manifest still answers — reusing it, manifest action skipped");
+        } else {
+            log_record(server, sid, "info", "scriptManifest", st->url, 0, -1,
+                       "the saved session manifest no longer answers — running the manifest action");
+        }
+    }
     if (st->want_manifest) {
         char *out = NULL;
         int rc = stream_start_run(server, sid, st, "manifest", NULL, 0, 45.0, &out);
@@ -5115,6 +5134,14 @@ static rs_stream_start *stream_start_snapshot(const rs_json *provider, const rs_
     st->force_ipv6 = rs_json_obj_bool(provider, "forceIpv6", false);
     st->rotate_proxies = rs_json_obj_bool(provider, "rotateProxies", false);
     st->want_manifest = want_manifest;
+    st->reuse_manifest = !rs_provider_option_bool(provider, "alwaysRefreshManifest");
+    // The mirrors the last session manifest saved, so a start that reuses that
+    // session still has them for the key retries; a fresh manifest replaces them.
+    const rs_json *saved_mirrors = rs_json_obj_get(stream, "cdnUrls");
+    if (saved_mirrors && rs_json_type_of(saved_mirrors) == RS_JSON_ARR) {
+        rs_json_free(st->cdn_urls);
+        st->cdn_urls = rs_json_clone(saved_mirrors);
+    }
     st->want_cdm = want_cdm;
     st->want_pssh_hook = rs_panel_script_action_allowed(provider, stream, "pssh");
     st->want_initparse = rs_panel_script_action_allowed(provider, stream, "initparse");
@@ -6242,8 +6269,8 @@ static bool dispatch_stream_start(restream_server_t *s, struct mg_connection *c,
     pf->start = st;
 
     const char *start_plan = want_manifest && want_cdm
-        ? "start: running manifest, then checking it for DRM (CDM only for DRM whose KIDs the stored keys do not cover)"
-        : (want_manifest ? "start: running manifest"
+        ? "start: session manifest (saved one if it still answers), then checking it for DRM (CDM only for DRM whose KIDs the stored keys do not cover)"
+        : (want_manifest ? "start: session manifest (saved one if it still answers)"
                          : "start: checking the manifest for DRM (CDM only for DRM whose KIDs the stored keys do not cover)");
     log_record(s, stream_id, "info", "scriptManifest", NULL, 0, -1, start_plan);
     if (!pending_job_dispatch(s, c, pf)) {
