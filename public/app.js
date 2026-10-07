@@ -377,8 +377,15 @@ function switchView(view, { history: historyMode = "push" } = {}) {
       if (!logsPaused) logsPollTimer = startRefreshPoll(loadLogs, "logsRefreshMs");
     }
   };
-  if (document.startViewTransition) {
-    document.startViewTransition(apply);
+  // A transition can be refused or aborted — a page opened in a background
+  // tab, a second switch arriving mid-transition. The view must still change,
+  // so apply it directly when the transition never ran its callback.
+  if (document.startViewTransition && !document.hidden) {
+    let applied = false;
+    const transition = document.startViewTransition(() => { applied = true; apply(); });
+    transition.ready.catch(() => {});
+    transition.updateCallbackDone.catch(() => { if (!applied) apply(); });
+    transition.finished.catch(() => {});
   } else {
     apply();
   }
@@ -2315,6 +2322,80 @@ function readScriptActions(container) {
 
 // MARK: - Provider settings
 
+// A click on a dialog's backdrop closes it — but only when the press started
+// there too. Selecting text in a field and releasing the mouse outside the
+// dialog fires a click whose target is the dialog itself, which used to close
+// the provider settings mid-edit and throw away whatever wasn't saved.
+function closeOnBackdropClick(dialog, close) {
+  let pressedOnBackdrop = false;
+  dialog.addEventListener("pointerdown", (event) => { pressedOnBackdrop = event.target === dialog; });
+  dialog.addEventListener("click", (event) => {
+    if (pressedOnBackdrop && event.target === dialog) close();
+    pressedOnBackdrop = false;
+  });
+}
+
+// Small transient notice in the corner ("Saved", or what went wrong).
+let toastTimer = null;
+function showToast(text, kind = "ok") {
+  const el = $("#toast");
+  if (!el) return;
+  // A modal dialog sits in the browser's top layer, above everything else in
+  // the page, so the notice has to live inside it to be seen.
+  const host = document.querySelector("dialog[open]") || document.body;
+  if (el.parentElement !== host) host.append(el);
+  el.textContent = text;
+  el.className = `toast ${kind}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add("hidden"), kind === "error" ? 6000 : 2200);
+}
+
+// Provider settings save themselves: a checkbox or dropdown at once, typing
+// once it pauses, a text field when it loses focus. One save runs at a time;
+// changes made during it are saved straight after.
+let providerAutosaveTimer = null;
+let providerSaveRunning = false;
+let providerSavePending = false;
+function scheduleProviderAutosave(delay) {
+  clearTimeout(providerAutosaveTimer);
+  providerAutosaveTimer = setTimeout(runProviderAutosave, delay);
+}
+async function runProviderAutosave() {
+  if (!$("#providerSettingsDialog").open) return;
+  if (providerSaveRunning) { providerSavePending = true; return; }
+  const form = $("#providerSettingsForm");
+  // Mid-typing an invalid value is normal; say nothing until it is fixed.
+  if (!form.checkValidity()) return;
+  providerSaveRunning = true;
+  try {
+    await saveProviderSettings();
+    render();
+    showToast("Provider settings saved");
+  } catch (error) {
+    showToast(`Not saved: ${error.message || error}`, "error");
+  } finally {
+    providerSaveRunning = false;
+    if (providerSavePending) { providerSavePending = false; scheduleProviderAutosave(0); }
+  }
+}
+
+// Sets every one of the provider's existing streams to `mode` in one request.
+async function applyInputModeToAllStreams(mode) {
+  const provider = selectedProvider();
+  if (!provider) return;
+  const ids = provider.streams.map((stream) => stream.id);
+  if (!ids.length) { showToast("This provider has no streams yet."); return; }
+  const label = mode === "internal" ? "Internal remuxer / HLS proxy" : mode;
+  if (!confirm(`Set the input mode of all ${ids.length} stream(s) of "${provider.name}" to ${label}? Running streams switch now.`)) return;
+  try {
+    state = await request("/api/streams/bulk", { method: "POST", body: JSON.stringify({ action: "set", ids, fields: { inputMode: mode } }) });
+    render();
+    showToast(`Input mode set on ${ids.length} stream(s)`);
+  } catch (error) {
+    showToast(`Couldn't change the streams: ${error.message || error}`, "error");
+  }
+}
+
 function updateSegmentUrlParamsVisibility() {
   const form = $("#providerSettingsForm");
   $("#segmentUrlParamsField").classList.toggle("hidden", form.elements.inheritUrlParams.checked);
@@ -2545,12 +2626,24 @@ function renderProviderOptions(provider) {
       groups.set(field.group, grid);
     }
     const label = document.createElement("label");
-    const input = document.createElement("input");
+    const input = document.createElement(field.type === "select" ? "select" : "input");
     input.name = `providerOption_${field.name}`;
     input.dataset.providerOption = field.name;
-    input.type = field.type;
+    if (field.type !== "select") input.type = field.type;
     const value = provider.options?.[field.name] ?? field.default;
-    if (field.type === "checkbox") {
+    if (field.type === "select") {
+      for (const choice of field.choices || []) input.append(new Option(choice.label, choice.value));
+      input.value = value ?? "";
+      label.append(document.createTextNode(field.label), input);
+      if (field.name === "importInputMode") {
+        const apply = document.createElement("button");
+        apply.type = "button";
+        apply.className = "ghost";
+        apply.textContent = `Apply to all ${provider.streams.length} existing stream(s) now`;
+        apply.addEventListener("click", () => applyInputModeToAllStreams(input.value || "internal"));
+        label.append(apply);
+      }
+    } else if (field.type === "checkbox") {
       label.className = "check";
       input.checked = Boolean(value);
       label.append(input, document.createTextNode(field.label));
@@ -2734,6 +2827,7 @@ $("#testProviderWebhookBtn").addEventListener("click", async () => {
 
 $("#providerSettingsForm").addEventListener("submit", async (event) => {
   event.preventDefault();
+  clearTimeout(providerAutosaveTimer);
   try {
     await saveProviderSettings();
   } catch (error) {
@@ -4012,9 +4106,7 @@ $("#importProviderFile").addEventListener("change", async (event) => {
   if (file) await importProviderFromFile(file);
 });
 $("#closeNewProviderBtn").addEventListener("click", closeNewProviderDialog);
-$("#newProviderDialog").addEventListener("click", (event) => {
-  if (event.target === event.currentTarget) closeNewProviderDialog();
-});
+closeOnBackdropClick($("#newProviderDialog"), closeNewProviderDialog);
 
 $("#providerForm").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -4033,9 +4125,7 @@ $("#toggleRunBtn").addEventListener("click", toggleSelectedRun);
 $("#deleteStreamBtn").addEventListener("click", deleteSelectedStream);
 $("#deleteProviderBtn").addEventListener("click", deleteSelectedProvider);
 $("#closeStreamEditorBtn").addEventListener("click", closeStreamEditorDialog);
-$("#streamEditorDialog").addEventListener("click", (event) => {
-  if (event.target === event.currentTarget) closeStreamEditorDialog();
-});
+closeOnBackdropClick($("#streamEditorDialog"), closeStreamEditorDialog);
 $("#streamEditorDialog").addEventListener("close", () => { editingNewStream = false; stopPlayer(); });
 $("#pipVideo").addEventListener("leavepictureinpicture", stopPipPlayer);
 $("#themeToggle").addEventListener("click", toggleTheme);
@@ -4054,11 +4144,17 @@ $("#showScriptingBtn").addEventListener("click", () => {
   if (!group.classList.contains("hidden")) $("#streamForm").elements.sessionManifest.focus();
 });
 $("#closeProviderSettingsBtn").addEventListener("click", closeProviderSettingsDialog);
-$("#providerSettingsDialog").addEventListener("click", (event) => {
-  if (event.target === event.currentTarget) closeProviderSettingsDialog();
-});
+closeOnBackdropClick($("#providerSettingsDialog"), closeProviderSettingsDialog);
 $("#providerSettingsDialog").addEventListener("close", stopScriptOutputPoll);
 $("#providerSettingsForm").elements.inheritUrlParams.addEventListener("change", updateSegmentUrlParamsVisibility);
+$("#providerSettingsForm").addEventListener("change", (event) => {
+  // Buttons inside the form (Apply to all, account editing) handle their own saves.
+  if (event.target.closest("[data-no-autosave]")) return;
+  scheduleProviderAutosave(150);
+});
+$("#providerSettingsForm").addEventListener("input", (event) => {
+  if (event.target.matches("input[type=text], input:not([type]), input[type=number], textarea")) scheduleProviderAutosave(900);
+});
 $("#addScriptAccountBtn").addEventListener("click", () => {
   const username = $("#newScriptAccountUsername").value.trim();
   if (!username) return;

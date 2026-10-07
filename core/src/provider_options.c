@@ -12,11 +12,15 @@ typedef struct {
     rs_json_type type;
     int value, min, max;
     const char *hint, *inactive;
+    // A dropdown: "value:Label|value:Label". The stored value must be one of
+    // the values; "" (the first entry) means "not set".
+    const char *choices;
 } option_field;
 
-#define B(n,l,h,i) {n,l,"Behaviour",RS_JSON_BOOL,0,0,0,h,i}
-#define S(n,l,g,h,i) {n,l,g,RS_JSON_STR,0,0,4096,h,i}
-#define N(n,l,g,v,lo,hi,h,i) {n,l,g,RS_JSON_NUM,v,lo,hi,h,i}
+#define B(n,l,h,i) {n,l,"Behaviour",RS_JSON_BOOL,0,0,0,h,i,NULL}
+#define S(n,l,g,h,i) {n,l,g,RS_JSON_STR,0,0,4096,h,i,NULL}
+#define N(n,l,g,v,lo,hi,h,i) {n,l,g,RS_JSON_NUM,v,lo,hi,h,i,NULL}
+#define C(n,l,g,c,h,i) {n,l,g,RS_JSON_STR,0,0,64,h,i,c}
 static const option_field fields[] = {
     B("alwaysResetSession", "Always reset session", "Clear saved session files before login or the first stream start while the provider is idle. Concurrent streams share their active session.", ""),
     B("noRestartOnError", "No restart on error", "DASH and FFmpeg: stop automatic recovery after an exhausted request, process failure or stall. Manual starts still work.", ""),
@@ -40,6 +44,10 @@ static const option_field fields[] = {
     S("offAirFallbackUrl", "Off air fallback MPD URL", "Requests and scripts", "Internal DASH: live MPD to play when the primary is unavailable. Returns to the primary on manual or timed restart. Use a clear, publicly reachable fallback source.", ""),
     S("defaultCdn", "Default CDN", "Requests and scripts", "Name of the CDN entry to choose from a manifest script response. A missing name fails the start visibly. Blank uses the script primary URL.", ""),
     S("defaultVideo", "Default video", "Requests and scripts", "Comma-separated preferences: best, worst, id=ID, codec=avc, height<=720, bandwidth<=2000000. Internal DASH picks the first match; HLS pass-through only offers players the variants the first matching rule allows (e.g. height<=720 hides 1080p). Explicit stream selections take precedence.", ""),
+    B("singleVideoQuality", "Single video quality", "HLS pass-through and Buffered HLS: offer players exactly one video quality — the best one Default video allows (e.g. height<=720 gives 720p only), or the best overall when Default video is empty. Audio tracks are kept.", ""),
+    C("importInputMode", "Input mode for imported streams", "Requests and scripts",
+      ":Keep the default (internal)|internal:Internal remuxer / HLS proxy|hlsBuffered:Buffered HLS · download on first viewer|ffmpegResident:FFmpeg resident|ffmpegTsHls:FFmpeg TS HLS/Direct|ffmpegMultiTsHls:FFmpeg MultiTS HLS|ffmpegFmp4Hls:FMP4 HLS",
+      "Input mode given to channels and events this provider imports from now on. Existing streams keep theirs; use Apply to all streams below to change them too. Buffered HLS needs an HLS (m3u8) source.", ""),
     S("defaultAudio", "Default audio", "Requests and scripts", "Internal DASH defaults: comma-separated preferences: lang=ur, id=ID, codec=mp4a, best or worst. Explicit stream selections take precedence.", ""),
     S("pipeCommand", "Pipe command", "Requests and scripts", "Fallback command for streams using Program pipe input with an empty stream Pipe command. Applies on next start.", ""),
     N("scriptTimeoutSeconds", "Script timeout (s)", "Requests and scripts", 30,1,3600, "Maximum duration of each provider or stream script action. Applies to the next action.", ""),
@@ -63,6 +71,7 @@ static const option_field fields[] = {
 #undef B
 #undef S
 #undef N
+#undef C
 
 static const option_field *field_named(const char *name) {
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
@@ -83,7 +92,27 @@ rs_json *rs_provider_options_schema(void) {
         rs_json_obj_set_str(v, "name", f->name);
         rs_json_obj_set_str(v, "label", f->label);
         rs_json_obj_set_str(v, "group", f->group);
-        rs_json_obj_set_str(v, "type", f->type == RS_JSON_BOOL ? "checkbox" : f->type == RS_JSON_STR ? "text" : "number");
+        rs_json_obj_set_str(v, "type", f->choices ? "select" : f->type == RS_JSON_BOOL ? "checkbox" : f->type == RS_JSON_STR ? "text" : "number");
+        if (f->choices) {
+            rs_json *choices = rs_json_new_arr();
+            const char *p = f->choices;
+            while (*p) {
+                const char *end = strchr(p, '|');
+                size_t len = end ? (size_t)(end - p) : strlen(p);
+                const char *colon = memchr(p, ':', len);
+                size_t vlen = colon ? (size_t)(colon - p) : len;
+                char value[64], label[128];
+                snprintf(value, sizeof(value), "%.*s", (int)vlen, p);
+                snprintf(label, sizeof(label), "%.*s", colon ? (int)(len - vlen - 1) : (int)len, colon ? colon + 1 : p);
+                rs_json *c = rs_json_new_obj();
+                rs_json_obj_set_str(c, "value", value);
+                rs_json_obj_set_str(c, "label", label);
+                rs_json_arr_push(choices, c);
+                if (!end) break;
+                p = end + 1;
+            }
+            rs_json_obj_set(v, "choices", choices);
+        }
         rs_json_obj_set(v, "default", default_value(f));
         rs_json_obj_set_int(v, "min", f->value == 0 ? 0 : f->min);
         rs_json_obj_set_int(v, "max", f->max);
@@ -132,6 +161,17 @@ bool rs_provider_options_valid(const rs_json *options, const char **err) {
             valid = strlen(s) <= (size_t)f->max && !strpbrk(s, "\r\n");
             if (valid && !strcmp(f->name, "offAirFallbackUrl") && s[0] && strncmp(s, "http://", 7) && strncmp(s, "https://", 8)) {
                 *err = "Off air fallback URL must begin with http:// or https://."; return false;
+            }
+            if (valid && f->choices) {
+                // One of the listed values, matched as a whole "value:" entry.
+                size_t n = strlen(s);
+                bool listed = false;
+                for (const char *p = f->choices; p && *p && !listed;) {
+                    if (!strncmp(p, s, n) && p[n] == ':') listed = true;
+                    p = strchr(p, '|');
+                    if (p) p++;
+                }
+                if (!listed) { *err = "Invalid provider option: choose one of the listed values."; return false; }
             }
             if (valid && !strcmp(f->name, "epgTimezone")) {
                 int minutes;
@@ -227,6 +267,7 @@ void rs_provider_source_policy(const rs_json *provider, rs_source_policy *out) {
     snprintf(out->provider_id, sizeof(out->provider_id), "%s", rs_json_obj_str(provider, "id", ""));
     snprintf(out->cookie_file, sizeof(out->cookie_file), "runtime/sessions/%s/cookies.txt", out->provider_id);
     snprintf(out->video_filter, sizeof(out->video_filter), "%s", rs_provider_option_str(provider, "defaultVideo"));
+    out->single_video = rs_provider_option_bool(provider, "singleVideoQuality");
     snprintf(out->audio_filter, sizeof(out->audio_filter), "%s", rs_provider_option_str(provider, "defaultAudio"));
     out->timeout_seconds = (int)rs_provider_option_int(provider, "httpGetTimeoutSeconds");
     out->attempts = (int)rs_provider_option_int(provider, "httpGetAttempts");

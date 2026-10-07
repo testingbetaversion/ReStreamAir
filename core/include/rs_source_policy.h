@@ -10,6 +10,7 @@ typedef struct {
     int use_cookies, detect_json_redirect, legacy_dash;
     int no_restart_error, restart_finished, no_restart_track, cooldown;
     int restart_delay, stalled_seconds, manifest_retries, ignore_static, use_dash_delay;
+    int single_video;  // HLS pass-through: offer only one video variant
 } rs_source_policy;
 
 #endif

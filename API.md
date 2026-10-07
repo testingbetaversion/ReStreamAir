@@ -384,6 +384,8 @@ backend behavior; pipeline-specific controls identify their scope in the schema.
 | `detectJsonRedirect` | Follows recognized HTTP(S) JSON URL fields at the root or under `data`, at most five hops. Relative playlist paths resolve against the final URL. |
 | `defaultCdn` | Selects `Name`/`name` from the manifest script's `Cdn` list. An unmatched configured name fails visibly. |
 | `defaultVideo`, `defaultAudio` | Ordered comma-separated preferences: `best`, `worst`, `id=ID`, `lang=ur`, `codec=avc`, `height<=720`, `bandwidth<=2000000`. Internal DASH picks the first match. For HLS pass-through, `defaultVideo` limits the master playlist to the variants the first matching rule allows (`height<=720` hides everything above 720p; a rule matching nothing is skipped). Explicit stream selections win. |
+| `singleVideoQuality` | Boolean. HLS pass-through and Buffered HLS offer exactly one video variant: the highest-bandwidth one `defaultVideo` allows (with `height<=720`, 720p only), or the best overall when `defaultVideo` is empty. Audio tracks stay; I-frame variants are dropped. |
+| `importInputMode` | `""` (keep the default) or one input mode (`internal`, `hlsBuffered`, `ffmpegResident`, `ffmpegTsHls`, `ffmpegMultiTsHls`, `ffmpegFmp4Hls`). Applied to channels and events this provider's imports create from now on; existing streams keep theirs. |
 | `legacyDashParser` | Internal DASH XML recovery mode; default parsing is strict. |
 | `useDashDelay` | Honors MPD `suggestedPresentationDelay`, bounded to 120s, taking the larger of the source delay and stream/provider buffer. |
 | `ignoreDashStaticFlag` | Continues polling a static MPD. Otherwise a drained static source publishes ENDLIST. |
@@ -427,7 +429,7 @@ provider.
 | `DELETE /api/streams/<id>` | Stop and delete; `200` state. |
 | `POST /api/streams/<id>/start` | No body or `{}`; `200` state. Script-based starts wait for manifest/key work before replying. |
 | `POST /api/streams/<id>/stop` | No body or `{}`; `200` state. Worker shutdown completes asynchronously. |
-| `POST /api/streams/bulk` | `{"action":"stop"\|"delete","ids":["<id>",...]}`; `200` state after one save. Unknown ids are skipped. Starts are per stream only. |
+| `POST /api/streams/bulk` | `{"action":"stop"\|"delete","ids":["<id>",...]}`, or `{"action":"set","ids":[…],"fields":{"inputMode":"hlsBuffered"}}` to change only the input mode (running streams switch at once); `200` state after one save. Unknown ids are skipped. Starts are per stream only. |
 | `POST /api/probe` | Source probe request below; `200` probe result. |
 
 Create requires nonblank `name` and HTTP(S) `url`. For `inputMode: "pipe"`,

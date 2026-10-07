@@ -121,6 +121,11 @@ static const char *normalize_downloader(const char *d) {
 
 static long long clamp_ll(long long v, long long lo) { return v < lo ? lo : v; }
 
+// The stream input modes the panel offers (Settings → stream editor → Input).
+static const char *valid_inputs[] = {"internal", "ffmpegResident", "ffmpegTsHls",
+                                     "ffmpegMultiTsHls", "ffmpegFmp4Hls", "hlsBuffered", "pipe",
+                                     "nm3u8dlre"};
+
 // Builds a stream object from a body, applying every default and clamp but no
 // validation. Split out of stream_from_body so the channel/event import can
 // mint a fully-formed stream from an empty body: an imported entry carries no
@@ -186,9 +191,7 @@ static rs_json *stream_build(const rs_json *body, const char *id) {
     rs_json_obj_set_str(s, "tvgId", rs_json_obj_str(body, "tvgId", ""));
 
     // Enumerated fields fall back to their default when the value isn't valid.
-    static const char *valid_inputs[] = {"internal", "ffmpegResident", "ffmpegTsHls",
-                                         "ffmpegMultiTsHls", "ffmpegFmp4Hls", "hlsBuffered", "pipe",
-                                         "nm3u8dlre"};
+
     bool input_ok = false;
     for (size_t i = 0; i < sizeof(valid_inputs) / sizeof(valid_inputs[0]); i++) {
         if (strcmp(input_mode, valid_inputs[i]) == 0) { input_ok = true; break; }
@@ -854,6 +857,7 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
         if (!name || !name[0]) { free(name); continue; }
 
         rs_json *stream = find_imported_stream(streams, name, source_type);
+        bool created = stream == NULL;  // new (or a reused, wiped event slot)
         if (!stream && events && rs_provider_option_bool(p, "reuseEventIndex")) {
             for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
                 rs_json *old = (rs_json *)rs_json_arr_at(streams, j);
@@ -890,6 +894,11 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
         }
 
         rs_json_obj_set_str(stream, "name", name);
+        // The provider's chosen input mode for imports applies to streams this
+        // import creates; ones that already existed keep whatever the operator
+        // set (Apply to all streams changes those deliberately).
+        const char *import_mode = rs_provider_option_str(p, "importInputMode");
+        if (created && import_mode[0]) rs_json_obj_set_str(stream, "inputMode", import_mode);
         // A logo the operator set by hand (or a previous import resolved) wins
         // over the freshly looked-up one; only an empty slot is filled.
         const char *existing_logo = rs_json_obj_str(stream, "logo", "");
@@ -1282,6 +1291,18 @@ const rs_json *rs_panel_api_key(const rs_state *st, const char *provided_key) {
             return rs_json_obj_bool(k, "api", false) && rs_panel_key_active(k) ? k : NULL;
     }
     return NULL;
+}
+
+int rs_panel_set_stream_input_mode(rs_state *st, const char *stream_id, const char *mode,
+                                   const char **err) {
+    bool ok = false;
+    for (size_t i = 0; mode && i < sizeof(valid_inputs) / sizeof(valid_inputs[0]); i++)
+        if (strcmp(mode, valid_inputs[i]) == 0) ok = true;
+    if (!ok) { *err = "Unknown input mode."; return -400; }
+    rs_json *stream = find_stream(st, stream_id, NULL);
+    if (!stream) { *err = "Stream not found."; return -404; }
+    rs_json_obj_set_str(stream, "inputMode", mode);
+    return 0;
 }
 
 int rs_panel_delete_key(rs_state *st, const char *id, const char **err) {

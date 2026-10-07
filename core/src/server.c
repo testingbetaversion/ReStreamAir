@@ -2787,9 +2787,52 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         rs_json *body = parse_body(hm);
         const char *action = rs_json_obj_str(body, "action", "");
         bool del = strcmp(action, "delete") == 0;
-        if (!del && strcmp(action, "stop") != 0) {
+        bool set = strcmp(action, "set") == 0;
+        const char *input_mode = rs_json_obj_str(rs_json_obj_get(body, "fields"), "inputMode", "");
+        if (!del && !set && strcmp(action, "stop") != 0) {
             rs_json_free(body);
-            reply_error(c, 400, "action must be \"stop\" or \"delete\".");
+            reply_error(c, 400, "action must be \"stop\", \"delete\" or \"set\".");
+            return true;
+        }
+        if (set && !input_mode[0]) {
+            rs_json_free(body);
+            reply_error(c, 400, "action \"set\" needs fields.inputMode.");
+            return true;
+        }
+        if (set) {
+            // Change one setting on many streams. Running ones are re-synced
+            // exactly as a single stream editor save would, so they switch
+            // pipelines now rather than on their next restart.
+            char *ip = client_ip(s, c, hm);
+            const rs_json *ids = rs_json_obj_get(body, "ids");
+            size_t n = rs_json_arr_len(ids), done = 0;
+            const char *err = NULL;
+            for (size_t i = 0; i < n; i++) {
+                const char *id = rs_json_as_str(rs_json_arr_at(ids, i), "");
+                if (!id[0]) continue;
+                int rc = rs_panel_set_stream_input_mode(&s->state, id, input_mode, &err);
+                if (rc == -400) break;  // invalid mode: same for every stream
+                if (rc != 0) continue;
+                done++;
+                const rs_json *stream = rs_panel_find_stream(&s->state, id);
+                if (stream && strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0) {
+                    live_sync_stream(s, id);
+                    char pipeline_err[256] = {0};
+                    if (pipeline_sync_stream(s, id, pipeline_err, sizeof(pipeline_err)) != 0)
+                        log_record(s, id, "error", "ffmpegPipeline", NULL, 0, -1, pipeline_err);
+                }
+            }
+            if (err && done == 0 && n > 0) {
+                rs_free(ip); rs_json_free(body);
+                reply_error(c, 400, err);
+                return true;
+            }
+            log_recordf(s, "__panel__", "info", "streamUpdate", NULL, 0, -1,
+                        "bulk input mode %s on %lu stream(s) by %s (%lu requested)", input_mode,
+                        (unsigned long)done, ip, (unsigned long)n);
+            rs_free(ip);
+            rs_json_free(body);
+            reply_after_mutation(s, c, hm, 0, NULL);
             return true;
         }
         char *ip = client_ip(s, c, hm);
@@ -5547,7 +5590,8 @@ static void pending_job_finish_playlist(struct mg_connection *c, rs_pending_job 
     if (rs_m3u8_is_master(pf->body)) {
         // The provider's "Default video" rules cap which variants a player may
         // pick (height<=720 and the like); with no rule this is a no-op.
-        char *limited = rs_m3u8_filter_master_video(pf->body, pf->source_policy.video_filter);
+        char *limited = rs_m3u8_filter_master_video(pf->body, pf->source_policy.video_filter,
+                                                    pf->source_policy.single_video);
         rewritten = rs_m3u8_rewrite_master(limited ? limited : pf->body, pf->url, server_decrypts_hls,
                                            master_transform, &ctx);
         rs_free(limited);
@@ -6306,6 +6350,13 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     pf->decryption_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
     pf->hls_key = rs_strdup(rs_json_obj_str(stream, "hlsKey", ""));
     pf->playback_key_str = playback_key(hm);
+    // The Buffered HLS feed: FFmpeg maps only the first video and audio unless
+    // the stream has renditions ticked, yet its HLS demuxer probes every variant
+    // the master lists before it starts — through a distant proxy that alone
+    // can outlast the buffer's warm-up. Hand it the one variant it will use.
+    if (is_pipeline_feed(server, c, pf->playback_key_str) &&
+        rs_json_arr_len(rs_json_obj_get(stream, "representations")) == 0)
+        pf->source_policy.single_video = 1;
     pending_source_context(server, pf, stream, NULL, variant != NULL);
     char *cdn_hint = query_var(hm, "cdn");
     if (cdn_hint && rs_json_obj_get(pf->source_headers, cdn_hint)) {

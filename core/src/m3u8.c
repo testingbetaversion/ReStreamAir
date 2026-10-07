@@ -525,8 +525,9 @@ static bool variant_matches(const hls_variant_line *v, const char *rule, bool *u
     return false;
 }
 
-char *rs_m3u8_filter_master_video(const char *text, const char *filter) {
-    if (!text || !filter || !filter[0] || !rs_m3u8_is_master(text)) return NULL;
+char *rs_m3u8_filter_master_video(const char *text, const char *filter, bool single) {
+    if (!filter) filter = "";
+    if (!text || (!filter[0] && !single) || !rs_m3u8_is_master(text)) return NULL;
     lines l;
     if (!split_lines(text, &l)) return NULL;
 
@@ -597,6 +598,22 @@ char *rs_m3u8_filter_master_video(const char *text, const char *filter) {
             }
         }
         break;
+    }
+
+    // Single quality: of the playable variants still kept, only the
+    // highest-bandwidth one stays (first listed wins a tie). Trick-play
+    // I-frame variants go too — a one-quality restream has no use for them.
+    if (single) {
+        size_t chosen = nvars;
+        for (size_t k = 0; k < nvars; k++) {
+            if (vars[k].iframe || drop[vars[k].inf]) continue;
+            if (chosen == nvars || vars[k].bandwidth > vars[chosen].bandwidth) chosen = k;
+        }
+        for (size_t k = 0; k < nvars; k++) {
+            if (k == chosen) continue;
+            drop[vars[k].inf] = true;
+            drop[vars[k].uri] = true;
+        }
     }
 
     {
