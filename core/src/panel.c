@@ -390,6 +390,10 @@ static rs_json *stream_view(const rs_state *st, const rs_json *stream, const cha
     if (!process_pipeline && strcmp(kind, "m3u8") != 0) {
         snprintf(url, sizeof(url), "http://%s/direct/%s.ts", host, id);
         rs_json_obj_set_str(direct, "muxed (mpeg-ts)", url);
+        // The same mux, cut into classic MPEG-TS HLS segments.
+        snprintf(url, sizeof(url), "http://%s/play/%s/ts.m3u8", host, play_id);
+        rs_json_obj_set_str(direct, "HLS muxed (mpeg-ts)", url);
+        rs_json_obj_set_str(v, "tsHlsUrl", url);
     }
     rs_json_obj_set(v, "directStreamUrls", direct);
     rs_json_obj_set(v, "downloadUrls", download);

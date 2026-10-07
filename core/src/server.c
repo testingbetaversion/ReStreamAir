@@ -2209,6 +2209,11 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
     char *running_filter = query_var(hm, "running");
     char *name_filter = query_var(hm, "q");
     char *format = query_var(hm, "format");
+    // ?hls=ts: link internal-engine (DASH) streams to their muxed MPEG-TS HLS
+    // (/play/<id>/ts.m3u8) instead of the fMP4 playlist.
+    char *hls_variant = query_var(hm, "hls");
+    bool ts_hls = hls_variant && strcmp(hls_variant, "ts") == 0;
+    free(hls_variant);
     bool only_running = running_filter && (strcmp(running_filter, "1") == 0 || strcmp(running_filter, "true") == 0);
     bool as_json = format && strcmp(format, "json") == 0;
     free(running_filter);
@@ -2236,9 +2241,12 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
                 strcmp(source_type[0] ? source_type : "manual", type_filter) != 0) continue;
             if (only_running && !running) continue;
             if (name_filter && name_filter[0] && !ci_contains(name, name_filter)) continue;
+            bool engine_stream = strcmp(rs_json_obj_str(stream, "kind", "mpd"), "mpd") == 0 &&
+                                 strcmp(rs_json_obj_str(stream, "inputMode", "internal"), "internal") == 0;
+            const char *playlist_name = ts_hls && engine_stream ? "ts.m3u8" : "index.m3u8";
             if (list) {
                 rs_buf url = RS_BUF_INIT;
-                rs_buf_appendf(&url, "%s%s/play/%s/index.m3u8", scheme, host, id);
+                rs_buf_appendf(&url, "%s%s/play/%s/%s", scheme, host, id, playlist_name);
                 if (encoded_key) rs_buf_appendf(&url, "?key=%s", encoded_key);
                 char *url_text = rs_buf_take(&url);
                 rs_json *item = rs_json_new_obj();
@@ -2283,7 +2291,8 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
             rs_buf_append_str(&body, host);
             rs_buf_append_str(&body, "/play/");
             rs_buf_append_str(&body, id);
-            rs_buf_append_str(&body, "/index.m3u8");
+            rs_buf_append_char(&body, '/');
+            rs_buf_append_str(&body, playlist_name);
             if (encoded_key) rs_buf_appendf(&body, "?key=%s", encoded_key);
             rs_buf_append_char(&body, '\n');
         }
@@ -7442,6 +7451,12 @@ typedef struct rs_direct_client {
 // cost of muxing a few more seconds of a stream nobody is watching.
 #define RS_TS_LINGER_TICKS 20  // 10 s at RS_DIRECT_PUMP_MS
 
+#define RS_TS_HLS_WAITERS 32
+#define RS_TS_HLS_SEGMENTS 6      // segments listed in the TS-HLS playlist
+#define RS_TS_HLS_MIN_READY 2     // complete segments before the first playlist is served
+#define RS_TS_HLS_WAIT_S 20.0     // how long a first playlist request is held
+#define RS_TS_HLS_ALIVE_S 15.0    // a TS-HLS player counts as a viewer this long after a request
+
 typedef struct rs_ts_session {
     struct rs_ts_session *next;
     char *stream_id;
@@ -7464,6 +7479,17 @@ typedef struct rs_ts_session {
     uint64_t ring_base;     // absolute position of ring[0]
     uint64_t joins[RS_TS_MAX_JOINS];
     size_t njoins;
+    // TS-over-HLS (/play/<id>/ts.m3u8) cuts the ring into segments at the join
+    // points: segment k runs from joins[k] to joins[k+1]. Each join carries the
+    // video PTS found there (seconds, <0 when unreadable) for exact EXTINFs,
+    // and join_seq_base numbers joins[0] so media sequences survive the oldest
+    // joins scrolling away.
+    double join_pts[RS_TS_MAX_JOINS];
+    uint64_t join_seq_base;
+    uint64_t disc_seq;  // first segment after a mux rebuild (EXT-X-DISCONTINUITY); UINT64_MAX = none
+    double hls_seen;  // last TS-HLS request, seconds; keeps the mux alive like a viewer
+    struct { unsigned long conn_id; double deadline; char *key; } hls_wait[RS_TS_HLS_WAITERS];
+    int nhls_wait;    // playlist requests held until the first segments exist
 
     int viewers;
     int idle_pumps;   // consecutive pumps with no viewer; see RS_TS_LINGER_TICKS
@@ -7505,6 +7531,7 @@ static void ts_client_free(rs_ts_client *t) {
 
 static void ts_session_free(rs_ts_session *s) {
     if (!s) return;
+    for (int i = 0; i < s->nhls_wait; i++) free(s->hls_wait[i].key);
     rs_ts_mux_destroy(s->mux);
     rs_free(s->stream_id);
     free(s->ring);
@@ -7556,6 +7583,7 @@ static rs_ts_session *ts_session_open(restream_server_t *s, const char *stream_i
         ts_session_free(sess);
         return NULL;
     }
+    sess->disc_seq = UINT64_MAX;
     sess->next = s->ts_sessions;
     s->ts_sessions = sess;
     return sess;
@@ -7566,6 +7594,11 @@ static void ts_session_close(restream_server_t *s, const char *stream_id) {
         if (strcmp((*pp)->stream_id, stream_id) == 0) {
             rs_ts_session *dead = *pp;
             *pp = dead->next;
+            // Players still waiting for a first TS-HLS playlist get an answer.
+            for (int i = 0; i < dead->nhls_wait; i++) {
+                struct mg_connection *c = conn_by_id(s, dead->hls_wait[i].conn_id);
+                if (c) reply_error(c, 503, "The stream stopped before its MPEG-TS HLS was ready.");
+            }
             ts_session_free(dead);
         } else {
             pp = &(*pp)->next;
@@ -7656,6 +7689,35 @@ static void ts_session_bind(restream_server_t *server, rs_ts_session *sess) {
 }
 
 // Appends muxed output to the ring, dropping the oldest bytes when it is full.
+// The PTS (seconds) of the first video PES that starts at or after `p`, read
+// from the TS packets themselves. Negative when none is found nearby.
+static double ts_video_pts(const uint8_t *p, size_t len) {
+    for (size_t off = 0, n = 0; off + RS_TS_PACKET_SIZE <= len && n < 64; off += RS_TS_PACKET_SIZE, n++) {
+        const uint8_t *pkt = p + off;
+        if (pkt[0] != 0x47 || !(pkt[1] & 0x40)) continue;  // sync, payload_unit_start
+        int afc = (pkt[3] >> 4) & 3;
+        if (!(afc & 1)) continue;
+        size_t pl = 4 + ((afc & 2) ? 1u + pkt[4] : 0u);
+        if (pl + 14 > RS_TS_PACKET_SIZE) continue;
+        const uint8_t *pes = pkt + pl;
+        if (pes[0] || pes[1] || pes[2] != 1 || (pes[3] & 0xF0) != 0xE0) continue;  // video PES
+        if (!(pes[7] & 0x80)) continue;  // no PTS
+        const uint8_t *t = pes + 9;
+        uint64_t pts = ((uint64_t)((t[0] >> 1) & 7) << 30) | ((uint64_t)t[1] << 22) |
+                       ((uint64_t)(t[2] >> 1) << 15) | ((uint64_t)t[3] << 7) | (uint64_t)(t[4] >> 1);
+        return (double)pts / 90000.0;
+    }
+    return -1;
+}
+
+// Drops the oldest join point (and its PTS), advancing the sequence numbering.
+static void ts_drop_oldest_join(rs_ts_session *sess) {
+    memmove(sess->joins, sess->joins + 1, (sess->njoins - 1) * sizeof(*sess->joins));
+    memmove(sess->join_pts, sess->join_pts + 1, (sess->njoins - 1) * sizeof(*sess->join_pts));
+    sess->njoins--;
+    sess->join_seq_base++;
+}
+
 static void ts_ring_append(rs_ts_session *sess, const uint8_t *data, size_t len,
                            const size_t *joins, size_t njoins) {
     uint64_t append_pos = sess->ring_base + sess->ring_len;
@@ -7664,10 +7726,8 @@ static void ts_ring_append(rs_ts_session *sess, const uint8_t *data, size_t len,
         // refuse the new one, or the "newest join point" a viewer is seated at
         // would freeze at whatever was recorded first and strand every later
         // viewer that far behind the live edge.
-        if (sess->njoins == RS_TS_MAX_JOINS) {
-            memmove(sess->joins, sess->joins + 1, (RS_TS_MAX_JOINS - 1) * sizeof(*sess->joins));
-            sess->njoins--;
-        }
+        if (sess->njoins == RS_TS_MAX_JOINS) ts_drop_oldest_join(sess);
+        sess->join_pts[sess->njoins] = joins[i] < len ? ts_video_pts(data + joins[i], len - joins[i]) : -1;
         sess->joins[sess->njoins++] = append_pos + joins[i];
     }
 
@@ -7692,11 +7752,9 @@ static void ts_ring_append(rs_ts_session *sess, const uint8_t *data, size_t len,
         sess->ring_len += len;
     }
 
-    // Forget join points that have scrolled out of the window.
-    size_t keep = 0;
-    for (size_t i = 0; i < sess->njoins; i++)
-        if (sess->joins[i] >= sess->ring_base) sess->joins[keep++] = sess->joins[i];
-    sess->njoins = keep;
+    // Forget join points that have scrolled out of the window. Joins are in
+    // ascending order, so the ones that went are always a prefix.
+    while (sess->njoins && sess->joins[0] < sess->ring_base) ts_drop_oldest_join(sess);
 }
 
 // The newest position a viewer can start decoding from, or the live edge when
@@ -7727,6 +7785,11 @@ static bool ts_session_rebuild(restream_server_t *server, rs_ts_session *sess,
     memset(sess->tracks, 0, sizeof(sess->tracks));
     sess->ring_base += sess->ring_len;
     sess->ring_len = 0;
+    // Keep TS-HLS sequence numbers moving forward across the rebuild — a player
+    // that saw a number reused would skip the new media as already played —
+    // and flag the first new segment as a discontinuity (new PTS timeline).
+    sess->join_seq_base += sess->njoins;
+    sess->disc_seq = sess->join_seq_base;
     sess->njoins = 0;
 
     for (rs_ts_client *client = server->ts_head; client; client = client->next)
@@ -7878,6 +7941,8 @@ static void ts_client_pump(restream_server_t *server, rs_ts_client *t,
     rs_metrics_record(server->metrics, t->stream_id, t->identity, t->ip, t->ua, (int)avail);
 }
 
+static void ts_hls_answer_waiters(restream_server_t *s, rs_ts_session *sess);
+
 // The direct-link timer. Runs the muxes, then feeds every viewer.
 static void pump_direct_links(void *arg) {
     restream_server_t *s = (restream_server_t *)arg;
@@ -7889,15 +7954,18 @@ static void pump_direct_links(void *arg) {
         rs_ts_session *next = sess->next;
         if (!rs_live_is_running(s->live, sess->stream_id)) {
             ts_session_close(s, sess->stream_id);
-        } else if (sess->viewers > 0) {
+        } else if (sess->viewers > 0 || sess->nhls_wait > 0 ||
+                   (double)mg_millis() / 1000.0 - sess->hls_seen < RS_TS_HLS_ALIVE_S) {
             sess->idle_pumps = 0;
         } else if (++sess->idle_pumps > RS_TS_LINGER_TICKS) {
             ts_session_close(s, sess->stream_id);
         }
         sess = next;
     }
-    for (rs_ts_session *sess = s->ts_sessions; sess; sess = sess->next)
+    for (rs_ts_session *sess = s->ts_sessions; sess; sess = sess->next) {
         ts_session_pump(s, sess);
+        ts_hls_answer_waiters(s, sess);
+    }
 
     for (rs_direct_client **pp = &s->direct_head; *pp;) {
         rs_direct_client *d = *pp;
@@ -7991,6 +8059,139 @@ static void serve_direct(restream_server_t *server, struct mg_connection *c,
     log_recordf(server, stream_id, "info", "directOpen", NULL, 200, -1,
                 "fMP4 direct link opened by %s (rendition %d)", d->ip, rep_index);
     direct_client_pump(server, d, c);
+}
+
+// --- MPEG-TS over HLS ---------------------------------------------------------
+//
+// /play/<id>/ts.m3u8 lists the shared mux's output cut at its keyframe join
+// points, each piece one MPEG-TS segment with video and audio together and
+// starting on PAT/PMT + a keyframe; /play/<id>/ts/<seq>.ts serves one. It is
+// the same mux the /direct/<id>.ts viewers share, so it costs nothing extra
+// upstream. For players and boxes that want classic muxed-TS HLS rather than
+// fMP4 with separate audio and video renditions.
+
+// Complete segments currently in the ring (the newest join has no end yet).
+static size_t ts_hls_complete(const rs_ts_session *sess) {
+    return sess->njoins > 1 ? sess->njoins - 1 : 0;
+}
+
+static double ts_hls_duration(const rs_ts_session *sess, size_t k, double fallback) {
+    double a = sess->join_pts[k], b = sess->join_pts[k + 1];
+    double d = b - a;
+    return (a >= 0 && b >= 0 && d > 0.05 && d < 30) ? d : fallback;
+}
+
+static char *ts_hls_playlist(const rs_ts_session *sess, const char *stream_id, const char *key) {
+    size_t complete = ts_hls_complete(sess);
+    size_t first = complete > RS_TS_HLS_SEGMENTS ? complete - RS_TS_HLS_SEGMENTS : 0;
+    // A fallback duration for a segment whose PTS could not be read: the
+    // median-ish of its neighbours is overkill; the previous good one will do.
+    double fallback = 2.0, longest = 1.0;
+    for (size_t k = first; k < complete; k++) {
+        double d = ts_hls_duration(sess, k, fallback);
+        fallback = d;
+        if (d > longest) longest = d;
+    }
+    char *enc_key = key && key[0] ? query_encode(key) : NULL;
+    rs_buf b = RS_BUF_INIT;
+    rs_buf_appendf(&b, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%llu\n",
+                   (int)(longest + 0.999), (unsigned long long)(sess->join_seq_base + first));
+    fallback = 2.0;
+    for (size_t k = first; k < complete; k++) {
+        uint64_t seq = sess->join_seq_base + k;
+        double d = ts_hls_duration(sess, k, fallback);
+        fallback = d;
+        if (seq == sess->disc_seq && k > first) rs_buf_append_str(&b, "#EXT-X-DISCONTINUITY\n");
+        rs_buf_appendf(&b, "#EXTINF:%.3f,\n/play/%s/ts/%llu.ts%s%s\n", d, stream_id,
+                       (unsigned long long)seq, enc_key ? "?key=" : "", enc_key ? enc_key : "");
+    }
+    free(enc_key);
+    return rs_buf_take(&b);
+}
+
+static void ts_hls_reply_playlist(struct mg_connection *c, const rs_ts_session *sess,
+                                  const char *stream_id, const char *key) {
+    char *text = ts_hls_playlist(sess, stream_id, key);
+    if (!text) { reply_error(c, 500, "Out of memory."); return; }
+    mg_http_reply(c, 200, RS_CORS_HEADERS "Content-Type: application/vnd.apple.mpegurl\r\n"
+                          "Cache-Control: no-store\r\n", "%s", text);
+    rs_free(text);
+}
+
+// Answers held first-playlist requests once there is enough to play, or with
+// a 503 when the wait runs out. Runs on every pump.
+static void ts_hls_answer_waiters(restream_server_t *s, rs_ts_session *sess) {
+    if (!sess->nhls_wait) return;
+    bool ready = ts_hls_complete(sess) >= RS_TS_HLS_MIN_READY;
+    double now = (double)mg_millis() / 1000.0;
+    int keep = 0;
+    for (int i = 0; i < sess->nhls_wait; i++) {
+        struct mg_connection *c = conn_by_id(s, sess->hls_wait[i].conn_id);
+        if (c && !c->is_closing && (ready || now >= sess->hls_wait[i].deadline)) {
+            if (ready) ts_hls_reply_playlist(c, sess, sess->stream_id, sess->hls_wait[i].key);
+            else reply_error(c, 503, "MPEG-TS HLS is still warming up; retry in a few seconds.");
+            free(sess->hls_wait[i].key);
+        } else if (!c || c->is_closing) {
+            free(sess->hls_wait[i].key);
+        } else {
+            sess->hls_wait[keep++] = sess->hls_wait[i];
+        }
+    }
+    sess->nhls_wait = keep;
+    if (keep) sess->hls_seen = now;
+}
+
+// GET /play/<id>/ts.m3u8
+static void serve_ts_hls_playlist(restream_server_t *server, struct mg_connection *c,
+                                  struct mg_http_message *hm, const char *stream_id) {
+    rs_ts_session *sess = ts_session_open(server, stream_id);
+    if (!sess) { reply_error(c, 500, "Out of memory."); return; }
+    sess->hls_seen = (double)mg_millis() / 1000.0;
+    char *key = playback_key(hm);
+    if (ts_hls_complete(sess) >= RS_TS_HLS_MIN_READY) {
+        ts_hls_reply_playlist(c, sess, stream_id, key);
+        free(key);
+        return;
+    }
+    // The mux has only just started (or the stream just did): hold the request
+    // until the first segments exist rather than hand a player an empty list.
+    if (sess->nhls_wait >= RS_TS_HLS_WAITERS) {
+        free(key);
+        reply_error(c, 503, "MPEG-TS HLS is still warming up; retry in a few seconds.");
+        return;
+    }
+    sess->hls_wait[sess->nhls_wait].conn_id = c->id;
+    sess->hls_wait[sess->nhls_wait].deadline = sess->hls_seen + RS_TS_HLS_WAIT_S;
+    sess->hls_wait[sess->nhls_wait].key = key;
+    sess->nhls_wait++;
+}
+
+// GET /play/<id>/ts/<seq>.ts
+static void serve_ts_hls_segment(restream_server_t *server, struct mg_connection *c,
+                                 struct mg_http_message *hm, const char *stream_id,
+                                 const char *name) {
+    rs_ts_session *sess = ts_session_find(server, stream_id);
+    char *end = NULL;
+    unsigned long long seq = strtoull(name, &end, 10);
+    if (!sess || !end || end == name || strcmp(end, ".ts") != 0 || seq < sess->join_seq_base ||
+        seq - sess->join_seq_base >= ts_hls_complete(sess)) {
+        reply_error(c, 404, "That MPEG-TS segment is no longer (or not yet) available.");
+        return;
+    }
+    sess->hls_seen = (double)mg_millis() / 1000.0;
+    size_t k = (size_t)(seq - sess->join_seq_base);
+    size_t start = (size_t)(sess->joins[k] - sess->ring_base);
+    size_t len = (size_t)(sess->joins[k + 1] - sess->joins[k]);
+    mg_printf(c, "HTTP/1.1 200 OK\r\n" RS_CORS_HEADERS "Content-Type: video/mp2t\r\n"
+                 "Content-Length: %lu\r\nCache-Control: no-store\r\n\r\n", (unsigned long)len);
+    mg_send(c, sess->ring + start, len);
+    c->is_resp = 0;  // see pending_job_finish_item: a raw reply must clear it by hand
+    char *ip = client_ip(server, c, hm);
+    char *ua = header_dup(hm, "User-Agent");
+    char *key = playback_key(hm);
+    rs_metrics_record(server->metrics, stream_id, key && key[0] ? key : (ip ? ip : ""),
+                      ip ? ip : "", ua ? ua : "", (int)len);
+    rs_free(ip); free(ua); free(key);
 }
 
 // GET /direct/<id>[/<rep>].ts — video and audio muxed into one MPEG-TS stream.
@@ -8399,6 +8600,24 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
     if (is_play && !feed && serve_pipeline_hls(server, c, hm)) return true;
 
     // /play/<segment>/index.m3u8 or index.mpd
+    // MPEG-TS HLS (video+audio muxed) from the internal engine's shared mux.
+    struct mg_str tscaps[3];
+    bool is_ts_m3u8 = mg_match(hm->uri, mg_str("/play/*/ts.m3u8"), tscaps);
+    bool is_ts_seg = !is_ts_m3u8 && mg_match(hm->uri, mg_str("/play/*/ts/*"), tscaps);
+    if (is_ts_m3u8 || is_ts_seg) {
+        char *ref = capture_dup(tscaps[0]);
+        char *name = is_ts_seg ? capture_dup(tscaps[1]) : NULL;
+        const rs_json *stream = ref ? rs_panel_find_stream(&server->state, ref) : NULL;
+        const char *sid = stream ? rs_json_obj_str(stream, "id", "") : "";
+        if (!stream) reply_error(c, 404, "Stream not found.");
+        else if (!rs_live_is_running(server->live, sid))
+            reply_error(c, 404, "MPEG-TS HLS needs the stream running on the internal DASH engine "
+                                "(for HLS sources, use the Buffered HLS input mode, which outputs MPEG-TS).");
+        else if (is_ts_m3u8) serve_ts_hls_playlist(server, c, hm, sid);
+        else serve_ts_hls_segment(server, c, hm, sid, name);
+        free(ref); free(name);
+        return true;
+    }
     bool is_m3u8 = mg_match(hm->uri, mg_str("/play/*/index.m3u8"), NULL);
     bool is_mpd = mg_match(hm->uri, mg_str("/play/*/index.mpd"), NULL);
     if (is_m3u8 || is_mpd) {
