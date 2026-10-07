@@ -2224,6 +2224,13 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
     char *hls_variant = query_var(hm, "hls");
     bool ts_hls = hls_variant && strcmp(hls_variant, "ts") == 0;
     free(hls_variant);
+    // ?links=name: build play links from each stream's name (its slug, e.g.
+    // /direct/wta-china-open-oitavas-de-final.ts) instead of its id. Every
+    // playback route accepts either; a name shared by two streams can't
+    // identify one, so those keep their id.
+    char *links_param = query_var(hm, "links");
+    bool links_by_name = links_param && strcmp(links_param, "name") == 0;
+    free(links_param);
     bool only_running = running_filter && (strcmp(running_filter, "1") == 0 || strcmp(running_filter, "true") == 0);
     bool as_json = format && strcmp(format, "json") == 0;
     free(running_filter);
@@ -2252,14 +2259,22 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
             if (only_running && !running) continue;
             if (name_filter && name_filter[0] && !ci_contains(name, name_filter)) continue;
             bool engine_stream = stream_uses_engine(stream);
+            char *slug = rs_panel_slugify(name);
+            bool slug_unique = slug && slug[0] && rs_panel_find_stream(&s->state, slug) == stream;
+            const char *ref = links_by_name && slug_unique ? slug : id;
             const char *playlist_name = ts_hls && engine_stream ? "ts.m3u8" : "index.m3u8";
             if (list) {
                 rs_buf url = RS_BUF_INIT;
-                rs_buf_appendf(&url, "%s%s/play/%s/%s", scheme, host, id, playlist_name);
+                rs_buf_appendf(&url, "%s%s/play/%s/%s", scheme, host, ref, playlist_name);
                 if (encoded_key) rs_buf_appendf(&url, "?key=%s", encoded_key);
                 char *url_text = rs_buf_take(&url);
                 rs_json *item = rs_json_new_obj();
                 rs_json_obj_set_str(item, "name", name);
+                rs_json_obj_set_str(item, "id", id);
+                // The name form every playback route also accepts; null when
+                // another stream has the same name.
+                if (slug_unique) rs_json_obj_set_str(item, "slug", slug);
+                else rs_json_obj_set(item, "slug", rs_json_new_null());
                 rs_json_obj_set_str(item, "url", url_text ? url_text : "");
                 // Every output this stream offers, not just the one `url`
                 // picks: fMP4/HLS for all, and for the internal DASH engine
@@ -2271,7 +2286,7 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
                     if (o > 0 && !engine_stream) break;
                     rs_buf ob = RS_BUF_INIT;
                     rs_buf_appendf(&ob, "%s%s", scheme, host);
-                    rs_buf_appendf(&ob, outputs[o][1], id);
+                    rs_buf_appendf(&ob, outputs[o][1], ref);
                     if (encoded_key) rs_buf_appendf(&ob, "?key=%s", encoded_key);
                     char *text = rs_buf_take(&ob);
                     rs_json_obj_set_str(urls, outputs[o][0], text ? text : "");
@@ -2289,6 +2304,7 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
                 if (end) rs_json_obj_set_int(item, "end", end);
                 rs_json_arr_push(list, item);
                 rs_free(url_text);
+                free(slug);
                 continue;
             }
             const char *logo = rs_json_obj_str(stream, "logo", "");
@@ -2316,11 +2332,12 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
             rs_buf_append_str(&body, scheme);
             rs_buf_append_str(&body, host);
             rs_buf_append_str(&body, "/play/");
-            rs_buf_append_str(&body, id);
+            rs_buf_append_str(&body, ref);
             rs_buf_append_char(&body, '/');
             rs_buf_append_str(&body, playlist_name);
             if (encoded_key) rs_buf_appendf(&body, "?key=%s", encoded_key);
             rs_buf_append_char(&body, '\n');
+            free(slug);
         }
     }
     free(host);
