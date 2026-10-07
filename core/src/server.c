@@ -2252,6 +2252,23 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
                 rs_json *item = rs_json_new_obj();
                 rs_json_obj_set_str(item, "name", name);
                 rs_json_obj_set_str(item, "url", url_text ? url_text : "");
+                // Every output this stream offers, not just the one `url`
+                // picks: fMP4/HLS for all, and for the internal DASH engine
+                // also the muxed MPEG-TS as HLS and as one continuous stream.
+                rs_json *urls = rs_json_new_obj();
+                static const char *const outputs[][2] = {
+                    {"hls", "/play/%s/index.m3u8"}, {"tsHls", "/play/%s/ts.m3u8"}, {"ts", "/direct/%s.ts"}};
+                for (size_t o = 0; o < sizeof(outputs) / sizeof(outputs[0]); o++) {
+                    if (o > 0 && !engine_stream) break;
+                    rs_buf ob = RS_BUF_INIT;
+                    rs_buf_appendf(&ob, "%s%s", scheme, host);
+                    rs_buf_appendf(&ob, outputs[o][1], id);
+                    if (encoded_key) rs_buf_appendf(&ob, "?key=%s", encoded_key);
+                    char *text = rs_buf_take(&ob);
+                    rs_json_obj_set_str(urls, outputs[o][0], text ? text : "");
+                    rs_free(text);
+                }
+                rs_json_obj_set(item, "urls", urls);
                 rs_json_obj_set_str(item, "provider", provider_name);
                 const char *item_logo = rs_json_obj_str(stream, "logo", "");
                 rs_json_obj_set_str(item, "logo", item_logo[0] ? item_logo : provider_logo);
