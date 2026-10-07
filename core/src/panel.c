@@ -731,7 +731,7 @@ int rs_panel_update_stream(rs_state *st, const char *stream_id, const rs_json *b
     // the existing stream rather than resetting them (a PUT merges, not replaces).
     static const char *carried[] = {"sourceType", "mode", "scriptVideoSelector", "scriptAudioSelector",
                                     "onDemand", "speedUp", "autostart", "scriptStart", "scriptEnd",
-                                    "recordEvent", "cdnHeaders"};
+                                    "recordEvent", "cdnHeaders", "autoStarted"};
     for (size_t i = 0; i < sizeof(carried) / sizeof(carried[0]); i++) {
         const rs_json *v = rs_json_obj_get(existing, carried[i]);
         if (v) rs_json_obj_set(updated, carried[i], rs_json_clone(v));

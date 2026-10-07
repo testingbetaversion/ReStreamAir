@@ -37,6 +37,7 @@ static const option_field fields[] = {
     B("coolDownAutoRestart", "Cool down streams auto-restart", "DASH and FFmpeg: progressively double the restart delay after consecutive failures, capped at 5 minutes or the configured delay if larger.", ""),
     B("autoRemoveMissingChannels", "Auto-remove missing channels", "After a successful channel import, remove imported channels absent from that list and stop their pipelines. Manually added streams are retained.", ""),
     B("autoRefreshEvents", "Auto-refresh events", "Periodically run the declared events script action, even with the panel closed. Uses Events refresh period and waits while another provider script job is running.", ""),
+    B("autoStartEvents", "Auto-start events", "Start each imported event when its Start time arrives, one at a time, within Max streams concurrency. Each event is started once: one you stop by hand stays stopped. A failed start is retried after Restart delay, up to 3 attempts.", ""),
     B("autoRemoveFinishedEvents", "Auto-remove finished events", "Stop and remove imported events when their End timestamp is reached. Events without an end remain.", ""),
     S("userAgent", "User Agent", "Requests and scripts", "Blank uses the downloader's default. A User-Agent in Additional HTTP headers takes precedence.", ""),
     S("xForwardedFor", "X-Forwarded-For", "Requests and scripts", "Optional upstream request header. An X-Forwarded-For in Additional HTTP headers takes precedence.", ""),

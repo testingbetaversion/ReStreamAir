@@ -7309,6 +7309,53 @@ static void provider_maintenance(restream_server_t *s) {
                 changed = true;
             }
         }
+        // Auto-start events: each event is started once when its Start time
+        // arrives. One start per tick (each runs the provider's scripts), and
+        // never past Max streams concurrency — checked here, before any script
+        // runs, since the cap is otherwise only enforced once a start finishes.
+        // `autoStarted` is set the first time the event is seen running, so a
+        // stream someone stops by hand is not started again.
+        if (rs_provider_option_bool(provider, "autoStartEvents") && !provider_job_busy(s, provider)) {
+            size_t n = rs_json_arr_len(streams);
+            long long limit = rs_provider_option_int(provider, "maxStreamsConcurrency");
+            long long active = 0;
+            for (size_t j = 0; j < n; j++) {
+                rs_json *stream = (rs_json *)rs_json_arr_at(streams, j);
+                if (strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) continue;
+                active++;
+                if (!strcmp(rs_json_obj_str(stream, "sourceType", ""), "event") &&
+                    !rs_json_obj_bool(stream, "autoStarted", false)) {
+                    rs_json_obj_set_bool(stream, "autoStarted", true);
+                    changed = true;
+                }
+            }
+            for (size_t j = 0; j < n && (limit <= 0 || active < limit); j++) {
+                rs_json *stream = (rs_json *)rs_json_arr_at(streams, j);
+                if (strcmp(rs_json_obj_str(stream, "sourceType", ""), "event") ||
+                    rs_json_obj_bool(stream, "autoStarted", false) ||
+                    !strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) continue;
+                double start = rs_json_obj_num(stream, "scriptStart", 0), end = rs_json_obj_num(stream, "scriptEnd", 0);
+                if (start > now || (end > 0 && end <= now)) continue;
+                const char *id = rs_json_obj_str(stream, "id", "");
+                rs_json *stimer = provider_timer(s, id);
+                if (rs_json_obj_num(stimer, "autoStartNext", 0) > now) continue;
+                long long tries = rs_json_obj_int(stimer, "autoStartTries", 0);
+                if (tries >= 3) {
+                    rs_json_obj_set_bool(stream, "autoStarted", true);
+                    changed = true;
+                    log_record(s, id, "error", "scheduledStart", NULL, 0, -1,
+                               "auto-start events: gave up after 3 failed starts");
+                    continue;
+                }
+                double retry = (double)rs_provider_option_int(provider, "restartDelaySeconds");
+                rs_json_obj_set_int(stimer, "autoStartTries", tries + 1);
+                rs_json_obj_set(stimer, "autoStartNext", rs_json_new_num(now + (retry > 30 ? retry : 30)));
+                char *sid = rs_strdup(id);
+                scheduled_stream_start(s, sid, tries ? "auto-start events: retrying the start" : "auto-start events: its start time has arrived");
+                free(sid);
+                break;
+            }
+        }
         static const char *options[] = {"sequentialAutostartPeriodSeconds", "randomAutostartPeriodSeconds"};
         for (size_t mode = 0; mode < 2; mode++) {
             if (provider_job_busy(s, provider) || !provider_timer_due(timer, options[mode], rs_provider_option_int(provider, options[mode]), now)) continue;
