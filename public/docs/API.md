@@ -317,6 +317,7 @@ Both playlist routes also filter and can answer in JSON:
 | `running=1` | Only streams that are running. |
 | `q=<text>` | Only names containing the text, case-insensitive. |
 | `format=json` | `[{"name","url","logo","provider","type","running","start","end"}]` instead of M3U; `start`/`end` (Unix seconds) only on events. |
+| `hls=ts` | Link internal-engine (DASH) streams to their muxed MPEG-TS HLS (`/play/<id>/ts.m3u8`) instead of the fMP4 playlist. |
 
 For example, every event's name and playable link:
 
@@ -622,6 +623,8 @@ and the user running the process. Where available, service status includes
 | `GET /restream/<id>/<generated-filename>` | Internal init/media/key/subtitle route. Follow the filenames and query strings emitted by playlists. |
 | `GET /direct/<id>` or `/direct/<id>/<representation>` | Continuous fMP4 tail for DASH; source redirect for HLS. |
 | `GET /direct/<id>.ts` | Continuous muxed MPEG-TS for DASH. |
+| `GET /play/<id>/ts.m3u8` | HLS with MPEG-TS segments carrying video and audio together, for DASH streams on the internal engine (the same mux as `/direct/<id>.ts`, cut at keyframes; exact `EXTINF`s from the PTS). The first request waits up to 20 s for two segments. HLS sources get muxed TS through the Buffered HLS input mode instead. Also listed as `tsHlsUrl` and in `directStreamUrls`. |
+| `GET /play/<id>/ts/<seq>.ts` | One segment of that playlist; `404` once it has left the window. |
 | `GET /download/<id>.mp4` or `/download/<id>/<representation>.mp4` | Buffered DASH media download, not a complete historical recording. |
 | `GET /source/<id>` | Redirect to current source URL. |
 
