@@ -122,7 +122,7 @@ static const char *normalize_downloader(const char *d) {
 static long long clamp_ll(long long v, long long lo) { return v < lo ? lo : v; }
 
 // The stream input modes the panel offers (Settings → stream editor → Input).
-static const char *valid_inputs[] = {"internal", "ffmpegResident", "ffmpegTsHls",
+static const char *valid_inputs[] = {"internal", "engine", "ffmpegResident", "ffmpegTsHls",
                                      "ffmpegMultiTsHls", "ffmpegFmp4Hls", "hlsBuffered", "pipe",
                                      "nm3u8dlre"};
 
@@ -312,7 +312,10 @@ static rs_json *stream_view(const rs_state *st, const rs_json *stream, const cha
     const char *name = rs_json_obj_str(stream, "name", "");
     const char *input_mode = rs_json_obj_str(stream, "inputMode", "internal");
     const char *output_mode = rs_json_obj_str(stream, "outputMode", "hls");
-    bool process_pipeline = strcmp(input_mode, "internal") != 0 || strcmp(output_mode, "hls") != 0;
+    // "engine" is the internal live engine taking an HLS source: no FFmpeg
+    // process, same outputs as a DASH stream on the engine.
+    bool engine_hls = strcmp(input_mode, "engine") == 0 && strcmp(kind, "m3u8") == 0;
+    bool process_pipeline = (strcmp(input_mode, "internal") != 0 && !engine_hls) || strcmp(output_mode, "hls") != 0;
 
     // Slug for the play URL: the name slug when unique, else the id.
     char *slug = rs_panel_slugify(name);
@@ -348,7 +351,7 @@ static rs_json *stream_view(const rs_state *st, const rs_json *stream, const cha
             rs_json_obj_set_str(direct, "HLS", url);
             rs_json_obj_set_str(v, "directUrl", url);
         }
-    } else if (strcmp(kind, "m3u8") == 0) {
+    } else if (strcmp(kind, "m3u8") == 0 && !engine_hls) {
         snprintf(url, sizeof(url), "http://%s/direct/%s", host, id);
         rs_json_obj_set_str(direct, "source", url);
     } else {
@@ -387,7 +390,7 @@ static rs_json *stream_view(const rs_state *st, const rs_json *stream, const cha
     // single URL — hence one entry for the stream rather than one per
     // rendition. DASH only: an m3u8 source has no separate renditions here to
     // mux, and its /source link already is one stream.
-    if (!process_pipeline && strcmp(kind, "m3u8") != 0) {
+    if (!process_pipeline && (strcmp(kind, "m3u8") != 0 || engine_hls)) {
         snprintf(url, sizeof(url), "http://%s/direct/%s.ts", host, id);
         rs_json_obj_set_str(direct, "muxed (mpeg-ts)", url);
         // The same mux, cut into classic MPEG-TS HLS segments.

@@ -386,7 +386,7 @@ backend behavior; pipeline-specific controls identify their scope in the schema.
 | `defaultCdn` | Selects `Name`/`name` from the manifest script's `Cdn` list. An unmatched configured name fails visibly. |
 | `defaultVideo`, `defaultAudio` | Ordered comma-separated preferences: `best`, `worst`, `id=ID`, `lang=ur`, `codec=avc`, `height<=720`, `bandwidth<=2000000`. Internal DASH picks the first match. For HLS pass-through, `defaultVideo` limits the master playlist to the variants the first matching rule allows (`height<=720` hides everything above 720p; a rule matching nothing is skipped). Explicit stream selections win. |
 | `singleVideoQuality` | Boolean. HLS pass-through and Buffered HLS offer exactly one video variant: the highest-bandwidth one `defaultVideo` allows (with `height<=720`, 720p only), or the best overall when `defaultVideo` is empty. Audio tracks stay; I-frame variants are dropped. |
-| `importInputMode` | `""` (keep the default) or one input mode (`internal`, `hlsBuffered`, `ffmpegResident`, `ffmpegTsHls`, `ffmpegMultiTsHls`, `ffmpegFmp4Hls`). Applied to channels and events this provider's imports create from now on; existing streams keep theirs. |
+| `importInputMode` | `""` (keep the default) or one input mode (`internal`, `engine`, `hlsBuffered`, `ffmpegResident`, `ffmpegTsHls`, `ffmpegMultiTsHls`, `ffmpegFmp4Hls`). Applied to channels and events this provider's imports create from now on; existing streams keep theirs. |
 | `legacyDashParser` | Internal DASH XML recovery mode; default parsing is strict. |
 | `useDashDelay` | Honors MPD `suggestedPresentationDelay`, bounded to 120s, taking the larger of the source delay and stream/provider buffer. |
 | `ignoreDashStaticFlag` | Continues polling a static MPD. Otherwise a drained static source publishes ENDLIST. |
@@ -457,7 +457,7 @@ across PUT; it is not writable through the ordinary editor route.
 | `forceOffline`, `reducedManifestPolling`, `prioritizeOldest` | Booleans, `false`. Static MPD permission, reduced polling and backlog preference. |
 | `audioDelayMs` | Signed integer milliseconds, default 0. |
 | `decryptionKeys`, `hlsKey`, `hlsIV` | Strings, `""`. DASH KID:KEY pairs; HLS AES key/IV in hex. |
-| `inputMode` | `internal` default, `hlsBuffered`, `ffmpegResident`, `ffmpegTsHls`, `ffmpegMultiTsHls`, `ffmpegFmp4Hls`, `pipe`, `nm3u8dlre`. |
+| `inputMode` | `internal` default, `engine`, `hlsBuffered`, `ffmpegResident`, `ffmpegTsHls`, `ffmpegMultiTsHls`, `ffmpegFmp4Hls`, `pipe`, `nm3u8dlre`. |
 | `outputMode`, `outputTarget` | `hls` default, `srtServer`, `udpSrt`, `custom`; destination string `""`. Some combinations are not implemented. |
 | `pipeCommand`, `nm3u8dlreParams` | Strings, `""`; argv-style command / external-tool options. |
 | `cdnUrls` | HTTP(S) URL string array, `[]`. Invalid entries are dropped. |
@@ -476,6 +476,15 @@ guarantee a pipeline is available: check the Start response. A successful Start
 means startup was accepted, not that a playable segment is already buffered.
 
 `hlsBuffered` requires `kind: "m3u8"`, `outputMode: "hls"` and installed FFmpeg.
+
+`engine` runs an HLS source (`kind: "m3u8"`) on the internal live engine, the
+same one DASH streams use, instead of per-request pass-through: it follows one
+video quality (the best the provider's `defaultVideo` allows) and its audio
+track, prefetches segments in parallel, decrypts CENC fMP4 with the stream's
+keys, and offers every engine output — fMP4 HLS (`/play/<id>/index.m3u8`),
+continuous muxed MPEG-TS (`/direct/<id>.ts`) and MPEG-TS HLS
+(`/play/<id>/ts.m3u8`). Whole-segment AES-128 and byte-range playlists are
+refused; use pass-through or `hlsBuffered` for those.
 It forces `directSource` off. Start arms the stream; the first authenticated
 viewer starts one shared downloader. FFmpeg copies the selected video/audio
 tracks into a rolling disk buffer and every viewer receives local playlists

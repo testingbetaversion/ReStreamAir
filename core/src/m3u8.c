@@ -1,6 +1,8 @@
 #include "rs_m3u8.h"
 
+#include <ctype.h>
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -635,4 +637,225 @@ done:
     free(rules);
     lines_dispose(&l);
     return out_text;
+}
+
+// --- HLS sources for the internal engine -------------------------------------
+//
+// The live engine was built for DASH: it reads a manifest description, then
+// prefetches, decrypts and republishes each rendition. These two functions let
+// it take an HLS source the same way — one picks the renditions from a master,
+// the other reads a media playlist into the segment window the engine wants.
+
+static char *dup_or_null(const char *s) { return s ? rs_strdup(s) : NULL; }
+
+// True when a CODECS entry names an audio codec.
+static bool codec_is_audio(const char *c, size_t n) {
+    static const char *const audio[] = {"mp4a", "ac-3", "ec-3", "opus", "flac", "mp3", "dtsc"};
+    for (size_t i = 0; i < sizeof(audio) / sizeof(audio[0]); i++) {
+        size_t k = strlen(audio[i]);
+        if (n >= k && !strncmp(c, audio[i], k)) return true;
+    }
+    return false;
+}
+
+// The video (or audio) half of a variant's CODECS list, e.g. "avc1.64001f".
+static char *codecs_part(const char *codecs, bool want_audio) {
+    if (!codecs) return NULL;
+    rs_buf b = RS_BUF_INIT;
+    const char *p = codecs;
+    while (*p) {
+        const char *end = strchr(p, ',');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        while (n && *p == ' ') { p++; n--; }
+        if (n && codec_is_audio(p, n) == want_audio) {
+            if (b.len) rs_buf_append_char(&b, ',');
+            rs_buf_append(&b, p, n);
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+    char *out = rs_buf_take(&b);
+    if (out && !out[0]) { rs_free(out); return NULL; }
+    return out;
+}
+
+void rs_hls_pick_dispose(rs_hls_pick *p) {
+    if (!p) return;
+    free(p->video_uri); free(p->video_id); free(p->video_codecs);
+    free(p->audio_uri); free(p->audio_id); free(p->audio_codecs); free(p->audio_lang);
+    memset(p, 0, sizeof(*p));
+}
+
+// A stable rendition id from its attributes (tokens in URIs rotate; these don't).
+static char *hls_id(const char *prefix, const char *a, const char *b) {
+    rs_buf out = RS_BUF_INIT;
+    rs_buf_append_str(&out, prefix);
+    for (const char *src = a; src && *src; src++)
+        rs_buf_append_char(&out, isalnum((unsigned char)*src) ? *src : '_');
+    if (b && b[0]) {
+        rs_buf_append_char(&out, '-');
+        for (const char *src = b; *src; src++)
+            rs_buf_append_char(&out, isalnum((unsigned char)*src) ? *src : '_');
+    }
+    return rs_buf_take(&out);
+}
+
+int rs_hls_pick_renditions(const char *master, const char *base_url, const char *video_filter,
+                           const char *audio_filter, rs_hls_pick *out) {
+    if (!master || !base_url || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    // One video variant: the best the provider's Default video rule allows.
+    char *single = rs_m3u8_filter_master_video(master, video_filter ? video_filter : "", true);
+    const char *text = single ? single : master;
+    lines l;
+    if (!split_lines(text, &l)) { rs_free(single); return -1; }
+
+    char *audio_group = NULL;
+    for (size_t i = 0; i < l.count && !out->video_uri; i++) {
+        slice t = slice_trimmed(l.items[i]);
+        if (!slice_has_prefix(t, "#EXT-X-STREAM-INF:")) continue;
+        size_t uri = i + 1;
+        for (; uri < l.count; uri++) {
+            slice u = slice_trimmed(l.items[uri]);
+            if (u.len && u.ptr[0] != '#') break;
+        }
+        if (uri >= l.count) break;
+        attrs a;
+        parse_attributes(t, &a);
+        char *rel = slice_dup(slice_trimmed(l.items[uri]));
+        out->video_uri = rel ? rs_url_resolve(base_url, rel) : NULL;
+        free(rel);
+        int64_t w, h;
+        attr_resolution(&a, &w, &h);
+        out->bandwidth = attr_int(&a, "BANDWIDTH");
+        out->height = h;
+        char bw[32], ht[32];
+        snprintf(bw, sizeof(bw), "%lld", (long long)(out->bandwidth > 0 ? out->bandwidth : 0));
+        snprintf(ht, sizeof(ht), "%lldp", (long long)(h > 0 ? h : 0));
+        out->video_id = hls_id("hlsv-", ht, bw);
+        out->video_codecs = codecs_part(attrs_get(&a, "CODECS"), false);
+        out->audio_codecs = codecs_part(attrs_get(&a, "CODECS"), true);
+        audio_group = dup_or_null(attrs_get(&a, "AUDIO"));
+        attrs_dispose(&a);
+    }
+
+    // Its audio: the provider's lang= rule, else DEFAULT=YES, else the first
+    // track of the variant's AUDIO group. No URI means the audio is muxed into
+    // the video playlist, so there is no separate rendition to fetch.
+    const char *want_lang = NULL;
+    for (const char *p = audio_filter ? strstr(audio_filter, "lang=") : NULL; p; p = NULL)
+        want_lang = p + 5;
+    int best_rank = 99;
+    for (size_t i = 0; audio_group && i < l.count; i++) {
+        slice t = slice_trimmed(l.items[i]);
+        if (!slice_has_prefix(t, "#EXT-X-MEDIA:")) continue;
+        attrs a;
+        parse_attributes(t, &a);
+        const char *type = attrs_get(&a, "TYPE"), *group = attrs_get(&a, "GROUP-ID");
+        const char *uri = attrs_get(&a, "URI"), *lang = attrs_get(&a, "LANGUAGE");
+        const char *dflt = attrs_get(&a, "DEFAULT"), *name = attrs_get(&a, "NAME");
+        if (type && !strcmp(type, "AUDIO") && group && !strcmp(group, audio_group) && uri) {
+            int rank = 3;
+            if (want_lang && lang) {
+                size_t n = strcspn(want_lang, ",");
+                if (!strncmp(lang, want_lang, n)) rank = 0;
+            }
+            if (rank > 1 && dflt && !strcmp(dflt, "YES")) rank = 1;
+            if (rank < best_rank) {
+                best_rank = rank;
+                free(out->audio_uri); free(out->audio_id); free(out->audio_lang);
+                out->audio_uri = rs_url_resolve(base_url, uri);
+                out->audio_id = hls_id("hlsa-", group, name ? name : lang);
+                out->audio_lang = dup_or_null(lang);
+            }
+        }
+        attrs_dispose(&a);
+    }
+    if (!out->audio_uri) { free(out->audio_codecs); out->audio_codecs = NULL; }
+    free(audio_group);
+    lines_dispose(&l);
+    rs_free(single);
+    return out->video_uri ? 0 : -1;
+}
+
+void rs_hls_media_dispose(rs_hls_media *m) {
+    if (!m) return;
+    for (size_t i = 0; i < m->count; i++) free(m->segments[i].url);
+    free(m->segments);
+    free(m->init_url);
+    memset(m, 0, sizeof(*m));
+}
+
+int rs_hls_media_parse(const char *text, const char *base_url, int want, rs_hls_media *out,
+                       char *err, size_t err_len) {
+    if (err && err_len) err[0] = '\0';
+    if (!text || !base_url || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    if (rs_m3u8_is_master(text)) {
+        if (err) snprintf(err, err_len, "Expected an HLS media playlist, got a master.");
+        return -1;
+    }
+    lines l;
+    if (!split_lines(text, &l)) return -1;
+    int64_t seq = rs_m3u8_media_sequence(text);
+    double pending_duration = -1;
+    size_t cap = 0;
+    int rc = 0;
+    for (size_t i = 0; i < l.count && rc == 0; i++) {
+        slice t = slice_trimmed(l.items[i]);
+        if (!t.len) continue;
+        if (slice_has_prefix(t, "#EXT-X-TARGETDURATION:")) {
+            out->target_duration = strtod(t.ptr + 22, NULL);
+        } else if (slice_has_prefix(t, "#EXT-X-ENDLIST")) {
+            out->ended = true;
+        } else if (slice_has_prefix(t, "#EXT-X-MAP:")) {
+            attrs a;
+            parse_attributes(t, &a);
+            const char *uri = attrs_get(&a, "URI");
+            if (uri) { free(out->init_url); out->init_url = rs_url_resolve(base_url, uri); }
+            if (attrs_get(&a, "BYTERANGE")) rc = -2;
+            attrs_dispose(&a);
+        } else if (slice_has_prefix(t, "#EXT-X-BYTERANGE")) {
+            rc = -2;
+        } else if (slice_has_prefix(t, "#EXT-X-KEY:")) {
+            attrs a;
+            parse_attributes(t, &a);
+            const char *method = attrs_get(&a, "METHOD");
+            // CENC (SAMPLE-AES-CTR, cbcs) lives inside fMP4 and the engine
+            // decrypts it with the stream's keys; whole-segment AES-128 and
+            // TS SAMPLE-AES do not.
+            if (method && (!strcmp(method, "AES-128") ||
+                           (!strcmp(method, "SAMPLE-AES") && !out->init_url))) rc = -3;
+            attrs_dispose(&a);
+        } else if (slice_has_prefix(t, "#EXTINF:")) {
+            pending_duration = strtod(t.ptr + 8, NULL);
+        } else if (t.ptr[0] != '#') {
+            if (out->count == cap) {
+                size_t next = cap ? cap * 2 : 64;
+                rs_hls_segment *grown = (rs_hls_segment *)realloc(out->segments, next * sizeof(*grown));
+                if (!grown) { rc = -1; break; }
+                out->segments = grown;
+                cap = next;
+            }
+            char *rel = slice_dup(t);
+            rs_hls_segment *s = &out->segments[out->count++];
+            s->url = rel ? rs_url_resolve(base_url, rel) : NULL;
+            free(rel);
+            s->sequence = seq++;
+            s->duration = pending_duration > 0 ? pending_duration : out->target_duration;
+            pending_duration = -1;
+        }
+    }
+    lines_dispose(&l);
+    if (rc == -2 && err) snprintf(err, err_len, "Byte-range HLS playlists aren't supported by the internal engine; use pass-through.");
+    if (rc == -3 && err) snprintf(err, err_len, "AES-128 HLS isn't supported by the internal engine (only CENC fMP4); use pass-through or Buffered HLS.");
+    if (rc != 0) { rs_hls_media_dispose(out); return -1; }
+    // Keep only the newest `want` segments.
+    if (want > 0 && out->count > (size_t)want) {
+        size_t drop = out->count - (size_t)want;
+        for (size_t i = 0; i < drop; i++) free(out->segments[i].url);
+        memmove(out->segments, out->segments + drop, (size_t)want * sizeof(*out->segments));
+        out->count = (size_t)want;
+    }
+    return 0;
 }

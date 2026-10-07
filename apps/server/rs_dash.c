@@ -14,6 +14,7 @@
 #include "rs_url.h"
 #include "rs_json.h"
 #include "net.h"
+#include "rs_m3u8.h"
 
 // A live-DASH SegmentTemplate/SegmentTimeline expander — the C port of the
 // pieces of DASH manifest handling needed to turn one MPD poll
@@ -815,6 +816,132 @@ static char *url_query(const char *url) {
     return out;
 }
 
+// An HLS source, described the way the engine expects a DASH one: the master
+// picks one video variant and its audio track, each media playlist becomes a
+// plan, and a segment's media sequence number is its "time" (timescale 1) —
+// stable identity across polls, always increasing. Real timing still comes
+// from the fMP4 itself, so the writer's discontinuity detection keeps working.
+// `text` was fetched from `base` (the URL that finally answered).
+static char *hls_describe(const char *text, const char *base, const char *proxy, const char *headers,
+                          int force_ipv6, int rotate_proxies, const char *rep, int want,
+                          const char *append_params, char *errbuf, size_t errbuf_len,
+                          const rs_source_policy *policy) {
+    rs_hls_pick pick;
+    memset(&pick, 0, sizeof(pick));
+    bool is_master = rs_m3u8_is_master(text);
+    if (is_master) {
+        if (rs_hls_pick_renditions(text, base, policy ? policy->video_filter : "",
+                                   policy ? policy->audio_filter : "", &pick) != 0) {
+            snprintf(errbuf, errbuf_len, "The HLS master lists no playable variant.");
+            rs_hls_pick_dispose(&pick);
+            return NULL;
+        }
+    } else {
+        // A bare media playlist is its own (single) rendition.
+        pick.video_uri = rs_strdup(base);
+        pick.video_id = rs_strdup("hlsv-main");
+    }
+
+    rs_json *obj = rs_json_new_obj();
+    rs_json *v = rs_json_new_obj();
+    rs_json_obj_set_str(v, "id", pick.video_id);
+    if (pick.video_codecs) rs_json_obj_set_str(v, "codecs", pick.video_codecs);
+    else rs_json_obj_set(v, "codecs", rs_json_new_null());
+    rs_json_obj_set_int(v, "bandwidth", pick.bandwidth > 0 ? pick.bandwidth : 0);
+    rs_json_obj_set(obj, "video", v);
+    if (pick.audio_uri) {
+        rs_json *a = rs_json_new_obj();
+        rs_json_obj_set_str(a, "id", pick.audio_id);
+        if (pick.audio_codecs) rs_json_obj_set_str(a, "codecs", pick.audio_codecs);
+        else rs_json_obj_set_str(a, "codecs", "mp4a.40.2");
+        if (pick.audio_lang) rs_json_obj_set_str(a, "lang", pick.audio_lang);
+        else rs_json_obj_set(a, "lang", rs_json_new_null());
+        rs_json_obj_set(obj, "audio", a);
+    } else rs_json_obj_set(obj, "audio", rs_json_new_null());
+    rs_json_obj_set(obj, "text", rs_json_new_null());
+    rs_json_obj_set(obj, "cc", rs_json_new_arr());
+
+    bool dynamic = true;
+    double target = 0;
+    bool failed = false;
+    rs_json *plans = rs_json_new_arr();
+    const char *ids[2] = {pick.video_id, pick.audio_id};
+    const char *uris[2] = {pick.video_uri, pick.audio_uri};
+    const char *types[2] = {"video", "audio"};
+    for (int r = 0; r < 2 && !failed; r++) {
+        if (!ids[r] || !uris[r]) continue;
+        // Only the renditions the engine asked for this poll.
+        bool asked = false;
+        for (const char *c = rep ? rep : ""; *c && !asked;) {
+            const char *comma = strchr(c, ',');
+            size_t n = comma ? (size_t)(comma - c) : strlen(c);
+            asked = n == strlen(ids[r]) && !strncmp(c, ids[r], n);
+            c = comma ? comma + 1 : c + n;
+        }
+        if (!asked) continue;
+        char *body = NULL, *eff = NULL;
+        size_t blen = 0;
+        const char *media_text = NULL;
+        if (!is_master && r == 0) {
+            media_text = text;
+        } else if (rs_fetch_url(uris[r], proxy, headers, NULL, NULL, NULL, force_ipv6, rotate_proxies,
+                                &body, &blen, NULL, NULL, NULL, &eff, errbuf, errbuf_len, 30000,
+                                NULL, NULL, policy) != 0) {
+            failed = true;
+            break;
+        } else {
+            media_text = body;
+        }
+        rs_hls_media media;
+        const char *media_base = eff && eff[0] ? eff : uris[r];
+        if (rs_hls_media_parse(media_text, media_base, want, &media, errbuf, errbuf_len) != 0) {
+            if (!errbuf[0]) snprintf(errbuf, errbuf_len, "Could not read the HLS media playlist.");
+            free(body); free(eff);
+            failed = true;
+            break;
+        }
+        if (media.ended) dynamic = false;
+        if (media.target_duration > target) target = media.target_duration;
+        rs_json *p = rs_json_new_obj();
+        rs_json_obj_set_str(p, "repId", ids[r]);
+        rs_json_obj_set_str(p, "type", types[r]);
+        rs_json_obj_set_int(p, "timescale", 1);
+        if (media.init_url) {
+            char *init = append_params ? append_query(media.init_url, append_params) : rs_strdup(media.init_url);
+            rs_json_obj_set_str(p, "initUrl", init);
+            free(init);
+        } else rs_json_obj_set(p, "initUrl", rs_json_new_null());
+        rs_json *segs = rs_json_new_arr();
+        for (size_t i = 0; i < media.count; i++) {
+            if (!media.segments[i].url) continue;
+            rs_json *sg = rs_json_new_obj();
+            char *u = append_params ? append_query(media.segments[i].url, append_params) : rs_strdup(media.segments[i].url);
+            rs_json_obj_set_str(sg, "url", u);
+            free(u);
+            rs_json_obj_set_int(sg, "time", (long long)media.segments[i].sequence);
+            rs_json_obj_set(sg, "duration", rs_json_new_num(media.segments[i].duration));
+            rs_json_arr_push(segs, sg);
+        }
+        rs_json_obj_set(p, "segments", segs);
+        if (rs_json_arr_len(plans) == 0) rs_json_obj_set(obj, "plan", rs_json_clone(p));
+        rs_json_arr_push(plans, p);
+        rs_hls_media_dispose(&media);
+        free(body); free(eff);
+    }
+    rs_hls_pick_dispose(&pick);
+    if (failed) { rs_json_free(plans); rs_json_free(obj); return NULL; }
+    rs_json_obj_set(obj, "plans", plans);
+    rs_json_obj_set_bool(obj, "dynamic", dynamic);
+    // Re-read about once per target duration, the cadence HLS clients use.
+    rs_json_obj_set(obj, "mup", rs_json_new_num(target > 0 ? target : 4));
+    rs_json_obj_set(obj, "tsb", rs_json_new_num(0));
+    rs_json_obj_set(obj, "suggestedDelay", rs_json_new_num(0));
+    char *json = rs_json_serialize(obj, false);
+    rs_json_free(obj);
+    if (!json) snprintf(errbuf, errbuf_len, "Out of memory building the HLS description.");
+    return json;
+}
+
 char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
                        const char *downloader, const char *dl_params,
                        int force_ipv6, int rotate_proxies,
@@ -967,6 +1094,18 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
     const char *append_params = inherit_url_params
         ? (inherited_params && inherited_params[0] ? inherited_params : NULL)
         : ((segment_url_params && segment_url_params[0]) ? segment_url_params : NULL);
+
+    // An HLS source on the internal engine: same engine, different manifest.
+    const char *doc_start = xml ? xml : "";
+    if (len >= 3 && (unsigned char)doc_start[0] == 0xEF && (unsigned char)doc_start[1] == 0xBB &&
+        (unsigned char)doc_start[2] == 0xBF) doc_start += 3;
+    while (*doc_start && isspace((unsigned char)*doc_start)) doc_start++;
+    if (!strncmp(doc_start, "#EXTM3U", 7)) {
+        char *json = hls_describe(doc_start, base, proxy, headers, force_ipv6, rotate_proxies, rep, want,
+                                  append_params, errbuf, errbuf_len, policy);
+        free(xml); free(effurl); free(inherited_params);
+        return json;
+    }
 
     xmlDoc *doc = xmlReadMemory(xml, (int)len, "mpd.xml", NULL,
                                 XML_PARSE_NOERROR | XML_PARSE_NOWARNING | XML_PARSE_NONET |
