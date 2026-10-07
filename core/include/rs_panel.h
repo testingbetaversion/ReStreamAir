@@ -57,6 +57,9 @@ int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool runnin
 // Records why a stream's last start failed (NULL/"" clears it). Starting it
 // successfully clears it too (see rs_panel_set_stream_running).
 void rs_panel_set_stream_error(rs_state *st, const char *stream_id, const char *message);
+// Marks a stream as stopped by a person (Stop button / bulk stop), or clears
+// it on a manual start. Auto-start events never restarts a marked stream.
+void rs_panel_set_stream_user_stopped(rs_state *st, const char *stream_id, bool stopped);
 
 // Applies a `manifest` action's reply to a stream: the fresh source URL, its
 // CDN mirrors, and — when the script supplied them — the per-category headers

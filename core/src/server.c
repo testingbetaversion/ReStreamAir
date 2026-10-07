@@ -2897,6 +2897,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
             rs_json_obj_remove(s->provider_timers, id);
             live_stop_stream(s, id);
             pipeline_stop_stream(id);
+            if (!del) rs_panel_set_stream_user_stopped(&s->state, id, true);
             int rc = del ? rs_panel_delete_stream(&s->state, id, &err)
                          : rs_panel_set_stream_running(&s->state, id, false, &err);
             if (rc == 0) done++;
@@ -2916,6 +2917,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     // fetch the single-threaded event loop happened to be blocked on.
     if (mg_match(hm->uri, mg_str("/api/streams/*/start"), NULL) && method_is(hm, "POST")) {
         char *id = capture(hm, "/api/streams/*/start");
+        rs_panel_set_stream_user_stopped(&s->state, id, false);
         rs_json_obj_remove(s->provider_timers, id);
         if (!reset_idle_provider_session(s, provider_of(&s->state, rs_panel_find_stream(&s->state, id)))) {
             free(id); reply_error(c, 500, "Could not reset provider session."); return true;
@@ -2964,6 +2966,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     }
     if (mg_match(hm->uri, mg_str("/api/streams/*/stop"), NULL) && method_is(hm, "POST")) {
         char *id = capture(hm, "/api/streams/*/stop");
+        rs_panel_set_stream_user_stopped(&s->state, id, true);  // auto-start leaves it alone
         rs_json_obj_remove(s->provider_timers, id);
         char *ip = client_ip(s, c, hm);
         const char *err = NULL;
@@ -7171,6 +7174,10 @@ static bool scheduled_stream_eligible(const rs_json *stream, double now) {
 }
 
 static void scheduled_stream_start(restream_server_t *s, const char *id, const char *reason) {
+    // Two schedulers (provider restart timer, auto-start events) can reach the
+    // same stream; whichever comes second finds it running and leaves it be.
+    const rs_json *current = rs_panel_find_stream(&s->state, id);
+    if (current && !strcmp(rs_json_obj_str(current, "status", "stopped"), "running")) return;
     if (!reset_idle_provider_session(s, provider_of(&s->state, rs_panel_find_stream(&s->state, id)))) return;
     if (dispatch_stream_start(s, NULL, NULL, id, "scheduler")) return;
     const char *err = NULL;
@@ -7301,9 +7308,28 @@ static void provider_maintenance(restream_server_t *s) {
                            condition == 2 ? rs_provider_option_bool(provider, "restartFinishedBroadcast") : condition == 3;
             if (fallback_active && condition) restart = true;
             if (condition && (restart || condition == 1)) {
+                // Read the engine's last error before stopping it frees it.
+                char engine_err[256] = "";
+                rs_live_last_error(s->live, id, engine_err, sizeof(engine_err));
+                // "Upstream returned HTTP 403. - <html>…": keep the status, not
+                // the error page the origin sent with it.
+                char *page = strstr(engine_err, ". - ");
+                if (page) page[1] = '\0';
                 live_stop_stream(s, id); pipeline_stop_stream(id);
                 const char *err = NULL;
                 rs_panel_set_stream_running(&s->state, id, false, &err);
+                // Say why on the stream: a stop nobody clicked is otherwise
+                // indistinguishable from a manual one.
+                char why[400];
+                if (condition == 2)
+                    snprintf(why, sizeof(why), "Stopped: the source ended the broadcast (its playlist finished)%s",
+                             restart ? "; restarting" : ". Restart finished broadcast is off.");
+                else if (condition == 3)
+                    snprintf(why, sizeof(why), "Restarting: the source changed its tracks.");
+                else
+                    snprintf(why, sizeof(why), "Stopped: the source stopped delivering media%s%s%s",
+                             engine_err[0] ? " (" : "", engine_err, engine_err[0] ? ")" : "");
+                rs_panel_set_stream_error(&s->state, id, why);
                 running = false; changed = true;
                 double delay = (double)rs_provider_option_int(provider, "restartDelaySeconds");
                 if (condition == 1 && rs_provider_option_bool(provider, "coolDownAutoRestart")) {
@@ -7336,26 +7362,25 @@ static void provider_maintenance(restream_server_t *s) {
         // arrives. One start per tick (each runs the provider's scripts), and
         // never past Max streams concurrency — checked here, before any script
         // runs, since the cap is otherwise only enforced once a start finishes.
-        // `autoStartSeen` is set the first time the event is seen running, so a
-        // stream someone stops by hand is not started again.
+        // Any event inside its window that is not running gets (re)started —
+        // whether it never started, or a revoked session / failing source /
+        // failed restart stopped it — except one a person stopped with the
+        // Stop button (`stoppedByUser`, cleared by a manual start).
         if (rs_provider_option_bool(provider, "autoStartEvents") && !provider_job_busy(s, provider)) {
             size_t n = rs_json_arr_len(streams);
             long long limit = rs_provider_option_int(provider, "maxStreamsConcurrency");
             long long active = 0;
             for (size_t j = 0; j < n; j++) {
-                rs_json *stream = (rs_json *)rs_json_arr_at(streams, j);
+                const rs_json *stream = rs_json_arr_at(streams, j);
                 if (strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) continue;
                 active++;
-                if (!strcmp(rs_json_obj_str(stream, "sourceType", ""), "event") &&
-                    !rs_json_obj_bool(stream, "autoStartSeen", false)) {
-                    rs_json_obj_set_bool(stream, "autoStartSeen", true);
-                    changed = true;
-                }
+                // Running again: a later failure starts its back-off afresh.
+                rs_json_obj_remove(provider_timer(s, rs_json_obj_str(stream, "id", "")), "autoStartTries");
             }
             for (size_t j = 0; j < n && (limit <= 0 || active < limit); j++) {
                 rs_json *stream = (rs_json *)rs_json_arr_at(streams, j);
                 if (strcmp(rs_json_obj_str(stream, "sourceType", ""), "event") ||
-                    rs_json_obj_bool(stream, "autoStartSeen", false) ||
+                    rs_json_obj_bool(stream, "stoppedByUser", false) ||
                     !strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) continue;
                 double start = rs_json_obj_num(stream, "scriptStart", 0), end = rs_json_obj_num(stream, "scriptEnd", 0);
                 if (start > now || (end > 0 && end <= now)) continue;

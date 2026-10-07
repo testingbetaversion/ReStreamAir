@@ -481,6 +481,11 @@ typedef struct live_stream {
     char *id;
 
     pthread_mutex_t mu;
+    // The newest error any of this stream's workers logged, for the supervisor
+    // to say why it stopped the stream. Own lock: lg() runs with and without
+    // `mu` held, from every worker.
+    pthread_mutex_t err_mu;
+    char last_error[256];
     pthread_cond_t cv;
     bool stop;
 
@@ -651,6 +656,11 @@ static void cfg_snapshot_locked(const live_stream *st, cfg_snap *out) {
 
 static void lg(live_stream *st, const char *level, const char *event, const char *url,
                long status, long long bytes, const char *message) {
+    if (st && message && level && !strcmp(level, "error")) {
+        pthread_mutex_lock(&st->err_mu);
+        snprintf(st->last_error, sizeof(st->last_error), "%s", message);
+        pthread_mutex_unlock(&st->err_mu);
+    }
     if (st && st->mgr && st->mgr->log)
         st->mgr->log(st->mgr->log_ctx, st->id, level, event, url, status, bytes, message);
 }
@@ -2693,6 +2703,7 @@ static void stream_dispose(live_stream *st) {
     free(st->sources);
     free(st->master);
     pthread_mutex_destroy(&st->mu);
+    pthread_mutex_destroy(&st->err_mu);
     pthread_cond_destroy(&st->cv);
     free(st);
 }
@@ -2892,6 +2903,7 @@ int rs_live_start(rs_live *live, const char *stream_id, const rs_live_config *cf
     st->mgr = live;
     st->id = rs_strdup(stream_id);
     pthread_mutex_init(&st->mu, NULL);
+    pthread_mutex_init(&st->err_mu, NULL);
     pthread_cond_init(&st->cv, NULL);
     stream_apply_config_locked(st, cfg);
     st->worker_parallel_downloads = effective_parallel_downloads(cfg->parallel_downloads);
@@ -3183,6 +3195,20 @@ char *rs_live_status_line(rs_live *live, const char *stream_id) {
     }
     pthread_mutex_unlock(&live->mu);
     return out;
+}
+
+bool rs_live_last_error(rs_live *live, const char *stream_id, char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!live || !stream_id || !out || !cap) return false;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    if (st) {
+        pthread_mutex_lock(&st->err_mu);
+        snprintf(out, cap, "%s", st->last_error);
+        pthread_mutex_unlock(&st->err_mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    return out[0] != '\0';
 }
 
 double rs_live_realtime(rs_live *live, const char *stream_id) {

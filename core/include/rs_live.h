@@ -352,6 +352,10 @@ long long rs_live_drain_ingest(rs_live *live, const char *stream_id);
 // keeping up. Negative when no rendition has reported recently.
 double rs_live_realtime(rs_live *live, const char *stream_id);
 
+// The newest error the stream's engine logged (manifest refused, segment 403,
+// ...), copied into `out`. False (and "") when there is none.
+bool rs_live_last_error(rs_live *live, const char *stream_id, char *out, size_t cap);
+
 // A one-line health summary for the logs/diagnostics ("video 12 segs, seq 431,
 // 3 disc; audio 12 segs …"). Caller frees with rs_free, or NULL if unknown.
 char *rs_live_status_line(rs_live *live, const char *stream_id);
