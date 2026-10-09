@@ -72,3 +72,9 @@
   under rotation, and `CURLOPT_MAXCONNECTS 1` on proxied handles. Four Disney
   streams at 2 parallel downloads had held all 20 Proxy-Seller connections
   (10 per IP), so the script's manifest calls got 429 PROXY_MAX_CONNS.
+- **Idle-connection limit scoped to rotating lists** (`440ddca`): single-proxy
+  providers (claro's tunnel) keep normal connection reuse.
+- **Script falls over to the next proxy** (`85e1e28`): a stream-start script
+  action that fails with a proxy refusal (429 PROXY_MAX_CONNS, tunnel/SOCKS/auth)
+  is rerun through the next proxy line; the script used to get only the first
+  line, which was full. Tested on moonmuaaz with a throwaway server.
