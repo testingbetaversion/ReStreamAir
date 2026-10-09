@@ -4387,6 +4387,7 @@ typedef struct rs_stream_start {
     bool reuse_manifest;  // try the stream's saved session URL before running `manifest`
     char script_tail[200];  // last line a failed action printed (stderr, else stdout), for the error
     char *cdm_mode, *cdm_type, *cached_keys;
+    char *required_kid;  // KID the engine found the media encrypted under (wrongKeys)
     double script_timeout;
     unsigned long long token;
     int url_arg;  // index of the url= argument, rewritten once the manifest refreshes it
@@ -4409,7 +4410,7 @@ static void stream_start_free(struct rs_stream_start *st) {
     free(st->kind); free(st->url); free(st->proxy); free(st->media_proxy); free(st->headers);
     free(st->media_fetch_headers); free(st->provider_headers);
     free(st->downloader); free(st->dl_params); free(st->rep); free(st->host);
-    free(st->cdm_mode); free(st->cdm_type); free(st->cached_keys);
+    free(st->cdm_mode); free(st->cdm_type); free(st->cached_keys); free(st->required_kid);
     free(st->manifest_url); free(st->manifest_headers); free(st->media_headers);
     free(st->keys);
     rs_json_free(st->cdn_urls);
@@ -5029,6 +5030,22 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
             free(init);
         }
     }
+    // The engine's own verdict outranks anything parsed here: it read the
+    // init it actually plays and found no key for this KID. The init fetched
+    // above can differ from it (a playlist served per request), so without
+    // this the step kept judging the stale key "covered" and never licensed.
+    if (st->required_kid && st->required_kid[0] && ch.kids_count > 0) {
+        bool named = false;
+        for (size_t i = 0; i < ch.kids_count && !named; i++)
+            named = stream_start_kid_equal(ch.kids[i], st->required_kid);
+        if (!named) {
+            rs_cdm_challenge_add_kid(&ch, st->required_kid);
+            log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
+                        "the engine found the video encrypted under KID %s — requesting the licence for it",
+                        st->required_kid);
+        }
+        if (!init_only_kid) init_only_kid = rs_strdup(st->required_kid);
+    }
     if (rs_cdm_challenge_synthesize_pssh(&ch))
         log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
                     "no PSSH advertised — built a Widevine box from the %lu KID(s) found",
@@ -5396,6 +5413,7 @@ static rs_stream_start *stream_start_snapshot(const rs_json *provider, const rs_
     st->cdm_mode = rs_strdup(rs_json_obj_str(stream, "cdmMode", "external"));
     st->cdm_type = rs_strdup(rs_json_obj_str(stream, "cdmType", ""));
     st->cached_keys = rs_strdup(rs_json_obj_str(stream, "decryptionKeys", ""));
+    st->required_kid = rs_strdup(rs_json_obj_str(stream, "requiredKid", ""));
 
     return st;
 }
@@ -7536,9 +7554,17 @@ static void provider_maintenance(restream_server_t *s) {
                              restart ? "; restarting" : ". Restart finished broadcast is off.");
                 else if (condition == 3)
                     snprintf(why, sizeof(why), "Restarting: the source changed its tracks.");
-                else if (strncmp(engine_err, "Wrong decryption keys", 21) == 0)
+                else if (strncmp(engine_err, "Wrong decryption keys", 21) == 0) {
                     snprintf(why, sizeof(why), "Stopped: %s%s", engine_err,
                              restart ? " — restarting to fetch new keys" : "");
+                    // Hand the KID to the next start so its key step licenses it.
+                    const char *at = strstr(engine_err, "under KID ");
+                    if (at && strlen(at + 10) >= 32) {
+                        char kid[33];
+                        memcpy(kid, at + 10, 32); kid[32] = '\0';
+                        rs_panel_set_stream_required_kid(&s->state, id, kid);
+                    }
+                }
                 else
                     snprintf(why, sizeof(why), "Stopped: the source stopped delivering media%s%s%s",
                              engine_err[0] ? " (" : "", engine_err, engine_err[0] ? ")" : "");

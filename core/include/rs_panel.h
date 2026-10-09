@@ -57,6 +57,9 @@ int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool runnin
 // Records why a stream's last start failed (NULL/"" clears it). Starting it
 // successfully clears it too (see rs_panel_set_stream_running).
 void rs_panel_set_stream_error(rs_state *st, const char *stream_id, const char *message);
+// The KID the engine found the media encrypted under when no key matched it;
+// the next start's key step licenses it. "" / NULL clears it.
+void rs_panel_set_stream_required_kid(rs_state *st, const char *stream_id, const char *kid);
 // Marks a stream as stopped by a person (Stop button / bulk stop), or clears
 // it on a manual start. Auto-start events never restarts a marked stream.
 void rs_panel_set_stream_user_stopped(rs_state *st, const char *stream_id, bool stopped);
