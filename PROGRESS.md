@@ -13,3 +13,11 @@
   for a budget slot (`pollSlow`), segments aged out and streams stalled into
   provider restarts. MPD/playlist reads now get headroom of a quarter of the
   budget (minimum 2) above the limit.
+- **Automatic restarts show as "restarting"** (`a20a3a1`). During the
+  `restartDelaySeconds` gap after a stall restart, `/api/state` reports
+  `status: "restarting"` with `restartAt`, the card badge is amber, and
+  `/direct/<id>.ts` answers `503 retry in Ns` instead of `404 start it first`.
+- Diagnosed vpsrestream1's claro drops: its single Pinggy tunnel proxy delivers
+  ~13.5 Mbit/s for 6 streams (~2.2 Mbit/s per connection), so manifest reads
+  take 20-70 s and streams stall into restarts. Needs a faster or additional
+  proxy; not a code fault.
