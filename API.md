@@ -256,6 +256,8 @@ if (wasRunning) await api(`/api/streams/${encodeURIComponent(stream.id)}/start`,
 | `GET /api/state` | `200` full configuration view described below. |
 | `GET /api/events[?intervalMs=N]` | `200 text/event-stream`, or one `200` JSON snapshot with `?format=json`; monitoring snapshots, not configuration state or lifecycle notifications. See [EVENTS.md](EVENTS.md). |
 | `GET /api/logs[?streamId=ID&limit=150&verbose=1]` | `200 {"entries":[…],"availableDates":[]}`; newest first. `verbose=1` adds `debug` entries and a `verbose` object, and keeps debug capture on for 60 s ([verbose logging](EVENTS.md#verbose-debug-logging)). |
+
+Every non-debug entry is also appended to `logs/YYYY-MM-DD.jsonl` (UTC day, one JSON object per line, same fields as `entries`) in the working directory, readable only by the account running the server, so the log survives restarts and can be read on the host itself. Files older than three days are deleted.
 | `DELETE /api/logs[?streamId=ID]` | Clear matching visible history, return the same log envelope. Omit ID to clear all logs. |
 | `GET /ping` | `200 {"status":"ok","build":"…"}`; binary build date/time, no authentication. |
 
