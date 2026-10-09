@@ -7536,6 +7536,9 @@ static void provider_maintenance(restream_server_t *s) {
                              restart ? "; restarting" : ". Restart finished broadcast is off.");
                 else if (condition == 3)
                     snprintf(why, sizeof(why), "Restarting: the source changed its tracks.");
+                else if (strncmp(engine_err, "Wrong decryption keys", 21) == 0)
+                    snprintf(why, sizeof(why), "Stopped: %s%s", engine_err,
+                             restart ? " — restarting to fetch new keys" : "");
                 else
                     snprintf(why, sizeof(why), "Stopped: the source stopped delivering media%s%s%s",
                              engine_err[0] ? " (" : "", engine_err, engine_err[0] ? ")" : "");

@@ -1230,17 +1230,9 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
             for (size_t i = 0; i < keys.count; i++)
                 if (keys.kids[i] && strcmp(keys.kids[i], swapped) == 0) { pick = i; matched = true; break; }
         }
-        if (matched || !kid_hex || keys.count == 1) {
+        if (matched || !kid_hex) {
             memcpy(key, keys.keys[pick], 16);
             have_key = true;
-            // Still try a lone key whose KID label differs — some key sources
-            // label it oddly — but say so: when it really belongs to another
-            // quality (Disney+ keys each one separately) the picture is gray.
-            if (!matched && kid_hex)
-                lgf(st, "error", "keyGuess", init_url, 0, -1,
-                    "%s: init declares KID %s but the only key is for %s — trying it anyway; "
-                    "a gray or broken picture means the keys are for another quality",
-                    rep->rep_id, kid_hex, keys.kids[0] ? keys.kids[0] : "?");
         } else {
             key_mismatch = true;
         }
@@ -1264,7 +1256,29 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
     if (have_key) memcpy(rep->key, key, 16);
     pthread_mutex_unlock(&st->mu);
 
-    lgf(st, key_mismatch ? "error" : "info", "initReady", init_url, status, (long long)out_len,
+    if (key_mismatch) {
+        // Wrong keys must not play: decrypting with a key for another KID (or
+        // passing ciphertext through) gives a gray or broken picture that looks
+        // like a working stream. Stop the engine with a clear error instead;
+        // the supervisor's restart runs the key step again, which licenses the
+        // init's KID.
+        rs_cenc_keys stored = rs_cenc_parse_keys(cfg->keys ? cfg->keys : "");
+        char have[200] = "";
+        size_t used = 0;
+        for (size_t i = 0; i < stored.count && used + 34 < sizeof(have); i++)
+            used += (size_t)snprintf(have + used, sizeof(have) - used, "%s%s", i ? ", " : "", stored.kids[i]);
+        rs_cenc_keys_free(&stored);
+        lgf(st, "error", "wrongKeys", init_url, 0, -1,
+            "Wrong decryption keys: %s is encrypted under KID %s, but the keys are for %s",
+            rep->rep_id, kid_hex ? kid_hex : "?", have[0] ? have : "no KID");
+        pthread_mutex_lock(&st->mu);
+        st->terminal = 1;
+        pthread_cond_broadcast(&st->cv);
+        pthread_mutex_unlock(&st->mu);
+    }
+    // Info even on a mismatch: wrongKeys above is the error that names it, and
+    // an error here would replace it as the stream's last error.
+    lgf(st, "info", "initReady", init_url, status, (long long)out_len,
         "%s: timescale %u, iv %d, key %s%s%s%s", rep->rep_id, ts, rep->iv_size,
         have_key ? "yes" : "no", kid_hex ? ", kid " : "", kid_hex ? kid_hex : "",
         key_mismatch ? " — none of the configured keys match this KID; segments will stay encrypted" : "");
