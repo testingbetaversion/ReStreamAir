@@ -1218,9 +1218,29 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
                 if (keys.kids[i] && strcmp(keys.kids[i], kid_hex) == 0) { pick = i; matched = true; break; }
             }
         }
+        // PlayReady writes a KID as a little-endian GUID; accept that form too.
+        if (kid_hex && !matched && strlen(kid_hex) == 32) {
+            static const int order[16] = {3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15};
+            char swapped[33];
+            for (int b = 0; b < 16; b++) {
+                swapped[b * 2] = kid_hex[order[b] * 2];
+                swapped[b * 2 + 1] = kid_hex[order[b] * 2 + 1];
+            }
+            swapped[32] = '\0';
+            for (size_t i = 0; i < keys.count; i++)
+                if (keys.kids[i] && strcmp(keys.kids[i], swapped) == 0) { pick = i; matched = true; break; }
+        }
         if (matched || !kid_hex || keys.count == 1) {
             memcpy(key, keys.keys[pick], 16);
             have_key = true;
+            // Still try a lone key whose KID label differs — some key sources
+            // label it oddly — but say so: when it really belongs to another
+            // quality (Disney+ keys each one separately) the picture is gray.
+            if (!matched && kid_hex)
+                lgf(st, "error", "keyGuess", init_url, 0, -1,
+                    "%s: init declares KID %s but the only key is for %s — trying it anyway; "
+                    "a gray or broken picture means the keys are for another quality",
+                    rep->rep_id, kid_hex, keys.kids[0] ? keys.kids[0] : "?");
         } else {
             key_mismatch = true;
         }
