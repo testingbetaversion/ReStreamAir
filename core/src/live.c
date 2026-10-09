@@ -2510,11 +2510,17 @@ static void *director_main(void *arg) {
         pthread_cond_broadcast(&st->cv);
         pthread_mutex_unlock(&st->mu);
 
+        // The chosen video's size, so "is it really 720p?" is answered by the log.
+        char vres[48] = "";
+        long long vh = have_video ? (long long)rs_json_as_num(rs_json_obj_get(video, "height"), 0) : 0;
+        long long vw = have_video ? (long long)rs_json_as_num(rs_json_obj_get(video, "width"), 0) : 0;
+        if (vh > 0 && vw > 0) snprintf(vres, sizeof(vres), ", %lldx%lld", vw, vh);
+        else if (vh > 0) snprintf(vres, sizeof(vres), ", %lldp", vh);
         if (first)
             lgf(st, "info", "renditions", cfg.mpd_url, 0, -1,
-                "%s MPD — %lu video %s (first \"%s\")%s%s%s%s%s%s%s, master playlist ready",
+                "%s MPD — %lu video %s (first \"%s\"%s)%s%s%s%s%s%s%s, master playlist ready",
                 dynamic ? "dynamic" : "static",
-                (unsigned long)variants, variants == 1 ? "quality" : "qualities", vid,
+                (unsigned long)variants, variants == 1 ? "quality" : "qualities", vid, vres,
                 (have_audio && aid[0]) ? ", audio \"" : "",
                 (have_audio && aid[0]) ? aid : "",
                 (have_audio && aid[0]) ? "\"" : "",

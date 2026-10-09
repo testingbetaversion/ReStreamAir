@@ -552,7 +552,7 @@ typedef struct {
 
 typedef struct {
     char *video_id, *video_codecs;
-    long long video_bw;
+    long long video_bw, video_width, video_height;
     char *audio_id, *audio_codecs, *audio_lang;
     char *text_id, *text_codecs, *text_lang, *text_mime;
     cc_track cc[RS_DASH_MAX_CC];
@@ -699,6 +699,8 @@ static int rendition_rank(const char *filters, const char *id, const char *lang,
             else if (!strncmp(v, "lang=", 5)) match = lang && !strcmp(v + 5, lang);
             else if (!strncmp(v, "codec=", 6)) match = codecs && strstr(codecs, v + 6);
             else if (!strncmp(v, "height<=", 8)) match = height > 0 && height <= strtoll(v + 8, NULL, 10);
+            else if (!strncmp(v, "height>=", 8)) match = height > 0 && height >= strtoll(v + 8, NULL, 10);
+            else if (!strncmp(v, "height=", 7)) match = height > 0 && height == strtoll(v + 7, NULL, 10);
             else if (!strncmp(v, "bandwidth<=", 11)) match = bandwidth > 0 && bandwidth <= strtoll(v + 11, NULL, 10);
             else match = !strcmp(v, id) || (lang && !strcmp(v, lang));
         }
@@ -723,6 +725,11 @@ static void pick_default_reps(xmlNode *root, rendition_set *out, const rs_source
             char *ctype = attr(adap, "contentType");
             char *adap_codecs = attr(adap, "codecs");
             char *lang = attr(adap, "lang");
+            // Size may sit on the AdaptationSet when all its representations share it.
+            char *adap_h = attr(adap, "height"), *adap_w = attr(adap, "width");
+            long long adap_height = adap_h ? strtoll(adap_h, NULL, 10) : 0;
+            long long adap_width = adap_w ? strtoll(adap_w, NULL, 10) : 0;
+            free(adap_h); free(adap_w);
             const char *type = classify(mime, ctype);
             if (strcmp(type, "video") == 0) scan_cc_descriptors(adap, out);
             for (xmlNode *rep = adap->children; rep; rep = rep->next) {
@@ -733,9 +740,10 @@ static void pick_default_reps(xmlNode *root, rendition_set *out, const rs_source
                 if (!codecs && adap_codecs) codecs = rs_strdup(adap_codecs);
                 char *bw = attr(rep, "bandwidth");
                 long long bwv = bw ? strtoll(bw, NULL, 10) : 0;
-                char *height_text = attr(rep, "height");
-                long long height = height_text ? strtoll(height_text, NULL, 10) : 0;
-                free(height_text);
+                char *height_text = attr(rep, "height"), *width_text = attr(rep, "width");
+                long long height = height_text ? strtoll(height_text, NULL, 10) : adap_height;
+                long long width = width_text ? strtoll(width_text, NULL, 10) : adap_width;
+                free(height_text); free(width_text);
                 bool worst = false;
                 const char *filter = !policy ? "" : strcmp(type, "audio") == 0 ? policy->audio_filter : policy->video_filter;
                 int rank = rendition_rank(filter, rid, lang, codecs, bwv, height, &worst);
@@ -747,6 +755,8 @@ static void pick_default_reps(xmlNode *root, rendition_set *out, const rs_source
                         out->video_id = rs_strdup(rid);
                         out->video_codecs = codecs ? rs_strdup(codecs) : NULL;
                         out->video_bw = bwv;
+                        out->video_width = width;
+                        out->video_height = height;
                     }
                 } else if (strcmp(type, "audio") == 0 && rank >= 0 &&
                            (!out->audio_id || rank < audio_rank || (filter[0] && rank == audio_rank && (worst ? bwv < audio_bw : bwv > audio_bw)))) {
@@ -862,6 +872,7 @@ static char *hls_describe(const char *text, const char *base, const char *proxy,
     if (pick.video_codecs) rs_json_obj_set_str(v, "codecs", pick.video_codecs);
     else rs_json_obj_set(v, "codecs", rs_json_new_null());
     rs_json_obj_set_int(v, "bandwidth", pick.bandwidth > 0 ? pick.bandwidth : 0);
+    if (pick.height > 0) rs_json_obj_set_int(v, "height", pick.height);
     rs_json_obj_set(obj, "video", v);
     if (pick.audio_uri) {
         rs_json *a = rs_json_new_obj();
@@ -1147,6 +1158,10 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         if (reps.video_codecs) rs_json_obj_set_str(v, "codecs", reps.video_codecs);
         else rs_json_obj_set(v, "codecs", rs_json_new_null());
         rs_json_obj_set_int(v, "bandwidth", reps.video_bw > 0 ? reps.video_bw : 0);
+        if (reps.video_height > 0) {
+            rs_json_obj_set_int(v, "width", reps.video_width);
+            rs_json_obj_set_int(v, "height", reps.video_height);
+        }
         rs_json_obj_set(obj, "video", v);
     } else rs_json_obj_set(obj, "video", rs_json_new_null());
     if (reps.audio_id) {

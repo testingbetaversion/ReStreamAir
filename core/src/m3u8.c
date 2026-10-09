@@ -520,6 +520,8 @@ typedef struct {
 static bool variant_matches(const hls_variant_line *v, const char *rule, bool *usable) {
     *usable = true;
     if (!strncmp(rule, "height<=", 8)) return v->height > 0 && v->height <= strtoll(rule + 8, NULL, 10);
+    if (!strncmp(rule, "height>=", 8)) return v->height > 0 && v->height >= strtoll(rule + 8, NULL, 10);
+    if (!strncmp(rule, "height=", 7)) return v->height > 0 && v->height == strtoll(rule + 7, NULL, 10);
     if (!strncmp(rule, "bandwidth<=", 11)) return v->bandwidth > 0 && v->bandwidth <= strtoll(rule + 11, NULL, 10);
     if (!strncmp(rule, "codec=", 6)) return v->codecs && strstr(v->codecs, rule + 6);
     if (!strcmp(rule, "best") || !strcmp(rule, "worst")) return true;
