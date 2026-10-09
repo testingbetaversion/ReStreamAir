@@ -523,6 +523,7 @@ function updateStreamCardDynamic(card, stream) {
   if (badge) {
     badge.textContent = stream.status || "stopped";
     badge.classList.toggle("running", Boolean(stream.running));
+    badge.classList.toggle("restarting", stream.status === "restarting");
   }
   const stats = card.querySelectorAll(".stream-stats span");
   if (stats.length >= 3) {
@@ -847,7 +848,7 @@ function renderStreamsGrid() {
         <span class="stream-title-name">
           <strong>${escapeHtml(stream.name)}</strong>
         </span>
-        <span class="badge ${stream.running ? "running" : ""}">${escapeHtml(stream.status || "stopped")}</span>
+        <span class="badge ${stream.running ? "running" : stream.status === "restarting" ? "restarting" : ""}">${escapeHtml(stream.status || "stopped")}</span>
       </div>
       <div class="stream-url">${escapeHtml(stream.kind.toUpperCase())} · ${escapeHtml(stream.url)}</div>
       ${eventWindow ? `<div class="stream-url">${escapeHtml(eventWindow)}${stream.autostart ? " · autostart" : ""}</div>` : ""}

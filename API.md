@@ -646,7 +646,11 @@ and the user running the process. Where available, service status includes
 in this build. The legacy state `directUrl` may point to `/restream/<id>/live.m3u8`,
 which is also not a working master alias; use `/play/<id>/index.m3u8` for HLS. Playback errors can be JSON
 or plain text. Warming streams return `503` with Retry-After; stopped/missing
-streams commonly return `404`. Some unavailable modes return `501`.
+streams commonly return `404`. Some unavailable modes return `501`. A stream
+waiting out an automatic restart (stall, track change, autorestart period) shows
+`"status":"restarting"` with `restartAt` (epoch ms) in `/api/state`, and its
+`/direct/<id>.ts` link answers `503 Stream is restarting — retry in Ns.` instead
+of `404`, so players should retry.
 
 Follow the segment/init/key/variant URLs emitted in playlists rather than
 constructing internal `/proxy` or `/play` child query strings. Forward `Range`
