@@ -21,10 +21,14 @@
 #define POLICY_MKDIR(p) _mkdir(p)
 static __declspec(thread) const rs_source_policy *active_policy;
 static __declspec(thread) int manifest_priority;
+static __declspec(thread) const void *t_proxy_pool;   // pool of the last proxy this thread used
+static __declspec(thread) size_t t_proxy_index;
 #else
 #define POLICY_MKDIR(p) mkdir(p, 0700)
 static _Thread_local const rs_source_policy *active_policy;
 static _Thread_local int manifest_priority;
+static _Thread_local const void *t_proxy_pool;
+static _Thread_local size_t t_proxy_index;
 #endif
 
 int rs_fetch_set_manifest_priority(int on) {
@@ -548,7 +552,15 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     }
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "ReStreamAir/1.0");
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    if (proxy && proxy[0]) curl_easy_setopt(curl, CURLOPT_PROXY, proxy);
+    if (proxy && proxy[0]) {
+        curl_easy_setopt(curl, CURLOPT_PROXY, proxy);
+        // Proxy plans limit simultaneous connections per IP (Proxy-Seller:
+        // 10). A thread's handle otherwise keeps up to 5 idle tunnels — one per
+        // CDN host and proxy it touched — so a handful of streams held every
+        // allowed connection and the provider script got 429 PROXY_MAX_CONNS.
+        // Keep only the connection in use.
+        curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, 1L);
+    }
     if (header_list) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
     if (range && range[0]) {
         // libcurl's CURLOPT_RANGE wants just the byte spec, without "bytes=".
@@ -1087,8 +1099,15 @@ static size_t proxy_acquire(const char *list, size_t count, bool rotate,
         return count;
     }
 
+    // Sticky per thread: with rotation a thread used to alternate proxies on
+    // every request, holding a tunnel through each one. Threads are spread
+    // round-robin when they first pick, then each keeps its proxy while it is
+    // healthy — the load still splits across the pool, one connection each.
+    if (rotate && t_proxy_pool == (const void *)pool && t_proxy_index < count &&
+        !(tried_mask & (1u << t_proxy_index)) && pool->proxy[t_proxy_index].healthy)
+        chosen = t_proxy_index;
     // Spread initial health checks across concurrent download workers.
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; chosen == count && i < count; i++) {
         if (!(tried_mask & (1u << i)) && !pool->proxy[i].known && pool->proxy[i].in_flight == 0) {
             chosen = i;
             break;
@@ -1156,6 +1175,8 @@ static int proxy_release(const char *list, size_t count, size_t index,
         if (outcome == PROXY_NO_VERDICT) {
             // Cancelled requests say nothing about the proxy.
         } else if (outcome == PROXY_OK) {
+            t_proxy_pool = (const void *)pool;
+            t_proxy_index = index;
             if (h->known && !h->healthy) change = -1;
             h->known = true;
             h->healthy = true;
