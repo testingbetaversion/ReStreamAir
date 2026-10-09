@@ -4965,14 +4965,21 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
 
     // PSSH, in the three places it can be: the manifest above, the init
     // segment, or — for a source that only ever names a KID — built from that.
-    // The init is only fetched when the manifest didn't carry a box, or when
-    // the script has asked to inspect it itself.
-    if (text && (ch.pssh_all_count == 0 || ch.kids_count == 0 || st->want_initparse)) {
+    // The init is always read when there is one: its tenc names the KID the
+    // media is really encrypted with, and a playlist can advertise another
+    // (Disney+ has served a 720p variant whose playlist named the KID of a
+    // different key) — trusting the playlist kept a stale cached key that
+    // decrypted the video into garbage.
+    if (text) {
         size_t init_len = 0;
         uint8_t *init = stream_start_fetch_init(st, drm_manifest_url, text, &init_len);
         if (init) {
-            size_t before = ch.pssh_all_count;
+            size_t before = ch.pssh_all_count, kids_before = ch.kids_count;
             rs_cdm_challenge_add_from_init(&ch, init, init_len);
+            if (ch.kids_count > kids_before && kids_before > 0)
+                log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
+                            "the init segment is encrypted under KID %s, which the playlist did not name",
+                            ch.kids[ch.kids_count - 1]);
             if (ch.pssh_all_count > before)
                 log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
                             "no PSSH in the manifest — found %lu box(es) in the init segment",
