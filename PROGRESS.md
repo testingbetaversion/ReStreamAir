@@ -21,3 +21,6 @@
   ~13.5 Mbit/s for 6 streams (~2.2 Mbit/s per connection), so manifest reads
   take 20-70 s and streams stall into restarts. Needs a faster or additional
   proxy; not a code fault.
+- **Exact quality rules** (`5890b9a`). `defaultVideo` accepts `height=N`
+  (exactly N) and `height>=N` alongside `height<=N`, for DASH and HLS. The
+  engine's `renditions` log entry names the chosen video size.
