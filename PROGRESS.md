@@ -48,3 +48,8 @@
   init's tenc, so cached keys were reused and the video decoded as garbage
   downstream. The key step now always reads the init and runs the CDM when its
   KID is not covered.
+- **Licence requested for the init's KID** (`70033ba`). On Disney "Playlist
+  Rádio Disney" the playlist PSSH named KID c184d3cd while the 720p init used
+  a2ba9a84; the script licensed the advertised box and got only c184's key.
+  The key step now builds the Widevine PSSH (and `kid=`) from the init's KID
+  when the playlist does not name it, and logs when the init can't be fetched.
