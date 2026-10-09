@@ -2978,15 +2978,18 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         const char *action = rs_json_obj_str(body, "action", "");
         bool del = strcmp(action, "delete") == 0;
         bool set = strcmp(action, "set") == 0;
-        const char *input_mode = rs_json_obj_str(rs_json_obj_get(body, "fields"), "inputMode", "");
+        const rs_json *fields = rs_json_obj_get(body, "fields");
+        const char *input_mode = rs_json_obj_str(fields, "inputMode", "");
+        long long parallel = rs_json_obj_get(fields, "parallelDownloads")
+            ? rs_json_obj_int(fields, "parallelDownloads", 0) : 0;
         if (!del && !set && strcmp(action, "stop") != 0) {
             rs_json_free(body);
             reply_error(c, 400, "action must be \"stop\", \"delete\" or \"set\".");
             return true;
         }
-        if (set && !input_mode[0]) {
+        if (set && !input_mode[0] && !parallel) {
             rs_json_free(body);
-            reply_error(c, 400, "action \"set\" needs fields.inputMode.");
+            reply_error(c, 400, "action \"set\" needs fields.inputMode or fields.parallelDownloads.");
             return true;
         }
         if (set) {
@@ -3000,8 +3003,10 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
             for (size_t i = 0; i < n; i++) {
                 const char *id = rs_json_as_str(rs_json_arr_at(ids, i), "");
                 if (!id[0]) continue;
-                int rc = rs_panel_set_stream_input_mode(&s->state, id, input_mode, &err);
-                if (rc == -400) break;  // invalid mode: same for every stream
+                int rc = 0;
+                if (input_mode[0]) rc = rs_panel_set_stream_input_mode(&s->state, id, input_mode, &err);
+                if (rc == 0 && parallel) rc = rs_panel_set_stream_parallel_downloads(&s->state, id, parallel, &err);
+                if (rc == -400) break;  // invalid value: same for every stream
                 if (rc != 0) continue;
                 done++;
                 const rs_json *stream = rs_panel_find_stream(&s->state, id);
@@ -3018,7 +3023,9 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
                 return true;
             }
             log_recordf(s, "__panel__", "info", "streamUpdate", NULL, 0, -1,
-                        "bulk input mode %s on %lu stream(s) by %s (%lu requested)", input_mode,
+                        "bulk set%s%s%s on %lu stream(s) by %s (%lu requested)",
+                        input_mode[0] ? " input mode " : "", input_mode,
+                        parallel ? " + parallel downloads" : "",
                         (unsigned long)done, ip, (unsigned long)n);
             rs_free(ip);
             rs_json_free(body);

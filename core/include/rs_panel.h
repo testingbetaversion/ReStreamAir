@@ -129,6 +129,8 @@ size_t rs_panel_admin_count(const rs_state *st);
 int rs_panel_create_key(rs_state *st, const rs_json *body, const char **err);
 int rs_panel_delete_key(rs_state *st, const char *id, const char **err);
 // Changes only a stream's input mode (validated like the stream editor's).
+int rs_panel_set_stream_parallel_downloads(rs_state *st, const char *stream_id, long long n,
+                                           const char **err);
 int rs_panel_set_stream_input_mode(rs_state *st, const char *stream_id, const char *mode,
                                    const char **err);
 // Partial update: label, api (bool), expiresInHours (0 = never). Same fields

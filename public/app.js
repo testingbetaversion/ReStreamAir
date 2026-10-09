@@ -2410,6 +2410,22 @@ async function applyInputModeToAllStreams(mode) {
   }
 }
 
+async function applyParallelDownloadsToAllStreams(count) {
+  const provider = selectedProvider();
+  if (!provider) return;
+  const ids = provider.streams.map((stream) => stream.id);
+  if (!ids.length) { showToast("This provider has no streams yet."); return; }
+  if (count < 1 || count > 8) { showToast("Use 1–8 parallel downloads.", "error"); return; }
+  if (!confirm(`Set parallel downloads to ${count} on all ${ids.length} stream(s) of "${provider.name}"? Running streams reopen their connections now.`)) return;
+  try {
+    state = await request("/api/streams/bulk", { method: "POST", body: JSON.stringify({ action: "set", ids, fields: { parallelDownloads: count } }) });
+    render();
+    showToast(`Parallel downloads set to ${count} on ${ids.length} stream(s)`);
+  } catch (error) {
+    showToast(`Couldn't change the streams: ${error.message || error}`, "error");
+  }
+}
+
 function updateSegmentUrlParamsVisibility() {
   const form = $("#providerSettingsForm");
   $("#segmentUrlParamsField").classList.toggle("hidden", form.elements.inheritUrlParams.checked);
@@ -2669,6 +2685,14 @@ function renderProviderOptions(provider) {
         input.max = field.max;
         input.step = "1";
         input.required = true;
+        if (field.name === "importParallelDownloads") {
+          const apply = document.createElement("button");
+          apply.type = "button";
+          apply.className = "ghost";
+          apply.textContent = `Apply to all ${provider.streams.length} existing stream(s) now`;
+          apply.addEventListener("click", () => applyParallelDownloadsToAllStreams(Number(input.value) || 6));
+          label.append(apply);
+        }
         if (field.name === "outputFragmentsCount") {
           input.addEventListener("input", () => {
             input.setCustomValidity([1, 2].includes(Number(input.value)) ? "Use 0 or a whole number from 3 to 240." : "");
