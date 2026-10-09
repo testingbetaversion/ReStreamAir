@@ -53,3 +53,9 @@
   a2ba9a84; the script licensed the advertised box and got only c184's key.
   The key step now builds the Widevine PSSH (and `kid=`) from the init's KID
   when the playlist does not name it, and logs when the init can't be fetched.
+- **Wrong keys stop the stream** (`443ec00`): a KID with no matching key logs
+  `wrongKeys` and ends the engine instead of playing a gray picture.
+- **Engine's KID drives the next licence** (`39a3ec7`): the supervisor stores
+  the wrongKeys KID on the stream (`requiredKid`); the next key step adds it,
+  so a stale stored key no longer counts as covering, and licenses that KID.
+  Fixes the Playlist Rádio Disney loop (video a2ba9a84, key c184d3cd).
