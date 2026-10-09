@@ -68,3 +68,7 @@
   keeping the end), instead of per-line alerts where only the traceback's top
   line got through the burst limit. JWTs and `Bearer` tokens are redacted.
   Tested on moonmuaaz with a local webhook listener.
+- **One proxy connection per thread** (`f6e2391`): sticky proxy per thread
+  under rotation, and `CURLOPT_MAXCONNECTS 1` on proxied handles. Four Disney
+  streams at 2 parallel downloads had held all 20 Proxy-Seller connections
+  (10 per IP), so the script's manifest calls got 429 PROXY_MAX_CONNS.
