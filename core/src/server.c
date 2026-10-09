@@ -416,6 +416,20 @@ static char *webhook_redact_message(const char *message) {
     rs_buf out = RS_BUF_INIT;
     for (const char *p = input; *p;) {
         bool url = strncmp(p, "https://", 8) == 0 || strncmp(p, "http://", 7) == 0;
+        // Scripts print access tokens (JWTs, "Bearer …") in their tracebacks;
+        // an alert channel is no place for a live session token.
+        bool at_word = p == input || !(isalnum((unsigned char)p[-1]) || p[-1] == '_' || p[-1] == '-');
+        if (at_word && strncmp(p, "eyJ", 3) == 0) {
+            size_t n = 0;
+            while (isalnum((unsigned char)p[n]) || p[n] == '_' || p[n] == '-' || p[n] == '.' || p[n] == '=') n++;
+            if (n >= 40) { rs_buf_append_str(&out, "[redacted token]"); p += n; continue; }
+        }
+        if (strncmp(p, "Bearer ", 7) == 0 || strncmp(p, "bearer ", 7) == 0) {
+            rs_buf_append_str(&out, "Bearer [redacted]");
+            p += 7;
+            while (*p && *p != ' ' && *p != '\'' && *p != '"' && *p != '\n' && *p != ',' && *p != '}') p++;
+            continue;
+        }
         if (!url) {
             rs_buf_append_char(&out, *p++);
             continue;
@@ -538,6 +552,26 @@ static void webhook_enqueue_error(restream_server_t *s, const char *sid, const c
     pthread_mutex_unlock(&s->webhook_mu);
 }
 
+// One alert per failed script run: its exit status and everything it wrote to
+// stderr (stdout when stderr is empty), whole.
+static void webhook_script_failure(restream_server_t *s, const char *sid, const char *action,
+                                   int rc, const char *stderr_text, const char *stdout_text) {
+    const char *text = stderr_text && stderr_text[0] ? stderr_text : stdout_text;
+    rs_buf m = RS_BUF_INIT;
+    char head[160];
+    snprintf(head, sizeof(head), "The %s action exited %d.", action && action[0] ? action : "script", rc);
+    rs_buf_append_str(&m, head);
+    if (text && text[0]) {
+        rs_buf_append_char(&m, '\n');
+        size_t n = strlen(text);
+        while (n && (text[n - 1] == '\n' || text[n - 1] == '\r' || text[n - 1] == ' ')) n--;
+        rs_buf_append(&m, text, n);
+    }
+    char *message = rs_buf_take(&m);
+    webhook_enqueue_error(s, sid, "scriptFailed", message ? message : head, 0);
+    rs_free(message);
+}
+
 static bool webhook_enqueue_test(restream_server_t *s, const char *provider_id) {
     if (!g_webhook_handler) return false;
     bool queued = false;
@@ -564,10 +598,35 @@ static char *webhook_payload(const rs_webhook_job *job) {
     rs_json *embed = rs_json_new_obj();
     rs_json_obj_set_str(embed, "title", job->test ? "Webhook test" : "Provider error");
     rs_json_obj_set_int(embed, "color", job->test ? 5763719 : 15548997);
-    char description[1200];
-    snprintf(description, sizeof(description), "%.1000s%s", job->message,
-             strlen(job->message) > 1000 ? "…" : "");
-    rs_json_obj_set_str(embed, "description", description);
+    // Discord caps an embed description at 4096 characters. A script failure
+    // carries its whole stderr; when even that is too long, keep the first
+    // line and the end, where a traceback names the actual exception.
+    const char *msg = job->message;
+    size_t len = strlen(msg);
+    bool multiline = strchr(msg, '\n') != NULL;
+    const size_t cap = 3900;
+    rs_buf d = RS_BUF_INIT;
+    const char *nl = strchr(msg, '\n');
+    if (multiline) {
+        size_t head = (size_t)(nl - msg);
+        if (head > 400) head = 400;
+        rs_buf_append(&d, msg, head);
+        rs_buf_append_str(&d, "\n```\n");
+        const char *body = nl + 1;
+        size_t blen = strlen(body);
+        if (blen > cap - head) {
+            rs_buf_append_str(&d, "…\n");
+            body += blen - (cap - head);
+        }
+        for (const char *q = body; *q; q++) rs_buf_append_char(&d, *q == '`' ? '\'' : *q);
+        rs_buf_append_str(&d, "\n```");
+    } else {
+        rs_buf_append(&d, msg, len > cap ? cap : len);
+        if (len > cap) rs_buf_append_str(&d, "…");
+    }
+    char *description = rs_buf_take(&d);
+    rs_json_obj_set_str(embed, "description", description ? description : "");
+    rs_free(description);
     rs_json *fields = rs_json_new_arr();
     const char *names[] = {"Provider", "Stream", "Event"};
     const char *values[] = {job->provider_name, job->stream_name, job->event};
@@ -840,7 +899,11 @@ static void log_record(restream_server_t *s, const char *sid, const char *level,
     s->log_head = (s->log_head + 1) % RS_LOG_CAP;
     if (s->log_count < RS_LOG_CAP) s->log_count++;
     log_unlock(s);
-    if (level && strcmp(level, "error") == 0)
+    // A failed script is alerted once with its whole output (webhook_script_
+    // failure); its per-line stderr records and exit record would otherwise
+    // each claim the burst window and Discord got only the traceback's top line.
+    if (level && strcmp(level, "error") == 0 && event &&
+        strcmp(event, "scriptError") != 0 && strcmp(event, "scriptEnd") != 0)
         webhook_enqueue_error(s, sid ? sid : "__panel__", event, message, status);
 }
 
@@ -4529,6 +4592,7 @@ static int stream_start_run(restream_server_t *server, const char *sid,
     rs_buf_dispose(&log_ctx.stderr_line);
     log_record(server, sid, rc == 0 ? "info" : "error", "scriptEnd", NULL, rc, -1,
                rc == 0 ? "ok" : "script exited non-zero");
+    if (rc != 0) webhook_script_failure(server, sid, action, rc, err_text, out ? *out : NULL);
     // What the script said last before failing — usually the provider's own
     // refusal — so the stream's error can say why, not just "exited 1".
     st->script_tail[0] = '\0';
@@ -6357,6 +6421,9 @@ static void pending_job_finish_probe(struct mg_connection *c, rs_pending_job *pf
 static void pending_job_finish_script(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf) {
     log_record(server, pf->stream_id, pf->rc == 0 ? "info" : "error", "scriptEnd", NULL, pf->rc, -1,
                pf->rc == 0 ? "ok" : "script exited non-zero");
+    if (pf->rc != 0)
+        webhook_script_failure(server, pf->stream_id, pf->script_action, pf->rc,
+                               pf->script_stderr, pf->script_stdout);
     // A catalogue action's whole point is the streams it produces, so fold the
     // document the worker parsed into the provider before the save below. The
     // state DOM is only ever touched from this thread; the worker did the
