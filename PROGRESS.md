@@ -63,3 +63,8 @@
   (0 = keep 6, else 1–8) for imported streams, plus an Apply to all streams
   button (bulk `fields.parallelDownloads`). Sized for Proxy-Seller IPs, which
   allow 10 connections each: ~3 per Disney stream at 2 downloads.
+- **Whole script errors on Discord** (`14773b1`): one `scriptFailed` alert per
+  failed script run with its full stderr in a code block (up to ~3,900 chars,
+  keeping the end), instead of per-line alerts where only the traceback's top
+  line got through the burst limit. JWTs and `Bearer` tokens are redacted.
+  Tested on moonmuaaz with a local webhook listener.
