@@ -34,3 +34,8 @@
   video/audio filters) plus its audio playlist. The engine matches
   PlayReady-order KIDs and logs `keyGuess` when it falls back to a lone key
   with a different KID.
+- **SOCKS proxies resolve remotely** (`f9526e0`). `socks5://` made the client
+  hand the proxy an IPv6 address from the dual-stack server, which the v4-only
+  SOCKS proxy refused (reply 4), so every Disney script call failed. Server
+  fetches and the script's `proxy=` argument now use `socks5h://` /
+  `socks4a://`.
