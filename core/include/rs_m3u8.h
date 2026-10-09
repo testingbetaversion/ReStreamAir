@@ -43,7 +43,8 @@ char *rs_m3u8_rewrite(const char *text, const char *base_url, bool drop_key,
 
 // Limits which variants of a master playlist a player may choose, using the
 // provider "Default video" rule list (comma-separated, first rule that keeps
-// at least one variant wins): height<=N, bandwidth<=N, codec=X, best, worst.
+// at least one variant wins): height<=N, height>=N, height=N, bandwidth<=N, codec=X,
+// best, worst.
 // If no rule keeps anything, nothing is removed. I-frame variants follow the
 // same rule. With `single`, only the highest-bandwidth variant left after the
 // rules survives (I-frame variants are dropped). Returns a new string
