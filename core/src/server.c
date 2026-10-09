@@ -5158,7 +5158,11 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
     extra[extra_n++] = rs_script_arg("cdm", st->cdm_mode[0] ? st->cdm_mode : "external", false);
     extra[extra_n++] = rs_script_arg("challenge", "", false);
     if (cdm_type[0]) extra[extra_n++] = rs_script_arg("cdmType", cdm_type, false);
-    if (ch.kids_count) {
+    if (init_only_kid) {
+        // The media's own KID alone: scripts commonly build a fallback PSSH
+        // from `kid` with UUID(kid), which a comma-separated list breaks.
+        extra[extra_n++] = rs_script_arg("kid", init_only_kid, false);
+    } else if (ch.kids_count) {
         char *j = join_list(ch.kids, ch.kids_count, ",");
         extra[extra_n++] = rs_script_arg("kid", j, false);
         free(j);
