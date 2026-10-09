@@ -1184,7 +1184,20 @@ static int fetch_with_proxies(const char *url, const char *proxy, const char *he
                  char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
                  long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx) {
     if (!proxy || !strpbrk(proxy, "\r\n")) {
-        return fetch_through_one_proxy(url, proxy, headers, range, downloader, dl_params, force_ipv6,
+        // A single proxy pasted with a trailing space reached libcurl as part
+        // of the host name ("Could not resolve proxy name"); the list path
+        // below trims each entry, so trim this one the same way.
+        char one[1100];
+        if (proxy && (*proxy == ' ' || *proxy == '\t' ||
+                      (*proxy && (proxy[strlen(proxy) - 1] == ' ' || proxy[strlen(proxy) - 1] == '\t')))) {
+            const char *start = proxy;
+            while (*start == ' ' || *start == '\t') start++;
+            size_t len = strlen(start);
+            while (len && (start[len - 1] == ' ' || start[len - 1] == '\t')) len--;
+            if (len < sizeof(one)) { memcpy(one, start, len); one[len] = '\0'; proxy = one; }
+        }
+        return fetch_through_one_proxy(url, proxy && proxy[0] ? proxy : NULL, headers, range, downloader,
+                                       dl_params, force_ipv6,
                                        out, out_len, status, content_type, content_range,
                                        effective_url, errbuf, errbuf_len,
                                        timeout_ms, should_cancel, cancel_ctx);

@@ -8,6 +8,8 @@
 
 #include "rs_internal.h"
 
+static void set_proxy_list(rs_json *dst, const char *value);
+
 // The 2001 reference epoch that dates in state.json are recorded against.
 #define RS_APPLE_EPOCH_OFFSET 978307200.0
 
@@ -142,7 +144,7 @@ static rs_json *stream_build(const rs_json *body, const char *id) {
     rs_json_obj_set_str(s, "url", url);
     rs_json_obj_set_str(s, "representation", rs_json_obj_str(body, "representation", ""));
     rs_json_obj_set_str(s, "period", rs_json_obj_str(body, "period", ""));
-    rs_json_obj_set_str(s, "proxy", rs_json_obj_str(body, "proxy", ""));
+    set_proxy_list(s, rs_json_obj_str(body, "proxy", ""));
     rs_json_obj_set_str(s, "downloader", normalize_downloader(rs_json_obj_str(body, "downloader", "")));
     rs_json_obj_set_str(s, "downloaderParams", rs_json_obj_str(body, "downloaderParams", ""));
     rs_json_obj_set_int(s, "playlistSegments", clamp_ll(rs_json_obj_int(body, "playlistSegments", 6), 3));
@@ -524,7 +526,7 @@ int rs_panel_create_provider(rs_state *st, const rs_json *body, const char **err
     rs_json_obj_set(p, "options", rs_provider_options_merge(rs_json_obj_get(p, "options"), rs_json_obj_get(body, "options")));
     rs_json_obj_set_str(p, "name", name);
     rs_json_obj_set_str(p, "logo", rs_json_obj_str(body, "logo", ""));
-    rs_json_obj_set_str(p, "proxy", rs_json_obj_str(body, "proxy", ""));
+    set_proxy_list(p, rs_json_obj_str(body, "proxy", ""));
     rs_json_obj_set_str(p, "errorWebhookUrl", rs_json_obj_str(body, "errorWebhookUrl", ""));
     rs_json_obj_set_str(p, "headers", rs_json_obj_str(body, "headers", ""));
     rs_json_obj_set_str(p, "downloader", normalize_downloader(rs_json_obj_str(body, "downloader", "")));
@@ -549,6 +551,33 @@ int rs_panel_create_provider(rs_state *st, const rs_json *body, const char **err
 
 // Replaces a key in `dst` with a clone of `src`'s value, or removes it when
 // absent — the "?? default" pattern for optional body fields on update.
+// Stores a proxy list one entry per line, each trimmed, blank lines dropped.
+// A pasted proxy often carries a trailing space, which libcurl would read as
+// part of the host name.
+static void set_proxy_list(rs_json *dst, const char *value) {
+    size_t cap = strlen(value ? value : "") + 1;
+    char *out = (char *)malloc(cap);
+    if (!out) { rs_json_obj_set_str(dst, "proxy", value ? value : ""); return; }
+    size_t n = 0;
+    for (const char *p = value ? value : ""; *p;) {
+        const char *end = p;
+        while (*end && *end != '\n' && *end != '\r') end++;
+        const char *a = p, *b = end;
+        while (a < b && (*a == ' ' || *a == '\t')) a++;
+        while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+        if (b > a) {
+            if (n) out[n++] = '\n';
+            memcpy(out + n, a, (size_t)(b - a));
+            n += (size_t)(b - a);
+        }
+        p = end;
+        while (*p == '\n' || *p == '\r') p++;
+    }
+    out[n] = '\0';
+    rs_json_obj_set_str(dst, "proxy", out);
+    free(out);
+}
+
 static void set_str_from(rs_json *dst, const char *key, const rs_json *body, const char *fallback) {
     rs_json_obj_set_str(dst, key, rs_json_obj_str(body, key, fallback));
 }
@@ -567,7 +596,7 @@ int rs_panel_update_provider(rs_state *st, const char *id, const rs_json *body, 
     rs_json_obj_set_str(p, "name", name);
     // logo keeps its existing value when the body omits it.
     if (rs_json_obj_get(body, "logo")) set_str_from(p, "logo", body, "");
-    set_str_from(p, "proxy", body, "");
+    set_proxy_list(p, rs_json_obj_str(body, "proxy", ""));
     set_str_from(p, "errorWebhookUrl", body, "");
     set_str_from(p, "headers", body, "");
     rs_json_obj_set_str(p, "downloader", normalize_downloader(rs_json_obj_str(body, "downloader", "")));
