@@ -27,3 +27,10 @@
 - **Proxy health is logged** (`be9ebe6`): `proxyHealth` entries when a proxy is
   benched (error + cooldown) or comes back. The restarting `.ts` 503 says
   "fetching a fresh source" once the restart timer has passed.
+- **Gray picture on Disney 720p fixed** (`8ffd889`). Disney+ keys each quality
+  separately; the key step read the first (lower) HLS variant, found its KID
+  covered by cached keys, and the engine decrypted 720p with the wrong key.
+  The key step now inspects the variant the engine will play (provider
+  video/audio filters) plus its audio playlist. The engine matches
+  PlayReady-order KIDs and logs `keyGuess` when it falls back to a lone key
+  with a different KID.
