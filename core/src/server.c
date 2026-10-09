@@ -2154,6 +2154,25 @@ static void provider_session_paths(const char *pid, char *sessiondir, size_t sd_
 // the session store, the network overrides, and the active account. `action=`
 // is not included — the manual route puts it first, the playback pipeline adds
 // a different one per step. Returns the new argument count.
+// One proxy line as a script's proxy= value: socks5:// / socks4:// become
+// socks5h:// / socks4a:// (see proxy_remote_dns in net.c) — a script resolving
+// locally hands a v4-only SOCKS proxy an IPv6 address it cannot reach.
+static char *script_proxy_value(const char *line) {
+    if (!line) return NULL;
+    bool plain_socks = strlen(line) > 9 && strncmp(line + 6, "://", 3) == 0 &&
+                       (line[5] == '5' || line[5] == '4');
+    for (int i = 0; plain_socks && i < 5; i++)
+        if (tolower((unsigned char)line[i]) != "socks"[i]) plain_socks = false;
+    if (!plain_socks) return rs_strdup(line);
+    size_t len = strlen(line);
+    char *up = (char *)malloc(len + 2);
+    if (!up) return rs_strdup(line);
+    memcpy(up, line, 6);
+    up[6] = line[5] == '5' ? 'h' : 'a';
+    memcpy(up + 7, line + 6, len - 6 + 1);
+    return up;
+}
+
 static int fill_common_script_args(const rs_json *provider, const rs_json *stream,
                                    char **args, int n, int cap) {
     char sessiondir[512], cookies[640];
@@ -2171,25 +2190,9 @@ static int fill_common_script_args(const rs_json *provider, const rs_json *strea
     // the proxy, the same way it decides for the manifest and media fetches.
     char *scoped = effective_proxy(provider, stream,
                                    !stream || rs_json_obj_bool(stream, "proxyScript", true));
-    char *script_proxy = primary_proxy(scoped ? scoped : "");
-    // Same upgrade as the server's own fetches (see proxy_remote_dns in
-    // net.c): a script resolving locally hands a v4-only SOCKS proxy an IPv6
-    // address it cannot reach.
-    bool plain_socks = script_proxy && strlen(script_proxy) > 9 && strncmp(script_proxy + 6, "://", 3) == 0 &&
-                       (script_proxy[5] == '5' || script_proxy[5] == '4');
-    for (int i = 0; plain_socks && i < 5; i++)
-        if (tolower((unsigned char)script_proxy[i]) != "socks"[i]) plain_socks = false;
-    if (plain_socks) {
-        size_t len = strlen(script_proxy);
-        char *up = (char *)malloc(len + 2);
-        if (up) {
-            memcpy(up, script_proxy, 6);
-            up[6] = script_proxy[5] == '5' ? 'h' : 'a';
-            memcpy(up + 7, script_proxy + 6, len - 6 + 1);
-            free(script_proxy);
-            script_proxy = up;
-        }
-    }
+    char *first = primary_proxy(scoped ? scoped : "");
+    char *script_proxy = script_proxy_value(first);
+    free(first);
     if (script_proxy && script_proxy[0] && n < cap)
         args[n++] = rs_script_arg("proxy", script_proxy, false);
     free(script_proxy);
@@ -4458,6 +4461,7 @@ typedef struct rs_stream_start {
     char script_tail[200];  // last line a failed action printed (stderr, else stdout), for the error
     char *cdm_mode, *cdm_type, *cached_keys;
     char *required_kid;  // KID the engine found the media encrypted under (wrongKeys)
+    char *script_proxies;  // the script's whole proxy list, for falling over (see stream_start_run)
     double script_timeout;
     unsigned long long token;
     int url_arg;  // index of the url= argument, rewritten once the manifest refreshes it
@@ -4480,7 +4484,7 @@ static void stream_start_free(struct rs_stream_start *st) {
     free(st->kind); free(st->url); free(st->proxy); free(st->media_proxy); free(st->headers);
     free(st->media_fetch_headers); free(st->provider_headers);
     free(st->downloader); free(st->dl_params); free(st->rep); free(st->host);
-    free(st->cdm_mode); free(st->cdm_type); free(st->cached_keys); free(st->required_kid);
+    free(st->cdm_mode); free(st->cdm_type); free(st->cached_keys); free(st->required_kid); free(st->script_proxies);
     free(st->manifest_url); free(st->manifest_headers); free(st->media_headers);
     free(st->keys);
     rs_json_free(st->cdn_urls);
@@ -4588,6 +4592,53 @@ static int stream_start_run(restream_server_t *server, const char *sid,
                                   stream_start_output_chunk, &log_ctx);
     stream_start_flush_line(&log_ctx, false);
     stream_start_flush_line(&log_ctx, true);
+    // The script is handed one proxy (the first line) while the engine
+    // rotates across the whole list. When that proxy refuses — a plan's
+    // connection cap (429 PROXY_MAX_CONNS), a dead tunnel — rerun the action
+    // through the next line instead of failing the start while other proxies
+    // have room. The one that worked stays in the args for later actions.
+    int proxy_arg = -1;
+    for (int i = 0; i < st->argc; i++)
+        if (st->args[i] && strncmp(st->args[i], "proxy=", 6) == 0) { proxy_arg = i; break; }
+    char *lines[16];
+    size_t nlines = 0;
+    char *list = st->script_proxies ? rs_strdup(st->script_proxies) : NULL;
+    for (char *tok = list; tok && *tok && nlines < 16;) {
+        char *end = tok;
+        while (*end && *end != '\r' && *end != '\n') end++;
+        char *rest = *end ? end + 1 : end;
+        *end = '\0';
+        while (*tok == ' ' || *tok == '\t') tok++;
+        size_t len = strlen(tok);
+        while (len && (tok[len - 1] == ' ' || tok[len - 1] == '\t')) tok[--len] = '\0';
+        if (*tok) lines[nlines++] = tok;
+        tok = rest;
+    }
+    for (size_t next = 1; rc != 0 && proxy_arg >= 0 && next < nlines; next++) {
+        const char *said = err_text && err_text[0] ? err_text : (out && *out ? *out : "");
+        bool proxy_refused = strstr(said, "ProxyError") || strstr(said, "CONNECT tunnel failed") ||
+                             strstr(said, "PROXY_MAX_CONNS") || strstr(said, "SOCKS") ||
+                             strstr(said, "resolve proxy") || strstr(said, "Proxy Authentication");
+        if (!proxy_refused) break;
+        char *value = script_proxy_value(lines[next]);
+        if (!value) break;
+        const char *at = strrchr(value, '@');
+        log_recordf(server, sid, "info", "scriptProxy", NULL, 0, -1,
+                    "%s failed through its proxy — retrying through %s", action, at ? at + 1 : value);
+        char *arg = rs_script_arg("proxy", value, false);
+        free(value);
+        if (!arg) break;
+        free(st->args[proxy_arg]);
+        st->args[proxy_arg] = arg;
+        argv[1 + proxy_arg] = arg;
+        if (out && *out) { rs_free(*out); *out = NULL; }
+        rs_free(err_text); err_text = NULL;
+        rc = rs_script_run_stream(st->script_path, argv, n, timeout, out, &err_text,
+                                  stream_start_output_chunk, &log_ctx);
+        stream_start_flush_line(&log_ctx, false);
+        stream_start_flush_line(&log_ctx, true);
+    }
+    free(list);
     rs_buf_dispose(&log_ctx.stdout_line);
     rs_buf_dispose(&log_ctx.stderr_line);
     log_record(server, sid, rc == 0 ? "info" : "error", "scriptEnd", NULL, rc, -1,
@@ -5458,6 +5509,7 @@ static rs_stream_start *stream_start_snapshot(const rs_json *provider, const rs_
     st->kind = rs_strdup(rs_json_obj_str(stream, "kind", "mpd"));
     st->url = rs_strdup(rs_json_obj_str(stream, "url", ""));
     st->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
+    st->script_proxies = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyScript", true));
     st->media_proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
     st->headers = effective_headers(provider, stream, "manifestHeaders");
     st->media_fetch_headers = effective_headers(provider, stream, "mediaHeaders");
