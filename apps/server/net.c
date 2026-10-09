@@ -1124,8 +1124,12 @@ static size_t proxy_acquire(const char *list, size_t count, bool rotate,
 
 typedef enum { PROXY_OK, PROXY_FAILED, PROXY_NO_VERDICT } proxy_outcome;
 
-static void proxy_release(const char *list, size_t count, size_t index,
-                          proxy_outcome outcome) {
+// Returns the cooldown in seconds when this release benched the proxy, -1 when
+// it brought a benched proxy back, 0 otherwise — so the caller logs only state
+// changes, not every request.
+static int proxy_release(const char *list, size_t count, size_t index,
+                         proxy_outcome outcome) {
+    int change = 0;
     pthread_mutex_lock(&g_proxy_pool_mu);
     proxy_pool *pool = proxy_pool_locked(list, count);
     if (pool && index < count) {
@@ -1134,20 +1138,26 @@ static void proxy_release(const char *list, size_t count, size_t index,
         if (outcome == PROXY_NO_VERDICT) {
             // Cancelled requests say nothing about the proxy.
         } else if (outcome == PROXY_OK) {
+            if (h->known && !h->healthy) change = -1;
             h->known = true;
             h->healthy = true;
             h->failures = 0;
             h->retry_at = 0;
         } else {
+            // Requests already in flight when the proxy was benched fail too;
+            // they extend nothing and say nothing new, so only log the first.
+            bool already_benched = h->known && !h->healthy && h->retry_at > time(NULL);
             h->known = true;
             h->healthy = false;
             if (h->failures < 6) h->failures++;
             unsigned delay = 15u << (h->failures ? h->failures - 1 : 0);
             if (delay > 300u) delay = 300u;
             h->retry_at = time(NULL) + (time_t)delay;
+            if (!already_benched) change = (int)delay;
         }
     }
     pthread_mutex_unlock(&g_proxy_pool_mu);
+    return change;
 }
 
 static int fetch_with_proxies(const char *url, const char *proxy, const char *headers, const char *range,
@@ -1206,7 +1216,21 @@ static int fetch_with_proxies(const char *url, const char *proxy, const char *he
                             got != 403 && got != 407 && got != 408 && got != 429;
         proxy_outcome outcome = rc == 0 || origin_final ? PROXY_OK
                               : cancelled ? PROXY_NO_VERDICT : PROXY_FAILED;
-        proxy_release(proxy, count, index, outcome);
+        int change = proxy_release(proxy, count, index, outcome);
+        if (change) {
+            // Name the proxy by host:port only; the credentials stay out of logs.
+            const char *at = strrchr(items[index], '@');
+            const char *host = at ? at + 1 : items[index];
+            const char *scheme_end = at ? NULL : strstr(host, "://");
+            if (scheme_end) host = scheme_end + 3;
+            char msg[512];
+            if (change > 0)
+                snprintf(msg, sizeof(msg), "proxy %s failed (%s) — skipped for %ds, using the other proxies",
+                         host, errbuf && errbuf[0] ? errbuf : "no response", change);
+            else
+                snprintf(msg, sizeof(msg), "proxy %s is answering again — back in rotation", host);
+            restream_log_event(change > 0 ? "error" : "info", "proxyHealth", msg);
+        }
         if (rc == 0 || cancelled || origin_final) break;
     }
     if (rc != 0 && count > 1 && attempted > 0 && errbuf && errbuf_len) {

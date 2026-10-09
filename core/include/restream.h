@@ -82,6 +82,8 @@ void restream_log_set_stream(const char *stream_id);
 bool restream_debug_enabled(void);
 void restream_debug_log(const char *event, const char *url, long status, long long bytes,
                         const char *message);
+// An ordinary (not debug-only) log entry, filed the same way.
+void restream_log_event(const char *level, const char *event, const char *message);
 
 // Bounds on the files the server holds open while viewers download them
 // (segments, playlists, panel assets). At most `max_open` are open at once and
