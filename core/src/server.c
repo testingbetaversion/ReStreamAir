@@ -4970,16 +4970,33 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
     // (Disney+ has served a 720p variant whose playlist named the KID of a
     // different key) — trusting the playlist kept a stale cached key that
     // decrypted the video into garbage.
+    // The KID the media is encrypted under when the playlist named another one;
+    // the licence request is then built for it (see below).
+#define RS_CDM_MAX_KIDS_FOR_PSSH 64
+    char *init_only_kid = NULL;
     if (text) {
         size_t init_len = 0;
         uint8_t *init = stream_start_fetch_init(st, drm_manifest_url, text, &init_len);
+        if (!init)
+            log_record(server, sid, "warn", "cdm", drm_manifest_url, 0, -1,
+                       "could not fetch the init segment — trusting the playlist's KIDs");
         if (init) {
             size_t before = ch.pssh_all_count, kids_before = ch.kids_count;
+            rs_drm_challenge from_init;
+            memset(&from_init, 0, sizeof(from_init));
+            rs_cdm_challenge_add_from_init(&from_init, init, init_len);
+            for (size_t k = 0; k < from_init.kids_count && kids_before > 0 && !init_only_kid; k++) {
+                bool named = false;
+                for (size_t j = 0; j < kids_before; j++)
+                    if (stream_start_kid_equal(from_init.kids[k], ch.kids[j])) { named = true; break; }
+                if (!named) init_only_kid = rs_strdup(from_init.kids[k]);
+            }
+            rs_drm_challenge_free(&from_init);
             rs_cdm_challenge_add_from_init(&ch, init, init_len);
-            if (ch.kids_count > kids_before && kids_before > 0)
+            if (init_only_kid)
                 log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
-                            "the init segment is encrypted under KID %s, which the playlist did not name",
-                            ch.kids[ch.kids_count - 1]);
+                            "the init segment is encrypted under KID %s, which the playlist did not name — "
+                            "requesting the licence for it", init_only_kid);
             if (ch.pssh_all_count > before)
                 log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
                             "no PSSH in the manifest — found %lu box(es) in the init segment",
@@ -5024,6 +5041,7 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
         rs_drm_challenge_free(&ch);
         free(text);
         free(variant_url);
+        free(init_only_kid);
         return RS_KEYS_NOT_NEEDED;
     } else {
         char *kid_list = ch.kids_count ? join_list(ch.kids, ch.kids_count, ", ") : NULL;
@@ -5054,6 +5072,7 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
         rs_drm_challenge_free(&ch);
         free(text);
         free(variant_url);
+        free(init_only_kid);
         return RS_KEYS_OK;
     }
     if (ch.pssh_widevine) *systems |= RS_DRM_WIDEVINE;
@@ -5072,6 +5091,24 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
     else if (ch.pssh_all_count)
         selected_pssh = ch.pssh_all[0];
     char *license_pssh = selected_pssh ? rs_strdup(selected_pssh) : NULL;
+    // The advertised box names the playlist's KID, and a licence server answers
+    // only for the KIDs it is asked about — Disney+ returned just the playlist
+    // KID's key while the 720p video used another. Ask for the media's own KID
+    // first, followed by every other one discovered.
+    if (init_only_kid && strcasecmp(cdm_type, "playready") != 0) {
+        char *ordered[RS_CDM_MAX_KIDS_FOR_PSSH];
+        size_t n = 0;
+        ordered[n++] = init_only_kid;
+        for (size_t i = 0; i < ch.kids_count && n < RS_CDM_MAX_KIDS_FOR_PSSH; i++)
+            if (!stream_start_kid_equal(ch.kids[i], init_only_kid)) ordered[n++] = ch.kids[i];
+        char *built = rs_cdm_pssh_from_kids(ordered, n);
+        if (built) {
+            free(license_pssh);
+            license_pssh = rs_strdup(built);
+            rs_free(built);
+            selected_pssh = NULL;
+        }
+    }
     bool selected_widevine = selected_pssh && selected_pssh == ch.pssh_widevine;
     bool selected_playready = selected_pssh && selected_pssh == ch.pssh_playready;
     if (st->want_pssh_hook && license_pssh) {
@@ -5188,6 +5225,7 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
     rs_drm_challenge_free(&ch);
     free(text);
     free(variant_url);
+    free(init_only_kid);
     return result;
 }
 
