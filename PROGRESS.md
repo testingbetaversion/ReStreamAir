@@ -59,3 +59,7 @@
   the wrongKeys KID on the stream (`requiredKid`); the next key step adds it,
   so a stale stored key no longer counts as covering, and licenses that KID.
   Fixes the Playlist Rádio Disney loop (video a2ba9a84, key c184d3cd).
+- **Provider-wide parallel downloads** (`e468adb`): `importParallelDownloads`
+  (0 = keep 6, else 1–8) for imported streams, plus an Apply to all streams
+  button (bulk `fields.parallelDownloads`). Sized for Proxy-Seller IPs, which
+  allow 10 connections each: ~3 per Disney stream at 2 downloads.
