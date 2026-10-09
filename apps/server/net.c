@@ -1087,6 +1087,11 @@ static size_t proxy_acquire(const char *list, size_t count, bool rotate,
                 break;
             }
         }
+        // Advance at hand-out, not on completion: the download pool asks for
+        // many proxies before any request finishes, and advancing only on
+        // success sent every one of those concurrent requests to the same
+        // entry.
+        if (rotate && chosen < count) pool->next_rotate = (chosen + 1) % count;
     }
     // Healthy entries may all be busy. Sharing one is still better than using
     // a proxy that is inside its failure cooldown.
@@ -1109,20 +1114,24 @@ static size_t proxy_acquire(const char *list, size_t count, bool rotate,
     return chosen;
 }
 
+typedef enum { PROXY_OK, PROXY_FAILED, PROXY_NO_VERDICT } proxy_outcome;
+
 static void proxy_release(const char *list, size_t count, size_t index,
-                          bool rotate, bool usable) {
+                          proxy_outcome outcome) {
     pthread_mutex_lock(&g_proxy_pool_mu);
     proxy_pool *pool = proxy_pool_locked(list, count);
     if (pool && index < count) {
         proxy_health *h = &pool->proxy[index];
         if (h->in_flight) h->in_flight--;
-        h->known = true;
-        if (usable) {
+        if (outcome == PROXY_NO_VERDICT) {
+            // Cancelled requests say nothing about the proxy.
+        } else if (outcome == PROXY_OK) {
+            h->known = true;
             h->healthy = true;
             h->failures = 0;
             h->retry_at = 0;
-            if (rotate && count) pool->next_rotate = (index + 1) % count;
         } else {
+            h->known = true;
             h->healthy = false;
             if (h->failures < 6) h->failures++;
             unsigned delay = 15u << (h->failures ? h->failures - 1 : 0);
@@ -1171,16 +1180,26 @@ static int fetch_with_proxies(const char *url, const char *proxy, const char *he
         attempted++;
         long attempt_status = 0;
         long *status_out = status ? status : &attempt_status;
+        *status_out = 0;  // never judge this proxy by the previous attempt's code
         rc = fetch_through_one_proxy(url, items[index], headers, range, downloader, dl_params, force_ipv6,
                                      out, out_len, status_out, content_type, content_range,
                                      effective_url, errbuf, errbuf_len,
                                      timeout_ms, should_cancel, cancel_ctx);
         // Health is provider-specific: a proxy that answers but cannot fetch
-        // this provider's URL is not useful to this pool, so any failed fetch
-        // moves it behind the working entries for a cooldown.
-        bool usable = rc == 0;
-        proxy_release(proxy, count, index, rotate_proxies != 0, usable);
-        if (rc == 0) break;
+        // this provider's URL (geo 403, 407, transport error, 5xx) is not
+        // useful to this pool and goes behind the working entries for a
+        // cooldown. Two outcomes are not the proxy's fault and used to
+        // quarantine healthy entries under load: a request the caller
+        // cancelled (live-edge drop, stream stop), and an origin answer such
+        // as 404/410/416 that every other proxy would repeat.
+        long got = *status_out;
+        bool cancelled = rc != 0 && should_cancel && should_cancel(cancel_ctx, 0);
+        bool origin_final = rc != 0 && got >= 400 && got < 500 &&
+                            got != 403 && got != 407 && got != 408 && got != 429;
+        proxy_outcome outcome = rc == 0 || origin_final ? PROXY_OK
+                              : cancelled ? PROXY_NO_VERDICT : PROXY_FAILED;
+        proxy_release(proxy, count, index, outcome);
+        if (rc == 0 || cancelled || origin_final) break;
     }
     if (rc != 0 && count > 1 && attempted > 0 && errbuf && errbuf_len) {
         size_t used = strnlen(errbuf, errbuf_len);
