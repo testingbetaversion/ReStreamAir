@@ -894,6 +894,12 @@ void restream_debug_log(const char *event, const char *url, long status, long lo
     log_record_debug(s, t_log_stream[0] ? t_log_stream : "__panel__", event, url, status, bytes, message);
 }
 
+void restream_log_event(const char *level, const char *event, const char *message) {
+    restream_server_t *s = g_debug_server;
+    if (!s) return;
+    log_record(s, t_log_stream[0] ? t_log_stream : "__panel__", level, event, NULL, 0, -1, message);
+}
+
 // The live engine's log sink. Called from its worker threads, which is why
 // log_record takes a lock.
 static void live_log_sink(void *ctx, const char *stream_id, const char *level,
