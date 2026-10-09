@@ -4899,7 +4899,20 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
     char *variant_url = NULL;
     if (manifest_is_hls && text && (ch.pssh_all_count == 0 || ch.kids_count == 0)
         && strstr(text, "#EXT-X-STREAM-INF:")) {
-        variant_url = hls_first_variant_url(manifest_url, text);
+        // Inspect the variant the engine will actually play, not the first
+        // one listed: some services (Disney+) key each quality separately, so
+        // the first (lower) variant's KID says nothing about the 720p one, the
+        // cached-key check passed on the wrong KID, and the engine decrypted
+        // 720p with a key that does not belong to it (a gray picture).
+        rs_hls_pick pick;
+        char *audio_url = NULL;
+        if (rs_hls_pick_renditions(text, manifest_url, st->source_policy.video_filter,
+                                   st->source_policy.audio_filter, &pick) == 0) {
+            variant_url = pick.video_uri; pick.video_uri = NULL;
+            audio_url = pick.audio_uri; pick.audio_uri = NULL;
+            rs_hls_pick_dispose(&pick);
+        }
+        if (!variant_url) variant_url = hls_first_variant_url(manifest_url, text);
         size_t variant_len = 0;
         char *variant = variant_url ? stream_start_fetch(st, variant_url, &variant_len) : NULL;
         if (variant) {
@@ -4910,15 +4923,25 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
             rs_cdm_challenge_merge(&media, &ch);
             rs_drm_challenge_free(&ch);
             ch = media;
+            // A separate audio playlist can carry its own KID.
+            size_t audio_len = 0;
+            char *audio = audio_url ? stream_start_fetch(st, audio_url, &audio_len) : NULL;
+            if (audio) {
+                rs_drm_challenge a = rs_cdm_challenge_from_hls(audio);
+                rs_cdm_challenge_merge(&ch, &a);
+                rs_drm_challenge_free(&a);
+                free(audio);
+            }
             free(text);
             text = variant;
             text_len = variant_len;
             log_record(server, sid, "info", "cdm", variant_url, 0, -1,
-                       "HLS master lacks complete DRM data — inspecting its first media playlist");
+                       "HLS master lacks complete DRM data — inspecting the media playlist the engine will play");
         } else {
             free(variant_url);
             variant_url = NULL;
         }
+        free(audio_url);
     }
     const char *drm_manifest_url = variant_url ? variant_url : manifest_url;
 
