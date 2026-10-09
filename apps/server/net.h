@@ -47,6 +47,11 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
                  char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
                  long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx, const rs_source_policy *policy);
 
+// Marks this thread's following rs_fetch_url calls as manifest/playlist reads,
+// which may run while segment downloads hold the provider's whole budget.
+// Returns the previous setting so callers can restore it.
+int rs_fetch_set_manifest_priority(int on);
+
 // POSTs a JSON document to an HTTP(S) endpoint. Used by the provider error
 // webhook worker; deliberately separate from rs_fetch_url so a configured
 // downloader or stream proxy can never alter where operational alerts go.

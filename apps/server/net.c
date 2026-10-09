@@ -20,10 +20,18 @@
 #include <direct.h>
 #define POLICY_MKDIR(p) _mkdir(p)
 static __declspec(thread) const rs_source_policy *active_policy;
+static __declspec(thread) int manifest_priority;
 #else
 #define POLICY_MKDIR(p) mkdir(p, 0700)
 static _Thread_local const rs_source_policy *active_policy;
+static _Thread_local int manifest_priority;
 #endif
+
+int rs_fetch_set_manifest_priority(int on) {
+    int previous = manifest_priority;
+    manifest_priority = on;
+    return previous;
+}
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1241,6 +1249,13 @@ static provider_budget *budget_enter(const rs_source_policy *policy,
     if (!policy || !policy->provider_id[0]) return NULL;
     int limit = policy->use_cookies ? 1 : policy->max_downloads;
     if (limit < 1) limit = 1;
+    // Playlist reads get headroom above the download budget. Waiters are not
+    // queued in order, so with more segment workers than slots (16 streams x
+    // 6 connections against a budget of 50 on production) a manifest poll lost
+    // the race for 20-90 s, its segments aged out of the window and the stream
+    // stalled into a restart. A manifest is a few KB; letting a handful of them
+    // past a full budget costs nothing. The cookie jar still serializes.
+    if (manifest_priority && !policy->use_cookies) limit += limit / 4 > 2 ? limit / 4 : 2;
     double deadline = net_now() + policy->timeout_seconds;
     pthread_mutex_lock(&budget_mu);
     provider_budget *b = budgets;

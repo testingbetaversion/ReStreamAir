@@ -816,6 +816,20 @@ static char *url_query(const char *url) {
     return out;
 }
 
+// Every MPD / playlist read goes through here so it runs with manifest
+// priority against the provider's download budget (see net.h).
+static int fetch_playlist(const char *url, const char *proxy, const char *headers,
+                          int force_ipv6, int rotate_proxies, char **out, size_t *len,
+                          char **effective_url, char *errbuf, size_t errbuf_len,
+                          const rs_source_policy *policy) {
+    int previous = rs_fetch_set_manifest_priority(1);
+    int rc = rs_fetch_url(url, proxy, headers, NULL, NULL, NULL, force_ipv6, rotate_proxies,
+                          out, len, NULL, NULL, NULL, effective_url, errbuf, errbuf_len,
+                          30000, NULL, NULL, policy);
+    rs_fetch_set_manifest_priority(previous);
+    return rc;
+}
+
 // An HLS source, described the way the engine expects a DASH one: the master
 // picks one video variant and its audio track, each media playlist becomes a
 // plan, and a segment's media sequence number is its "time" (timescale 1) —
@@ -884,9 +898,8 @@ static char *hls_describe(const char *text, const char *base, const char *proxy,
         const char *media_text = NULL;
         if (!is_master && r == 0) {
             media_text = text;
-        } else if (rs_fetch_url(uris[r], proxy, headers, NULL, NULL, NULL, force_ipv6, rotate_proxies,
-                                &body, &blen, NULL, NULL, NULL, &eff, errbuf, errbuf_len, 30000,
-                                NULL, NULL, policy) != 0) {
+        } else if (fetch_playlist(uris[r], proxy, headers, force_ipv6, rotate_proxies,
+                                  &body, &blen, &eff, errbuf, errbuf_len, policy) != 0) {
             failed = true;
             break;
         } else {
@@ -1036,10 +1049,8 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         entry->private_response = policy != NULL;
         pthread_mutex_unlock(&g_dash_mu);
 
-        int rc = rs_fetch_url(url, proxy, headers, NULL, NULL, NULL,
-                              force_ipv6, rotate_proxies, &xml, &len,
-                              NULL, NULL, NULL, &effurl, errbuf, errbuf_len,
-                              30000, NULL, NULL, policy);
+        int rc = fetch_playlist(url, proxy, headers, force_ipv6, rotate_proxies,
+                                &xml, &len, &effurl, errbuf, errbuf_len, policy);
 
         pthread_mutex_lock(&g_dash_mu);
         entry->fetching = false;
