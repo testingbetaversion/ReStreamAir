@@ -43,3 +43,8 @@
   a trailing space reached libcurl untrimmed ("Could not resolve proxy name"),
   stopping every Disney stream on vpsrestream1. The fetch path trims it, and
   provider/stream proxy fields are stored trimmed, one entry per line.
+- **Init-segment KID decides the keys** (`24cfcee`). Two Disney channels
+  (Xangai, Falando de Quem) had playlists naming a different KID from the
+  init's tenc, so cached keys were reused and the video decoded as garbage
+  downstream. The key step now always reads the init and runs the CDM when its
+  KID is not covered.
