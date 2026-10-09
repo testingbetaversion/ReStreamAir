@@ -24,3 +24,6 @@
 - **Exact quality rules** (`5890b9a`). `defaultVideo` accepts `height=N`
   (exactly N) and `height>=N` alongside `height<=N`, for DASH and HLS. The
   engine's `renditions` log entry names the chosen video size.
+- **Proxy health is logged** (`be9ebe6`): `proxyHealth` entries when a proxy is
+  benched (error + cooldown) or comes back. The restarting `.ts` 503 says
+  "fetching a fresh source" once the restart timer has passed.

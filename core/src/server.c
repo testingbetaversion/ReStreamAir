@@ -8848,10 +8848,12 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
             free(tail);
             if (restart_at > 0) {
                 // Temporary: a player that retries gets the stream back.
+                // Past the timer means the start is underway (a provider
+                // script can take a while to fetch a fresh manifest).
                 long wait = (long)(restart_at - now_ms() / 1000.0) + 1;
-                if (wait < 1) wait = 1;
                 char msg[96];
-                snprintf(msg, sizeof(msg), "Stream is restarting — retry in %lds.", wait);
+                if (wait <= 1) snprintf(msg, sizeof(msg), "Stream is restarting — fetching a fresh source, retry shortly.");
+                else snprintf(msg, sizeof(msg), "Stream is restarting — retry in %lds.", wait);
                 reply_error(c, 503, msg);
             } else {
                 reply_error(c, 404, "Stream is stopped — start it first.");
