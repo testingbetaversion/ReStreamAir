@@ -738,6 +738,11 @@ textarea {
   color: var(--badge-running-text);
 }
 
+.badge.restarting {
+  background: color-mix(in srgb, #d97706 16%, transparent);
+  color: #d97706;
+}
+
 .badge.running::before {
   content: "";
   width: 6px;

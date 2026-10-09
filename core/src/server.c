@@ -1514,6 +1514,15 @@ static void inject_stream_metrics(restream_server_t *s, rs_json *view) {
             rs_json *st = (rs_json *)rs_json_arr_at(streams, j);
             const char *id = rs_json_obj_str(st, "id", "");
             if (!id[0]) continue;
+            // An automatic restart (stall, track change, autorestart period)
+            // leaves the stream stopped for restartDelaySeconds. Say so, so a
+            // stream about to come back does not read as one that was stopped.
+            double restart_at = s->provider_timers
+                ? rs_json_obj_num(rs_json_obj_get(s->provider_timers, id), "restartAt", 0) : 0;
+            if (restart_at > 0 && strcmp(rs_json_obj_str(st, "status", "stopped"), "running") != 0) {
+                rs_json_obj_set_str(st, "status", "restarting");
+                rs_json_obj_set_int(st, "restartAt", (long long)(restart_at * 1000));
+            }
             rs_json_obj_set_int(st, "activeClients", rs_metrics_active_clients(s->metrics, id));
             rs_json *out = rs_json_new_obj();
             rs_json_obj_set_int(out, "bytesPerSecond",
@@ -8828,8 +8837,19 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
         if (!stream) { free(tail); reply_error(c, 404, "Stream not found."); return true; }
         const char *sid = rs_json_obj_str(stream, "id", tail);
         if (strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") != 0) {
+            double restart_at = server->provider_timers
+                ? rs_json_obj_num(rs_json_obj_get(server->provider_timers, sid), "restartAt", 0) : 0;
             free(tail);
-            reply_error(c, 404, "Stream is stopped — start it first.");
+            if (restart_at > 0) {
+                // Temporary: a player that retries gets the stream back.
+                long wait = (long)(restart_at - now_ms() / 1000.0) + 1;
+                if (wait < 1) wait = 1;
+                char msg[96];
+                snprintf(msg, sizeof(msg), "Stream is restarting — retry in %lds.", wait);
+                reply_error(c, 503, msg);
+            } else {
+                reply_error(c, 404, "Stream is stopped — start it first.");
+            }
             return true;
         }
         if (stream_needs_pipeline(stream)) {
