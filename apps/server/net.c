@@ -23,12 +23,14 @@ static __declspec(thread) const rs_source_policy *active_policy;
 static __declspec(thread) int manifest_priority;
 static __declspec(thread) const void *t_proxy_pool;   // pool of the last proxy this thread used
 static __declspec(thread) size_t t_proxy_index;
+static __declspec(thread) int t_proxy_pool_fetch;  // inside a rotating proxy-list fetch
 #else
 #define POLICY_MKDIR(p) mkdir(p, 0700)
 static _Thread_local const rs_source_policy *active_policy;
 static _Thread_local int manifest_priority;
 static _Thread_local const void *t_proxy_pool;
 static _Thread_local size_t t_proxy_index;
+static _Thread_local int t_proxy_pool_fetch;
 #endif
 
 int rs_fetch_set_manifest_priority(int on) {
@@ -558,8 +560,10 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
         // 10). A thread's handle otherwise keeps up to 5 idle tunnels — one per
         // CDN host and proxy it touched — so a handful of streams held every
         // allowed connection and the provider script got 429 PROXY_MAX_CONNS.
-        // Keep only the connection in use.
-        curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, 1L);
+        // Keep only the connection in use. Only for a rotating proxy list —
+        // the setup that hits those limits; a provider with one proxy (an
+        // unlimited tunnel) keeps libcurl's normal connection reuse.
+        if (t_proxy_pool_fetch) curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, 1L);
     }
     if (header_list) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
     if (range && range[0]) {
@@ -1251,10 +1255,12 @@ static int fetch_with_proxies(const char *url, const char *proxy, const char *he
         long attempt_status = 0;
         long *status_out = status ? status : &attempt_status;
         *status_out = 0;  // never judge this proxy by the previous attempt's code
+        t_proxy_pool_fetch = rotate_proxies != 0;
         rc = fetch_through_one_proxy(url, items[index], headers, range, downloader, dl_params, force_ipv6,
                                      out, out_len, status_out, content_type, content_range,
                                      effective_url, errbuf, errbuf_len,
                                      timeout_ms, should_cancel, cancel_ctx);
+        t_proxy_pool_fetch = 0;
         // Health is provider-specific: a proxy that answers but cannot fetch
         // this provider's URL (geo 403, 407, transport error, 5xx) is not
         // useful to this pool and goes behind the working entries for a
