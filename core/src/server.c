@@ -42,6 +42,7 @@
 #define RS_MKDIR(path) _mkdir(path)
 #else
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #define RS_MKDIR(path) mkdir((path), 0755)
 #endif
@@ -180,6 +181,10 @@ struct restream_server {
     size_t log_head;        // next write slot
     size_t log_count;       // entries in use (<= RS_LOG_CAP)
     rs_log_clear_entry *log_clears; // per-sid "cleared before" cutoffs; guarded by log_mu
+    // The same entries, appended to logs/YYYY-MM-DD.jsonl (owner-only) so they
+    // survive restarts and can be read on the box itself. Guarded by log_mu.
+    FILE *log_file;
+    int log_file_day;               // yyyymmdd of log_file, 0 = none open
     rs_log_entry *debug_ring;       // RS_DEBUG_LOG_CAP entries; guarded by log_mu
     size_t debug_head;
     size_t debug_count;
@@ -704,6 +709,101 @@ static void log_record_debug(restream_server_t *s, const char *sid, const char *
 // Records one log entry (ring buffer overwrites the oldest). url/message may be
 // NULL; status 0 and bytes -1 mean "absent". Never blocks on I/O, and is safe to
 // call from the live engine's worker threads.
+#define RS_LOG_DIR "logs"
+#define RS_LOG_KEEP_DAYS 3
+
+static rs_json *log_entry_json(const rs_log_entry *e);
+
+// Deletes this server's own day files older than RS_LOG_KEEP_DAYS. Only names
+// of the exact form YYYY-MM-DD.jsonl are considered.
+static bool log_file_name_day(const char *name, int *day) {
+    int y, m, dd;
+    char tail[16];
+    if (strlen(name) != 16 || sscanf(name, "%4d-%2d-%2d%15s", &y, &m, &dd, tail) != 4 ||
+        strcmp(tail, ".jsonl") != 0) return false;
+    *day = y * 10000 + m * 100 + dd;
+    return true;
+}
+
+static void log_files_prune(int today) {
+    time_t now = time(NULL);
+    struct tm cut;
+    time_t cutoff = now - (time_t)RS_LOG_KEEP_DAYS * 86400;
+#ifdef _WIN32
+    gmtime_s(&cut, &cutoff);
+#else
+    gmtime_r(&cutoff, &cut);
+#endif
+    int oldest_kept = (cut.tm_year + 1900) * 10000 + (cut.tm_mon + 1) * 100 + cut.tm_mday;
+#ifdef _WIN32
+    struct _finddata_t entry;
+    intptr_t handle = _findfirst(RS_LOG_DIR "\\*.jsonl", &entry);
+    if (handle == -1) return;
+    do {
+        const char *name = entry.name;
+#else
+    DIR *d = opendir(RS_LOG_DIR);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *name = ent->d_name;
+#endif
+        int day = 0;
+        if (!log_file_name_day(name, &day) || day >= oldest_kept || day >= today) continue;
+        char path[64];
+        snprintf(path, sizeof(path), RS_LOG_DIR "/%s", name);
+        remove(path);
+#ifdef _WIN32
+    } while (_findnext(handle, &entry) == 0);
+    _findclose(handle);
+#else
+    }
+    closedir(d);
+#endif
+}
+
+// Appends one entry to today's file, rolling to a new file at UTC midnight.
+// Caller holds log_mu. Failures are silent: the in-memory log still has it.
+static void log_file_append(restream_server_t *s, const rs_log_entry *e) {
+    time_t now = time(NULL);
+    struct tm utc;
+#ifdef _WIN32
+    gmtime_s(&utc, &now);
+#else
+    gmtime_r(&now, &utc);
+#endif
+    int today = (utc.tm_year + 1900) * 10000 + (utc.tm_mon + 1) * 100 + utc.tm_mday;
+    if (!s->log_file || s->log_file_day != today) {
+        if (s->log_file) fclose(s->log_file);
+        s->log_file = NULL;
+        s->log_file_day = today;
+#ifdef _WIN32
+        _mkdir(RS_LOG_DIR);
+#else
+        mkdir(RS_LOG_DIR, 0700);
+#endif
+        char path[64];
+        snprintf(path, sizeof(path), RS_LOG_DIR "/%04d-%02d-%02d.jsonl",
+                 utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday);
+#ifdef _WIN32
+        s->log_file = fopen(path, "ab");
+#else
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (fd >= 0) {
+            fchmod(fd, 0600);  // an existing file written with a wider mode
+            s->log_file = fdopen(fd, "a");
+            if (!s->log_file) close(fd);
+        }
+#endif
+        log_files_prune(today);
+    }
+    if (!s->log_file) return;
+    rs_json *o = log_entry_json(e);
+    char *line = o ? rs_json_serialize(o, false) : NULL;
+    rs_json_free(o);
+    if (line) { fputs(line, s->log_file); fputc('\n', s->log_file); rs_free(line); }
+}
+
 static void log_record(restream_server_t *s, const char *sid, const char *level,
                        const char *event, const char *url, long status, long long bytes,
                        const char *message) {
@@ -736,6 +836,7 @@ static void log_record(restream_server_t *s, const char *sid, const char *level,
     // Overwriting the oldest live entry — free its strings first.
     if (s->log_count == RS_LOG_CAP) log_entry_dispose(e);
     log_entry_fill(e, sid, level, event, url, status, bytes, message);
+    log_file_append(s, e);
     s->log_head = (s->log_head + 1) % RS_LOG_CAP;
     if (s->log_count < RS_LOG_CAP) s->log_count++;
     log_unlock(s);
@@ -1850,6 +1951,10 @@ static void maintenance_tick(void *arg) {
     // instantly instead of waiting for an in-flight segment download.
     rs_live_reap(s->live);
     file_gate_report(s);
+    // The day file is buffered; push it out once a second so it is current.
+    log_lock(s);
+    if (s->log_file) fflush(s->log_file);
+    log_unlock(s);
 }
 
 // The Logs view. Everything the server does lands in the ring buffer — panel
@@ -9241,6 +9346,7 @@ void restream_server_destroy(restream_server_t* server) {
         if (server->logo_cache) rs_logo_cache_destroy(server->logo_cache);
         if (g_debug_server == server) g_debug_server = NULL;
         log_clear(server, "");  // frees ring-buffer strings
+        if (server->log_file) { fclose(server->log_file); server->log_file = NULL; }
         free(server->debug_ring);
         pthread_mutex_destroy(&server->pending_mu);
         pthread_cond_destroy(&server->pending_cv);
