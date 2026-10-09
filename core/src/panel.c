@@ -1036,6 +1036,13 @@ void rs_panel_set_stream_user_stopped(rs_state *st, const char *stream_id, bool 
     else rs_json_obj_remove(stream, "stoppedByUser");
 }
 
+void rs_panel_set_stream_required_kid(rs_state *st, const char *stream_id, const char *kid) {
+    rs_json *stream = find_stream(st, stream_id, NULL);
+    if (!stream) return;
+    if (kid && kid[0]) rs_json_obj_set_str(stream, "requiredKid", kid);
+    else rs_json_obj_remove(stream, "requiredKid");
+}
+
 void rs_panel_set_stream_error(rs_state *st, const char *stream_id, const char *message) {
     rs_json *stream = find_stream(st, stream_id, NULL);
     if (!stream) return;
