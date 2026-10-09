@@ -2109,6 +2109,24 @@ static int fill_common_script_args(const rs_json *provider, const rs_json *strea
     char *scoped = effective_proxy(provider, stream,
                                    !stream || rs_json_obj_bool(stream, "proxyScript", true));
     char *script_proxy = primary_proxy(scoped ? scoped : "");
+    // Same upgrade as the server's own fetches (see proxy_remote_dns in
+    // net.c): a script resolving locally hands a v4-only SOCKS proxy an IPv6
+    // address it cannot reach.
+    bool plain_socks = script_proxy && strlen(script_proxy) > 9 && strncmp(script_proxy + 6, "://", 3) == 0 &&
+                       (script_proxy[5] == '5' || script_proxy[5] == '4');
+    for (int i = 0; plain_socks && i < 5; i++)
+        if (tolower((unsigned char)script_proxy[i]) != "socks"[i]) plain_socks = false;
+    if (plain_socks) {
+        size_t len = strlen(script_proxy);
+        char *up = (char *)malloc(len + 2);
+        if (up) {
+            memcpy(up, script_proxy, 6);
+            up[6] = script_proxy[5] == '5' ? 'h' : 'a';
+            memcpy(up + 7, script_proxy + 6, len - 6 + 1);
+            free(script_proxy);
+            script_proxy = up;
+        }
+    }
     if (script_proxy && script_proxy[0] && n < cap)
         args[n++] = rs_script_arg("proxy", script_proxy, false);
     free(script_proxy);

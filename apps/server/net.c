@@ -940,6 +940,22 @@ static int fetch_external(const char *tool, const char *dl_params,
     return 0;
 }
 
+// socks5:// and socks4:// make the CLIENT resolve the target and hand the
+// proxy an address. On a dual-stack host that address is often IPv6, which a
+// v4-only SOCKS proxy refuses ("cannot complete SOCKS5 connection ... (4)",
+// host unreachable) — and it also sends the proxy this server's geo-DNS
+// answer instead of its own. Letting the proxy resolve (socks5h/socks4a) is
+// what a remote proxy is for, so the plain forms are upgraded. Writes into
+// `buf` and returns it when rewritten, else returns `proxy` unchanged.
+static const char *proxy_remote_dns(const char *proxy, char *buf, size_t cap) {
+    if (!proxy) return proxy;
+    const char *rest = NULL, *scheme = NULL;
+    if (strncasecmp(proxy, "socks5://", 9) == 0) { rest = proxy + 9; scheme = "socks5h://"; }
+    else if (strncasecmp(proxy, "socks4://", 9) == 0) { rest = proxy + 9; scheme = "socks4a://"; }
+    if (!rest || (size_t)snprintf(buf, cap, "%s%s", scheme, rest) >= cap) return proxy;
+    return buf;
+}
+
 // One fetch through one proxy. The public wrapper below expands a newline-
 // separated proxy list and calls this until one succeeds.
 static int fetch_through_one_proxy(const char *url, const char *proxy,
@@ -958,6 +974,8 @@ static int fetch_through_one_proxy(const char *url, const char *proxy,
         snprintf(errbuf, errbuf_len, "Refusing to fetch a non-HTTP(S) URL.");
         return -1;
     }
+    char proxy_buf[1100];
+    proxy = proxy_remote_dns(proxy, proxy_buf, sizeof(proxy_buf));
     // NULL / "" / "internal" / "libcurl" → in-process libcurl. Otherwise run the
     // chosen external tool, falling back to libcurl if it isn't installed so a
     // missing binary never dead-ends a stream.
