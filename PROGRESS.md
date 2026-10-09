@@ -39,3 +39,7 @@
   SOCKS proxy refused (reply 4), so every Disney script call failed. Server
   fetches and the script's `proxy=` argument now use `socks5h://` /
   `socks4a://`.
+- **Proxy entries are trimmed** (`02b7bff`). A single provider proxy saved with
+  a trailing space reached libcurl untrimmed ("Could not resolve proxy name"),
+  stopping every Disney stream on vpsrestream1. The fetch path trims it, and
+  provider/stream proxy fields are stored trimmed, one entry per line.
