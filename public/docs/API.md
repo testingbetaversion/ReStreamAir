@@ -391,6 +391,7 @@ backend behavior; pipeline-specific controls identify their scope in the schema.
 | `autoStartEvents` | Boolean. Keeps imported events running inside their `scriptStart`–`scriptEnd` window: an event that isn't running is started (one per second, never beyond `maxStreamsConcurrency`) — whether it never started or something else stopped it (a revoked provider session, a failing source, a failed restart). Only an event a person stopped (`POST /api/streams/<id>/stop` or bulk stop, recorded as `stoppedByUser` until a manual start) is left alone. Failed attempts back off from `restartDelaySeconds` (at least 30 s), doubling to at most every 10 minutes; the reason is kept in the stream's `lastError`, as is the reason the engine stopped a stream. |
 | `alwaysRefreshManifest` | Boolean, default off. Off: a Session manifest stream's start first tries its saved manifest URL and runs the `manifest` action only when that no longer answers. On: `manifest` runs on every start. |
 | `singleVideoQuality` | Boolean. HLS pass-through and Buffered HLS offer exactly one video variant: the highest-bandwidth one `defaultVideo` allows (with `height<=720`, 720p only), or the best overall when `defaultVideo` is empty. Audio tracks stay; I-frame variants are dropped. |
+| `importParallelDownloads` | `0` (keep the default of 6) or 1–8: `parallelDownloads` given to channels and events this provider's imports create from now on. Each is one proxy connection, plus one for manifest polling. |
 | `importInputMode` | `""` (keep the default) or one input mode (`internal`, `engine`, `hlsBuffered`, `ffmpegResident`, `ffmpegTsHls`, `ffmpegMultiTsHls`, `ffmpegFmp4Hls`). Applied to channels and events this provider's imports create from now on; existing streams keep theirs. |
 | `legacyDashParser` | Internal DASH XML recovery mode; default parsing is strict. |
 | `useDashDelay` | Honors MPD `suggestedPresentationDelay`, bounded to 120s, taking the larger of the source delay and stream/provider buffer. |
@@ -435,7 +436,7 @@ provider.
 | `DELETE /api/streams/<id>` | Stop and delete; `200` state. |
 | `POST /api/streams/<id>/start` | No body or `{}`; `200` state. Script-based starts wait for manifest/key work before replying. |
 | `POST /api/streams/<id>/stop` | No body or `{}`; `200` state. Worker shutdown completes asynchronously. |
-| `POST /api/streams/bulk` | `{"action":"stop"\|"delete","ids":["<id>",...]}`, or `{"action":"set","ids":[…],"fields":{"inputMode":"hlsBuffered"}}` to change only the input mode (running streams switch at once); `200` state after one save. Unknown ids are skipped. Starts are per stream only. |
+| `POST /api/streams/bulk` | `{"action":"stop"\|"delete","ids":["<id>",...]}`, or `{"action":"set","ids":[…],"fields":{"inputMode":"hlsBuffered"}}` to change only the input mode (running streams switch at once), or `"fields":{"parallelDownloads":2}` (1–8); `200` state after one save. Unknown ids are skipped. Starts are per stream only. |
 | `POST /api/probe` | Source probe request below; `200` probe result. |
 
 Create requires nonblank `name` and HTTP(S) `url`. For `inputMode: "pipe"`,

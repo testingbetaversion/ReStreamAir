@@ -935,6 +935,9 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
         // set (Apply to all streams changes those deliberately).
         const char *import_mode = rs_provider_option_str(p, "importInputMode");
         if (created && import_mode[0]) rs_json_obj_set_str(stream, "inputMode", import_mode);
+        long long import_parallel = rs_provider_option_int(p, "importParallelDownloads");
+        if (created && import_parallel >= 1 && import_parallel <= 8)
+            rs_json_obj_set_int(stream, "parallelDownloads", import_parallel);
         // A logo the operator set by hand (or a previous import resolved) wins
         // over the freshly looked-up one; only an empty slot is filled.
         const char *existing_logo = rs_json_obj_str(stream, "logo", "");
@@ -1359,6 +1362,15 @@ int rs_panel_set_stream_input_mode(rs_state *st, const char *stream_id, const ch
     rs_json *stream = find_stream(st, stream_id, NULL);
     if (!stream) { *err = "Stream not found."; return -404; }
     rs_json_obj_set_str(stream, "inputMode", mode);
+    return 0;
+}
+
+int rs_panel_set_stream_parallel_downloads(rs_state *st, const char *stream_id, long long n,
+                                           const char **err) {
+    if (n < 1 || n > 8) { *err = "parallelDownloads must be 1–8."; return -400; }
+    rs_json *stream = find_stream(st, stream_id, NULL);
+    if (!stream) { *err = "Stream not found."; return -404; }
+    rs_json_obj_set_int(stream, "parallelDownloads", n);
     return 0;
 }
 
