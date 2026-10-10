@@ -78,3 +78,6 @@
   action that fails with a proxy refusal (429 PROXY_MAX_CONNS, tunnel/SOCKS/auth)
   is rerun through the next proxy line; the script used to get only the first
   line, which was full. Tested on moonmuaaz with a throwaway server.
+- **Muxed-TS viewer buffer 8 → 24 MB** (`2ff2907`): ~27 s at Disney 720p. The
+  downstream restreamer kept slipping out of the 8 MB (~9 s) window and being
+  jumped to the live edge (up to 156 `tsResync` per stream in 2 h).
