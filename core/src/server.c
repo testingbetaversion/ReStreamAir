@@ -7965,7 +7965,11 @@ typedef struct rs_direct_client {
 // The muxed output for one stream, shared by every .ts viewer of it. Muxing
 // once and fanning out is what keeps a second viewer free; it also means every
 // viewer sees the same byte stream, so a join point is a join point for all.
-#define RS_TS_RING_CAP   (8u * 1024u * 1024u)
+// 24 MB is ~27 s of a 7 Mbit/s 720p feed. 8 MB held barely two 3.5 MB
+// segments (~9 s), so a restreamer reading at live pace slipped out of the
+// window and was jumped to the live edge, losing the bytes in between, over a
+// hundred times an hour on production Disney streams.
+#define RS_TS_RING_CAP   (24u * 1024u * 1024u)
 #define RS_TS_MAX_JOINS  128
 
 // Pumps a rendition may produce nothing for before the mux stops waiting on it.
