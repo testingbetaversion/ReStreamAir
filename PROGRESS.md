@@ -81,3 +81,31 @@
 - **Muxed-TS viewer buffer 8 → 24 MB** (`2ff2907`): ~27 s at Disney 720p. The
   downstream restreamer kept slipping out of the 8 MB (~9 s) window and being
   jumped to the live edge (up to 156 `tsResync` per stream in 2 h).
+
+### 2026-10-10 — cdm action gets `kids=` instead of `keyUri=`
+**What was done:** The provider script's `cdm` call no longer receives `keyUri=` (the PSSH boxes repeated as long `data:` URIs). It now receives `kids=<kid>,<kid>,…` with every discovered KID, the one the video is encrypted under first. `kid=` is unchanged. Docs updated.
+
+**Files changed:** core/src/server.c, SCRIPTING.md, public/docs/SCRIPTING.md, PROGRESS.md
+
+**Commands run:**
+```bash
+python3 scripts/sync-panel-docs.py
+```
+Copies the root docs into public/docs so the panel and CI see the same text.
+
+```bash
+git add -A && git commit -m "cdm action gets kids= (every KID) instead of keyUri=" && git pull --rebase && git push
+```
+Commits the change and pushes it to main.
+
+```bash
+ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build && cd build && ctest'
+```
+Builds the server on moonmuaaz and runs the test suites (both passed).
+
+```bash
+ssh root@moonmuaaz.xyz 'screen -S 610526.restream -p 0 -X stuff "^C"; screen -S 610526.restream -p 0 -X stuff "./restreamair-server -p 1234\n"'
+```
+Restarts the moonmuaaz server on the new build.
+
+**Unfinished:** 23.237.79.50 needs a rebuild to pick this up. Not yet seen in a real Disney `cdm` call.
