@@ -5314,9 +5314,16 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
     }
     if (ch.pssh_widevine) extra[extra_n++] = rs_script_arg("psshWidevine", ch.pssh_widevine, false);
     if (ch.pssh_playready) extra[extra_n++] = rs_script_arg("psshPlayReady", ch.pssh_playready, false);
-    if (ch.key_uris_count) {
-        char *j = join_list(ch.key_uris, ch.key_uris_count, ",");
-        extra[extra_n++] = rs_script_arg("keyUri", j, false);
+    // Every discovered KID, the media's own first. Replaces keyUri=, which
+    // repeated the PSSH boxes as long data: URIs and named no KID directly.
+    if (ch.kids_count || init_only_kid) {
+        char *ordered[RS_CDM_MAX_KIDS_FOR_PSSH];
+        size_t n = 0;
+        if (init_only_kid) ordered[n++] = init_only_kid;
+        for (size_t i = 0; i < ch.kids_count && n < RS_CDM_MAX_KIDS_FOR_PSSH; i++)
+            if (!init_only_kid || !stream_start_kid_equal(ch.kids[i], init_only_kid)) ordered[n++] = ch.kids[i];
+        char *j = join_list(ordered, n, ",");
+        if (j) extra[extra_n++] = rs_script_arg("kids", j, false);
         free(j);
     }
 
