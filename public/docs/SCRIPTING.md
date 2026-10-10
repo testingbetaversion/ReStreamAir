@@ -235,7 +235,7 @@ The server stores the heartbeat interval but does not run a periodic heartbeat s
 | `initparse` | `url`, `init` (plain base64 of the init segment, no `b64:` prefix) | JSON with any of `kid`/`kids` and `pssh`/`psshAll`/`psshWidevine`/`psshPlayReady`, each a string or an array. |
 | `cdm` | KIDs, PSSH values, key URI, CDM type | Clear keys as `KID:KEY` lines or JSON. |
 
-DRM is detected automatically, so there is nothing to tick per stream. On every start of a stream whose script declares `cdm`, ReStreamAir first runs `manifest` (if the stream uses a session manifest), then searches the fresh manifest, its first HLS media playlist and the init segment for every KID, PSSH box and HLS key URI. If the stored clear keys already cover every discovered KID, they are reused and `cdm` is skipped. A missing or changed KID—or DRM input with no identifiable KID—runs `cdm` and passes `kid=`, `pssh=`, `psshAll=`, `psshWidevine=`, `psshPlayReady=` and `keyUri=`, along with `cdm=external`, the stream's `cdmType=` and its script params. The returned pairs replace the active decryption keys.
+DRM is detected automatically, so there is nothing to tick per stream. On every start of a stream whose script declares `cdm`, ReStreamAir first runs `manifest` (if the stream uses a session manifest), then searches the fresh manifest, its first HLS media playlist and the init segment for every KID, PSSH box and HLS key URI. If the stored clear keys already cover every discovered KID, they are reused and `cdm` is skipped. A missing or changed KID—or DRM input with no identifiable KID—runs `cdm` and passes `kid=`, `kids=` (every discovered KID, comma-separated, the one the video is encrypted under first), `pssh=`, `psshAll=`, `psshWidevine=` and `psshPlayReady=`, along with `cdm=external`, the stream's `cdmType=` and its script params. The returned pairs replace the active decryption keys.
 
 If `cdm` exits non-zero or returns no usable pairs, the start keeps trying before giving up: the configured `cdmType=`, then each other DRM system the manifest carries a PSSH for (`widevine`, `playready`), first against the session URL and then against every `Cdn` mirror in turn (a mirror whose manifest cannot be fetched is skipped). The first attempt that yields keys wins. Only when every attempt fails is the start refused, with the number of `cdm` attempts and CDNs in the error. A `manifest` result that succeeded is kept on the stream even then, so the panel shows the session URL and its mirrors. If no manifest could be fetched at all, nothing was licensed and the start proceeds on the stored keys.
 
@@ -529,7 +529,7 @@ At start, a `cdm` call for a Widevine stream looks like this (the long values ar
 python3 provider.py action=cdm sessiondir=$S cookies=$S/cookies.txt \
   id=stream_abc url=https://cdn1.example.com/live/202/index.mpd channel=202 \
   cdm=external challenge= cdmType=widevine \
-  kid=c3d43de9ff5b5a45cdc9f4e7f177a1a5 \
+  kid=c3d43de9ff5b5a45cdc9f4e7f177a1a5 kids=c3d43de9ff5b5a45cdc9f4e7f177a1a5 \
   pssh=AAAAW3Bzc2gAAAAA7e+L... psshAll=AAAAW3Bzc2gAAAAA7e+L... \
   psshWidevine=AAAAW3Bzc2gAAAAA7e+L...
 ```
@@ -539,7 +539,7 @@ cdmType=widevine kids=['c3d43de9ff5b5a45cdc9f4e7f177a1a5'] pssh=yes
 {"keys": [{"kid": "c3d43de9ff5b5a45cdc9f4e7f177a1a5", "key": "00112233445566778899aabbccddeeff"}]}
 ```
 
-`kid`, `psshAll` and `keyUri` are comma-separated lists when there is more than one. The progress line goes to stderr, so only the JSON is parsed. Printing `c3d43de9ff5b5a45cdc9f4e7f177a1a5:00112233445566778899aabbccddeeff`, one pair per line, works as well.
+`kids` and `psshAll` are comma-separated lists when there is more than one; `kid` is the single KID the licence is asked for when the video's KID differs from the playlist's, otherwise the same list as `kids`. The progress line goes to stderr, so only the JSON is parsed. Printing `c3d43de9ff5b5a45cdc9f4e7f177a1a5:00112233445566778899aabbccddeeff`, one pair per line, works as well.
 
 ### A shell script
 
