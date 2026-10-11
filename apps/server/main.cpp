@@ -2,6 +2,9 @@
 // the core, and this file only parses argv, wires up the handlers that need
 // libcurl and libxml2, runs the poll loop and shuts down cleanly.
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <climits>
 #include <csignal>
 #include <cstdio>
@@ -204,6 +207,12 @@ static int service_action(const char *action, unsigned port, const char *bind,
 }
 
 int main(int argc, char **argv) {
+#if defined(__GLIBC__)
+    // One malloc arena per core x 8 by default; with ~100 download threads that
+    // is dozens of 64 MB arenas each holding freed segment buffers. A few
+    // arenas keep contention low and memory from fragmenting across them.
+    mallopt(M_ARENA_MAX, 4);
+#endif
     unsigned short port = 8787;
     std::string bind_address = "0.0.0.0";
     rs_webroot_options web;
