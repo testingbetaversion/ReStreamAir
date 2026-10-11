@@ -2,8 +2,8 @@
 // the core, and this file only parses argv, wires up the handlers that need
 // libcurl and libxml2, runs the poll loop and shuts down cleanly.
 
-#if defined(__GLIBC__)
-#include <malloc.h>
+#if defined(__linux__)
+#include <malloc.h>  // mallopt (glibc); __GLIBC__ is only defined once a libc header is in
 #endif
 #include <climits>
 #include <csignal>
@@ -207,7 +207,7 @@ static int service_action(const char *action, unsigned port, const char *bind,
 }
 
 int main(int argc, char **argv) {
-#if defined(__GLIBC__)
+#if defined(__GLIBC__) && defined(M_ARENA_MAX)
     // One malloc arena per core x 8 by default; with ~100 download threads that
     // is dozens of 64 MB arenas each holding freed segment buffers. A few
     // arenas keep contention low and memory from fragmenting across them.
