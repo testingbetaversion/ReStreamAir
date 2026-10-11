@@ -31,6 +31,9 @@
 #include <errno.h>
 #include <math.h>
 #include <sys/stat.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 // live.c spawns threads unconditionally (director/rep/prefetch workers), so the
 // same primitives are needed here for the log ring those workers write into.
 // rs_thread.h is <pthread.h> on POSIX and a SRWLOCK/CONDITION_VARIABLE shim on
@@ -823,7 +826,24 @@ static void log_files_prune(int today) {
 
 // Appends one entry to today's file, rolling to a new file at UTC midnight.
 // Caller holds log_mu. Failures are silent: the in-memory log still has it.
+// The engine's per-segment and per-poll bookkeeping: several lines a second
+// per stream, ~93% of the day file (1.2 GB/day for 16 streams on production)
+// and long signed CDN URLs on every download line. They stay in the in-memory
+// log the panel shows; the day file keeps everything else, which is what a
+// later investigation needs (errors, starts/stops, keys, proxies, slow polls).
+static bool log_event_is_routine(const rs_log_entry *e) {
+    static const char *const routine[] = {
+        "downloadSegment", "pollDone", "pollQueued", "pollStart", "pollIdle", "poll",
+        "manifest", "playlist", "master", "serveSegment", "serveInit",
+    };
+    if (!e->event || (e->level && strcmp(e->level, "info") != 0)) return false;
+    for (size_t i = 0; i < sizeof(routine) / sizeof(routine[0]); i++)
+        if (strcmp(e->event, routine[i]) == 0) return true;
+    return false;
+}
+
 static void log_file_append(restream_server_t *s, const rs_log_entry *e) {
+    if (log_event_is_routine(e)) return;
     time_t now = time(NULL);
     struct tm utc;
 #ifdef _WIN32
@@ -2033,6 +2053,14 @@ static void maintenance_tick(void *arg) {
     log_lock(s);
     if (s->log_file) fflush(s->log_file);
     log_unlock(s);
+#if defined(__GLIBC__)
+    // Segment buffers are allocated and freed on ~100 worker threads, and
+    // glibc keeps freed memory inside each thread's arena: production RSS
+    // climbed to 8.9 GB while ~1.5 GB was actually held. Hand free pages
+    // back to the system once a minute.
+    static unsigned trim_ticks;
+    if (++trim_ticks >= 60) { trim_ticks = 0; malloc_trim(0); }
+#endif
 }
 
 // The Logs view. Everything the server does lands in the ring buffer — panel
