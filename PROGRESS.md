@@ -109,3 +109,28 @@ ssh root@moonmuaaz.xyz 'screen -S 610526.restream -p 0 -X stuff "^C"; screen -S 
 Restarts the moonmuaaz server on the new build.
 
 **Unfinished:** 23.237.79.50 needs a rebuild to pick this up. Not yet seen in a real Disney `cdm` call.
+
+### 2026-10-12 — Reduce log volume and memory use on production
+**What was done:** Checked both servers. moonmuaaz is idle (server 19 MB). vpsrestream1 (23.237.79.50): ReStreamAir at 8.9 GB of 11.4 GB RAM, ~60% of one of 12 cores, 99 Mbit/s each way, logs 1.2 GB/day. Two fixes, neither touching stream quality:
+- The engine's routine per-segment/per-poll info lines (93% of log bytes) are no longer written to `logs/*.jsonl`; they stay in the in-memory panel log. Errors and lifecycle events are still written.
+- glibc builds cap malloc arenas at 4 (`mallopt(M_ARENA_MAX, 4)`) and call `malloc_trim(0)` once a minute. Production's memory sat in 70 arenas over 60 MB each holding freed segment buffers.
+
+**Files changed:** core/src/server.c, apps/server/main.cpp, API.md, public/docs/API.md, PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@23.237.79.50 'ps -o pid,pcpu,pmem,rss -p <pid>; free -m; grep -E "^(Rss|Anonymous)" /proc/<pid>/smaps_rollup; du -sh /root/restream/app/logs'
+```
+Read-only resource check on production: CPU, memory, memory map, log size.
+
+```bash
+python3 scripts/sync-panel-docs.py
+```
+Copies the root docs into public/docs.
+
+```bash
+ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build && cd build && ctest && nm -D restreamair-server | grep -E "mallopt|malloc_trim"'
+```
+Builds on moonmuaaz, runs the test suites (passed) and confirms the memory calls are linked.
+
+**Unfinished:** vpsrestream1 needs a rebuild to get this; memory and log size should be re-checked there a few hours after.
