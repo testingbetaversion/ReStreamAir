@@ -152,3 +152,21 @@ ssh root@moonmuaaz.xyz '... throwaway server on 127.0.0.1:8797 with a script tha
 End-to-end check: the start logged `scriptProxy … retrying through second-proxy` and started. Test files moved to /tmp/rsa-test/trash/pf4-*.
 
 **Unfinished:** vpsrestream1 needs a rebuild. Proxy-Seller IPs are still at their 10-connection cap and br53 (NordVPN) keeps failing with SSL errors.
+
+### 2026-10-12 — Home SSH tunnel for claro instead of Pinggy
+**What was done:** Replaced the claro Pinggy proxy with a reverse dynamic SSH tunnel from the home Windows PC (164.163.208.85, Pernambuco) to vpsrestream1: the PC's SSH acts as a SOCKS proxy on the server's 127.0.0.1:1080, used as `socks5h://127.0.0.1:1080`. Checked that sshd allows forwarding, that port 1080 was free, and that the host-key fingerprint the PC accepted is the server's real one. The tunnel was confirmed listening. Step-by-step guide written to the user's Documents folder at their request.
+
+**Files changed:** /Users/moon/Documents/ReStreamAir - Home proxy tunnel (claro).md (new, outside the repo), PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@23.237.79.50 'sshd -T | grep -iE "allowtcpforwarding|gatewayports|permitlisten"; ss -ltn | grep :1080'
+```
+Read-only check that the server allows the tunnel and the port is free.
+
+```bash
+ssh root@23.237.79.50 'ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub; ss -ltn | grep :1080'
+```
+Confirms the server's host-key fingerprint and that the tunnel is listening.
+
+**Unfinished:** Key login from the PC (send the existing key's .pub to authorized_keys), switching the claro proxy to `socks5h://127.0.0.1:1080`, then re-checking the Globo gaps and slow manifest reads.
