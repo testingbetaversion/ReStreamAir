@@ -170,3 +170,12 @@ ssh root@23.237.79.50 'ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub; ss -ltn
 Confirms the server's host-key fingerprint and that the tunnel is listening.
 
 **Unfinished:** Key login from the PC (send the existing key's .pub to authorized_keys), switching the claro proxy to `socks5h://127.0.0.1:1080`, then re-checking the Globo gaps and slow manifest reads.
+
+### 2026-10-12 — Tunnel guide: another PC or VPS
+**What was done:** Added an "Another PC or VPS" section to the home-tunnel guide: one server port per machine (1080, 1081, …) with all of them in the provider list and Rotate proxies on; another Windows PC; a Linux PC or Raspberry Pi as a systemd service; a Brazilian VPS either tunnelled from the server (`ssh -D`) or running its own SOCKS proxy restricted to 23.237.79.50; and how to list the connected tunnels.
+
+**Files changed:** /Users/moon/Documents/ReStreamAir - Home proxy tunnel (claro).md (outside the repo), PROGRESS.md
+
+**Commands run:** None (documentation only).
+
+**Unfinished:** Same as the previous entry: key login from the PC, switching claro to `socks5h://127.0.0.1:1080`, then re-checking the Globo channels.
