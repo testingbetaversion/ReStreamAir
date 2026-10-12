@@ -134,3 +134,21 @@ ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build 
 Builds on moonmuaaz, runs the test suites (passed) and confirms the memory calls are linked.
 
 **Unfinished:** vpsrestream1 needs a rebuild to get this; memory and log size should be re-checked there a few hours after.
+
+### 2026-10-12 — Script proxy fallback when the script exits 0 with nothing
+**What was done:** On vpsrestream1, Ajax x NEC stayed stopped: the Disney script's `cdm` call got `429` from Proxy-Seller, crashed (`UnboundLocalError`) and still exited 0 with no keys, so the proxy fallback (which only reacted to a non-zero exit) never tried the next proxy. A proxy refusal in the script output now moves to the next proxy unless the action produced its result: KID:KEY pairs for `cdm`, a `ManifestUrl` for `manifest`. Also checked production: memory 2.0 GB, logs ~60–90 MB/day, 16 streams running.
+
+**Files changed:** core/src/server.c, PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build && cd build && ctest'
+```
+Builds on moonmuaaz and runs the test suites (passed).
+
+```bash
+ssh root@moonmuaaz.xyz '... throwaway server on 127.0.0.1:8797 with a script that exits 0 after a 429 on the first proxy ...'
+```
+End-to-end check: the start logged `scriptProxy … retrying through second-proxy` and started. Test files moved to /tmp/rsa-test/trash/pf4-*.
+
+**Unfinished:** vpsrestream1 needs a rebuild. Proxy-Seller IPs are still at their 10-connection cap and br53 (NordVPN) keeps failing with SSL errors.
