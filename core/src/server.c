@@ -4642,12 +4642,34 @@ static int stream_start_run(restream_server_t *server, const char *sid,
         if (*tok) lines[nlines++] = tok;
         tok = rest;
     }
-    for (size_t next = 1; rc != 0 && proxy_arg >= 0 && next < nlines; next++) {
+    for (size_t next = 1; proxy_arg >= 0 && next < nlines; next++) {
         const char *said = err_text && err_text[0] ? err_text : (out && *out ? *out : "");
         bool proxy_refused = strstr(said, "ProxyError") || strstr(said, "CONNECT tunnel failed") ||
                              strstr(said, "PROXY_MAX_CONNS") || strstr(said, "SOCKS") ||
                              strstr(said, "resolve proxy") || strstr(said, "Proxy Authentication");
         if (!proxy_refused) break;
+        // A script can catch the proxy error and still exit 0 with nothing
+        // useful (the Disney+ script does: 429, then UnboundLocalError, exit
+        // 0, no keys). Judge by what the action was asked to produce.
+        const char *stdout_text = out && *out ? *out : "";
+        bool produced = rc == 0;
+        if (produced && strcmp(action, "cdm") == 0) {
+            produced = false;
+            for (const char *q = stdout_text; *q && !produced; q++) {
+                size_t h = 0;
+                while (isxdigit((unsigned char)q[h])) h++;
+                if (h >= 32 && q[h] == ':' ) {
+                    size_t k = 0;
+                    while (isxdigit((unsigned char)q[h + 1 + k])) k++;
+                    produced = k >= 32;
+                }
+                if (h) q += h - 1;
+            }
+            if (!produced && strstr(stdout_text, "\"key\"")) produced = true;  // JSON keys reply
+        } else if (produced && strcmp(action, "manifest") == 0) {
+            produced = strstr(stdout_text, "anifestUrl") != NULL;
+        }
+        if (produced) break;
         char *value = script_proxy_value(lines[next]);
         if (!value) break;
         const char *at = strrchr(value, '@');
