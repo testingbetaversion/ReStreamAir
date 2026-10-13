@@ -197,3 +197,21 @@ ssh root@moonmuaaz.xyz '... fake HLS (720p under KID B, 540p under KID A) on 127
 End-to-end check: the start requested `kid=bbbb…`, got only A, logged the step-down and started on `hlsv-540p-3000000` with `keyLimitedVideo=height=540`. Test files moved to /tmp/rsa-test/trash/sd-*, test servers stopped.
 
 **Unfinished:** vpsrestream1 needs a rebuild; the 7 stuck Disney events then start at the lower quality automatically.
+
+### 2026-10-13 — Export saved keys; kids= only for missing keys
+**What was done:** Added `GET /api/keys/export` (admin only): every saved decryption key per stream, optionally for one provider (`provider=<id or name>`), as JSON or `format=txt` (`KID:KEY` lines with a `# provider / stream (id)` comment per stream). An **Export keys** button on All Streams downloads the shown provider's keys, or all of them. Each export is logged as `keysExport`. The cdm action's `kids=` now lists only discovered KIDs with no saved key yet, the media's own first.
+
+**Files changed:** core/src/server.c, public/app.js, public/index.html, API.md, SCRIPTING.md, public/docs/API.md, public/docs/SCRIPTING.md, PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build && cd build && ctest'
+```
+Builds on moonmuaaz and runs the test suites (passed).
+
+```bash
+ssh root@moonmuaaz.xyz '... throwaway server on 127.0.0.1:8797 with two streams holding keys; curl /api/keys/export (txt, json, unauthenticated) ...'
+```
+txt and JSON exports listed all three keys with the provider/stream comments; without sign-in it answered 401. Test files moved to /tmp/rsa-test/trash/kx-*.
+
+**Unfinished:** vpsrestream1 needs a rebuild. Detecting a key whose KID matches but whose value is wrong (test-decrypting one frame) is not built yet.
