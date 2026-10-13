@@ -179,3 +179,21 @@ Confirms the server's host-key fingerprint and that the tunnel is listening.
 **Commands run:** None (documentation only).
 
 **Unfinished:** Same as the previous entry: key login from the PC, switching claro to `socks5h://127.0.0.1:1080`, then re-checking the Globo channels.
+
+### 2026-10-13 — Step down to the quality the licence unlocks
+**What was done:** On vpsrestream1, 7 Disney events were stuck: the 720p video's KID was requested (`kid=`), but Disney's licence returned only the lower-quality KID's key, so starts were refused ("do not cover all discovered KIDs"). Now, when the returned keys don't unlock the preferred quality, the key step walks the master's video heights from the top, reads each candidate's init KID and plays the best quality the returned key unlocks. The rule (e.g. `height=540`) is stored on the stream as `keyLimitedVideo` and overrides the provider's Default video for it; a manual Start clears it and retries the preferred quality. Claro, now on the home SSH tunnel, was also checked: about 1 slow manifest read per channel per hour, no restarts.
+
+**Files changed:** core/src/server.c, core/src/panel.c, core/include/rs_panel.h, API.md, public/docs/API.md, PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build && cd build && ctest'
+```
+Builds on moonmuaaz and runs the test suites (passed).
+
+```bash
+ssh root@moonmuaaz.xyz '... fake HLS (720p under KID B, 540p under KID A) on 127.0.0.1:8798, a cdm script returning only A, throwaway server on 8797 ...'
+```
+End-to-end check: the start requested `kid=bbbb…`, got only A, logged the step-down and started on `hlsv-540p-3000000` with `keyLimitedVideo=height=540`. Test files moved to /tmp/rsa-test/trash/sd-*, test servers stopped.
+
+**Unfinished:** vpsrestream1 needs a rebuild; the 7 stuck Disney events then start at the lower quality automatically.
