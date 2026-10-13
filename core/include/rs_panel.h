@@ -60,6 +60,10 @@ void rs_panel_set_stream_error(rs_state *st, const char *stream_id, const char *
 // The KID the engine found the media encrypted under when no key matched it;
 // the next start's key step licenses it. "" / NULL clears it.
 void rs_panel_set_stream_required_kid(rs_state *st, const char *stream_id, const char *kid);
+// The video rule a stream plays at because its licence lacked the preferred
+// quality's key ("height=540"); overrides the provider's Default video for it.
+// "" / NULL clears it (a manual Start does).
+void rs_panel_set_stream_key_limited_video(rs_state *st, const char *stream_id, const char *rule);
 // Marks a stream as stopped by a person (Stop button / bulk stop), or clears
 // it on a manual start. Auto-start events never restarts a marked stream.
 void rs_panel_set_stream_user_stopped(rs_state *st, const char *stream_id, bool stopped);
