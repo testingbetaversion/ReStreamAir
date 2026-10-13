@@ -2616,6 +2616,78 @@ static uint8_t *read_file(const char *path, size_t *out_len) {
     return buf;
 }
 
+// Every saved decryption key, per stream: GET /api/keys/export
+// [?provider=<id or name>][&format=txt]. JSON lists provider, stream and its
+// KID:KEY pairs plus a de-duplicated `keys` map; txt is "KID:KEY" lines with a
+// comment per stream, the format scripts and tools take directly. Admin only:
+// these are content keys.
+static void serve_keys_export(restream_server_t *s, struct mg_connection *c, struct mg_http_message *hm) {
+    char *want = query_var(hm, "provider");
+    char *format = query_var(hm, "format");
+    bool txt = format && strcmp(format, "txt") == 0;
+    rs_json *streams_out = rs_json_new_arr();
+    rs_json *all = rs_json_new_obj();
+    rs_buf text = RS_BUF_INIT;
+    size_t nkeys = 0;
+    const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
+    for (size_t p = 0; p < rs_json_arr_len(providers); p++) {
+        const rs_json *provider = rs_json_arr_at(providers, p);
+        const char *pid = rs_json_obj_str(provider, "id", "");
+        const char *pname = rs_json_obj_str(provider, "name", "");
+        if (want && want[0] && strcmp(want, pid) != 0 && strcmp(want, pname) != 0) continue;
+        const rs_json *streams = rs_json_obj_get(provider, "streams");
+        for (size_t i = 0; i < rs_json_arr_len(streams); i++) {
+            const rs_json *stream = rs_json_arr_at(streams, i);
+            rs_cenc_keys keys = rs_cenc_parse_keys(rs_json_obj_str(stream, "decryptionKeys", ""));
+            if (keys.count == 0) { rs_cenc_keys_free(&keys); continue; }
+            rs_json *entry = rs_json_new_obj();
+            rs_json_obj_set_str(entry, "provider", pname);
+            rs_json_obj_set_str(entry, "stream", rs_json_obj_str(stream, "name", ""));
+            rs_json_obj_set_str(entry, "id", rs_json_obj_str(stream, "id", ""));
+            rs_json *list = rs_json_new_arr();
+            rs_buf_appendf(&text, "# %s / %s (%s)\n", pname, rs_json_obj_str(stream, "name", ""),
+                           rs_json_obj_str(stream, "id", ""));
+            for (size_t k = 0; k < keys.count; k++) {
+                char hex[33];
+                for (int b = 0; b < 16; b++) snprintf(hex + b * 2, 3, "%02x", keys.keys[k][b]);
+                rs_json *pair = rs_json_new_obj();
+                rs_json_obj_set_str(pair, "kid", keys.kids[k]);
+                rs_json_obj_set_str(pair, "key", hex);
+                rs_json_arr_push(list, pair);
+                rs_json_obj_set_str(all, keys.kids[k], hex);
+                rs_buf_appendf(&text, "%s:%s\n", keys.kids[k], hex);
+                nkeys++;
+            }
+            rs_json_obj_set(entry, "keys", list);
+            rs_json_arr_push(streams_out, entry);
+            rs_cenc_keys_free(&keys);
+        }
+    }
+    char *ip = client_ip(s, c, hm);
+    log_recordf(s, "__panel__", "info", "keysExport", NULL, 0, -1,
+                "%lu saved key(s) exported by %s%s%s", (unsigned long)nkeys, ip,
+                want && want[0] ? " for provider " : "", want && want[0] ? want : "");
+    rs_free(ip);
+    if (txt) {
+        char *body = rs_buf_take(&text);
+        mg_http_reply(c, 200,
+                      "Content-Type: text/plain; charset=utf-8\r\n"
+                      "Content-Disposition: attachment; filename=\"restreamair-keys.txt\"\r\n"
+                      "Cache-Control: no-store\r\n", "%s", body ? body : "");
+        rs_free(body);
+        rs_json_free(streams_out);
+        rs_json_free(all);
+    } else {
+        rs_buf_dispose(&text);
+        rs_json *doc = rs_json_new_obj();
+        rs_json_obj_set(doc, "streams", streams_out);
+        rs_json_obj_set(doc, "keys", all);
+        reply_json(c, 200, doc, "Content-Disposition: attachment; filename=\"restreamair-keys.json\"\r\nCache-Control: no-store\r\n");
+    }
+    free(want);
+    free(format);
+}
+
 static void serve_provider_export(restream_server_t *s, struct mg_connection *c,
                                   const char *provider_id) {
     rs_json *doc = rs_panel_export_provider(&s->state, provider_id);
@@ -3026,6 +3098,11 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         char *provider_id = capture(hm, "/api/providers/*/playlist.m3u8");
         serve_m3u_playlist(s, c, hm, provider_id, NULL);
         free(provider_id);
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/keys/export"), NULL) && method_is(hm, "GET")) {
+        if (is_viewer) { reply_error(c, 403, "Key export requires an admin account."); return true; }
+        serve_keys_export(s, c, hm);
         return true;
     }
     if (mg_match(hm->uri, mg_str("/api/providers/*/export"), NULL) && method_is(hm, "GET")) {
@@ -5446,16 +5523,24 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
     }
     if (ch.pssh_widevine) extra[extra_n++] = rs_script_arg("psshWidevine", ch.pssh_widevine, false);
     if (ch.pssh_playready) extra[extra_n++] = rs_script_arg("psshPlayReady", ch.pssh_playready, false);
-    // Every discovered KID, the media's own first. Replaces keyUri=, which
-    // repeated the PSSH boxes as long data: URIs and named no KID directly.
+    // The KIDs still missing a key, the media's own first: a KID whose key is
+    // already saved needs no licence. (Replaces keyUri=, which repeated the
+    // PSSH boxes as long data: URIs and named no KID directly.)
     if (ch.kids_count || init_only_kid) {
+        rs_cenc_keys have = rs_cenc_parse_keys(st->cached_keys ? st->cached_keys : "");
         char *ordered[RS_CDM_MAX_KIDS_FOR_PSSH];
         size_t n = 0;
         if (init_only_kid) ordered[n++] = init_only_kid;
-        for (size_t i = 0; i < ch.kids_count && n < RS_CDM_MAX_KIDS_FOR_PSSH; i++)
-            if (!init_only_kid || !stream_start_kid_equal(ch.kids[i], init_only_kid)) ordered[n++] = ch.kids[i];
-        char *j = join_list(ordered, n, ",");
-        if (j) extra[extra_n++] = rs_script_arg("kids", j, false);
+        for (size_t i = 0; i < ch.kids_count && n < RS_CDM_MAX_KIDS_FOR_PSSH; i++) {
+            if (init_only_kid && stream_start_kid_equal(ch.kids[i], init_only_kid)) continue;
+            bool saved = false;
+            for (size_t k = 0; k < have.count && !saved; k++)
+                saved = stream_start_kid_equal(ch.kids[i], have.kids[k]);
+            if (!saved) ordered[n++] = ch.kids[i];
+        }
+        rs_cenc_keys_free(&have);
+        char *j = n ? join_list(ordered, n, ",") : NULL;
+        if (j && j[0]) extra[extra_n++] = rs_script_arg("kids", j, false);
         free(j);
     }
 
