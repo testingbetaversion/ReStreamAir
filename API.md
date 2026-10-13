@@ -303,6 +303,7 @@ level, text and date filtering are client-side. See [log schema](EVENTS.md#logs)
 | `POST /api/providers` | `{"name":"News","logo":"https://…"}`; `200` state. Name required; creation accepts name/logo and shared network/webhook fields below. Set scripting fields with PUT. |
 | `PUT /api/providers/<id>` | Full provider settings object; `200` state. |
 | `DELETE /api/providers/<id>` | No body; `200` state. Removes provider and streams, and deletes script session files. Stop streams before deleting their provider. |
+| `GET /api/keys/export` | Admin only. Every saved decryption key per stream. Optional `provider=<id or name>`; `format=txt` gives `KID:KEY` lines with a `# provider / stream (id)` comment per stream, otherwise JSON `{"streams":[{provider,stream,id,keys:[{kid,key}]}],"keys":{kid:key}}`. Logged as `keysExport`. |
 | `GET /api/providers/<id>/export` | Admin only; JSON attachment described below. |
 | `POST /api/providers/import` | Export envelope; `200` state with a newly assigned provider ID and stream IDs. |
 | `GET /api/providers/<id>/playlist.m3u8` | M3U text for that provider. |

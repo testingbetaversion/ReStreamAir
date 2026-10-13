@@ -472,6 +472,21 @@ function exportProvider(providerId, providerName) {
   link.remove();
 }
 
+// Saved decryption keys of the provider the grid is filtered to (or all), as
+// KID:KEY text. Admin only on the server side.
+function exportSavedKeys() {
+  const url = new URL("/api/keys/export", location.origin);
+  url.searchParams.set("format", "txt");
+  const provider = streamsGridProviderId && state.providers.find((p) => p.id === streamsGridProviderId);
+  if (provider) url.searchParams.set("provider", provider.id);
+  const link = document.createElement("a");
+  link.href = url.href;
+  link.download = provider ? `${provider.name}-keys.txt` : "restreamair-keys.txt";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
 function exportProviderPlaylist(providerId, providerName) {
   const link = document.createElement("a");
   const url = new URL(`/api/providers/${providerId}/playlist.m3u8`, location.origin);
@@ -3269,6 +3284,7 @@ $("#updateBannerDismiss")?.addEventListener("click", () => {
 $("#gridStartAllBtn").addEventListener("click", () => bulkStreamAction("start"));
 $("#gridStopAllBtn").addEventListener("click", () => bulkStreamAction("stop"));
 $("#gridDeleteAllBtn").addEventListener("click", () => bulkStreamAction("delete"));
+$("#gridExportKeysBtn")?.addEventListener("click", exportSavedKeys);
 $("#gridSelectPageBox").addEventListener("change", (event) => {
   for (const { stream } of streamsGridPageRows()) {
     if (event.currentTarget.checked) streamsGridSelected.add(stream.id);
