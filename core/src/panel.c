@@ -1039,6 +1039,13 @@ void rs_panel_set_stream_user_stopped(rs_state *st, const char *stream_id, bool 
     else rs_json_obj_remove(stream, "stoppedByUser");
 }
 
+void rs_panel_set_stream_key_limited_video(rs_state *st, const char *stream_id, const char *rule) {
+    rs_json *stream = find_stream(st, stream_id, NULL);
+    if (!stream) return;
+    if (rule && rule[0]) rs_json_obj_set_str(stream, "keyLimitedVideo", rule);
+    else rs_json_obj_remove(stream, "keyLimitedVideo");
+}
+
 void rs_panel_set_stream_required_kid(rs_state *st, const char *stream_id, const char *kid) {
     rs_json *stream = find_stream(st, stream_id, NULL);
     if (!stream) return;

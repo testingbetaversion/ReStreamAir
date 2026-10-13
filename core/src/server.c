@@ -3157,6 +3157,8 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
     if (mg_match(hm->uri, mg_str("/api/streams/*/start"), NULL) && method_is(hm, "POST")) {
         char *id = capture(hm, "/api/streams/*/start");
         rs_panel_set_stream_user_stopped(&s->state, id, false);
+        // A person pressing Start retries the preferred quality.
+        rs_panel_set_stream_key_limited_video(&s->state, id, NULL);
         rs_json_obj_remove(s->provider_timers, id);
         if (!reset_idle_provider_session(s, provider_of(&s->state, rs_panel_find_stream(&s->state, id)))) {
             free(id); reply_error(c, 500, "Could not reset provider session."); return true;
@@ -3902,6 +3904,15 @@ static char *effective_headers(const rs_json *provider, const rs_json *stream, c
     return out;
 }
 
+// A stream whose licence only covers a lower quality plays that quality: the
+// key step stores the rule ("height=540") on the stream as keyLimitedVideo and
+// it overrides the provider's Default video for that stream until a manual
+// Start, which clears it and tries the preferred quality again.
+static void stream_apply_key_limited_video(const rs_json *stream, rs_source_policy *policy) {
+    const char *limited = rs_json_obj_str(stream, "keyLimitedVideo", "");
+    if (limited[0]) snprintf(policy->video_filter, sizeof(policy->video_filter), "%s", limited);
+}
+
 // The video rendition the panel has selected, to pin the engine to.
 //
 // The panel writes the checkbox selection to `representations` (an array that
@@ -4490,6 +4501,7 @@ typedef struct rs_stream_start {
     char *cdm_mode, *cdm_type, *cached_keys;
     char *required_kid;  // KID the engine found the media encrypted under (wrongKeys)
     char *script_proxies;  // the script's whole proxy list, for falling over (see stream_start_run)
+    char *key_limited_video;  // video rule chosen because the licence lacked the preferred quality's key
     double script_timeout;
     unsigned long long token;
     int url_arg;  // index of the url= argument, rewritten once the manifest refreshes it
@@ -4512,7 +4524,7 @@ static void stream_start_free(struct rs_stream_start *st) {
     free(st->kind); free(st->url); free(st->proxy); free(st->media_proxy); free(st->headers);
     free(st->media_fetch_headers); free(st->provider_headers);
     free(st->downloader); free(st->dl_params); free(st->rep); free(st->host);
-    free(st->cdm_mode); free(st->cdm_type); free(st->cached_keys); free(st->required_kid); free(st->script_proxies);
+    free(st->cdm_mode); free(st->cdm_type); free(st->cached_keys); free(st->required_kid); free(st->script_proxies); free(st->key_limited_video);
     free(st->manifest_url); free(st->manifest_headers); free(st->media_headers);
     free(st->keys);
     rs_json_free(st->cdn_urls);
@@ -5044,6 +5056,76 @@ enum {
 #define RS_DRM_WIDEVINE 1u
 #define RS_DRM_PLAYREADY 2u
 
+static bool stream_start_is_hls(const rs_stream_start *st) {
+    return st->kind && strcmp(st->kind, "m3u8") == 0;
+}
+
+// The licence came back without the preferred quality's key (Disney+ issues an
+// L3 device only the lower-quality key on many events). Walk the master's video
+// heights from the top, read each candidate's init KID, and return the rule for
+// the best one the returned keys unlock ("height=540"), or NULL.
+static char *stream_start_step_down(restream_server_t *server, const char *sid, rs_stream_start *st,
+                                    const char *master_url, const char *pairs) {
+    size_t mlen = 0;
+    char *master = stream_start_fetch(st, master_url, &mlen);
+    if (!master || !strstr(master, "#EXT-X-STREAM-INF:")) { free(master); return NULL; }
+    long heights[32];
+    size_t nh = 0;
+    for (const char *p = strstr(master, "#EXT-X-STREAM-INF:"); p && nh < 32;
+         p = strstr(p + 1, "#EXT-X-STREAM-INF:")) {
+        const char *eol = strchr(p, '\n');
+        const char *res = strstr(p, "RESOLUTION=");
+        if (!res || (eol && res > eol)) continue;
+        const char *x = strchr(res, 'x');
+        if (!x || (eol && x > eol)) continue;
+        long h = strtol(x + 1, NULL, 10);
+        bool seen = h <= 0;
+        for (size_t i = 0; i < nh && !seen; i++) seen = heights[i] == h;
+        if (!seen) heights[nh++] = h;
+    }
+    // Highest first.
+    for (size_t i = 0; i < nh; i++)
+        for (size_t j = i + 1; j < nh; j++)
+            if (heights[j] > heights[i]) { long t = heights[i]; heights[i] = heights[j]; heights[j] = t; }
+    rs_cenc_keys keys = rs_cenc_parse_keys(pairs);
+    char *rule = NULL;
+    for (size_t i = 0; i < nh && !rule; i++) {
+        char filter[32];
+        snprintf(filter, sizeof(filter), "height=%ld", heights[i]);
+        rs_hls_pick pick;
+        if (rs_hls_pick_renditions(master, master_url, filter, st->source_policy.audio_filter, &pick) != 0)
+            continue;
+        size_t vlen = 0;
+        char *variant = pick.video_uri ? stream_start_fetch(st, pick.video_uri, &vlen) : NULL;
+        size_t ilen = 0;
+        uint8_t *init = variant ? stream_start_fetch_init(st, pick.video_uri, variant, &ilen) : NULL;
+        rs_drm_challenge c;
+        memset(&c, 0, sizeof(c));
+        if (init) rs_cdm_challenge_add_from_init(&c, init, ilen);
+        bool covered = c.kids_count > 0;
+        for (size_t k = 0; k < c.kids_count && covered; k++) {
+            bool found = false;
+            for (size_t q = 0; q < keys.count && !found; q++)
+                found = stream_start_kid_equal(c.kids[k], keys.kids[q]);
+            covered = found;
+        }
+        if (covered) {
+            rule = rs_strdup(filter);
+            log_recordf(server, sid, "error", "cdm", NULL, 0, -1,
+                        "the licence did not include the preferred quality's key — playing %ldp, "
+                        "the best quality the returned key (KID %s) unlocks; press Start to retry the preferred quality",
+                        heights[i], c.kids[0]);
+        }
+        rs_drm_challenge_free(&c);
+        free(init);
+        free(variant);
+        rs_hls_pick_dispose(&pick);
+    }
+    rs_cenc_keys_free(&keys);
+    free(master);
+    return rule;
+}
+
 // Asks the script for clear keys: scrape the manifest for every scrap of DRM
 // it advertises, give the `pssh` hook first refusal on the box, then run `cdm`
 // as `cdm_type`. `*systems` reports which DRM systems the manifest carried a
@@ -5388,7 +5470,17 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
                  st->script_tail[0] ? ": " : ".", st->script_tail);
     } else {
         char *pairs = rs_cdm_parse_key_output(out);
-        if (pairs && pairs[0] && ch.kids_count > 0
+        char *step_rule = NULL;
+        if (pairs && pairs[0] && ch.kids_count > 0 && !stream_start_cached_keys_cover(pairs, &ch) &&
+            stream_start_is_hls(st))
+            step_rule = stream_start_step_down(server, sid, st, manifest_url, pairs);
+        if (step_rule) {
+            result = RS_KEYS_OK;
+            free(st->keys);
+            st->keys = pairs;
+            free(st->key_limited_video);
+            st->key_limited_video = step_rule;
+        } else if (pairs && pairs[0] && ch.kids_count > 0
             && !stream_start_cached_keys_cover(pairs, &ch)) {
             rs_cenc_keys returned = rs_cenc_parse_keys(pairs);
             log_recordf(server, sid, "error", "cdm", NULL, 0, -1,
@@ -5557,6 +5649,7 @@ static rs_stream_start *stream_start_snapshot(const rs_json *provider, const rs_
     n = append_script_params(args, n, RS_SCRIPT_ARG_CAP, rs_json_obj_str(stream, "scriptParams", ""));
 
     rs_provider_source_policy(provider, &st->source_policy);
+    stream_apply_key_limited_video(stream, &st->source_policy);
     st->script_timeout = (double)rs_provider_option_int(provider, "scriptTimeoutSeconds");
     st->url_arg = url_arg;
     st->script_path = rs_strdup(script);
@@ -6631,6 +6724,10 @@ static void pending_job_finish_stream_start(restream_server_t *server, struct mg
                                         st->heartbeat_seconds, &err);
     if (st->keys && st->keys[0])
         rs_panel_set_stream_keys(&server->state, pf->stream_id, st->keys, &err);
+    if (st->key_limited_video) {
+        rs_panel_set_stream_key_limited_video(&server->state, pf->stream_id, st->key_limited_video);
+        rs_panel_set_stream_required_kid(&server->state, pf->stream_id, NULL);
+    }
 
     int rc = rs_panel_set_stream_running(&server->state, pf->stream_id, true, &err);
     char pipeline_err[256] = {0};
@@ -7392,6 +7489,7 @@ static int live_sync_stream(restream_server_t *s, const char *stream_id) {
     rs_live_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     rs_provider_source_policy(provider, &cfg.source_policy);
+    stream_apply_key_limited_video(stream, &cfg.source_policy);
     cfg.mpd_url = src;
     cfg.cdn_urls = mirror_urls;
     cfg.cdn_url_count = mirror_used;
