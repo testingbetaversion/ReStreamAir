@@ -215,3 +215,26 @@ ssh root@moonmuaaz.xyz '... throwaway server on 127.0.0.1:8797 with two streams 
 txt and JSON exports listed all three keys with the provider/stream comments; without sign-in it answered 401. Test files moved to /tmp/rsa-test/trash/kx-*.
 
 **Unfinished:** vpsrestream1 needs a rebuild. Detecting a key whose KID matches but whose value is wrong (test-decrypting one frame) is not built yet.
+
+### 2026-10-13 — Fix the quality step-down (216p by mistake)
+**What was done:** On vpsrestream1, Cleveland Guardians x Tampa Bay Rays played at 216p. The cdm action had returned the 720p video's own key, but the start was refused because the playlist also named another quality's KID. The step-down then could not read the higher qualities' init segments (proxy at its connection cap) and treated that as "no key". Fixed: keys covering the KID the video is encrypted under are accepted. The step-down retries a failed init read up to 3 times, skips a quality it could not check, and stores nothing when the result is the preferred quality. Production had 358 needless step-downs (all but one back to 720p) from the same over-strict check.
+
+**Files changed:** core/src/server.c, PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@23.237.79.50 'python3 -c "...list streams with keyLimitedVideo..."; grep "the licence did not include" logs/2026-10-13.jsonl'
+```
+Read-only: found 4 streams with a stored step-down and 359 step-downs today (358 to 720p, 1 to 216p).
+
+```bash
+ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build && cd build && ctest'
+```
+Builds on moonmuaaz and runs the test suites (passed).
+
+```bash
+ssh root@moonmuaaz.xyz '... fake HLS source + two cdm scripts, throwaway server on 127.0.0.1:8797 ...'
+```
+Case A (720p key returned): played 720p, nothing stored. Case B (only the lower key): stepped down to 540p. Test files in /tmp/rsa-test/trash/sd2-*.
+
+**Unfinished:** vpsrestream1 needs a rebuild, then Start pressed on Cleveland x Tampa Bay (clears its stored 216p). Xangai, Al Nassr x Neftchi and Linha de Passe have a harmless stored `height=720` that Start also clears.
