@@ -5172,13 +5172,25 @@ static char *stream_start_step_down(restream_server_t *server, const char *sid, 
         rs_hls_pick pick;
         if (rs_hls_pick_renditions(master, master_url, filter, st->source_policy.audio_filter, &pick) != 0)
             continue;
-        size_t vlen = 0;
-        char *variant = pick.video_uri ? stream_start_fetch(st, pick.video_uri, &vlen) : NULL;
+        // A check that could not be made (a proxy at its connection cap, a
+        // timeout) is not "no key": retry it, and if it still fails skip this
+        // quality rather than settle for a lower one on missing evidence.
+        char *variant = NULL;
+        uint8_t *init = NULL;
         size_t ilen = 0;
-        uint8_t *init = variant ? stream_start_fetch_init(st, pick.video_uri, variant, &ilen) : NULL;
+        for (int attempt = 0; attempt < 3 && !init; attempt++) {
+            size_t vlen = 0;
+            free(variant);
+            variant = pick.video_uri ? stream_start_fetch(st, pick.video_uri, &vlen) : NULL;
+            init = variant ? stream_start_fetch_init(st, pick.video_uri, variant, &ilen) : NULL;
+        }
         rs_drm_challenge c;
         memset(&c, 0, sizeof(c));
         if (init) rs_cdm_challenge_add_from_init(&c, init, ilen);
+        if (!init)
+            log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
+                        "could not read the %ldp init segment to check its KID — skipping that quality",
+                        heights[i]);
         bool covered = c.kids_count > 0;
         for (size_t k = 0; k < c.kids_count && covered; k++) {
             bool found = false;
@@ -5187,7 +5199,14 @@ static char *stream_start_step_down(restream_server_t *server, const char *sid, 
             covered = found;
         }
         if (covered) {
-            rule = rs_strdup(filter);
+            // The preferred rule already selects this quality: nothing to store.
+            const char *preferred = st->source_policy.video_filter;
+            bool same = strcmp(preferred, filter) == 0;
+            rule = same ? rs_strdup("") : rs_strdup(filter);
+            if (same)
+                log_recordf(server, sid, "info", "cdm", NULL, 0, -1,
+                            "the returned key (KID %s) unlocks the preferred %ldp — playing it", c.kids[0], heights[i]);
+            else
             log_recordf(server, sid, "error", "cdm", NULL, 0, -1,
                         "the licence did not include the preferred quality's key — playing %ldp, "
                         "the best quality the returned key (KID %s) unlocks; press Start to retry the preferred quality",
@@ -5555,8 +5574,20 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
                  st->script_tail[0] ? ": " : ".", st->script_tail);
     } else {
         char *pairs = rs_cdm_parse_key_output(out);
+        // The keys that matter are the ones for the media we will play. A
+        // playlist can name other KIDs too (another quality's): when the
+        // returned keys include the video's own KID, that is a usable start,
+        // not a failure — refusing it is what sent Disney+ events through
+        // hundreds of needless step-downs.
+        bool video_covered = false;
+        if (pairs && pairs[0] && init_only_kid) {
+            rs_cenc_keys got = rs_cenc_parse_keys(pairs);
+            for (size_t i = 0; i < got.count && !video_covered; i++)
+                video_covered = stream_start_kid_equal(got.kids[i], init_only_kid);
+            rs_cenc_keys_free(&got);
+        }
         char *step_rule = NULL;
-        if (pairs && pairs[0] && ch.kids_count > 0 && !stream_start_cached_keys_cover(pairs, &ch) &&
+        if (!video_covered && pairs && pairs[0] && ch.kids_count > 0 && !stream_start_cached_keys_cover(pairs, &ch) &&
             stream_start_is_hls(st))
             step_rule = stream_start_step_down(server, sid, st, manifest_url, pairs);
         if (step_rule) {
@@ -5565,7 +5596,7 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
             st->keys = pairs;
             free(st->key_limited_video);
             st->key_limited_video = step_rule;
-        } else if (pairs && pairs[0] && ch.kids_count > 0
+        } else if (!video_covered && pairs && pairs[0] && ch.kids_count > 0
             && !stream_start_cached_keys_cover(pairs, &ch)) {
             rs_cenc_keys returned = rs_cenc_parse_keys(pairs);
             log_recordf(server, sid, "error", "cdm", NULL, 0, -1,
