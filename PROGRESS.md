@@ -293,3 +293,16 @@ Times each proxy from vpsrestream1 itself.
 **Follow-up (same day):** 79.127.168.43:50100 is not faulty. The seller caps it at 10 connections, and vpsrestream1 held 9 to it steadily, so every extra connection was refused. The engine rotates disney's 4 proxies without knowing that cap. claro does not use the pinggy `kdwjgspsyy` tunnel: it goes through the SSH SOCKS tunnel on 127.0.0.1:1080 (~104 connections), with pinggy `kcsilonspa` as a backup. A claro manifest read through that tunnel normally takes ~1.8s (16 KB, one redirect). The 77 slow reads in 6h (median 21.7s, max 88s) are spikes, likely the small manifest stuck behind ~48 video downloads in the one SSH connection (not verified). The provider budget is not the cause: claro uses 48 of 50 slots, and manifests get extra headroom. Manifest reads use the provider's full 30s timeout × 2 attempts, and there is no separate manifest proxy (only the proxyManifest/proxyMedia on-off switches).
 
 **Unfinished:** Possible code changes: a per-proxy connection limit, a shorter manifest-read timeout that fails over to the next proxy, and a separate manifest proxy. The fallingBehind rounding fix in core/src/live.c, `ClientAliveInterval 15`, and removing the token prints from disneyplus.py are still open. vpsrestream1 still runs the 2026-10-13 14:31 build and needs a rebuild for the step-down fix.
+
+### 2026-10-14 — Third log review on vpsrestream1 (15:23–17:15 UTC)
+**What was done:** Read-only review. Much quieter than the earlier window: no `pollSlow` at all, one small burst (16:15, 5 errors), and only 8 proxy failures (79.127.168.43 timeout ×3, kdwjgspsyy timeout ×3, nordvpn SSL ×2). Connections dropped: SOCKS tunnel 52 (was 104), 79.127.168.43 at 6 of its 10. claro is nearly clean (worst 0.88x). Globo Recife skipped 13 segments at 15:49 and GLOBO BH skipped 3 at 15:43. disney turned over most events on the hour and half hour, and all of them started normally. One event (stream_1791993777000_230eeb) got wrong keys at 16:10: it is encrypted under KID 6024b91e…, the script returned keys for 42270234…, the same mismatch as stream_1791986572000_0d23c9 at 14:10. It restarted and the logs don't show it running after that. stream_1791993777000_4310b3 published nothing for 2 minutes at 16:09 before it stopped. Token prints from the disney script continue (9 per start).
+
+**Files changed:** PROGRESS.md
+
+**Commands run:**
+```bash
+ssh -o BatchMode=yes root@23.237.79.50 'python3 - <<EOF ... EOF; ss -tn state established ...'
+```
+Read-only: per-stream errors since 15:23, proxy failures and open connections per proxy.
+
+**Unfinished:** Same as above (per-proxy connection limit, shorter manifest timeout with failover, token prints, fallingBehind rounding, rebuild vpsrestream1).
