@@ -258,7 +258,24 @@ Gives the batch file Windows line endings.
 **Unfinished:** The script is untested on Windows. Fix the fallingBehind segment-rounding in core/src/live.c; set `ClientAliveInterval 15` on vpsrestream1; remove the token/debug prints from disneyplus.py and rotate the Disney session.
 
 ### 2026-10-14 — Second log review on vpsrestream1 (13:23–15:23 UTC)
-**What was done:** Read-only review of the last two hours on vpsrestream1 (16 streams running, service up since 2026-10-13 14:31, load 1.3, 7.7 GB free). Nothing is broken by the server itself. Errors arrive in bursts on many streams at once (13:28, 14:04, 14:20, 14:45) and line up with proxy failures: `79.127.168.43:50100` and `178.92.209.173:50100` refusing connections, the pinggy tunnel timing out, NordVPN `br53` SSL errors, and the disney script getting `CONNECT tunnel failed`. claro (GLOBO BH/RJ/BSB) still has `pollSlow` with 38–50s manifest reads through the tunnel. The `lagWatch` check now catches one-off slow windows, so most alerts are info, not `fallingBehind`. SportsCenter with Scott Van Pelt failed at 15:00 (no usable keys) and then started on retry; it has played cleanly since. One stream (15c4cf) published nothing for about 24 minutes before it was stopped at 13:30. The disney script still writes tokens to stderr.
+**What was done:** Read-only review of the last two hours on vpsrestream1, plus a live check of each proxy from that box. 16 streams are running. The service has been up since 2026-10-13 14:31; load is 1.3 and 7.7 GB is free, so the server itself is fine.
+
+Every proxy is up. All of their failures were brief, and each proxy was back in rotation within about 15s:
+
+| proxy | failures in 2h | live check from vpsrestream1 |
+|---|---|---|
+| 79.127.168.43:50100 | 19 × could not connect | 3/6: every other connection refused, ~2.1s when it answers |
+| kdwjgspsyy.a.pinggy.link:12227 | 16 × timeout, 1 × dropped | 12/12, ~1.4s (0.8s of it TLS) |
+| 178.92.209.173:50100 | 9 × could not connect | 6/6, 0.6s |
+| br53.proxy.nordvpn.com:89 | 5 × SSL, 2 × dropped, 1 × timeout | 6/6, 0.8s |
+
+The failures bunch up at the same minutes (13:28, 14:04, 14:20, 14:45), when many streams load the proxies at once. During each burst, affected streams briefly lose a rendition ("produced nothing for 15s") and publish at 0.4–0.9x real time, then recover. The disney script's `CONNECT tunnel failed` errors (20) fall in the same minutes.
+
+- claro GLOBO BH, RJ and BSB: manifest reads of 38–50s during the bursts, over the 18s margin (6–11 `pollSlow` and 3–5 `fallingBehind` each). curta got one HTTP 403 at 13:29 and restarted itself.
+- `lagWatch` now logs one-off slow windows as info, so most of them no longer raise `fallingBehind`.
+- SportsCenter with Scott Van Pelt: no usable keys at 15:00, started on the scheduler's retry and has played cleanly since.
+- stream_1791964957000_15c4cf published nothing for about 24 minutes before it was stopped at 13:30.
+- The disney script still prints access tokens to stderr (logged as `scriptError`; 267 of those on SportsCenter alone).
 
 **Files changed:** PROGRESS.md
 
@@ -266,6 +283,11 @@ Gives the batch file Windows line endings.
 ```bash
 ssh -o BatchMode=yes root@23.237.79.50 'python3 /tmp/rsa_s2.py; rm /tmp/rsa_s2.py'
 ```
-Read-only: errors per stream for the last 2h, clustered by minute, plus proxy failure messages; the temporary scripts were removed from the server.
+Read-only: errors per stream for the last 2h, grouped by minute and by proxy. The temporary scripts were removed from the server.
 
-**Unfinished:** Same as the last review. Replace or drop the dead proxies (79.127.168.43, 178.92.209.173) from rotation; the fallingBehind rounding fix, `ClientAliveInterval 15` and the token prints in disneyplus.py are still open. vpsrestream1 still runs the 2026-10-13 14:31 build (the step-down fix is not on it yet).
+```bash
+ssh -o BatchMode=yes root@23.237.79.50 'curl -x <proxy> https://ipinfo.io/json  (6–12 times per proxy)'
+```
+Times each proxy from vpsrestream1 itself.
+
+**Unfinished:** 79.127.168.43:50100 is the flakiest proxy (it refuses every other connection), so it is the one to replace or take out. The fallingBehind rounding fix in core/src/live.c, `ClientAliveInterval 15`, and removing the token prints from disneyplus.py are still open. vpsrestream1 still runs the 2026-10-13 14:31 build and needs a rebuild for the step-down fix.
