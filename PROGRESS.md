@@ -256,3 +256,16 @@ perl -pi -e 's/\r?\n/\r\n/' scripts/windows/reverse-socks-tunnel.bat
 Gives the batch file Windows line endings.
 
 **Unfinished:** The script is untested on Windows. Fix the fallingBehind segment-rounding in core/src/live.c; set `ClientAliveInterval 15` on vpsrestream1; remove the token/debug prints from disneyplus.py and rotate the Disney session.
+
+### 2026-10-14 — Second log review on vpsrestream1 (13:23–15:23 UTC)
+**What was done:** Read-only review of the last two hours on vpsrestream1 (16 streams running, service up since 2026-10-13 14:31, load 1.3, 7.7 GB free). Nothing is broken by the server itself. Errors arrive in bursts on many streams at once (13:28, 14:04, 14:20, 14:45) and line up with proxy failures: `79.127.168.43:50100` and `178.92.209.173:50100` refusing connections, the pinggy tunnel timing out, NordVPN `br53` SSL errors, and the disney script getting `CONNECT tunnel failed`. claro (GLOBO BH/RJ/BSB) still has `pollSlow` with 38–50s manifest reads through the tunnel. The `lagWatch` check now catches one-off slow windows, so most alerts are info, not `fallingBehind`. SportsCenter with Scott Van Pelt failed at 15:00 (no usable keys) and then started on retry; it has played cleanly since. One stream (15c4cf) published nothing for about 24 minutes before it was stopped at 13:30. The disney script still writes tokens to stderr.
+
+**Files changed:** PROGRESS.md
+
+**Commands run:**
+```bash
+ssh -o BatchMode=yes root@23.237.79.50 'python3 /tmp/rsa_s2.py; rm /tmp/rsa_s2.py'
+```
+Read-only: errors per stream for the last 2h, clustered by minute, plus proxy failure messages; the temporary scripts were removed from the server.
+
+**Unfinished:** Same as the last review. Replace or drop the dead proxies (79.127.168.43, 178.92.209.173) from rotation; the fallingBehind rounding fix, `ClientAliveInterval 15` and the token prints in disneyplus.py are still open. vpsrestream1 still runs the 2026-10-13 14:31 build (the step-down fix is not on it yet).
