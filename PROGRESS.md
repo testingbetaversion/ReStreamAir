@@ -306,3 +306,16 @@ ssh -o BatchMode=yes root@23.237.79.50 'python3 - <<EOF ... EOF; ss -tn state es
 Read-only: per-stream errors since 15:23, proxy failures and open connections per proxy.
 
 **Unfinished:** Same as above (per-proxy connection limit, shorter manifest timeout with failover, token prints, fallingBehind rounding, rebuild vpsrestream1).
+
+### 2026-10-14 — Fourth log review on vpsrestream1 (17:15–19:31 UTC)
+**What was done:** Read-only review. Quiet except for one event: at 18:24–18:25 requests through every proxy timed out together, both claro's SOCKS tunnel and all four disney proxies. All 6 claro channels and several disney events restarted at once and recovered within about a minute. Because every path failed at the same moment, the cause is probably vpsrestream1's own network for that minute rather than any one proxy (not verified). curta: the claro source itself jumped its timeline at 18:48 (+39–48s) and 19:07 (+36–40s); the engine logs "no download failed, so the source spliced". Those jumps account for most of curta's 466 skipped segments; one 404 on stream_05 at 18:47 added a real drop. One disney event (stream_1792002783000_cc7a5b) never started: two rounds of 4 cdm tries at 18:33 returned no usable keys. The other 5 disney events run fine (worst 0.58x on Estados Unidos x Espanha). sshd on vpsrestream1 allows root password login, and the journal shows 7653 failed password attempts in 24h.
+
+**Files changed:** PROGRESS.md
+
+**Commands run:**
+```bash
+ssh -o BatchMode=yes root@23.237.79.50 'python3 - <<EOF ... EOF; journalctl ...; grep sshd_config'
+```
+Read-only: per-stream errors since 17:15, the 18:24 outage timeline, curta's discontinuities, the failed cdm start, sshd settings.
+
+**Unfinished:** As before, plus: consider key-only SSH on vpsrestream1 (`PasswordAuthentication no`) once the Windows tunnel uses its key.
