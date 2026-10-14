@@ -11,6 +11,8 @@ typedef struct {
     int no_restart_error, restart_finished, no_restart_track, cooldown;
     int restart_delay, stalled_seconds, manifest_retries, ignore_static, use_dash_delay;
     int single_video;  // HLS pass-through: offer only one video variant
+    int proxy_limit;     // connections per proxy in the provider's list, 0 = unlimited
+    int manifest_stall;  // seconds without a byte before a manifest read is abandoned, 0 = off
 } rs_source_policy;
 
 #endif

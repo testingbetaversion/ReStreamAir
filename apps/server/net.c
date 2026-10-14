@@ -24,6 +24,9 @@ static __declspec(thread) int manifest_priority;
 static __declspec(thread) const void *t_proxy_pool;   // pool of the last proxy this thread used
 static __declspec(thread) size_t t_proxy_index;
 static __declspec(thread) int t_proxy_pool_fetch;  // inside a rotating proxy-list fetch
+static __declspec(thread) void *t_hold_pool;        // proxy this thread keeps a connection to,
+static __declspec(thread) size_t t_hold_index;      // counted against a connection limit
+static __declspec(thread) int t_hold_fetch;         // inside a fetch that keeps that hold
 #else
 #define POLICY_MKDIR(p) mkdir(p, 0700)
 static _Thread_local const rs_source_policy *active_policy;
@@ -31,6 +34,9 @@ static _Thread_local int manifest_priority;
 static _Thread_local const void *t_proxy_pool;
 static _Thread_local size_t t_proxy_index;
 static _Thread_local int t_proxy_pool_fetch;
+static _Thread_local void *t_hold_pool;
+static _Thread_local size_t t_hold_index;
+static _Thread_local int t_hold_fetch;
 #endif
 
 int rs_fetch_set_manifest_priority(int on) {
@@ -264,8 +270,11 @@ static CURLSH *shared_dns_cache(void) {
 static pthread_key_t g_handle_key;
 static bool g_handle_key_ok = false;
 
+static void proxy_hold_drop(void);
+
 static void handle_destructor(void *h) {
     if (h) curl_easy_cleanup((CURL *)h);
+    proxy_hold_drop();  // the connection it was counted for just closed
 }
 
 static void handle_key_init_once(void) {
@@ -286,6 +295,16 @@ static CURL *thread_handle(void) {
 }
 
 static bool thread_handle_is_owned(void) { return g_handle_key_ok; }
+
+// Closes this thread's cached connection by freeing its handle; the next
+// request gets a fresh one.
+static void thread_handle_discard(void) {
+    if (!g_handle_key_ok) return;
+    CURL *h = (CURL *)pthread_getspecific(g_handle_key);
+    if (!h) return;
+    pthread_setspecific(g_handle_key, NULL);
+    curl_easy_cleanup(h);
+}
 
 // --- CA trust store, for the static build -----------------------------------
 //
@@ -536,6 +555,17 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     // live engine's head-of-line rule instead, which measures the thing that
     // actually matters: whether this segment is holding up ones already
     // downloaded.
+    //
+    // Manifests are the one exception, and only for a request that receives
+    // NOTHING: no byte for manifestStallSeconds (15s by default, against a
+    // normal read of about two seconds). A stalled manifest read used to sit
+    // out the whole 30s request timeout while the window moved on; abandoning
+    // it retries on a fresh connection or the next proxy. One byte per second
+    // never cuts a slow manifest that is actually arriving.
+    if (manifest_priority && active_policy && active_policy->manifest_stall > 0) {
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, (long)active_policy->manifest_stall);
+    }
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION,
                      force_http11 ? (long)CURL_HTTP_VERSION_1_1 : (long)CURL_HTTP_VERSION_2TLS);
     // Keep-alive is the whole point of the per-thread handle; make the probes
@@ -563,7 +593,7 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
         // Keep only the connection in use. Only for a rotating proxy list —
         // the setup that hits those limits; a provider with one proxy (an
         // unlimited tunnel) keeps libcurl's normal connection reuse.
-        if (t_proxy_pool_fetch) curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, 1L);
+        if (t_proxy_pool_fetch || t_hold_fetch) curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, 1L);
     }
     if (header_list) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
     if (range && range[0]) {
@@ -678,6 +708,9 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
     }
 
     if (!borrowed) curl_easy_cleanup(curl);
+    // With one cached connection per handle, a fetch that did not go through
+    // the held proxy has replaced the connection the hold counted.
+    if (!t_hold_fetch || !borrowed) proxy_hold_drop();
     return result;
 }
 
@@ -1038,13 +1071,16 @@ typedef struct {
     bool known;
     bool healthy;
     unsigned failures;
+    unsigned benches;   // times benched in a row, without a success in between
     unsigned in_flight;
+    unsigned holders;   // threads keeping a connection to it (connection limit)
     time_t retry_at;
 } proxy_health;
 
 typedef struct {
     char *list;
     size_t next_rotate;
+    unsigned waiting;   // requests waiting for a free connection slot
     proxy_health proxy[RS_PROXY_FALLBACK_MAX];
 } proxy_pool;
 
@@ -1086,13 +1122,70 @@ static proxy_pool *proxy_pool_locked(const char *list, size_t count) {
     return pool;
 }
 
+#define RS_PROXY_ALL_FULL ((size_t)-1)
+
+// Whether this thread may use entry i under a connection limit: it already
+// holds a connection there, or the proxy has a free slot.
+static bool proxy_has_room(const proxy_pool *pool, size_t i, int limit) {
+    if (limit <= 0) return true;
+    if (t_hold_pool == (const void *)pool && t_hold_index == i) return true;
+    return pool->proxy[i].holders < (unsigned)limit;
+}
+
+// Moves this thread's hold to entry i. libcurl keeps one cached connection
+// per handle in a limited fetch (CURLOPT_MAXCONNECTS 1), so the connection to
+// the previous proxy is closed once this one opens. Call with the lock held.
+static void proxy_hold_move_locked(proxy_pool *pool, size_t i) {
+    if (t_hold_pool == (void *)pool && t_hold_index == i) return;
+    if (t_hold_pool) {
+        proxy_health *old = &((proxy_pool *)t_hold_pool)->proxy[t_hold_index];
+        if (old->holders) old->holders--;
+    }
+    pool->proxy[i].holders++;
+    t_hold_pool = pool;
+    t_hold_index = i;
+}
+
+static void proxy_wait_mark(const char *list, size_t count, int delta) {
+    pthread_mutex_lock(&g_proxy_pool_mu);
+    proxy_pool *pool = proxy_pool_locked(list, count);
+    if (pool) pool->waiting = delta > 0 ? pool->waiting + 1 : pool->waiting ? pool->waiting - 1 : 0;
+    pthread_mutex_unlock(&g_proxy_pool_mu);
+}
+
+// A kept-alive connection still occupies one of the proxy's slots while it
+// sits idle. When another request is waiting for a slot, a thread that has
+// just finished hands its slot over instead of keeping its connection.
+static void proxy_yield_if_waited(const char *list, size_t count) {
+    pthread_mutex_lock(&g_proxy_pool_mu);
+    proxy_pool *pool = proxy_pool_locked(list, count);
+    bool yield = pool && pool->waiting > 0 && t_hold_pool == (void *)pool;
+    pthread_mutex_unlock(&g_proxy_pool_mu);
+    if (!yield) return;
+    thread_handle_discard();
+    proxy_hold_drop();
+}
+
+static void proxy_hold_drop(void) {
+    if (!t_hold_pool) return;
+    pthread_mutex_lock(&g_proxy_pool_mu);
+    proxy_health *h = &((proxy_pool *)t_hold_pool)->proxy[t_hold_index];
+    if (h->holders) h->holders--;
+    t_hold_pool = NULL;
+    pthread_mutex_unlock(&g_proxy_pool_mu);
+}
+
 // Unknown proxies go first so the first few real requests check every entry
 // without fetching one object more than once. Failed entries are quarantined
 // with exponential backoff, then receive an ordinary request as a recovery
 // probe. If the whole pool is quarantined, the oldest entry is allowed through
 // so it can recover without external intervention.
+//
+// With a connection limit, an entry whose slots are all held by other threads
+// is passed over; when every untried entry is full this returns
+// RS_PROXY_ALL_FULL and the caller waits for a slot rather than going over.
 static size_t proxy_acquire(const char *list, size_t count, bool rotate,
-                            unsigned tried_mask) {
+                            unsigned tried_mask, int limit) {
     time_t now = time(NULL);
     size_t chosen = count;
     pthread_mutex_lock(&g_proxy_pool_mu);
@@ -1108,11 +1201,13 @@ static size_t proxy_acquire(const char *list, size_t count, bool rotate,
     // round-robin when they first pick, then each keeps its proxy while it is
     // healthy — the load still splits across the pool, one connection each.
     if (rotate && t_proxy_pool == (const void *)pool && t_proxy_index < count &&
-        !(tried_mask & (1u << t_proxy_index)) && pool->proxy[t_proxy_index].healthy)
+        !(tried_mask & (1u << t_proxy_index)) && pool->proxy[t_proxy_index].healthy &&
+        proxy_has_room(pool, t_proxy_index, limit))
         chosen = t_proxy_index;
     // Spread initial health checks across concurrent download workers.
     for (size_t i = 0; chosen == count && i < count; i++) {
-        if (!(tried_mask & (1u << i)) && !pool->proxy[i].known && pool->proxy[i].in_flight == 0) {
+        if (!(tried_mask & (1u << i)) && !pool->proxy[i].known && pool->proxy[i].in_flight == 0 &&
+            proxy_has_room(pool, i, limit)) {
             chosen = i;
             break;
         }
@@ -1121,7 +1216,7 @@ static size_t proxy_acquire(const char *list, size_t count, bool rotate,
         for (size_t i = 0; i < count; i++) {
             proxy_health *h = &pool->proxy[i];
             if (!(tried_mask & (1u << i)) && h->known && !h->healthy &&
-                h->retry_at <= now && h->in_flight == 0) {
+                h->retry_at <= now && h->in_flight == 0 && proxy_has_room(pool, i, limit)) {
                 chosen = i;
                 break;
             }
@@ -1131,7 +1226,7 @@ static size_t proxy_acquire(const char *list, size_t count, bool rotate,
         size_t start = rotate && count ? pool->next_rotate % count : 0;
         for (size_t step = 0; step < count; step++) {
             size_t i = rotate ? (start + step) % count : step;
-            if (!(tried_mask & (1u << i)) && pool->proxy[i].healthy) {
+            if (!(tried_mask & (1u << i)) && pool->proxy[i].healthy && proxy_has_room(pool, i, limit)) {
                 chosen = i;
                 break;
             }
@@ -1146,31 +1241,45 @@ static size_t proxy_acquire(const char *list, size_t count, bool rotate,
     // a proxy that is inside its failure cooldown.
     if (chosen == count) {
         for (size_t i = 0; i < count; i++)
-            if (!(tried_mask & (1u << i)) && pool->proxy[i].healthy) { chosen = i; break; }
+            if (!(tried_mask & (1u << i)) && pool->proxy[i].healthy && proxy_has_room(pool, i, limit)) { chosen = i; break; }
     }
+    bool full = false;
     if (chosen == count) {
         time_t earliest = 0;
         for (size_t i = 0; i < count; i++) {
             if (tried_mask & (1u << i)) continue;
+            if (!proxy_has_room(pool, i, limit)) { full = true; continue; }
             if (chosen == count || pool->proxy[i].retry_at < earliest) {
                 chosen = i;
                 earliest = pool->proxy[i].retry_at;
             }
         }
     }
-    if (chosen < count) pool->proxy[chosen].in_flight++;
+    if (chosen < count) {
+        pool->proxy[chosen].in_flight++;
+        if (limit > 0) proxy_hold_move_locked(pool, chosen);
+    }
     pthread_mutex_unlock(&g_proxy_pool_mu);
-    return chosen;
+    return chosen == count && full ? RS_PROXY_ALL_FULL : chosen;
 }
 
 typedef enum { PROXY_OK, PROXY_FAILED, PROXY_NO_VERDICT } proxy_outcome;
 
+// Benched this many times in a row before it is reported as an error. One
+// request a free tunnel drops benches a proxy that answers the very next one;
+// alerting on that sent a Discord message several times an hour for a proxy
+// that was working. Three means it also failed both re-checks after its
+// cooldowns (15s, then 30s) — a proxy that is actually down.
+#define RS_PROXY_ALERT_BENCHES 3
+
 // Returns the cooldown in seconds when this release benched the proxy, -1 when
 // it brought a benched proxy back, 0 otherwise — so the caller logs only state
-// changes, not every request.
+// changes, not every request. `benches` receives how many times in a row the
+// proxy has now been benched.
 static int proxy_release(const char *list, size_t count, size_t index,
-                         proxy_outcome outcome) {
+                         proxy_outcome outcome, unsigned *benches) {
     int change = 0;
+    *benches = 0;
     pthread_mutex_lock(&g_proxy_pool_mu);
     proxy_pool *pool = proxy_pool_locked(list, count);
     if (pool && index < count) {
@@ -1182,9 +1291,11 @@ static int proxy_release(const char *list, size_t count, size_t index,
             t_proxy_pool = (const void *)pool;
             t_proxy_index = index;
             if (h->known && !h->healthy) change = -1;
+            *benches = h->benches;  // how long the outage was, for the recovery line
             h->known = true;
             h->healthy = true;
             h->failures = 0;
+            h->benches = 0;
             h->retry_at = 0;
         } else {
             // Requests already in flight when the proxy was benched fail too;
@@ -1196,7 +1307,11 @@ static int proxy_release(const char *list, size_t count, size_t index,
             unsigned delay = 15u << (h->failures ? h->failures - 1 : 0);
             if (delay > 300u) delay = 300u;
             h->retry_at = time(NULL) + (time_t)delay;
-            if (!already_benched) change = (int)delay;
+            if (!already_benched) {
+                change = (int)delay;
+                h->benches++;
+            }
+            *benches = h->benches;
         }
     }
     pthread_mutex_unlock(&g_proxy_pool_mu);
@@ -1208,7 +1323,10 @@ static int fetch_with_proxies(const char *url, const char *proxy, const char *he
                  char **out, size_t *out_len, long *status, char **content_type,
                  char **content_range, char **effective_url, char *errbuf, size_t errbuf_len,
                  long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx) {
-    if (!proxy || !strpbrk(proxy, "\r\n")) {
+    // A connection limit is enforced by the proxy pool, so a single proxy with
+    // one goes through the list path below as a list of one.
+    int limit = active_policy ? active_policy->proxy_limit : 0;
+    if (!proxy || !proxy[0] || (!strpbrk(proxy, "\r\n") && limit <= 0)) {
         // A single proxy pasted with a trailing space reached libcurl as part
         // of the host name ("Could not resolve proxy name"); the list path
         // below trims each entry, so trim this one the same way.
@@ -1246,9 +1364,38 @@ static int fetch_with_proxies(const char *url, const char *proxy, const char *he
     int rc = -1;
     size_t attempted = 0;
     unsigned tried_mask = 0;
+    double full_until = 0;
+    bool waiting = false;
     while (attempted < count) {
         if (attempted > 0 && should_cancel && should_cancel(cancel_ctx, 0)) break;
-        size_t index = proxy_acquire(proxy, count, rotate_proxies != 0, tried_mask);
+        size_t index = proxy_acquire(proxy, count, rotate_proxies != 0, tried_mask, limit);
+        if (index == RS_PROXY_ALL_FULL) {
+            // Every proxy left to try has all its connections in use. Going
+            // over gets the request refused by the proxy (and benches a
+            // healthy proxy for it), so wait for a slot instead, as long as
+            // the request itself would have been allowed to take.
+            double now = net_now();
+            if (!waiting) { proxy_wait_mark(proxy, count, +1); waiting = true; }
+            if (full_until == 0) {
+                full_until = now + (timeout_ms > 0 ? (double)timeout_ms : 30000.0) / 1000.0;
+                static double last_note;  // a racy read only thins the log
+                if (now - last_note >= 60.0) {
+                    last_note = now;
+                    char note[160];
+                    snprintf(note, sizeof(note), "every proxy is using all %d of its connections — "
+                             "requests are waiting for a free one", limit);
+                    restream_log_event("info", "proxyLimit", note);
+                }
+            }
+            if (now >= full_until || (should_cancel && should_cancel(cancel_ctx, 0))) {
+                if (errbuf && errbuf_len)
+                    snprintf(errbuf, errbuf_len, "Every proxy stayed at its connection limit (%d).", limit);
+                break;
+            }
+            rs_proc_sleep_ms(50);
+            continue;
+        }
+        if (waiting) { proxy_wait_mark(proxy, count, -1); waiting = false; }
         if (index >= count) break;
         tried_mask |= 1u << index;
         attempted++;
@@ -1256,11 +1403,14 @@ static int fetch_with_proxies(const char *url, const char *proxy, const char *he
         long *status_out = status ? status : &attempt_status;
         *status_out = 0;  // never judge this proxy by the previous attempt's code
         t_proxy_pool_fetch = rotate_proxies != 0;
+        t_hold_fetch = limit > 0;
         rc = fetch_through_one_proxy(url, items[index], headers, range, downloader, dl_params, force_ipv6,
                                      out, out_len, status_out, content_type, content_range,
                                      effective_url, errbuf, errbuf_len,
                                      timeout_ms, should_cancel, cancel_ctx);
         t_proxy_pool_fetch = 0;
+        t_hold_fetch = 0;
+        if (limit > 0) proxy_yield_if_waited(proxy, count);
         // Health is provider-specific: a proxy that answers but cannot fetch
         // this provider's URL (geo 403, 407, transport error, 5xx) is not
         // useful to this pool and goes behind the working entries for a
@@ -1274,23 +1424,37 @@ static int fetch_with_proxies(const char *url, const char *proxy, const char *he
                             got != 403 && got != 407 && got != 408 && got != 429;
         proxy_outcome outcome = rc == 0 || origin_final ? PROXY_OK
                               : cancelled ? PROXY_NO_VERDICT : PROXY_FAILED;
-        int change = proxy_release(proxy, count, index, outcome);
+        unsigned benches = 0;
+        int change = proxy_release(proxy, count, index, outcome, &benches);
         if (change) {
             // Name the proxy by host:port only; the credentials stay out of logs.
             const char *at = strrchr(items[index], '@');
             const char *host = at ? at + 1 : items[index];
             const char *scheme_end = at ? NULL : strstr(host, "://");
             if (scheme_end) host = scheme_end + 3;
+            const char *why = errbuf && errbuf[0] ? errbuf : "no response";
+            // Only the bench that crosses the threshold is an error, so a
+            // proxy that is down alerts once, not on every failed re-check.
+            bool alert = change > 0 && benches == RS_PROXY_ALERT_BENCHES;
             char msg[512];
-            if (change > 0)
-                snprintf(msg, sizeof(msg), "proxy %s failed (%s) — skipped for %ds, using the other proxies",
-                         host, errbuf && errbuf[0] ? errbuf : "no response", change);
+            if (alert)
+                snprintf(msg, sizeof(msg), "proxy %s failed %u times in a row, including its re-checks (%s) — "
+                         "skipped for %ds, using the other proxies", host, benches, why, change);
+            else if (change > 0 && benches > RS_PROXY_ALERT_BENCHES)
+                snprintf(msg, sizeof(msg), "proxy %s is still failing (%s) — skipped for %ds", host, why, change);
+            else if (change > 0)
+                snprintf(msg, sizeof(msg), "proxy %s: one request failed (%s) — skipped for %ds; "
+                         "reported as an error only if it keeps failing", host, why, change);
+            else if (benches >= RS_PROXY_ALERT_BENCHES)
+                snprintf(msg, sizeof(msg), "proxy %s is answering again after %u failed checks — back in rotation",
+                         host, benches);
             else
                 snprintf(msg, sizeof(msg), "proxy %s is answering again — back in rotation", host);
-            restream_log_event(change > 0 ? "error" : "info", "proxyHealth", msg);
+            restream_log_event(alert ? "error" : "info", "proxyHealth", msg);
         }
         if (rc == 0 || cancelled || origin_final) break;
     }
+    if (waiting) proxy_wait_mark(proxy, count, -1);
     if (rc != 0 && count > 1 && attempted > 0 && errbuf && errbuf_len) {
         size_t used = strnlen(errbuf, errbuf_len);
         const char *suffix = " (all available proxies failed)";

@@ -540,6 +540,11 @@ not delivered. No webhook or a full queue produces `400`.
 ```
 
 HTTP status is optional. A test uses title `Webhook test` and color `5763719`.
+
+A proxy that fails one request is set aside for 15 s and logged as `info`; free
+tunnels drop single requests while working. The `proxyHealth` error, and its
+webhook, comes only when the proxy has been set aside three times in a row,
+having failed its re-checks after each cooldown. It is sent once per outage.
 Descriptions are truncated to approximately 1000 characters and URLs in error
 text are redacted. Extra burst errors are collapsed: one provider error is
 queued per 5-second window, and a subsequent alert may carry `footer.text`
