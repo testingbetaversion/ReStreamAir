@@ -1342,14 +1342,24 @@ static void test_provider_options(void) {
 
     rs_json *view = rs_panel_view(&st, "localhost");
     const rs_json *schema = rs_json_obj_get(view, "providerOptionFields");
-    check("options/screenshot-fields", rs_json_arr_len(schema) == 46);
+    check("options/screenshot-fields", rs_json_arr_len(schema) == 48);
+    {
+        rs_source_policy policy;
+        rs_provider_source_policy(provider, &policy);
+        check("options/proxy-limit-default-off", policy.proxy_limit == 0);
+        check("options/manifest-stall-default", policy.manifest_stall == 15);
+        rs_json *off = parse_json("{\"manifestStallSeconds\":0,\"proxyConnectionLimit\":8}");
+        check("options/manifest-stall-off-valid", rs_provider_options_valid(off, &err));
+        rs_json_free(off);
+    }
     rs_json *defaults = rs_provider_options_merge(NULL, NULL);
     check("options/defaults-valid", rs_provider_options_valid(defaults, &err));
     rs_json_free(defaults);
     rs_json_free(view);
     const char *invalid[] = {"[]", "null", "{\"scriptTimeoutSeconds\":0}", "{\"playbackDelaySeconds\":121}",
         "{\"outputFragmentsCount\":2}", "{\"maxStreamsConcurrency\":-1}", "{\"scriptTimeoutSeconds\":1.5}",
-        "{\"noRestartOnError\":1}", "{\"userAgent\":\"bad\\r\\nInjected: yes\"}"};
+        "{\"noRestartOnError\":1}", "{\"userAgent\":\"bad\\r\\nInjected: yes\"}",
+        "{\"proxyConnectionLimit\":101}", "{\"manifestStallSeconds\":301}"};
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
         rs_json *v = parse_json(invalid[i]);
         check("options/reject-invalid", !rs_provider_options_valid(v, &err));
