@@ -238,3 +238,21 @@ ssh root@moonmuaaz.xyz '... fake HLS source + two cdm scripts, throwaway server 
 Case A (720p key returned): played 720p, nothing stored. Case B (only the lower key): stepped down to 540p. Test files in /tmp/rsa-test/trash/sd2-*.
 
 **Unfinished:** vpsrestream1 needs a rebuild, then Start pressed on Cleveland x Tampa Bay (clears its stored 216p). Xangai, Al Nassr x Neftchi and Linha de Passe have a harmless stored `height=720` that Start also clears.
+
+### 2026-10-14 — Stream log review on vpsrestream1 + Windows tunnel script
+**What was done:** Read today's logs for the 16 running streams on vpsrestream1 (read-only). Findings: 633 of 634 `fallingBehind` alerts had no lost segments (whole ~6s segments counted in a ~64s window read as 0.93x); the claro 01:37–01:53 restart storm was the reverse SSH tunnel on 127.0.0.1:1080 dying while sshd (`ClientAliveInterval 0`) kept the port held; the disney script prints access tokens to stderr, which land in the logs as `scriptError`. Added a Windows batch script that keeps a reverse SOCKS tunnel up: asks server, ports and user once, installs its own SSH key with the password typed once, then reconnects forever with keepalives and `ExitOnForwardFailure`.
+
+**Files changed:** scripts/windows/reverse-socks-tunnel.bat (new), PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@23.237.79.50 'python3 /tmp/rsa_tbl.py; ...grep/journalctl/ss...'
+```
+Read-only: per-stream error table, tunnel origin and sshd keepalive settings; the temporary script was removed.
+
+```bash
+perl -pi -e 's/\r?\n/\r\n/' scripts/windows/reverse-socks-tunnel.bat
+```
+Gives the batch file Windows line endings.
+
+**Unfinished:** The script is untested on Windows. Fix the fallingBehind segment-rounding in core/src/live.c; set `ClientAliveInterval 15` on vpsrestream1; remove the token/debug prints from disneyplus.py and rotate the Disney session.
