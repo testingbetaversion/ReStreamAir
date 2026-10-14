@@ -59,6 +59,8 @@ static const option_field fields[] = {
     N("maxStreamsConcurrency", "Max streams concurrency", "Output and downloads", 0,1,10000, "0 = unlimited. Caps streams marked running for this provider. Lowering the limit leaves already running streams active.", ""),
     N("importParallelDownloads", "Parallel downloads for imported streams", "Output and downloads", 0,1,8, "Connections each channel or event this provider imports opens to the origin (1–8; 0 keeps the default of 6). Each one is a proxy connection, plus one for manifest polling — size it to your proxies' connection limit. Existing streams keep theirs; use Apply to all streams below to change them too.", ""),
     N("maxDownloadConcurrency", "Max download concurrency", "Output and downloads", 50,1,1000, "Shared cap on provider manifest, media and probe requests through the built-in/selected downloaders. FFmpeg manages its own internal downloads.", ""),
+    N("proxyConnectionLimit", "Connections per proxy", "Output and downloads", 0,1,100, "0 = unlimited. Most connections this server keeps open through each proxy in the provider's list; a request waits for a free slot or uses another proxy instead of going over. Set it 1–2 below your plan's limit (Proxy-Seller: 10) — the provider script's own requests through the same proxy are not counted.", ""),
+    N("manifestStallSeconds", "Manifest stall timeout (s)", "Output and downloads", 15,0,300, "0 = off. A manifest or playlist request that receives no data at all for this long is abandoned and retried on a fresh connection, or on the next proxy in the list. A manifest still downloading slowly is not affected; segments keep HTTP get timeout.", ""),
     N("httpGetTimeoutSeconds", "HTTP get timeout (s)", "Output and downloads", 30,1,3600, "Maximum duration of each upstream request attempt, including built-in and external downloaders. Also sets FFmpeg socket timeout.", ""),
     N("httpGetAttempts", "HTTP get tentatives count", "Output and downloads", 2,1,100, "Maximum HTTP attempts per URL and proxy pool operation. Does not retry permanent 4xx responses except 408/429. FFmpeg uses its own reconnect policy.", ""),
     N("stalledStreamTimeoutSeconds", "Stalled stream timeout (s)", "Output and downloads", 60,1,3600, "DASH and FFmpeg: treat a lack of new media/output timestamps for this duration as an error, then apply the restart policy.", ""),
@@ -287,4 +289,6 @@ void rs_provider_source_policy(const rs_json *provider, rs_source_policy *out) {
     out->manifest_retries = (int)rs_provider_option_int(provider, "retryNewManifestCount");
     out->ignore_static = rs_provider_option_bool(provider, "ignoreDashStaticFlag");
     out->use_dash_delay = rs_provider_option_bool(provider, "useDashDelay");
+    out->proxy_limit = (int)rs_provider_option_int(provider, "proxyConnectionLimit");
+    out->manifest_stall = (int)rs_provider_option_int(provider, "manifestStallSeconds");
 }
