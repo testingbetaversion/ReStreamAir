@@ -5013,17 +5013,77 @@ static char *hls_first_variant_url(const char *manifest_url, const char *text) {
     return NULL;
 }
 
+// How many of a live playlist's newest segments the engine starts on: its
+// first read takes a short run-up at the live edge (rep_window_want).
+#define RS_HLS_EDGE_SEGMENTS 8
+
+// The init segments (EXT-X-MAP) the newest `newest` segments of a media
+// playlist use, oldest first, resolved against `manifest_url`. Returns how
+// many were written to `out` (caller frees each).
+//
+// The newest, not the first: a live playlist lists every MAP still in its
+// window, and at a key rotation that is two — the outgoing one first. Disney+
+// rotates the key with the MAP (map96 → map97), so reading the first MAP
+// licensed the key the window was leaving, and the engine, which starts at the
+// live edge, found its video under a KID it had no key for. Around the
+// rotation the edge itself can span both, which is why this can return two.
+static size_t hls_edge_init_urls(const char *manifest_url, const char *text, size_t newest,
+                                 char **out, size_t cap) {
+    if (!text || !cap || !newest) return 0;
+    const char *ring_map[RS_HLS_EDGE_SEGMENTS];
+    size_t ring_len[RS_HLS_EDGE_SEGMENTS];
+    if (newest > RS_HLS_EDGE_SEGMENTS) newest = RS_HLS_EDGE_SEGMENTS;
+    size_t seen = 0;
+    const char *map = NULL;
+    size_t map_len = 0;
+    for (const char *line = text; line && *line;) {
+        const char *eol = line + strcspn(line, "\r\n");
+        if (!strncmp(line, "#EXT-X-MAP:", 11)) {
+            const char *uri = strstr(line, "URI=\"");
+            const char *start = uri && uri < eol ? uri + 5 : NULL;
+            const char *end = start ? memchr(start, '"', (size_t)(eol - start)) : NULL;
+            if (end && end > start) { map = start; map_len = (size_t)(end - start); }
+        } else if (eol > line && line[0] != '#' && map) {
+            // A segment URI: remember which MAP it is under.
+            ring_map[seen % newest] = map;
+            ring_len[seen % newest] = map_len;
+            seen++;
+        }
+        line = eol;
+        while (*line == '\r' || *line == '\n') line++;
+    }
+    if (seen == 0) {
+        // A playlist with a MAP but no segments yet still names its init.
+        if (!map) return 0;
+        ring_map[0] = map; ring_len[0] = map_len; seen = 1; newest = 1;
+    }
+    size_t count = seen < newest ? seen : newest;
+    size_t first = seen < newest ? 0 : seen % newest;
+    size_t n = 0;
+    for (size_t i = 0; i < count && n < cap; i++) {
+        size_t k = (first + i) % newest;
+        bool dup = false;
+        for (size_t j = 0; j < i && !dup; j++) {
+            size_t q = (first + j) % newest;
+            dup = ring_len[q] == ring_len[k] && !memcmp(ring_map[q], ring_map[k], ring_len[k]);
+        }
+        if (dup) continue;
+        char *ref = dup_n(ring_map[k], ring_len[k]);
+        char *resolved = ref ? rs_url_resolve(manifest_url, ref) : NULL;
+        free(ref);
+        if (resolved) out[n++] = resolved;
+    }
+    return n;
+}
+
+// The init segment the newest segment uses — the one playback starts with.
 static char *hls_init_url(const char *manifest_url, const char *manifest_text) {
-    const char *map = manifest_text ? strstr(manifest_text, "#EXT-X-MAP:") : NULL;
-    const char *uri = map ? strstr(map, "URI=\"") : NULL;
-    if (!uri) return NULL;
-    const char *start = uri + 5;
-    const char *end = strchr(start, '"');
-    if (!end || end <= start) return NULL;
-    char *ref = dup_n(start, (size_t)(end - start));
-    char *resolved = ref ? rs_url_resolve(manifest_url, ref) : NULL;
-    free(ref);
-    return resolved;
+    char *urls[RS_HLS_EDGE_SEGMENTS];
+    size_t n = hls_edge_init_urls(manifest_url, manifest_text, RS_HLS_EDGE_SEGMENTS, urls,
+                                  RS_HLS_EDGE_SEGMENTS);
+    if (n == 0) return NULL;
+    for (size_t i = 0; i + 1 < n; i++) free(urls[i]);
+    return urls[n - 1];
 }
 
 // The third place PSSH can live. A manifest that advertises only a bare
@@ -5372,6 +5432,29 @@ static int stream_start_resolve_keys(restream_server_t *server, const char *sid,
     // the licence request is then built for it (see below).
 #define RS_CDM_MAX_KIDS_FOR_PSSH 64
     char *init_only_kid = NULL;
+    // Mid-rotation, the segments the engine starts on can sit under the
+    // outgoing MAP before the newest one: license those too, so the first
+    // segments do not fail on a key the start never asked for.
+    if (text && strcmp(st->kind, "m3u8") == 0) {
+        char *edge[RS_HLS_EDGE_SEGMENTS];
+        size_t edge_n = hls_edge_init_urls(drm_manifest_url, text, RS_HLS_EDGE_SEGMENTS, edge,
+                                           RS_HLS_EDGE_SEGMENTS);
+        for (size_t e = 0; e + 1 < edge_n; e++) {
+            size_t older_len = 0;
+            char *older = stream_start_fetch_headers(st, edge[e], st->media_proxy,
+                                                     st->media_fetch_headers, &older_len);
+            if (older) {
+                size_t kids_before = ch.kids_count;
+                rs_cdm_challenge_add_from_init(&ch, (const uint8_t *)older, older_len);
+                if (ch.kids_count > kids_before)
+                    log_record(server, sid, "info", "cdm", edge[e], 0, -1,
+                               "the playlist is mid key rotation — the live edge also uses this "
+                               "init segment, so its KID is licensed too");
+                free(older);
+            }
+        }
+        for (size_t e = 0; e < edge_n; e++) free(edge[e]);
+    }
     if (text) {
         size_t init_len = 0;
         uint8_t *init = stream_start_fetch_init(st, drm_manifest_url, text, &init_len);
