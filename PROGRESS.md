@@ -367,3 +367,26 @@ ssh -o BatchMode=yes root@23.237.79.50 'python3 - <<EOF ... EOF; ss -tn ...'
 Read-only: errors per stream and hour since 04:31, segments skipped per 10 min, provider options, open proxy connections.
 
 **Unfinished:** Set disney's "Connections per proxy" to 8. Check DP World India in the new live traffic view (eye icon) to see which proxy its downloads use and how fast they are.
+
+### 2026-10-15 — License the key at the live edge (fixes most "Wrong decryption keys")
+**What was done:** On vpsrestream1 almost every Disney start logged "Wrong decryption keys" and restarted 30s later (35 in 24h). Traced on Linha de Passe at 13:25: the start inspected the right variant (`cmaf-cenc-ctr-7000K`), but `hls_init_url` read the playlist's first `#EXT-X-MAP` (`map96`, KID `7929…`). The engine starts at the live edge, under `map97` (KID `9aac…`). Disney rotates the key with the MAP, so around a rotation the live window lists both. `hls_init_url` now returns the MAP the newest segment uses. The start also licenses any older MAP still under the newest 8 segments, so a start mid-rotation gets both keys and nothing else. The 720p step-down check and pass-through use the same function and get the same fix.
+
+**Files changed:** core/src/server.c, PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@23.237.79.50 'python3 - <<EOF ... EOF'
+```
+Read-only: traced the Linha de Passe start (variant and init URLs, KIDs) and counted wrongKeys in the last 24h.
+
+```bash
+ssh root@moonmuaaz.xyz 'cd /tmp/rsa-test/edge && cc -fsanitize=address,undefined edge.c -o edge && ./edge'
+```
+Standalone test of the new playlist logic: rotation before the edge → `map97` only; rotation inside the edge → `map96` and `map97`; single MAP; MAP with no segments; TS without MAP; MAP with BYTERANGE. All correct, sanitizer-clean. Harness moved to /tmp/rsa-test/trash/edge-*.
+
+```bash
+ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build && cd build && ctest'
+```
+Builds on moonmuaaz and runs the test suites (2 of 2 passed).
+
+**Unfinished:** vpsrestream1 needs a rebuild to get this. A key rotation while a stream is already running still needs a new key mid-stream, which the engine does not fetch yet (see restreamair-cdm-scripting: key rotation pending).
