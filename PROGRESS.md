@@ -390,3 +390,21 @@ ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build 
 Builds on moonmuaaz and runs the test suites (2 of 2 passed).
 
 **Unfinished:** vpsrestream1 needs a rebuild to get this. A key rotation while a stream is already running still needs a new key mid-stream, which the engine does not fetch yet (see restreamair-cdm-scripting: key rotation pending).
+
+### 2026-10-15 — Key rotation while a stream plays (no more restart)
+**What was done:** When Disney rotates the key on a running stream, the engine no longer stops with "Wrong decryption keys" and restarts 30s later. Each HLS segment now carries the `#EXT-X-MAP` it is under, and the engine records every init's KID and decrypts each segment with its own init's key, so segments queued before a rotation keep the old key. When a new KID has no key, the engine asks the server, which runs the stream's `cdm` action for that KID in the background (the start-time key step without the manifest). The engine holds the new-key segments meanwhile, re-asks every 20s, and after 60s falls back to the old stop-and-restart. The keys go to the running engine and are added to the stream's saved keys. Logged as `keyRotation`. Documented in SCRIPTING.md.
+
+**Files changed:** core/src/live.c, core/include/rs_live.h, core/src/server.c, core/src/m3u8.c, core/include/rs_m3u8.h, apps/server/rs_dash.c, core/tests/selftest_main.c, SCRIPTING.md, public/docs/SCRIPTING.md, PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build && cd build && ctest'
+```
+Builds on moonmuaaz and runs the test suites (2 of 2 passed, including new playlist-parser tests for per-segment init URLs).
+
+```bash
+ssh root@moonmuaaz.xyz 'cd /tmp/rsa-test/kr && ./make.sh; packager ...; ./run.sh'
+```
+End-to-end on a throwaway server (127.0.0.1:8797). The same 120s video was packaged twice with shaka-packager (CENC, KID 1111… / KID 2222…) and served as a live HLS stream that switches init and key at segment 21 (~30s in), with a stub `cdm` script that answers only for the KIDs in `kids=`. Result: the key was requested at 28.2s and arrived 3.3s later, with no wrongKeys and no restart, and both keys were saved on the stream. A control run without a switch had 0 decoder errors. The whole output window across the switch decoded 2,900 frames with 0 errors, and 100% of them are identical to frames of the unencrypted source. (A first attempt with ffmpeg-encrypted media was invalid: ffmpeg cannot decrypt its own `-encryption_scheme` output.) Test files moved to /tmp/rsa-test/trash/kr-*.
+
+**Unfinished:** vpsrestream1 needs a rebuild to get this, along with the live-edge key fix (e3dbb56).
