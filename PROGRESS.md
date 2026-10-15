@@ -331,4 +331,4 @@ ssh -o BatchMode=yes root@23.237.79.50 'python3 - <<EOF ... EOF; journalctl ...;
 ```
 Read-only: per-stream errors since 19:31, proxy failures per hour, disney concurrency per 30 min, tunnel reconnects.
 
-**Unfinished:** a451f93 (proxy connection limit, manifest stall timeout, alerts only on lasting proxy failure) is pushed, but its selftest update (the options count 46 → 48 plus checks for the new options) is still uncommitted in core/tests/selftest_main.c, so the selftest fails on main. The functional test on moonmuaaz (scripts in /tmp/rsa-test/pl) was stopped before it ran. vpsrestream1 has not been rebuilt.
+**Unfinished:** a451f93 (proxy connection limit, manifest stall timeout, alerts only on lasting proxy failure) and its selftest update 265e017 are on main. The functional test of the connection limit on moonmuaaz was stopped mid-run; its leftover test processes were stopped and the files moved to /tmp/rsa-test/trash/pl-*. vpsrestream1 has not been rebuilt.
