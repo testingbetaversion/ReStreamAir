@@ -262,6 +262,8 @@ static restream_probe_fn g_probe_handler = NULL;
 static restream_epg_fn g_epg_handler = NULL;
 static restream_fetch_fn g_fetch_handler = NULL;
 static restream_webhook_fn g_webhook_handler = NULL;
+static restream_proxy_stats_fn g_proxy_stats_handler = NULL;
+static restream_stream_traffic_fn g_stream_traffic_handler = NULL;
 static restream_dash_fn g_dash_handler = NULL;
 static restream_service_status_fn g_service_status = NULL;
 static restream_service_action_fn g_service_action = NULL;
@@ -326,6 +328,7 @@ static void log_record(restream_server_t *s, const char *sid, const char *level,
                        const char *message);
 static char *primary_proxy(const char *list);
 static char *effective_proxy(const rs_json *provider, const rs_json *stream, bool category_on);
+static rs_json *proxy_view(const rs_json *provider, const char *list);
 static char *effective_headers(const rs_json *provider, const rs_json *stream, const char *field);
 static void pending_job_finish_buffer(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf);
 
@@ -959,6 +962,8 @@ static RS_THREAD_LOCAL char t_log_stream[160];
 void restream_log_set_stream(const char *stream_id) {
     snprintf(t_log_stream, sizeof(t_log_stream), "%s", stream_id ? stream_id : "");
 }
+
+const char *restream_log_current_stream(void) { return t_log_stream; }
 
 bool restream_debug_enabled(void) {
     restream_server_t *s = g_debug_server;
@@ -3047,6 +3052,35 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         }
     }
 
+    // --- live proxy connections and per-stream traffic (read-only) ---
+    if (mg_match(hm->uri, mg_str("/api/providers/*/proxies"), NULL) && method_is(hm, "GET")) {
+        char *id = capture(hm, "/api/providers/*/proxies");
+        const rs_json *provider = find_provider_by_id(&s->state, id);
+        free(id);
+        if (!provider) { reply_error(c, 404, "Unknown provider."); return true; }
+        reply_json(c, 200, proxy_view(provider, rs_json_obj_str(provider, "proxy", "")), NULL);
+        return true;
+    }
+    if (mg_match(hm->uri, mg_str("/api/streams/*/traffic"), NULL) && method_is(hm, "GET")) {
+        char *id = capture(hm, "/api/streams/*/traffic");
+        const rs_json *stream = rs_panel_find_stream(&s->state, id);
+        free(id);
+        const rs_json *provider = stream ? provider_of(&s->state, stream) : NULL;
+        if (!stream || !provider) { reply_error(c, 404, "Unknown stream."); return true; }
+        char *text = g_stream_traffic_handler ? g_stream_traffic_handler(rs_json_obj_str(stream, "id", "")) : NULL;
+        rs_json *out = text ? rs_json_parse(text, strlen(text)) : NULL;
+        free(text);
+        if (!out) out = rs_json_new_obj();
+        // The proxies this stream's segments use, with their connection counts.
+        char *list = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
+        rs_json_obj_set(out, "proxyStatus", proxy_view(provider, list));
+        free(list);
+        rs_json_obj_set_str(out, "name", rs_json_obj_str(stream, "name", ""));
+        rs_json_obj_set_str(out, "provider", rs_json_obj_str(provider, "name", ""));
+        reply_json(c, 200, out, NULL);
+        return true;
+    }
+
     // --- provider webhook test + CRUD ---
     if (mg_match(hm->uri, mg_str("/api/providers/*/webhook/test"), NULL) && method_is(hm, "POST")) {
         char *id = capture(hm, "/api/providers/*/webhook/test");
@@ -3942,6 +3976,19 @@ static const rs_json *provider_of(rs_state *st, const rs_json *stream) {
 
 // Effective proxy for a fetch: the stream's override, else the provider's, or
 // empty when the per-category toggle is off. Caller frees.
+// {"limit": n|null, "proxies": [...]} for one proxy list of a provider.
+static rs_json *proxy_view(const rs_json *provider, const char *list) {
+    int limit = (int)rs_provider_option_int(provider, "proxyConnectionLimit");
+    char *text = g_proxy_stats_handler ? g_proxy_stats_handler(list, limit) : NULL;
+    rs_json *proxies = text ? rs_json_parse(text, strlen(text)) : NULL;
+    free(text);
+    rs_json *out = rs_json_new_obj();
+    if (limit > 0) rs_json_obj_set_int(out, "limit", limit);
+    else rs_json_obj_set(out, "limit", rs_json_new_null());
+    rs_json_obj_set(out, "proxies", proxies ? proxies : rs_json_new_arr());
+    return out;
+}
+
 static char *effective_proxy(const rs_json *provider, const rs_json *stream, bool category_on) {
     if (!category_on) return rs_strdup("");
     const char *sp = rs_json_obj_str(stream, "proxy", "");
@@ -9768,6 +9815,12 @@ void restream_server_set_fetch_handler(restream_fetch_fn handler) {
 
 void restream_server_set_webhook_handler(restream_webhook_fn handler) {
     g_webhook_handler = handler;
+}
+
+void restream_server_set_traffic_handler(restream_proxy_stats_fn proxies,
+                                         restream_stream_traffic_fn traffic) {
+    g_proxy_stats_handler = proxies;
+    g_stream_traffic_handler = traffic;
 }
 
 void restream_server_set_dash_handler(restream_dash_fn handler) {

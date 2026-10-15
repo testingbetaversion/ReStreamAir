@@ -26,6 +26,7 @@ const ICONS = {
   close: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`,
   pip: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="14" rx="1.8"/><rect x="12.5" y="12" width="7" height="5" rx="1.1" fill="currentColor" stroke="none"/></svg>`,
   expand: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 3.5H4v4.5M15.5 3.5H20v4.5M20 15.5V20h-4.5M4 15.5V20h4.5"/></svg>`,
+  eye: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="3"/></svg>`,
   download: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v11.5M7.5 11l4.5 4.5L16.5 11M5 18.5h14"/></svg>`,
 };
 
@@ -878,6 +879,7 @@ function renderStreamsGrid() {
         <button type="button" class="ghost mini-icon-btn" data-action="copyurl" title="Copy the HLS (m3u8) output URL"><span data-icon="copy"></span></button>
         <button type="button" class="ghost mini-icon-btn" data-action="bigplayer" title="Open big player"><span data-icon="expand"></span></button>
         <button type="button" class="ghost mini-icon-btn" data-action="play" title="Play in Picture-in-Picture"><span data-icon="pip"></span></button>
+        <button type="button" class="ghost mini-icon-btn" data-action="traffic" title="Live traffic for this channel: proxies, connections and requests"><span data-icon="eye"></span></button>
         <button type="button" class="ghost mini-icon-btn" data-action="logs" title="View logs for this stream"><span data-icon="logs"></span></button>
         <button type="button" class="${stream.running ? "danger" : "success"}" data-action="toggle"><span data-icon="${stream.running ? "stop" : "play"}"></span>${stream.running ? "Stop" : "Start"}</button>
         <button type="button" class="icon-btn ghost" data-action="delete" title="Delete stream"><span data-icon="trash"></span></button>
@@ -912,6 +914,10 @@ function renderStreamsGrid() {
     card.querySelector('[data-action="logs"]').addEventListener("click", (event) => {
       event.stopPropagation();
       openStreamLogs(stream.id);
+    });
+    card.querySelector('[data-action="traffic"]').addEventListener("click", (event) => {
+      event.stopPropagation();
+      openTrafficDialog(stream.id);
     });
     card.querySelector('[data-action="toggle"]').addEventListener("click", async (event) => {
       event.stopPropagation();
@@ -2784,6 +2790,149 @@ function openProviderSettingsDialog() {
   updateScriptOutputToggleLabel();
   updateSegmentUrlParamsVisibility();
   $("#providerSettingsDialog").showModal();
+  startProxyStatusPoll(provider.id);
+}
+
+// MARK: - Proxy connections and live traffic
+//
+// Both views poll while their dialog is open and stop when it closes. Proxies
+// arrive as host:port only — the server never sends their credentials.
+
+let proxyStatusTimer = null;
+
+function proxyStatusText(entry) {
+  if (entry.status === "skipped") return `skipped, back in ${entry.skippedFor}s${entry.failuresInRow > 1 ? ` (${entry.failuresInRow} failures in a row)` : ""}`;
+  if (entry.status === "rechecking") return "rechecking";
+  if (entry.status === "unchecked") return "—";
+  return "healthy";
+}
+
+function proxyOpenText(entry) {
+  if (entry.open === null || entry.open === undefined) return "n/a";
+  return entry.limit ? `${entry.open} / ${entry.limit}` : String(entry.open);
+}
+
+// Open at or over the limit is the moment a proxy plan starts refusing.
+function proxyOpenClass(entry) {
+  if (!entry.limit || entry.open === null || entry.open === undefined) return "";
+  return entry.open >= entry.limit ? "proxy-full" : entry.open >= entry.limit - 1 ? "proxy-near" : "";
+}
+
+async function refreshProxyStatus(providerId) {
+  try {
+    const data = await request(`/api/providers/${encodeURIComponent(providerId)}/proxies`);
+    const body = $("#proxyStatusBody");
+    body.innerHTML = (data.proxies || []).map((p) => `
+      <tr>
+        <td>${escapeHtml(p.proxy)}</td>
+        <td class="${proxyOpenClass(p)}">${escapeHtml(proxyOpenText(p))}</td>
+        <td>${p.inUse ?? 0}</td>
+        <td>${escapeHtml(proxyStatusText(p))}</td>
+      </tr>`).join("");
+    $("#proxyStatusEmpty").classList.toggle("hidden", (data.proxies || []).length > 0);
+  } catch {
+    // A failed refresh leaves the last table up; the next tick tries again.
+  }
+}
+
+function startProxyStatusPoll(providerId) {
+  stopProxyStatusPoll();
+  $("#proxyStatusBody").innerHTML = "";
+  refreshProxyStatus(providerId);
+  proxyStatusTimer = setInterval(() => refreshProxyStatus(providerId), 2000);
+}
+
+function stopProxyStatusPoll() {
+  if (proxyStatusTimer) clearInterval(proxyStatusTimer);
+  proxyStatusTimer = null;
+}
+
+let trafficTimer = null;
+let trafficStreamId = null;
+
+function formatAgo(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  return s < 60 ? `${s}s ago` : `${Math.floor(s / 60)}m ${s % 60}s ago`;
+}
+
+function formatMs(ms) {
+  const value = Number(ms) || 0;
+  return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${Math.round(value)} ms`;
+}
+
+function renderTraffic(data) {
+  $("#trafficTitle").textContent = `Live traffic · ${data.name || ""}`;
+  $("#trafficSummary").innerHTML = `
+    <span title="Downloaded from the origin over the last 10 s">↓ ${formatBytesPerSecond(data.bytesPerSecond)}</span>
+    <span>${data.requestsPerMinute ?? 0} requests / min</span>
+    <span class="${data.errorsPerMinute ? "traffic-bad" : ""}">${data.errorsPerMinute ?? 0} errors / min</span>
+    ${data.proxyStatus?.limit ? `<span>limit ${data.proxyStatus.limit} connections per proxy</span>` : ""}`;
+  // Every proxy the channel can use, merged with what this channel sent
+  // through it — a proxy it has not touched yet still shows its open count.
+  const status = new Map((data.proxyStatus?.proxies || []).map((p) => [p.proxy, p]));
+  const used = new Map((data.proxies || []).map((p) => [p.proxy, p]));
+  const names = [...new Set([...status.keys(), ...used.keys()])];
+  $("#trafficProxiesBody").innerHTML = names.map((name) => {
+    const s = status.get(name) || {};
+    const u = used.get(name) || {};
+    const lastError = u.lastError ? `last error ${formatAgo(u.lastErrorAgo)}: ${u.lastError}` : "";
+    return `
+      <tr>
+        <td>${escapeHtml(name)}</td>
+        <td class="${proxyOpenClass(s)}">${escapeHtml(s.proxy ? proxyOpenText(s) : "—")}</td>
+        <td>${u.inUse ?? 0}</td>
+        <td>${u.requests ?? 0}</td>
+        <td class="${u.errors ? "traffic-bad" : ""}" title="${escapeAttr(lastError)}">${u.errors ?? 0}</td>
+        <td>${u.requests ? formatMs(u.avgMs) : "—"}</td>
+        <td>${formatBytes(u.bytes)}</td>
+        <td>${escapeHtml(s.proxy ? proxyStatusText(s) : "—")}</td>
+      </tr>`;
+  }).join("");
+  const recent = data.recent || [];
+  $("#trafficRequestsBody").innerHTML = recent.map((r) => {
+    const speed = r.ok && r.ms > 0 && r.bytes > 0 ? formatBytesPerSecond((r.bytes * 1000) / r.ms) : "—";
+    return `
+      <tr class="${r.ok ? "" : "traffic-failed"}">
+        <td>${formatAgo(r.ago)}</td>
+        <td>${escapeHtml(r.kind)}</td>
+        <td>${escapeHtml(r.proxy)}</td>
+        <td title="${escapeAttr(r.host)}">${escapeHtml(r.name || r.host)}</td>
+        <td title="${escapeAttr(r.error || "")}">${r.ok ? r.status : escapeHtml(r.error ? `failed: ${r.error}` : "failed")}</td>
+        <td>${r.ok ? formatBytes(r.bytes) : "—"}</td>
+        <td>${formatMs(r.ms)}</td>
+        <td>${speed}</td>
+      </tr>`;
+  }).join("");
+  $("#trafficEmpty").classList.toggle("hidden", recent.length > 0);
+}
+
+async function refreshTraffic() {
+  if (!trafficStreamId) return;
+  try {
+    renderTraffic(await request(`/api/streams/${encodeURIComponent(trafficStreamId)}/traffic`));
+  } catch {
+    // Keep the last view; the next tick retries.
+  }
+}
+
+function openTrafficDialog(streamId) {
+  trafficStreamId = streamId;
+  const stream = findStreamById(streamId);
+  $("#trafficTitle").textContent = `Live traffic · ${stream?.name || ""}`;
+  $("#trafficProxiesBody").innerHTML = "";
+  $("#trafficRequestsBody").innerHTML = "";
+  $("#trafficSummary").innerHTML = "";
+  $("#trafficEmpty").classList.add("hidden");
+  $("#trafficDialog").showModal();
+  refreshTraffic();
+  if (trafficTimer) clearInterval(trafficTimer);
+  trafficTimer = setInterval(refreshTraffic, 1000);
+}
+
+function stopTrafficPoll() {
+  if (trafficTimer) clearInterval(trafficTimer);
+  trafficTimer = null;
+  trafficStreamId = null;
 }
 
 // The terminal auto-shows whenever Login/Pair/Load channels/Load events is
@@ -4200,6 +4349,9 @@ $("#showScriptingBtn").addEventListener("click", () => {
 $("#closeProviderSettingsBtn").addEventListener("click", closeProviderSettingsDialog);
 closeOnBackdropClick($("#providerSettingsDialog"), closeProviderSettingsDialog);
 $("#providerSettingsDialog").addEventListener("close", stopScriptOutputPoll);
+$("#providerSettingsDialog").addEventListener("close", stopProxyStatusPoll);
+$("#trafficDialog").addEventListener("close", stopTrafficPoll);
+$("#closeTrafficBtn").addEventListener("click", () => $("#trafficDialog").close());
 $("#providerSettingsForm").elements.inheritUrlParams.addEventListener("change", updateSegmentUrlParamsVisibility);
 $("#providerSettingsForm").addEventListener("change", (event) => {
   // Buttons inside the form (Apply to all, account editing) handle their own saves.
