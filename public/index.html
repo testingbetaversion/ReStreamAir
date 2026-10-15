@@ -113,6 +113,16 @@
           <form id="providerSettingsForm" class="stream-form">
             <label>Name<input name="name" placeholder="Provider name" required></label>
             <label>Proxies<span class="field-hint">Default for every stream. Up to 16 HTTP or SOCKS5 proxies, one per line in fallback order.</span><textarea name="proxy" rows="3" placeholder="http://127.0.0.1:8888&#10;socks5h://127.0.0.1:1080"></textarea></label>
+            <div class="proxy-status">
+              <div class="proxy-status-head">Proxy connections<span class="field-hint">Open is the number of TCP connections from this server to the proxy right now — the number a proxy plan's connection limit counts, including the provider script's own. In use is requests the engine has in flight. Refreshes every 2 s.</span></div>
+              <div class="connections-table-wrap">
+                <table class="connections-table">
+                  <thead><tr><th>Proxy</th><th>Open</th><th>In use</th><th>Status</th></tr></thead>
+                  <tbody id="proxyStatusBody"></tbody>
+                </table>
+                <div id="proxyStatusEmpty" class="empty-state hidden">No proxies configured.</div>
+              </div>
+            </div>
             <label>Error webhook<span class="field-hint">Optional Discord webhook URL. Errors from this provider's streams and scripts are sent with source URLs redacted.</span><input name="errorWebhookUrl" type="url" placeholder="https://discord.com/api/webhooks/…"></label>
             <div class="actions"><button id="testProviderWebhookBtn" type="button" class="ghost"><span data-icon="play"></span>Send test notification</button></div>
             <label>Additional HTTP headers (one per line)<span class="field-hint">Applied to this provider's manifest, media and key requests. Enter Name: value.</span><textarea name="headers" placeholder="Authorization: Bearer TOKEN"></textarea></label>
@@ -188,6 +198,35 @@
               <button id="deleteProviderBtn" type="button" class="danger"><span data-icon="trash"></span>Delete provider</button>
             </div>
           </form>
+        </dialog>
+
+        <!-- One channel's live traffic: which proxies its requests go through,
+             how many connections each proxy has open, and the latest requests.
+             Top level for the same reason as providerSettingsDialog. -->
+        <dialog id="trafficDialog" class="stream-editor-dialog">
+          <div class="dialog-head">
+            <h3 id="trafficTitle">Live traffic</h3>
+            <button id="closeTrafficBtn" type="button" class="icon-btn ghost" title="Close"><span data-icon="close"></span></button>
+          </div>
+          <div class="traffic-body">
+            <div id="trafficSummary" class="traffic-summary"></div>
+            <h4>Proxies</h4>
+            <div class="connections-table-wrap">
+              <table class="connections-table">
+                <thead><tr><th>Proxy</th><th title="TCP connections this server has open to the proxy, all channels and the provider script included">Open (server)</th><th title="Requests this channel has in flight through the proxy">In use (channel)</th><th>Requests</th><th>Errors</th><th>Avg time</th><th>Downloaded</th><th>Status</th></tr></thead>
+                <tbody id="trafficProxiesBody"></tbody>
+              </table>
+            </div>
+            <h4>Latest requests</h4>
+            <div class="connections-table-wrap traffic-requests">
+              <table class="connections-table">
+                <thead><tr><th>When</th><th>Type</th><th>Proxy</th><th>File</th><th>Status</th><th>Size</th><th>Time</th><th>Speed</th></tr></thead>
+                <tbody id="trafficRequestsBody"></tbody>
+              </table>
+              <div id="trafficEmpty" class="empty-state hidden">No requests from this channel yet. It shows traffic while the channel runs on the internal engine.</div>
+            </div>
+            <p class="field-hint">Requests the engine makes for this channel. The provider script's own requests (login, manifest, keys) are not listed but do count in Open. Refreshes every second.</p>
+          </div>
         </dialog>
 
         <dialog id="streamEditorDialog" class="stream-editor-dialog">

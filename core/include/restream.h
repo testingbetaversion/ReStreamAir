@@ -79,6 +79,8 @@ void restream_server_set_verbose(bool verbose);
 // files them under the panel). restream_debug_enabled is a cheap check to skip
 // building a message nobody will see. All three are thread-safe.
 void restream_log_set_stream(const char *stream_id);
+// The stream the calling thread works for, "" when none.
+const char *restream_log_current_stream(void);
 bool restream_debug_enabled(void);
 void restream_debug_log(const char *event, const char *url, long status, long long bytes,
                         const char *message);
@@ -143,6 +145,13 @@ void restream_server_set_fetch_handler(restream_fetch_fn handler);
 typedef int (*restream_webhook_fn)(const char *url, const char *json, long *status,
                                    char *errbuf, size_t errbuf_len);
 void restream_server_set_webhook_handler(restream_webhook_fn handler);
+
+// Proxy and traffic views for the panel, from the app's HTTP layer. Each
+// returns malloc'd JSON (freed with free) or NULL.
+typedef char *(*restream_proxy_stats_fn)(const char *proxy_list, int limit);
+typedef char *(*restream_stream_traffic_fn)(const char *stream_id);
+void restream_server_set_traffic_handler(restream_proxy_stats_fn proxies,
+                                         restream_stream_traffic_fn traffic);
 
 // A DASH describe handler: fetches an MPD (through proxy/headers/downloader),
 // follows redirects, and returns a malloc'd JSON description (freed with

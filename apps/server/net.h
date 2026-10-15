@@ -52,6 +52,16 @@ int rs_fetch_url(const char *url, const char *proxy, const char *headers, const 
 // Returns the previous setting so callers can restore it.
 int rs_fetch_set_manifest_priority(int on);
 
+// For the panel. Both return malloc'd JSON (caller frees) and never include
+// proxy credentials — proxies appear as host:port.
+// rs_net_proxy_stats: one entry per proxy in `list` (one per line): open TCP
+// connections from this machine (null where the OS cannot say), the
+// connection limit, requests in flight, health.
+char *rs_net_proxy_stats(const char *list, int limit);
+// rs_net_stream_traffic: the requests made for one stream — rate, per-proxy
+// totals and the latest requests, newest first.
+char *rs_net_stream_traffic(const char *stream_id);
+
 // POSTs a JSON document to an HTTP(S) endpoint. Used by the provider error
 // webhook worker; deliberately separate from rs_fetch_url so a configured
 // downloader or stream proxy can never alter where operational alerts go.

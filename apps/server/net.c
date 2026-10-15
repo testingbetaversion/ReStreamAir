@@ -1005,8 +1005,224 @@ static const char *proxy_remote_dns(const char *proxy, char *buf, size_t cap) {
     return buf;
 }
 
-// One fetch through one proxy. The public wrapper below expands a newline-
-// separated proxy list and calls this until one succeeds.
+// --- Live traffic, per stream ---------------------------------------------
+//
+// What the panel's traffic view shows for one channel: every request the
+// engine made for it, which proxy carried it and how it went. Requests are
+// attributed through the thread's log stream (restream_log_set_stream), which
+// the engine's director and download threads set. Proxies appear by host:port
+// only; their credentials never leave this file.
+
+#define RS_TRAFFIC_STREAMS 256
+#define RS_TRAFFIC_RECENT 60
+#define RS_TRAFFIC_SECONDS 60
+#define RS_TRAFFIC_PROXIES 17
+
+typedef struct {
+    double at, ms;
+    long status;
+    long long bytes;
+    bool ok, manifest;
+    char proxy[80], host[80], name[64], err[120];
+} traffic_req;
+
+typedef struct {
+    char proxy[80];
+    unsigned in_flight;
+    unsigned long long requests, errors, bytes;
+    double ms;
+    double last_error_at;
+    char last_error[120];
+} traffic_proxy;
+
+typedef struct {
+    char sid[160];
+    double touched;
+    traffic_req recent[RS_TRAFFIC_RECENT];
+    size_t next, count;
+    traffic_proxy proxy[RS_TRAFFIC_PROXIES];
+    size_t nproxy;
+    long sec_stamp[RS_TRAFFIC_SECONDS];
+    long long sec_bytes[RS_TRAFFIC_SECONDS];
+    unsigned sec_reqs[RS_TRAFFIC_SECONDS], sec_errs[RS_TRAFFIC_SECONDS];
+} traffic_stream;
+
+static traffic_stream *g_traffic[RS_TRAFFIC_STREAMS];
+static pthread_mutex_t g_traffic_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// "http://user:pass@host:port/" -> "host:port"; NULL or "" -> "direct".
+static void proxy_label(const char *proxy, char *buf, size_t cap) {
+    if (!proxy || !proxy[0]) { snprintf(buf, cap, "direct"); return; }
+    const char *p = strstr(proxy, "://");
+    p = p ? p + 3 : proxy;
+    const char *slash = strchr(p, '/');
+    const char *end = slash ? slash : p + strlen(p);
+    for (const char *q = p; q < end; q++) if (*q == '@') p = q + 1;
+    snprintf(buf, cap, "%.*s", (int)(end - p), p);
+}
+
+static void url_brief(const char *url, char *host, size_t hcap, char *name, size_t ncap) {
+    host[0] = name[0] = '\0';
+    if (!url) return;
+    const char *p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    size_t h = strcspn(p, "/?#");
+    snprintf(host, hcap, "%.*s", (int)h, p);
+    const char *path = p + h;
+    size_t plen = strcspn(path, "?#");
+    const char *last = path;
+    for (size_t i = 0; i < plen; i++) if (path[i] == '/') last = path + i + 1;
+    snprintf(name, ncap, "%.*s", (int)(path + plen - last), last);
+}
+
+static traffic_stream *traffic_find_locked(const char *sid, bool create) {
+    size_t free_slot = RS_TRAFFIC_STREAMS, oldest = 0;
+    for (size_t i = 0; i < RS_TRAFFIC_STREAMS; i++) {
+        traffic_stream *ts = g_traffic[i];
+        if (!ts) { if (free_slot == RS_TRAFFIC_STREAMS) free_slot = i; continue; }
+        if (!strcmp(ts->sid, sid)) return ts;
+        if (g_traffic[oldest] == NULL || ts->touched < g_traffic[oldest]->touched) oldest = i;
+    }
+    if (!create) return NULL;
+    // Full: the stream that has been quiet longest gives its slot up.
+    size_t slot = free_slot < RS_TRAFFIC_STREAMS ? free_slot : oldest;
+    traffic_stream *ts = g_traffic[slot];
+    if (!ts) ts = (traffic_stream *)malloc(sizeof(*ts));
+    if (!ts) return NULL;
+    memset(ts, 0, sizeof(*ts));
+    snprintf(ts->sid, sizeof(ts->sid), "%s", sid);
+    g_traffic[slot] = ts;
+    return ts;
+}
+
+static traffic_proxy *traffic_proxy_locked(traffic_stream *ts, const char *label) {
+    for (size_t i = 0; i < ts->nproxy; i++)
+        if (!strcmp(ts->proxy[i].proxy, label)) return &ts->proxy[i];
+    if (ts->nproxy >= RS_TRAFFIC_PROXIES) return NULL;
+    traffic_proxy *tp = &ts->proxy[ts->nproxy++];
+    memset(tp, 0, sizeof(*tp));
+    snprintf(tp->proxy, sizeof(tp->proxy), "%s", label);
+    return tp;
+}
+
+static void traffic_begin(const char *sid, const char *label) {
+    pthread_mutex_lock(&g_traffic_mu);
+    traffic_stream *ts = traffic_find_locked(sid, true);
+    traffic_proxy *tp = ts ? traffic_proxy_locked(ts, label) : NULL;
+    if (tp) tp->in_flight++;
+    if (ts) ts->touched = net_now();
+    pthread_mutex_unlock(&g_traffic_mu);
+}
+
+static void traffic_end(const char *sid, const char *label, const char *url, bool ok, long status,
+                        long long bytes, double ms, const char *err) {
+    double now = net_now();
+    pthread_mutex_lock(&g_traffic_mu);
+    traffic_stream *ts = traffic_find_locked(sid, true);
+    if (ts) {
+        ts->touched = now;
+        traffic_proxy *tp = traffic_proxy_locked(ts, label);
+        if (tp) {
+            if (tp->in_flight) tp->in_flight--;
+            tp->requests++;
+            tp->ms += ms;
+            if (ok) tp->bytes += (unsigned long long)(bytes > 0 ? bytes : 0);
+            else {
+                tp->errors++;
+                tp->last_error_at = now;
+                snprintf(tp->last_error, sizeof(tp->last_error), "%s", err && err[0] ? err : "failed");
+            }
+        }
+        traffic_req *r = &ts->recent[ts->next];
+        ts->next = (ts->next + 1) % RS_TRAFFIC_RECENT;
+        if (ts->count < RS_TRAFFIC_RECENT) ts->count++;
+        memset(r, 0, sizeof(*r));
+        r->at = now; r->ms = ms; r->status = status; r->bytes = bytes; r->ok = ok;
+        r->manifest = manifest_priority != 0;
+        snprintf(r->proxy, sizeof(r->proxy), "%s", label);
+        url_brief(url, r->host, sizeof(r->host), r->name, sizeof(r->name));
+        if (!ok) snprintf(r->err, sizeof(r->err), "%s", err && err[0] ? err : "failed");
+        long sec = (long)now;
+        size_t b = (size_t)(sec % RS_TRAFFIC_SECONDS);
+        if (ts->sec_stamp[b] != sec) {
+            ts->sec_stamp[b] = sec; ts->sec_bytes[b] = 0; ts->sec_reqs[b] = 0; ts->sec_errs[b] = 0;
+        }
+        if (ok && bytes > 0) ts->sec_bytes[b] += bytes;
+        ts->sec_reqs[b]++;
+        if (!ok) ts->sec_errs[b]++;
+    }
+    pthread_mutex_unlock(&g_traffic_mu);
+}
+
+char *rs_net_stream_traffic(const char *stream_id) {
+    double now = net_now();
+    long sec = (long)now;
+    rs_json *out = rs_json_new_obj();
+    rs_json *proxies = rs_json_new_arr();
+    rs_json *recent = rs_json_new_arr();
+    pthread_mutex_lock(&g_traffic_mu);
+    traffic_stream *ts = stream_id ? traffic_find_locked(stream_id, false) : NULL;
+    long long bytes10 = 0;
+    unsigned reqs60 = 0, errs60 = 0;
+    if (ts) {
+        for (size_t b = 0; b < RS_TRAFFIC_SECONDS; b++) {
+            long age = sec - ts->sec_stamp[b];
+            if (age < 0 || age >= RS_TRAFFIC_SECONDS || !ts->sec_stamp[b]) continue;
+            reqs60 += ts->sec_reqs[b];
+            errs60 += ts->sec_errs[b];
+            if (age >= 1 && age <= 10) bytes10 += ts->sec_bytes[b];
+        }
+        for (size_t i = 0; i < ts->nproxy; i++) {
+            traffic_proxy *tp = &ts->proxy[i];
+            rs_json *o = rs_json_new_obj();
+            rs_json_obj_set_str(o, "proxy", tp->proxy);
+            rs_json_obj_set_int(o, "inUse", tp->in_flight);
+            rs_json_obj_set_int(o, "requests", (long long)tp->requests);
+            rs_json_obj_set_int(o, "errors", (long long)tp->errors);
+            rs_json_obj_set_int(o, "bytes", (long long)tp->bytes);
+            rs_json_obj_set(o, "avgMs", rs_json_new_num(tp->requests ? tp->ms / (double)tp->requests : 0));
+            if (tp->last_error[0]) {
+                rs_json_obj_set_str(o, "lastError", tp->last_error);
+                rs_json_obj_set(o, "lastErrorAgo", rs_json_new_num(now - tp->last_error_at));
+            }
+            rs_json_arr_push(proxies, o);
+        }
+        for (size_t k = 0; k < ts->count; k++) {
+            traffic_req *r = &ts->recent[(ts->next + RS_TRAFFIC_RECENT - 1 - k) % RS_TRAFFIC_RECENT];
+            rs_json *o = rs_json_new_obj();
+            rs_json_obj_set(o, "ago", rs_json_new_num(now - r->at));
+            rs_json_obj_set_str(o, "kind", r->manifest ? "manifest" : "media");
+            rs_json_obj_set_str(o, "proxy", r->proxy);
+            rs_json_obj_set_str(o, "host", r->host);
+            rs_json_obj_set_str(o, "name", r->name);
+            rs_json_obj_set_int(o, "status", r->status);
+            rs_json_obj_set_int(o, "bytes", r->bytes);
+            rs_json_obj_set(o, "ms", rs_json_new_num(r->ms));
+            rs_json_obj_set_bool(o, "ok", r->ok);
+            if (r->err[0]) rs_json_obj_set_str(o, "error", r->err);
+            rs_json_arr_push(recent, o);
+        }
+    }
+    pthread_mutex_unlock(&g_traffic_mu);
+    rs_json_obj_set(out, "bytesPerSecond", rs_json_new_num((double)bytes10 / 10.0));
+    rs_json_obj_set_int(out, "requestsPerMinute", reqs60);
+    rs_json_obj_set_int(out, "errorsPerMinute", errs60);
+    rs_json_obj_set(out, "proxies", proxies);
+    rs_json_obj_set(out, "recent", recent);
+    char *text = rs_json_serialize(out, false);
+    rs_json_free(out);
+    return text;
+}
+
+// One fetch through one proxy, recorded for the stream this thread works for.
+static int fetch_one_proxy_raw(const char *url, const char *proxy,
+                               const char *headers, const char *range,
+                               const char *downloader, const char *dl_params, int force_ipv6,
+                               char **out, size_t *out_len, long *status,
+                               char **content_type, char **content_range,
+                               char **effective_url, char *errbuf, size_t errbuf_len,
+                               long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx);
+
 static int fetch_through_one_proxy(const char *url, const char *proxy,
                                    const char *headers, const char *range,
                                    const char *downloader, const char *dl_params, int force_ipv6,
@@ -1014,6 +1230,32 @@ static int fetch_through_one_proxy(const char *url, const char *proxy,
                                    char **content_type, char **content_range,
                                    char **effective_url, char *errbuf, size_t errbuf_len,
                                    long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx) {
+    const char *sid = restream_log_current_stream();
+    if (!sid || !sid[0])
+        return fetch_one_proxy_raw(url, proxy, headers, range, downloader, dl_params, force_ipv6,
+                                   out, out_len, status, content_type, content_range, effective_url,
+                                   errbuf, errbuf_len, timeout_ms, should_cancel, cancel_ctx);
+    char label[80];
+    proxy_label(proxy, label, sizeof(label));
+    long local_status = 0;
+    long *st = status ? status : &local_status;
+    traffic_begin(sid, label);
+    double started = net_now();
+    int rc = fetch_one_proxy_raw(url, proxy, headers, range, downloader, dl_params, force_ipv6,
+                                 out, out_len, st, content_type, content_range, effective_url,
+                                 errbuf, errbuf_len, timeout_ms, should_cancel, cancel_ctx);
+    traffic_end(sid, label, url, rc == 0, *st, rc == 0 && out_len ? (long long)*out_len : 0,
+                (net_now() - started) * 1000.0, rc == 0 ? NULL : errbuf);
+    return rc;
+}
+
+static int fetch_one_proxy_raw(const char *url, const char *proxy,
+                               const char *headers, const char *range,
+                               const char *downloader, const char *dl_params, int force_ipv6,
+                               char **out, size_t *out_len, long *status,
+                               char **content_type, char **content_range,
+                               char **effective_url, char *errbuf, size_t errbuf_len,
+                               long timeout_ms, int (*should_cancel)(void *, size_t), void *cancel_ctx) {
     // One scheme rule for every downloader. The libcurl path pins this with
     // CURLOPT_PROTOCOLS, but an external curl/aria2c is a separate program with
     // its own defaults — and it would read a file:// or ftp:// target happily.
@@ -1316,6 +1558,133 @@ static int proxy_release(const char *list, size_t count, size_t index,
     }
     pthread_mutex_unlock(&g_proxy_pool_mu);
     return change;
+}
+
+// --- Proxy connections, for the panel ------------------------------------
+//
+// The number a proxy seller counts is open TCP connections from this machine,
+// idle kept-alive ones and the provider script's own included — none of which
+// the engine's bookkeeping can see. Linux exposes exactly that in
+// /proc/net/tcp{,6}; it is what `ss` reads. Elsewhere the count is unknown.
+
+#ifdef __linux__
+#include <netdb.h>
+#include <arpa/inet.h>
+
+// Established connections whose remote end is host:port.
+static int os_open_connections(const char *host, int port) {
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -1;
+    uint32_t v4[8]; size_t n4 = 0;
+    uint32_t v6[8][4]; size_t n6 = 0;
+    for (struct addrinfo *a = res; a; a = a->ai_next) {
+        if (a->ai_family == AF_INET && n4 < 8)
+            v4[n4++] = ((struct sockaddr_in *)a->ai_addr)->sin_addr.s_addr;
+        else if (a->ai_family == AF_INET6 && n6 < 8)
+            memcpy(v6[n6++], &((struct sockaddr_in6 *)a->ai_addr)->sin6_addr, 16);
+    }
+    freeaddrinfo(res);
+    int count = 0;
+    const char *files[2] = {"/proc/net/tcp", "/proc/net/tcp6"};
+    for (int f = 0; f < 2; f++) {
+        FILE *fp = fopen(files[f], "r");
+        if (!fp) continue;
+        char line[512];
+        if (!fgets(line, sizeof(line), fp)) { fclose(fp); continue; }  // header
+        while (fgets(line, sizeof(line), fp)) {
+            char local[64], remote[64];
+            unsigned state = 0;
+            if (sscanf(line, " %*s %63s %63s %x", local, remote, &state) != 3) continue;
+            if (state != 1) continue;  // TCP_ESTABLISHED
+            char *colon = strchr(remote, ':');
+            if (!colon || (int)strtol(colon + 1, NULL, 16) != port) continue;
+            *colon = '\0';
+            if (f == 0) {
+                uint32_t addr = (uint32_t)strtoul(remote, NULL, 16);
+                for (size_t i = 0; i < n4; i++) if (addr == v4[i]) { count++; break; }
+            } else if (strlen(remote) == 32) {
+                uint32_t w[4];
+                for (int k = 0; k < 4; k++) {
+                    char part[9]; memcpy(part, remote + k * 8, 8); part[8] = '\0';
+                    w[k] = (uint32_t)strtoul(part, NULL, 16);
+                }
+                bool hit = false;
+                for (size_t i = 0; i < n6 && !hit; i++) hit = !memcmp(w, v6[i], 16);
+                // An IPv4 peer reached through a dual-stack socket: ::ffff:a.b.c.d
+                for (size_t i = 0; i < n4 && !hit; i++)
+                    hit = w[0] == 0 && w[1] == 0 && w[2] == htonl(0xffffu) && w[3] == v4[i];
+                if (hit) count++;
+            }
+        }
+        fclose(fp);
+    }
+    return count;
+}
+#else
+static int os_open_connections(const char *host, int port) { (void)host; (void)port; return -1; }
+#endif
+
+// "host:port" (or "[v6]:port") from a proxy label; the port defaults the way
+// libcurl's does.
+static bool label_host_port(const char *label, const char *proxy, char *host, size_t cap, int *port) {
+    const char *colon = strrchr(label, ':');
+    const char *close = strrchr(label, ']');
+    if (colon && (!close || colon > close)) {
+        snprintf(host, cap, "%.*s", (int)(colon - label), label);
+        *port = atoi(colon + 1);
+    } else {
+        snprintf(host, cap, "%s", label);
+        *port = proxy && !strncasecmp(proxy, "https://", 8) ? 443 : 1080;
+    }
+    size_t n = strlen(host);
+    if (n >= 2 && host[0] == '[' && host[n - 1] == ']') { memmove(host, host + 1, n - 2); host[n - 2] = '\0'; }
+    return host[0] && *port > 0;
+}
+
+char *rs_net_proxy_stats(const char *list, int limit) {
+    rs_json *arr = rs_json_new_arr();
+    char *copy = rs_strdup(list ? list : "");
+    char *items[RS_PROXY_FALLBACK_MAX];
+    size_t count = copy ? split_proxy_list(copy, items, RS_PROXY_FALLBACK_MAX) : 0;
+    time_t now = time(NULL);
+    for (size_t i = 0; i < count; i++) {
+        char label[80], host[256];
+        int port = 0;
+        proxy_label(items[i], label, sizeof(label));
+        rs_json *o = rs_json_new_obj();
+        rs_json_obj_set_str(o, "proxy", label);
+        int open = label_host_port(label, items[i], host, sizeof(host), &port)
+            ? os_open_connections(host, port) : -1;
+        if (open >= 0) rs_json_obj_set_int(o, "open", open);
+        else rs_json_obj_set(o, "open", rs_json_new_null());
+        if (limit > 0) rs_json_obj_set_int(o, "limit", limit);
+        else rs_json_obj_set(o, "limit", rs_json_new_null());
+        // The engine's own view, from the pool its requests used: a provider
+        // proxy list is one pool, keyed by the exact list text.
+        pthread_mutex_lock(&g_proxy_pool_mu);
+        proxy_health h;
+        memset(&h, 0, sizeof(h));
+        bool found = false;
+        for (size_t k = 0; k < g_proxy_pool_count && !found; k++)
+            if (!strcmp(g_proxy_pools[k].list, list)) { h = g_proxy_pools[k].proxy[i]; found = true; }
+        pthread_mutex_unlock(&g_proxy_pool_mu);
+        rs_json_obj_set_int(o, "inUse", h.in_flight);
+        rs_json_obj_set_int(o, "holding", h.holders);
+        const char *status = !found || !h.known ? "unchecked"
+                           : h.healthy ? "healthy"
+                           : h.retry_at > now ? "skipped" : "rechecking";
+        rs_json_obj_set_str(o, "status", status);
+        if (!strcmp(status, "skipped")) rs_json_obj_set_int(o, "skippedFor", (long long)(h.retry_at - now));
+        rs_json_obj_set_int(o, "failuresInRow", h.benches);
+        rs_json_arr_push(arr, o);
+    }
+    free(copy);
+    char *text = rs_json_serialize(arr, false);
+    rs_json_free(arr);
+    return text;
 }
 
 static int fetch_with_proxies(const char *url, const char *proxy, const char *headers, const char *range,

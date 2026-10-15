@@ -310,6 +310,7 @@ level, text and date filtering are client-side. See [log schema](EVENTS.md#logs)
 | `GET /api/playlist.m3u8` | M3U text for all streams. |
 | `GET /api/providers/<id>/epg` | Last stored script EPG as XML or JSON; `404` if absent. |
 | `POST /api/providers/<id>/webhook/test` | `202 {"ok":true,"queued":true}`; delivery is asynchronous. |
+| `GET /api/providers/<id>/proxies` | `{"limit":n\|null,"proxies":[{"proxy":"host:port","open","limit","inUse","holding","status","skippedFor","failuresInRow"}]}`. `open` is the number of established TCP connections from this server to the proxy (Linux; `null` elsewhere), including idle kept-alive ones and the provider script's. `inUse` is requests the engine has in flight; `status` is `healthy`, `skipped` (with `skippedFor` seconds), `rechecking` or `unchecked`. Credentials are never included. |
 | `GET /api/logo-lookup?name=<encoded-name>` | `200 {"url":"…"}`; no match returns `404`. |
 
 Both playlist routes also filter and can answer in JSON:
@@ -440,6 +441,7 @@ provider.
 | `DELETE /api/streams/<id>` | Stop and delete; `200` state. |
 | `POST /api/streams/<id>/start` | No body or `{}`; `200` state. Script-based starts wait for manifest/key work before replying. |
 | `POST /api/streams/<id>/stop` | No body or `{}`; `200` state. Worker shutdown completes asynchronously. |
+| `GET /api/streams/<id>/traffic` | Live traffic of one stream: `bytesPerSecond` (last 10 s), `requestsPerMinute`, `errorsPerMinute`, `proxies` (per proxy for this stream: `inUse`, `requests`, `errors`, `bytes`, `avgMs`, `lastError`), `recent` (latest 60 requests, newest first: `ago`, `kind` manifest/media, `proxy`, `host`, `name`, `status`, `bytes`, `ms`, `ok`, `error`) and `proxyStatus` (the stream's proxy list in the `/proxies` shape). Covers the internal engine's requests; the provider script's are not recorded. |
 | `POST /api/streams/bulk` | `{"action":"stop"\|"delete","ids":["<id>",...]}`, or `{"action":"set","ids":[…],"fields":{"inputMode":"hlsBuffered"}}` to change only the input mode (running streams switch at once), or `"fields":{"parallelDownloads":2}` (1–8); `200` state after one save. Unknown ids are skipped. Starts are per stream only. |
 | `POST /api/probe` | Source probe request below; `200` probe result. |
 
