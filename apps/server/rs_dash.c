@@ -943,6 +943,15 @@ static char *hls_describe(const char *text, const char *base, const char *proxy,
             rs_json_obj_set_str(sg, "url", u);
             free(u);
             rs_json_obj_set_int(sg, "time", (long long)media.segments[i].sequence);
+            // Only on segments under an older MAP than the plan's (a key
+            // rotation in the window): they need that init's KID, not the
+            // newest one's.
+            const char *seg_init = media.segments[i].init_url;
+            if (seg_init && media.init_url && strcmp(seg_init, media.init_url) != 0) {
+                char *si = append_params ? append_query(seg_init, append_params) : rs_strdup(seg_init);
+                rs_json_obj_set_str(sg, "initUrl", si);
+                free(si);
+            }
             rs_json_obj_set(sg, "duration", rs_json_new_num(media.segments[i].duration));
             rs_json_arr_push(segs, sg);
         }

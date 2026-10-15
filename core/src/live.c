@@ -79,6 +79,16 @@
 // not a whole-request limit: a large video segment progressing through a slow
 // proxy may use the full media timeout below, while a request that receives no
 // bytes is removed before it can age out a signed live URL.
+// Key rotation while running. A segment under a KID with no key is held at
+// the head of its queue while the server licenses the new key; past
+// RS_LIVE_KEY_WAIT the engine gives up and stops with wrongKeys, and the
+// restart licenses it instead (the behaviour before keys could be added to a
+// running stream). The request is repeated every RS_LIVE_KEY_REASK seconds.
+#define RS_LIVE_KEY_WAIT 60.0
+#define RS_LIVE_KEY_REASK 20.0
+#define RS_LIVE_INIT_TAB 4
+#define RS_LIVE_KEY_WAITS 4
+
 #define RS_LIVE_HEAD_STALL_FACTOR 6.0
 #define RS_LIVE_HEAD_STALL_MIN 12.0
 
@@ -384,6 +394,11 @@ typedef struct {
     // abandoning the segment. The download thread then retries the same stable
     // segment identity using the URL most recently read from the MPD.
     uint64_t request_gen;
+    // The KID of the init segment this one is under, so it is decrypted with
+    // that key even after the playlist has moved to a newer one ("" = clear,
+    // or no init).
+    char kid[33];
+    int iv_size;
     char err[192];
 } pend_item;
 
@@ -454,6 +469,10 @@ typedef struct {
     uint8_t key[16];
     bool have_key;
     int iv_size;
+    // Every init this rendition has read, by identity: the KID and IV size its
+    // segments use. More than one while a key rotation is in the window.
+    struct { char key[288]; char kid[33]; int iv_size; } init_tab[RS_LIVE_INIT_TAB];
+    size_t init_tab_n, init_tab_next;
 
     seen_set seen;
     char *playlist;        // last rendered media playlist, or NULL
@@ -488,6 +507,8 @@ typedef struct live_stream {
     char last_error[256];
     pthread_cond_t cv;
     bool stop;
+    // KIDs the engine is waiting on a key for (a key rotation). Guarded by `mu`.
+    struct { char kid[33]; double since, asked_at; bool gave_up; } key_wait[RS_LIVE_KEY_WAITS];
 
     // Config, replaced wholesale by rs_live_start. Guarded by `mu`.
     char *mpd_url, *representation;
@@ -557,6 +578,8 @@ struct rs_live {
     rs_live_dash_fn dash;
     rs_live_log_fn log;
     void *log_ctx;
+    rs_live_key_fn key;                 // asks the server to license a KID; may be NULL
+    void *key_ctx;
     pthread_mutex_t mu;                 // guards the stream table only
     live_stream *streams[RS_LIVE_MAX_STREAMS];
     size_t nstreams;
@@ -747,10 +770,13 @@ static pend_counts pend_counts_locked(live_rep *rep) {
 
 // Appends one segment. Caller has already checked there is room.
 static void pend_push_locked(live_rep *rep, const char *url, const char *idkey,
-                             long long time_val, double duration, unsigned long plan_ts) {
+                             long long time_val, double duration, unsigned long plan_ts,
+                             const char *kid, int iv_size) {
     pend_item *it = pend_at_locked(rep, rep->pend_count);
     memset(it, 0, sizeof(*it));
     it->url = rs_strdup(url);
+    snprintf(it->kid, sizeof(it->kid), "%s", kid ? kid : "");
+    it->iv_size = iv_size;
     snprintf(it->idkey, sizeof(it->idkey), "%s", idkey);
     it->time_val = time_val;
     it->duration = duration;
@@ -1166,11 +1192,90 @@ static void ingest_record(live_stream *st, size_t bytes) {
     pthread_mutex_unlock(&st->mu);
 }
 
-// Fetches and installs the initialization segment: patch it to a clear codec,
-// pick the ClearKey that matches its default KID, and read the media timescale
-// the discontinuity check needs.
+// The 16-byte key for `kid_hex` among "KID:KEY" pairs. PlayReady writes a KID
+// as a little-endian GUID, so that form matches too. A NULL kid_hex (an init
+// that names none) takes the first key.
+static bool key_lookup(const char *keys_text, const char *kid_hex, uint8_t out[16]) {
+    rs_cenc_keys keys = rs_cenc_parse_keys(keys_text ? keys_text : "");
+    bool found = false;
+    if (keys.count > 0 && !kid_hex) {
+        memcpy(out, keys.keys[0], 16);
+        found = true;
+    }
+    for (size_t i = 0; kid_hex && i < keys.count && !found; i++)
+        if (keys.kids[i] && strcmp(keys.kids[i], kid_hex) == 0) { memcpy(out, keys.keys[i], 16); found = true; }
+    if (kid_hex && !found && strlen(kid_hex) == 32) {
+        static const int order[16] = {3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15};
+        char swapped[33];
+        for (int b = 0; b < 16; b++) {
+            swapped[b * 2] = kid_hex[order[b] * 2];
+            swapped[b * 2 + 1] = kid_hex[order[b] * 2 + 1];
+        }
+        swapped[32] = '\0';
+        for (size_t i = 0; i < keys.count && !found; i++)
+            if (keys.kids[i] && strcmp(keys.kids[i], swapped) == 0) { memcpy(out, keys.keys[i], 16); found = true; }
+    }
+    rs_cenc_keys_free(&keys);
+    return found;
+}
+
+// The init table entry for an init identity, or NULL. Caller holds st->mu.
+static const char *init_tab_kid_locked(const live_rep *rep, const char *idkey, int *iv_size) {
+    for (size_t i = 0; i < rep->init_tab_n; i++)
+        if (!strcmp(rep->init_tab[i].key, idkey)) {
+            if (iv_size) *iv_size = rep->init_tab[i].iv_size;
+            return rep->init_tab[i].kid;
+        }
+    return NULL;
+}
+
+static void init_tab_put_locked(live_rep *rep, const char *idkey, const char *kid, int iv_size) {
+    size_t slot = rep->init_tab_n;
+    for (size_t i = 0; i < rep->init_tab_n; i++)
+        if (!strcmp(rep->init_tab[i].key, idkey)) slot = i;
+    if (slot == rep->init_tab_n) {
+        if (rep->init_tab_n < RS_LIVE_INIT_TAB) rep->init_tab_n++;
+        else { slot = rep->init_tab_next; rep->init_tab_next = (rep->init_tab_next + 1) % RS_LIVE_INIT_TAB; }
+    }
+    snprintf(rep->init_tab[slot].key, sizeof(rep->init_tab[slot].key), "%s", idkey);
+    snprintf(rep->init_tab[slot].kid, sizeof(rep->init_tab[slot].kid), "%s", kid ? kid : "");
+    rep->init_tab[slot].iv_size = iv_size > 0 ? iv_size : 8;
+}
+
+// Asks the server for the key of `kid`, once, and again every
+// RS_LIVE_KEY_REASK seconds while segments wait for it. Caller holds st->mu.
+// Returns false when there is no handler to ask (the stream then stops on the
+// mismatch, as it always did).
+static bool request_key_locked(live_stream *st, const char *kid) {
+    if (!st->mgr->key || !kid || !kid[0]) return false;
+    double now = now_seconds();
+    size_t slot = RS_LIVE_KEY_WAITS, empty = RS_LIVE_KEY_WAITS;
+    for (size_t i = 0; i < RS_LIVE_KEY_WAITS; i++) {
+        if (!strcmp(st->key_wait[i].kid, kid)) slot = i;
+        else if (!st->key_wait[i].kid[0] && empty == RS_LIVE_KEY_WAITS) empty = i;
+    }
+    if (slot == RS_LIVE_KEY_WAITS) {
+        if (empty == RS_LIVE_KEY_WAITS) return false;
+        slot = empty;
+        snprintf(st->key_wait[slot].kid, sizeof(st->key_wait[slot].kid), "%s", kid);
+        st->key_wait[slot].since = now;
+        st->key_wait[slot].asked_at = 0;
+        st->key_wait[slot].gave_up = false;
+    }
+    if (st->key_wait[slot].asked_at == 0 || now - st->key_wait[slot].asked_at >= RS_LIVE_KEY_REASK) {
+        st->key_wait[slot].asked_at = now;
+        st->mgr->key(st->mgr->key_ctx, st->id, kid);
+    }
+    return true;
+}
+
+// Fetches an initialization segment, records the KID and IV size its segments
+// use, and — with `install` — makes it the rendition's init: patched to a clear
+// codec for output, with the ClearKey that matches its default KID and the
+// media timescale the discontinuity check needs. Without `install` it only
+// learns the KID: an older init still in the window during a key rotation.
 static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *cfg,
-                          unsigned long plan_timescale) {
+                          unsigned long plan_timescale, bool install) {
     live_stream *st = rep->owner;
     char *body = NULL;
     size_t len = 0;
@@ -1207,56 +1312,46 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
     // alone and saying so. `key_mismatch` now distinguishes that case so it
     // shows up as an error instead of looking like it worked.
     uint8_t key[16];
-    bool have_key = false;
-    bool key_mismatch = false;
-    rs_cenc_keys keys = rs_cenc_parse_keys(cfg->keys ? cfg->keys : "");
-    if (keys.count > 0) {
-        size_t pick = 0;
-        bool matched = false;
-        if (kid_hex) {
-            for (size_t i = 0; i < keys.count; i++) {
-                if (keys.kids[i] && strcmp(keys.kids[i], kid_hex) == 0) { pick = i; matched = true; break; }
-            }
-        }
-        // PlayReady writes a KID as a little-endian GUID; accept that form too.
-        if (kid_hex && !matched && strlen(kid_hex) == 32) {
-            static const int order[16] = {3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15};
-            char swapped[33];
-            for (int b = 0; b < 16; b++) {
-                swapped[b * 2] = kid_hex[order[b] * 2];
-                swapped[b * 2 + 1] = kid_hex[order[b] * 2 + 1];
-            }
-            swapped[32] = '\0';
-            for (size_t i = 0; i < keys.count; i++)
-                if (keys.kids[i] && strcmp(keys.kids[i], swapped) == 0) { pick = i; matched = true; break; }
-        }
-        if (matched || !kid_hex) {
-            memcpy(key, keys.keys[pick], 16);
-            have_key = true;
-        } else {
-            key_mismatch = true;
-        }
-    }
-    rs_cenc_keys_free(&keys);
+    rs_cenc_keys configured = rs_cenc_parse_keys(cfg->keys ? cfg->keys : "");
+    bool any_keys = configured.count > 0;
+    rs_cenc_keys_free(&configured);
+    bool have_key = any_keys && key_lookup(cfg->keys, kid_hex, key);
+    bool key_mismatch = any_keys && !have_key;
 
     char idkey[288];
     stable_key(init_url, -1, idkey, sizeof(idkey));
 
     pthread_mutex_lock(&st->mu);
-    free(rep->init_url);
-    free(rep->init_key);
-    free(rep->init_data);
-    rep->init_url = rs_strdup(init_url);
-    rep->init_key = rs_strdup(idkey);
-    rep->init_data = patched;
-    rep->init_len = out_len;
-    rep->timescale = ts;
-    rep->iv_size = iv_size > 0 ? iv_size : 8;
-    rep->have_key = have_key;
-    if (have_key) memcpy(rep->key, key, 16);
+    // A stream with no keys at all plays as it is; its segments need no KID.
+    init_tab_put_locked(rep, idkey, any_keys && kid_hex ? kid_hex : "", iv_size);
+    if (install) {
+        free(rep->init_url);
+        free(rep->init_key);
+        free(rep->init_data);
+        rep->init_url = rs_strdup(init_url);
+        rep->init_key = rs_strdup(idkey);
+        rep->init_data = patched;
+        patched = NULL;
+        rep->init_len = out_len;
+        rep->timescale = ts;
+        rep->iv_size = iv_size > 0 ? iv_size : 8;
+        rep->have_key = have_key;
+        if (have_key) memcpy(rep->key, key, 16);
+    }
+    // A key rotation: the media moved to a KID none of the keys cover. Ask for
+    // it and keep going — its segments wait at the head of the queue until the
+    // key arrives (see writer_main). Only without a handler to ask does the
+    // engine stop, as it always did.
+    bool asked = key_mismatch && kid_hex && request_key_locked(st, kid_hex);
     pthread_mutex_unlock(&st->mu);
+    free(patched);
 
-    if (key_mismatch) {
+    if (asked) {
+        lgf(st, "info", "keyRotation", init_url, 0, -1,
+            "%s: the source moved to KID %s, which none of the keys cover — requesting its key; "
+            "segments under it wait until it arrives (at most %.0fs)",
+            rep->rep_id, kid_hex, RS_LIVE_KEY_WAIT);
+    } else if (key_mismatch) {
         // Wrong keys must not play: decrypting with a key for another KID (or
         // passing ciphertext through) gives a gray or broken picture that looks
         // like a working stream. Stop the engine with a clear error instead;
@@ -1279,9 +1374,10 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
     // Info even on a mismatch: wrongKeys above is the error that names it, and
     // an error here would replace it as the stream's last error.
     lgf(st, "info", "initReady", init_url, status, (long long)out_len,
-        "%s: timescale %u, iv %d, key %s%s%s%s", rep->rep_id, ts, rep->iv_size,
+        "%s: timescale %u, iv %d, key %s%s%s%s%s", rep->rep_id, ts, iv_size > 0 ? iv_size : 8,
         have_key ? "yes" : "no", kid_hex ? ", kid " : "", kid_hex ? kid_hex : "",
-        key_mismatch ? " — none of the configured keys match this KID; segments will stay encrypted" : "");
+        install ? "" : " (an older init still in the window)",
+        key_mismatch ? (asked ? " — key requested" : " — none of the configured keys match this KID; segments will stay encrypted") : "");
     free(kid_hex);
 }
 
@@ -1449,17 +1545,33 @@ static void rep_apply_plan(live_rep *rep, const cfg_snap *cfg, const rs_json *pl
     // The init segment is fetched once, and again only if the source genuinely
     // rotates it — compared by stable identity, so a re-tokenized URL for the
     // same init does not trigger a pointless refetch every poll.
+    //
+    // During a key rotation the window holds segments under the outgoing init
+    // too, each with its own KID. Learn those first (once each); the newest
+    // init is installed last, so it is the one served to players — the
+    // patched inits differ only in the KID they no longer carry.
+    for (size_t i = skip; i < total; i++) {
+        const char *si = rs_json_obj_str(rs_json_arr_at(segs, i), "initUrl", "");
+        if (!si[0] || !strcmp(si, init_url)) continue;
+        char sk[288];
+        stable_key(si, -1, sk, sizeof(sk));
+        pthread_mutex_lock(&st->mu);
+        bool known = init_tab_kid_locked(rep, sk, NULL) != NULL;
+        pthread_mutex_unlock(&st->mu);
+        if (!known) rep_load_init(rep, si, cfg, plan_ts, false);
+        if (live_stopping(st)) return;
+    }
     char init_key[288];
     stable_key(init_url, -1, init_key, sizeof(init_key));
     bool need_init;
     pthread_mutex_lock(&st->mu);
     need_init = init_url[0] && (!rep->init_key || strcmp(rep->init_key, init_key) != 0);
     pthread_mutex_unlock(&st->mu);
-    if (need_init) rep_load_init(rep, init_url, cfg, plan_ts);
+    if (need_init) rep_load_init(rep, init_url, cfg, plan_ts, true);
     if (live_stopping(st)) return;
 
     // Collect the segments this poll has not already served, in timeline order.
-    typedef struct { const char *url; long long tv; double dur; char idkey[288]; } cand;
+    typedef struct { const char *url; long long tv; double dur; char idkey[288]; char kid[33]; int iv; } cand;
     cand *found = (cand *)calloc(total ? total : 1, sizeof(cand));
     if (!found) return;
     size_t n = 0;
@@ -1515,6 +1627,18 @@ static void rep_apply_plan(live_rep *rep, const cfg_snap *cfg, const rs_json *pl
         found[n].url = u;
         found[n].tv = tv;
         found[n].dur = rs_json_as_num(rs_json_obj_get(sg, "duration"), 0);
+        // The KID of the init this segment is under (its own MAP, else the
+        // plan's), so it keeps that key after the playlist moves on.
+        const char *si = rs_json_obj_str(sg, "initUrl", "");
+        if (!si[0]) si = init_url;
+        found[n].kid[0] = '\0';
+        found[n].iv = 0;
+        if (si[0]) {
+            char sk[288];
+            stable_key(si, -1, sk, sizeof(sk));
+            const char *kid = init_tab_kid_locked(rep, sk, &found[n].iv);
+            if (kid) snprintf(found[n].kid, sizeof(found[n].kid), "%s", kid);
+        }
         memcpy(found[n].idkey, idkey, sizeof(idkey));
         n++;
     }
@@ -1594,7 +1718,8 @@ static void rep_apply_plan(live_rep *rep, const cfg_snap *cfg, const rs_json *pl
         // visible to later polls so its signed URL can be refreshed; the writer
         // marks it seen at the moment it leaves the queue, under the same lock,
         // so it is never both un-queued and un-seen.
-        pend_push_locked(rep, found[i].url, found[i].idkey, found[i].tv, found[i].dur, plan_ts);
+        pend_push_locked(rep, found[i].url, found[i].idkey, found[i].tv, found[i].dur, plan_ts,
+                         found[i].kid, found[i].iv);
         queued++;
     }
     size_t queue_depth = rep->pend_count;
@@ -1666,6 +1791,12 @@ static void commit_one(live_rep *rep, const cfg_snap *cfg, pend_item *it,
     if (have_key) memcpy(key, rep->key, 16);
     uint32_t ts = rep->timescale;
     pthread_mutex_unlock(&st->mu);
+    // A segment that knows its init's KID uses that key, not whichever init
+    // the rendition holds now: across a key rotation the two differ.
+    if (it->kid[0]) {
+        have_key = key_lookup(cfg->keys, it->kid, key);
+        if (it->iv_size > 0) iv_size = it->iv_size;
+    }
 
     uint8_t *data = it->data;
     size_t len = it->len;
@@ -1770,6 +1901,37 @@ static void commit_one(live_rep *rep, const cfg_snap *cfg, pend_item *it,
 }
 
 // Drains the pending queue in order and publishes. One per representation.
+// Whether the head of the queue is a downloaded segment whose key has not
+// arrived yet (a key rotation in progress). It stays at the head — publishing
+// it encrypted would show a broken picture — while the request is repeated;
+// past RS_LIVE_KEY_WAIT the engine stops with wrongKeys and the restart
+// licenses the key instead. Caller holds st->mu.
+static bool head_waits_for_key_locked(live_stream *st, live_rep *rep) {
+    if (rep->pend_count == 0) return false;
+    pend_item *head = pend_at_locked(rep, 0);
+    if (head->state != PEND_READY || !head->kid[0]) return false;
+    uint8_t probe[16];
+    if (key_lookup(st->keys, head->kid, probe)) return false;
+    size_t slot = RS_LIVE_KEY_WAITS;
+    for (size_t i = 0; i < RS_LIVE_KEY_WAITS; i++)
+        if (!strcmp(st->key_wait[i].kid, head->kid)) slot = i;
+    // Never asked (no handler): the init's mismatch already stopped the stream.
+    if (slot == RS_LIVE_KEY_WAITS) return request_key_locked(st, head->kid);
+    if (now_seconds() - st->key_wait[slot].since <= RS_LIVE_KEY_WAIT) {
+        request_key_locked(st, head->kid);
+        return true;
+    }
+    if (!st->key_wait[slot].gave_up) {
+        st->key_wait[slot].gave_up = true;
+        lgf(st, "error", "wrongKeys", head->url, 0, -1,
+            "Wrong decryption keys: %s is encrypted under KID %s, and no key for it arrived within %.0fs",
+            rep->rep_id, head->kid, RS_LIVE_KEY_WAIT);
+        st->terminal = 1;
+        pthread_cond_broadcast(&st->cv);
+    }
+    return true;
+}
+
 static void *writer_main(void *arg) {
     live_rep *rep = (live_rep *)arg;
     live_stream *st = rep->owner;
@@ -1800,7 +1962,8 @@ static void *writer_main(void *arg) {
             if (st->stop) { pthread_mutex_unlock(&st->mu); return NULL; }
             if (rep->pend_count > 0) {
                 pend_state hs = pend_at_locked(rep, 0)->state;
-                if (hs == PEND_READY || hs == PEND_FAILED) break;
+                if (hs == PEND_FAILED) break;
+                if (hs == PEND_READY && !head_waits_for_key_locked(st, rep)) break;
             } else if (rep->poller_done) {
                 pthread_mutex_unlock(&st->mu);
                 return NULL;
@@ -1870,7 +2033,7 @@ static void *writer_main(void *arg) {
         bool have_item = false;
         if (rep->pend_count > 0) {
             pend_state hs = pend_at_locked(rep, 0)->state;
-            if (hs == PEND_READY || hs == PEND_FAILED) {
+            if (hs == PEND_FAILED || (hs == PEND_READY && !head_waits_for_key_locked(st, rep))) {
                 item = *pend_at_locked(rep, 0);
                 // Seen at the moment it leaves the queue, under the same lock
                 // that removes it: the poller refreshes the URL of anything
@@ -2896,6 +3059,65 @@ rs_live *rs_live_create(rs_live_fetch_fn fetch, rs_live_dash_fn dash,
     live->log_ctx = log_ctx;
     pthread_mutex_init(&live->mu, NULL);
     return live;
+}
+
+void rs_live_set_key_handler(rs_live *live, rs_live_key_fn key, void *ctx) {
+    if (!live) return;
+    pthread_mutex_lock(&live->mu);
+    live->key = key;
+    live->key_ctx = ctx;
+    pthread_mutex_unlock(&live->mu);
+}
+
+int rs_live_add_keys(rs_live *live, const char *stream_id, const char *keys) {
+    if (!live || !stream_id || !keys) return -1;
+    rs_cenc_keys add = rs_cenc_parse_keys(keys);
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    if (!st) { pthread_mutex_unlock(&live->mu); rs_cenc_keys_free(&add); return -1; }
+    pthread_mutex_lock(&st->mu);
+    int added = 0;
+    char arrived[RS_LIVE_KEY_WAITS][33];
+    double waited[RS_LIVE_KEY_WAITS];
+    size_t narrived = 0;
+    for (size_t i = 0; i < add.count; i++) {
+        uint8_t probe[16];
+        if (!add.kids[i] || key_lookup(st->keys, add.kids[i], probe)) continue;
+        char hex[33];
+        for (int b = 0; b < 16; b++) snprintf(hex + b * 2, 3, "%02x", add.keys[i][b]);
+        size_t old_len = st->keys ? strlen(st->keys) : 0;
+        size_t need = old_len + strlen(add.kids[i]) + 34 + 2;
+        char *merged = (char *)malloc(need);
+        if (!merged) break;
+        snprintf(merged, need, "%s%s%s:%s", st->keys ? st->keys : "", old_len ? "\n" : "",
+                 add.kids[i], hex);
+        free(st->keys);
+        st->keys = merged;
+        added++;
+    }
+    // Release whatever was waiting on these KIDs.
+    for (size_t w = 0; w < RS_LIVE_KEY_WAITS; w++) {
+        uint8_t probe[16];
+        if (!st->key_wait[w].kid[0] || !key_lookup(st->keys, st->key_wait[w].kid, probe)) continue;
+        snprintf(arrived[narrived], sizeof(arrived[narrived]), "%s", st->key_wait[w].kid);
+        waited[narrived++] = now_seconds() - st->key_wait[w].since;
+        memset(&st->key_wait[w], 0, sizeof(st->key_wait[w]));
+    }
+    // The rendition's own init key, for status: it may be one of the new ones.
+    for (size_t r = 0; r < st->nreps; r++) {
+        live_rep *rep = st->reps[r];
+        int iv = 0;
+        const char *kid = rep->init_key ? init_tab_kid_locked(rep, rep->init_key, &iv) : NULL;
+        if (kid && kid[0] && !rep->have_key && key_lookup(st->keys, kid, rep->key)) rep->have_key = true;
+    }
+    pthread_cond_broadcast(&st->cv);
+    pthread_mutex_unlock(&st->mu);
+    for (size_t i = 0; i < narrived; i++)
+        lgf(st, "info", "keyRotation", NULL, 0, -1,
+            "the key for KID %s arrived after %.1fs — its segments are playing", arrived[i], waited[i]);
+    pthread_mutex_unlock(&live->mu);
+    rs_cenc_keys_free(&add);
+    return added;
 }
 
 int rs_live_start(rs_live *live, const char *stream_id, const rs_live_config *cfg) {
