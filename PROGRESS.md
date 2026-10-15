@@ -319,3 +319,16 @@ ssh -o BatchMode=yes root@23.237.79.50 'python3 - <<EOF ... EOF; journalctl ...;
 Read-only: per-stream errors since 17:15, the 18:24 outage timeline, curta's discontinuities, the failed cdm start, sshd settings.
 
 **Unfinished:** As before, plus: consider key-only SSH on vpsrestream1 (`PasswordAuthentication no`) once the Windows tunnel uses its key.
+
+### 2026-10-15 — Fifth log review on vpsrestream1 (2026-10-14 19:31 – 04:31 UTC)
+**What was done:** Read-only review of the night. 15 streams are running (5 claro, 10 disney, which is disney's maxStreamsConcurrency). Errors per hour: 12–36 until 22:00, then 376 (22h) and 352 (23h), 112 at 00h, 30–160 afterwards. The bad hours are a proxy problem across the board: all four disney proxies failed at the same time, each 30–60 times an hour from 22:00 to 02:00 (timeouts, "could not connect" and a new "Transferred a partial file", where a connection was cut mid-transfer). The number of disney events stayed at 10 all night and the SSH tunnel did not reconnect, so neither of those changed. The likely cause is Brazil's evening peak (22:00–02:00 UTC is 19:00–23:00 there) slowing the proxies; not verified. At 22:22 many streams restarted together (GLOBO BSB and 8 disney events), and the worst events lost 35–47 segments to live-edge skips. claro was mostly fine: pollSlow 52 (median 23s), 17 segments skipped on GLOBO BSB around its 22:22 restart, all channels running now. The disney script still prints tokens (980 lines).
+
+**Files changed:** PROGRESS.md
+
+**Commands run:**
+```bash
+ssh -o BatchMode=yes root@23.237.79.50 'python3 - <<EOF ... EOF; journalctl ...; ss -tn ...'
+```
+Read-only: per-stream errors since 19:31, proxy failures per hour, disney concurrency per 30 min, tunnel reconnects.
+
+**Unfinished:** a451f93 (proxy connection limit, manifest stall timeout, alerts only on lasting proxy failure) is pushed, but its selftest update (the options count 46 → 48 plus checks for the new options) is still uncommitted in core/tests/selftest_main.c, so the selftest fails on main. The functional test on moonmuaaz (scripts in /tmp/rsa-test/pl) was stopped before it ran. vpsrestream1 has not been rebuilt.
