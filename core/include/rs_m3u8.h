@@ -110,10 +110,12 @@ typedef struct {
     char *url;          // absolute
     int64_t sequence;   // media sequence number — stable identity across polls
     double duration;    // seconds (EXTINF)
+    char *init_url;     // the EXT-X-MAP this segment is under, absolute, or NULL.
+                        // A live playlist mid key rotation lists two.
 } rs_hls_segment;
 
 typedef struct {
-    char *init_url;        // EXT-X-MAP, absolute, or NULL
+    char *init_url;        // the newest EXT-X-MAP, absolute, or NULL
     rs_hls_segment *segments;
     size_t count;
     double target_duration;

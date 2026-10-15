@@ -163,6 +163,22 @@ static void test_hls_engine_source(void) {
           strstr(err, "AES-128"));
     check("hls-engine/ended", rs_hls_media_parse("#EXTM3U\n#EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n", "https://x/y.m3u8", 0, &m, err, sizeof(err)) == 0 && m.ended && m.count == 1);
     rs_hls_media_dispose(&m);
+    // A key rotation in the window: each segment keeps the MAP it is under,
+    // and the playlist's init is the newest one.
+    check("hls-engine/rotation-parse",
+          rs_hls_media_parse("#EXTM3U\n#EXT-X-MAP:URI=\"map96.mp4\"\n#EXTINF:2,\na.m4s\n#EXTINF:2,\nb.m4s\n"
+                             "#EXT-X-MAP:URI=\"map97.mp4\"\n#EXTINF:2,\nc.m4s\n",
+                             "https://x/v/y.m3u8", 0, &m, err, sizeof(err)) == 0 && m.count == 3);
+    check_str("hls-engine/rotation-newest-init", m.init_url, "https://x/v/map97.mp4");
+    check_str("hls-engine/rotation-old-segment", m.segments[0].init_url, "https://x/v/map96.mp4");
+    check_str("hls-engine/rotation-new-segment", m.segments[2].init_url, "https://x/v/map97.mp4");
+    rs_hls_media_dispose(&m);
+    // Trimming to the newest segments frees the dropped ones' init URLs too.
+    check("hls-engine/rotation-window",
+          rs_hls_media_parse("#EXTM3U\n#EXT-X-MAP:URI=\"m1.mp4\"\n#EXTINF:2,\na.m4s\n#EXT-X-MAP:URI=\"m2.mp4\"\n#EXTINF:2,\nb.m4s\n",
+                             "https://x/y.m3u8", 1, &m, err, sizeof(err)) == 0 && m.count == 1 &&
+          m.segments[0].init_url && !strcmp(m.segments[0].init_url, "https://x/m2.mp4"));
+    rs_hls_media_dispose(&m);
 }
 
 static void test_metrics_connections(void) {

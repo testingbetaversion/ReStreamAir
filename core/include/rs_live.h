@@ -98,6 +98,13 @@ typedef void (*rs_live_log_fn)(void *ctx, const char *stream_id, const char *lev
                                const char *event, const char *url, long status,
                                long long bytes, const char *message);
 
+// Asks for the key of `kid` (32 lowercase hex) while a stream runs: its media
+// moved to a new init segment (a key rotation) whose KID none of its keys
+// cover. Called from engine threads, possibly with engine locks held — it must
+// only queue the request and return. The answer comes back through
+// rs_live_add_keys.
+typedef void (*rs_live_key_fn)(void *ctx, const char *stream_id, const char *kid);
+
 // A snapshot of one stream's playback settings. Strings are copied; NULL is
 // treated as "". One of these is built per stream from its stored settings.
 typedef struct {
@@ -240,6 +247,15 @@ int rs_live_status_is_throttle(long status);
 rs_live *rs_live_create(rs_live_fetch_fn fetch, rs_live_dash_fn dash,
                         rs_live_log_fn log, void *log_ctx);
 void rs_live_destroy(rs_live *live);
+
+// Registers the key-rotation handler (see rs_live_key_fn). Without one, a new
+// KID stops the stream with "Wrong decryption keys" as before.
+void rs_live_set_key_handler(rs_live *live, rs_live_key_fn key, void *ctx);
+
+// Adds "KID:KEY" pairs (one per line or |-separated) to a running stream's
+// keys. Segments held for one of these KIDs are released. Returns how many
+// keys were new, or -1 when the stream is not running.
+int rs_live_add_keys(rs_live *live, const char *stream_id, const char *keys);
 
 // Starts the engine for `stream_id`, or re-applies `cfg` to an already-running
 // one (an edit in the panel takes effect on the next poll). Returns 0 on

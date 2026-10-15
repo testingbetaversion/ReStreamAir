@@ -782,7 +782,7 @@ int rs_hls_pick_renditions(const char *master, const char *base_url, const char 
 
 void rs_hls_media_dispose(rs_hls_media *m) {
     if (!m) return;
-    for (size_t i = 0; i < m->count; i++) free(m->segments[i].url);
+    for (size_t i = 0; i < m->count; i++) { free(m->segments[i].url); free(m->segments[i].init_url); }
     free(m->segments);
     free(m->init_url);
     memset(m, 0, sizeof(*m));
@@ -845,6 +845,7 @@ int rs_hls_media_parse(const char *text, const char *base_url, int want, rs_hls_
             free(rel);
             s->sequence = seq++;
             s->duration = pending_duration > 0 ? pending_duration : out->target_duration;
+            s->init_url = out->init_url ? rs_strdup(out->init_url) : NULL;
             pending_duration = -1;
         }
     }
@@ -855,7 +856,7 @@ int rs_hls_media_parse(const char *text, const char *base_url, int want, rs_hls_
     // Keep only the newest `want` segments.
     if (want > 0 && out->count > (size_t)want) {
         size_t drop = out->count - (size_t)want;
-        for (size_t i = 0; i < drop; i++) free(out->segments[i].url);
+        for (size_t i = 0; i < drop; i++) { free(out->segments[i].url); free(out->segments[i].init_url); }
         memmove(out->segments, out->segments + drop, (size_t)want * sizeof(*out->segments));
         out->count = (size_t)want;
     }

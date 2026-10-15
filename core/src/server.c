@@ -141,6 +141,11 @@ struct restream_server {
     pthread_cond_t pending_cv;      // signalled whenever pending job ownership changes
     bool ffmpeg_install_running;    // guarded by pending_mu; installer thread holds the server alive
     pthread_mutex_t logo_mu;        // serialises RS_PENDING_LOGO workers' access to logo_cache (not itself thread-safe)
+    // Keys the live engine asked for mid-stream (a key rotation). Engine
+    // threads only queue here; the event loop turns them into cdm jobs.
+    pthread_mutex_t key_req_mu;
+    struct { char sid[160]; char kid[33]; } key_req[32];
+    size_t key_req_n;
     char pipeline_feed_key[65];  // random per-process credential, accepted only from this host
     char pipeline_feed_origin[256];
     uint16_t listen_port;   // the port actually bound, which is what /api/state must report
@@ -990,6 +995,24 @@ void restream_log_event(const char *level, const char *event, const char *messag
 
 // The live engine's log sink. Called from its worker threads, which is why
 // log_record takes a lock.
+// The live engine's key-rotation hook: a running stream's media moved to a KID
+// none of its keys cover. Called on engine threads, possibly under engine
+// locks, so it only queues; key_requests_dispatch runs the cdm action.
+static void live_key_request(void *ctx, const char *stream_id, const char *kid) {
+    restream_server_t *s = (restream_server_t *)ctx;
+    if (!s || !stream_id || !kid) return;
+    pthread_mutex_lock(&s->key_req_mu);
+    bool queued = false;
+    for (size_t i = 0; i < s->key_req_n && !queued; i++)
+        queued = !strcmp(s->key_req[i].sid, stream_id) && !strcmp(s->key_req[i].kid, kid);
+    if (!queued && s->key_req_n < sizeof(s->key_req) / sizeof(s->key_req[0])) {
+        snprintf(s->key_req[s->key_req_n].sid, sizeof(s->key_req[0].sid), "%s", stream_id);
+        snprintf(s->key_req[s->key_req_n].kid, sizeof(s->key_req[0].kid), "%s", kid);
+        s->key_req_n++;
+    }
+    pthread_mutex_unlock(&s->key_req_mu);
+}
+
 static void live_log_sink(void *ctx, const char *stream_id, const char *level,
                           const char *event, const char *url, long status,
                           long long bytes, const char *message) {
@@ -4285,6 +4308,7 @@ typedef enum {
     RS_PENDING_SCRIPT,
     RS_PENDING_STREAM_START,
     RS_PENDING_BUFFER,
+    RS_PENDING_KEY_ROTATION,  // a running stream's cdm action for a new KID
 } rs_pending_kind;
 
 struct rs_pending_job {
@@ -6176,6 +6200,10 @@ static void *pending_job_worker(void *arg) {
     case RS_PENDING_STREAM_START:
         stream_start_worker(server, pf->stream_id, pf->start);
         break;
+    case RS_PENDING_KEY_ROTATION:
+        // Only the key step: the session manifest is the running one.
+        stream_start_resolve_all_keys(server, pf->stream_id, pf->start, pf->start->url);
+        break;
     }
 
     pthread_mutex_lock(&server->pending_mu);
@@ -7166,6 +7194,7 @@ static void pending_job_finish(restream_server_t *server, struct mg_connection *
     case RS_PENDING_SCRIPT: pending_job_finish_script(server, c, pf); break;
     case RS_PENDING_STREAM_START: pending_job_finish_stream_start(server, c, pf); break;
     case RS_PENDING_BUFFER: pending_job_finish_buffer(server, c, pf); break;
+    case RS_PENDING_KEY_ROTATION: break;  // no connection; finished on the poll loop
     }
     pending_job_free(pf);
 }
@@ -7877,6 +7906,103 @@ static void live_sync_all(restream_server_t *s) {
                     started, started == 1 ? "" : "s");
 }
 
+// "KID:KEY" pairs of `old` plus every pair of `add` whose KID it lacks, one
+// per line. Caller frees.
+static char *keys_merge(const char *old, const char *add) {
+    rs_cenc_keys have = rs_cenc_parse_keys(old ? old : "");
+    rs_cenc_keys more = rs_cenc_parse_keys(add ? add : "");
+    rs_buf out = RS_BUF_INIT;
+    for (size_t i = 0; i < have.count + more.count; i++) {
+        bool from_add = i >= have.count;
+        const char *kid = from_add ? more.kids[i - have.count] : have.kids[i];
+        const uint8_t *key = from_add ? more.keys[i - have.count] : have.keys[i];
+        bool dup = false;
+        for (size_t j = 0; j < have.count && from_add && !dup; j++) dup = !strcmp(have.kids[j], kid);
+        for (size_t j = have.count; j < i && !dup; j++) dup = !strcmp(more.kids[j - have.count], kid);
+        if (dup || !kid) continue;
+        char hex[33];
+        for (int b = 0; b < 16; b++) snprintf(hex + b * 2, 3, "%02x", key[b]);
+        if (out.len) rs_buf_append_char(&out, '\n');
+        rs_buf_append_str(&out, kid);
+        rs_buf_append_char(&out, ':');
+        rs_buf_append_str(&out, hex);
+    }
+    rs_cenc_keys_free(&have);
+    rs_cenc_keys_free(&more);
+    char *text = rs_buf_take(&out);
+    return text ? text : rs_strdup("");
+}
+
+// A running stream's cdm job came back: hand the keys to its engine (which
+// releases the segments waiting on them) and keep them on the stream, so a
+// restart starts with them.
+static void pending_job_finish_key_rotation(restream_server_t *s, rs_pending_job *pf) {
+    rs_stream_start *st = pf->start;
+    const rs_json *stream = rs_panel_find_stream(&s->state, pf->stream_id);
+    if (!stream || !rs_live_is_running(s->live, pf->stream_id)) return;
+    const char *kid = st->required_kid ? st->required_kid : "";
+    if (st->err[0] || !st->keys || !st->keys[0]) {
+        log_recordf(s, pf->stream_id, "error", "keyRotation", NULL, 0, -1,
+                    "could not license KID %s while running: %s — the stream keeps waiting, "
+                    "and restarts if no key arrives", kid,
+                    st->err[0] ? st->err : "the cdm action returned no keys");
+        return;
+    }
+    int added = rs_live_add_keys(s->live, pf->stream_id, st->keys);
+    char *merged = keys_merge(rs_json_obj_str(stream, "decryptionKeys", ""), st->keys);
+    const char *err = NULL;
+    if (rs_panel_set_stream_keys(&s->state, pf->stream_id, merged, &err) == 0 && rs_state_save(&s->state) != 0)
+        log_record(s, pf->stream_id, "error", "keyRotation", NULL, 0, -1, "could not save the new keys");
+    free(merged);
+    log_recordf(s, pf->stream_id, "info", "keyRotation", NULL, 0, -1,
+                "licensed KID %s without restarting the stream (%d new key%s)", kid, added,
+                added == 1 ? "" : "s");
+}
+
+// Turns the engine's queued key requests into cdm jobs: one per stream at a
+// time, through the same key step a start uses, with the KID the engine
+// needs. A stream without a cdm action cannot be helped here; the engine
+// times out and the restart path takes over.
+static void key_requests_dispatch(restream_server_t *s) {
+    struct { char sid[160]; char kid[33]; } reqs[32];
+    size_t n = 0;
+    pthread_mutex_lock(&s->key_req_mu);
+    n = s->key_req_n;
+    memcpy(reqs, s->key_req, n * sizeof(reqs[0]));
+    s->key_req_n = 0;
+    pthread_mutex_unlock(&s->key_req_mu);
+    for (size_t i = 0; i < n; i++) {
+        const rs_json *stream = rs_panel_find_stream(&s->state, reqs[i].sid);
+        const rs_json *provider = stream ? provider_of(&s->state, stream) : NULL;
+        if (!stream || !provider || !rs_live_is_running(s->live, reqs[i].sid)) continue;
+        bool busy = false;
+        pthread_mutex_lock(&s->pending_mu);
+        for (rs_pending_job *pf = s->pending_head; pf && !busy; pf = pf->next)
+            busy = !pf->cancelled && pf->stream_id && !strcmp(pf->stream_id, reqs[i].sid) &&
+                   (pf->kind == RS_PENDING_KEY_ROTATION || pf->kind == RS_PENDING_STREAM_START);
+        pthread_mutex_unlock(&s->pending_mu);
+        if (busy) continue;  // the engine asks again in 20 s if it still needs it
+        if (!stream_wants_drm_discovery(provider, stream)) {
+            log_recordf(s, reqs[i].sid, "error", "keyRotation", NULL, 0, -1,
+                        "the source moved to KID %s, but this stream has no cdm action to license it",
+                        reqs[i].kid);
+            continue;
+        }
+        rs_stream_start *st = stream_start_snapshot(provider, stream, false, true);
+        rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
+        if (!st || !pf) { stream_start_free(st); free(pf); continue; }
+        free(st->required_kid);
+        st->required_kid = rs_strdup(reqs[i].kid);
+        pf->kind = RS_PENDING_KEY_ROTATION;
+        pf->stream_id = rs_strdup(reqs[i].sid);
+        pf->client_ip = rs_strdup("key rotation");
+        pf->start = st;
+        log_recordf(s, reqs[i].sid, "info", "keyRotation", NULL, 0, -1,
+                    "licensing KID %s for the running stream", reqs[i].kid);
+        if (!pending_job_dispatch(s, NULL, pf)) pending_job_free(pf);
+    }
+}
+
 // The event loop owns timers and consumes detached script results. A browser
 // connection is optional: closing Settings does not cancel scheduled work.
 static bool provider_job_busy(restream_server_t *s, const rs_json *provider) {
@@ -7996,10 +8122,12 @@ static void provider_maintenance(restream_server_t *s) {
         if (!pf->cancelled) {
             if (pf->kind == RS_PENDING_SCRIPT) pending_job_finish_script(s, NULL, pf);
             if (pf->kind == RS_PENDING_STREAM_START) pending_job_finish_stream_start(s, NULL, pf);
+            if (pf->kind == RS_PENDING_KEY_ROTATION) pending_job_finish_key_rotation(s, pf);
             if (pending_job_is_source_recovery(pf)) pending_source_finish(s, NULL, pf);
         }
         pending_job_free(pf);
     }
+    key_requests_dispatch(s);
 
     double now = now_ms() / 1000.0;
     const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
@@ -9797,6 +9925,7 @@ restream_server_t* restream_server_create(void) {
     pthread_mutex_init(&server->fetch_mu, NULL);
     pthread_cond_init(&server->fetch_cv, NULL);
     pthread_mutex_init(&server->logo_mu, NULL);
+    pthread_mutex_init(&server->key_req_mu, NULL);
     pthread_mutex_init(&server->log_mu, NULL);
     pthread_mutex_init(&server->webhook_mu, NULL);
     pthread_cond_init(&server->webhook_cv, NULL);
@@ -9806,6 +9935,7 @@ restream_server_t* restream_server_create(void) {
     // neither) it stays NULL and the DASH routes report that honestly instead
     // of half-working. The C++ app registers them before calling this.
     server->live = rs_live_create(g_fetch_handler, g_dash_handler, live_log_sink, server);
+    if (server->live) rs_live_set_key_handler(server->live, live_key_request, server);
     // state.json lives in the working directory.
     if (rs_state_load(&server->state, "state.json") != 0 || !server->auth || !server->sysstats || !server->metrics) {
         // A malformed state.json is fatal — better to refuse than to risk
@@ -10037,6 +10167,7 @@ void restream_server_destroy(restream_server_t* server) {
         pthread_mutex_destroy(&server->fetch_mu);
         pthread_cond_destroy(&server->fetch_cv);
         pthread_mutex_destroy(&server->logo_mu);
+        pthread_mutex_destroy(&server->key_req_mu);
         pthread_mutex_destroy(&server->log_mu);
         pthread_mutex_destroy(&server->webhook_mu);
         pthread_cond_destroy(&server->webhook_cv);
