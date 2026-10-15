@@ -354,3 +354,16 @@ ssh root@moonmuaaz.xyz 'cd /tmp/rsa-test/pl2 && ./run.sh 0; ./run.sh 3'
 Throwaway server on 127.0.0.1:8797. 3 engine channels with 4 downloads each, through 2 test proxies that refuse anything over 4 connections, fed by a live fMP4 origin answering each segment after 3s. Without a limit: 452 refused connections, 7 errors/min. With limit 3: 0 refused, 0 errors, same download rate (37.7 vs 37.8 KB/s). `/proxies` open counts matched the proxies' own; `/traffic` listed each request. Test files moved to /tmp/rsa-test/trash/pl2-*; processes stopped.
 
 **Unfinished:** vpsrestream1 needs a rebuild to get all of this; then set the disney provider's "Connections per proxy" to 8 (the seller allows 10; the script's requests are not counted by the engine). The panel UI has only been syntax-checked (node --check), not opened in a browser.
+
+### 2026-10-15 — Log review on vpsrestream1 after its rebuild (04:31–09:38 UTC)
+**What was done:** Read-only review. vpsrestream1 now runs the new build (binary 05:09, service restarted 06:52). Quieter alerts confirmed: 54 single proxy failures logged as `info`, only 1 proxy `error` (claro's tunnel returned HTTP 502 at 04:44, before the restart). disney's "Connections per proxy" is not set yet (0), so the limit is off: 79.127.168.43 had 9 and 178.92.209.173 had 10 connections open (at the seller's cap). claro: most skipped segments came in 06:30–06:50 on the old build (404s, HTTP/2 framing errors through both claro proxies, provider restarts at 06:38, then the rebuild restart); since 07:00 only GLOBO BH (18) and Globo Recife (2). disney: DP World India Championship has dropped segments steadily since 06:50 (about 40–140 per 10 min). Since 07:00 that is 264 evicted from a full queue plus 34 that left the source's window, meaning its 720p video (7.4 Mbps) arrives slower than it plays over its 2 download connections. Other disney events have the same settings and are not skipping. Wrong keys on 5 event starts (the script returned another event's KID). The script still prints tokens (546 lines). One SSH connection attempt timed out; the box and service were fine on retry.
+
+**Files changed:** PROGRESS.md
+
+**Commands run:**
+```bash
+ssh -o BatchMode=yes root@23.237.79.50 'python3 - <<EOF ... EOF; ss -tn ...'
+```
+Read-only: errors per stream and hour since 04:31, segments skipped per 10 min, provider options, open proxy connections.
+
+**Unfinished:** Set disney's "Connections per proxy" to 8. Check DP World India in the new live traffic view (eye icon) to see which proxy its downloads use and how fast they are.
