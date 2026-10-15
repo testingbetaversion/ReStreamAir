@@ -332,3 +332,25 @@ ssh -o BatchMode=yes root@23.237.79.50 'python3 - <<EOF ... EOF; journalctl ...;
 Read-only: per-stream errors since 19:31, proxy failures per hour, disney concurrency per 30 min, tunnel reconnects.
 
 **Unfinished:** a451f93 (proxy connection limit, manifest stall timeout, alerts only on lasting proxy failure) and its selftest update 265e017 are on main. The functional test of the connection limit on moonmuaaz was stopped mid-run; its leftover test processes were stopped and the files moved to /tmp/rsa-test/trash/pl-*. vpsrestream1 has not been rebuilt.
+
+### 2026-10-15 — Proxy connection limit, manifest stall timeout, quieter proxy alerts, proxy table and live traffic view
+**What was done:**
+- **`proxyConnectionLimit`** (provider option, 0 = off): caps the connections kept open through each proxy in the provider's list. A request waits for a free slot or uses another proxy instead of being refused, and an idle kept-alive connection gives up its slot when a request is waiting.
+- **`manifestStallSeconds`** (default 15, 0 = off): a manifest or playlist request that receives no data for that long is abandoned and retried on a fresh connection or the next proxy, instead of waiting out the 30s timeout.
+- **`proxyHealth`:** one failed request sets the proxy aside for 15s and is logged as `info`. The `error` (and Discord webhook) comes once, when the proxy is set aside 3 times in a row.
+- **Panel:** Provider settings shows a live **Proxy connections** table: open TCP connections from the server to each proxy (from /proc/net/tcp; idle connections and the script's included), the limit, requests in use, and status. A new eye icon on every stream card opens that channel's **live traffic**: download rate, requests and errors per minute, per-proxy totals for the channel, and the latest 60 requests (type, proxy, file, status, size, time, speed). New endpoints: `GET /api/providers/<id>/proxies` and `GET /api/streams/<id>/traffic`. Proxy credentials are never sent.
+
+**Files changed:** apps/server/net.c, apps/server/net.h, apps/server/main.cpp, core/include/restream.h, core/include/rs_source_policy.h, core/src/server.c, core/src/provider_options.c, core/tests/selftest_main.c, public/app.js, public/index.html, public/styles.css, API.md, EVENTS.md, public/docs/API.md, public/docs/EVENTS.md, PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build && cd build && ctest'
+```
+Builds on moonmuaaz and runs the test suites (2 of 2 passed; no new compiler warnings).
+
+```bash
+ssh root@moonmuaaz.xyz 'cd /tmp/rsa-test/pl2 && ./run.sh 0; ./run.sh 3'
+```
+Throwaway server on 127.0.0.1:8797. 3 engine channels with 4 downloads each, through 2 test proxies that refuse anything over 4 connections, fed by a live fMP4 origin answering each segment after 3s. Without a limit: 452 refused connections, 7 errors/min. With limit 3: 0 refused, 0 errors, same download rate (37.7 vs 37.8 KB/s). `/proxies` open counts matched the proxies' own; `/traffic` listed each request. Test files moved to /tmp/rsa-test/trash/pl2-*; processes stopped.
+
+**Unfinished:** vpsrestream1 needs a rebuild to get all of this; then set the disney provider's "Connections per proxy" to 8 (the seller allows 10; the script's requests are not counted by the engine). The panel UI has only been syntax-checked (node --check), not opened in a browser.
