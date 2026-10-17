@@ -640,6 +640,22 @@ static int fetch_once(CURL *curl, const char *url, const char *proxy, const char
     if (content_range) *content_range = captured_range;
     if (header_list) curl_slist_free_all(header_list);
 
+    // A proxy that refuses its login answers the CONNECT (https) or the
+    // request itself (http) with 407. libcurl reports the former as "Could
+    // not connect to server", which reads like a dead proxy and hid an
+    // expired proxy password for half a day.
+    long connect_code = 0;
+    if (proxy && proxy[0]) curl_easy_getinfo(curl, CURLINFO_HTTP_CONNECTCODE, &connect_code);
+    bool proxy_login = proxy && proxy[0] && (connect_code == 407 || (rc == CURLE_OK && code == 407));
+    if (proxy_login) {
+        snprintf(errbuf, errbuf_len, "The proxy rejected its username/password (HTTP 407)");
+        free(buf.data);
+        if (status) *status = 407;
+        if (content_type) { free(*content_type); *content_type = NULL; }
+        if (content_range) { free(*content_range); *content_range = NULL; }
+        if (effective_url) { free(*effective_url); *effective_url = NULL; }
+        return -1;
+    }
     if (rc != CURLE_OK) {
         if (rc == CURLE_ABORTED_BY_CALLBACK)
             snprintf(errbuf, errbuf_len, "Fetch cancelled because the segment is no longer current.");

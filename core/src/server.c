@@ -356,7 +356,7 @@ static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
                            const rs_json *stream, const rs_json *mirrors);
 static void dispatch_script_action(restream_server_t *server, struct mg_connection *c,
                                    const char *sid, const char *action, const char *script_path,
-                                   char **args, int argc, double timeout);
+                                   char **args, int argc, double timeout, char *proxies);
 static bool dispatch_stream_start(restream_server_t *server, struct mg_connection *c,
                                   struct mg_http_message *hm, const char *stream_id,
                                   const char *ip);
@@ -2229,6 +2229,64 @@ static char *script_proxy_value(const char *line) {
     return up;
 }
 
+// Whether a script run failed because of its proxy rather than the provider:
+// the proxy refused the connection, its login (407), or is out of slots.
+static bool script_said_proxy_refused(const char *said) {
+    if (!said) return false;
+    return strstr(said, "ProxyError") || strstr(said, "CONNECT tunnel failed") ||
+           strstr(said, "PROXY_MAX_CONNS") || strstr(said, "PROXY_AUTH_FAILED") ||
+           strstr(said, "SOCKS") || strstr(said, "resolve proxy") ||
+           strstr(said, "Proxy Authentication") || strstr(said, "response 407");
+}
+
+// The proxy line each provider's script last got through, by provider id.
+// Event-loop only: read when a job is built, written when one finishes, so it
+// needs no lock. Kept in memory — it is a hint, not configuration.
+static rs_json *g_script_proxy_pref;
+
+static void script_proxy_remember(const char *pid, const char *line) {
+    if (!pid || !pid[0] || !line || !line[0]) return;
+    if (!g_script_proxy_pref) g_script_proxy_pref = rs_json_new_obj();
+    if (g_script_proxy_pref) rs_json_obj_set_str(g_script_proxy_pref, pid, line);
+}
+
+// `list` (one proxy per line) with the line this provider's script last got
+// through moved to the top. Before, a script always started on the first line,
+// so a first proxy that had stopped accepting its login failed every run —
+// events stopped loading even though the next proxy worked. Caller frees.
+static char *script_proxy_list(const char *list, const char *pid) {
+    const char *pref = g_script_proxy_pref ? rs_json_obj_str(g_script_proxy_pref, pid ? pid : "", "") : "";
+    rs_buf out = RS_BUF_INIT;
+    bool found = false;
+    if (pref[0]) {
+        for (const char *line = list ? list : ""; *line;) {
+            const char *end = line + strcspn(line, "\r\n");
+            const char *a = line, *b = end;
+            while (a < b && (*a == ' ' || *a == '\t')) a++;
+            while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+            if ((size_t)(b - a) == strlen(pref) && !strncmp(a, pref, (size_t)(b - a))) found = true;
+            line = end;
+            while (*line == '\r' || *line == '\n') line++;
+        }
+    }
+    if (found) rs_buf_append_str(&out, pref);
+    for (const char *line = list ? list : ""; *line;) {
+        const char *end = line + strcspn(line, "\r\n");
+        const char *a = line, *b = end;
+        while (a < b && (*a == ' ' || *a == '\t')) a++;
+        while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+        bool is_pref = found && (size_t)(b - a) == strlen(pref) && !strncmp(a, pref, (size_t)(b - a));
+        if (b > a && !is_pref) {
+            if (out.len) rs_buf_append_char(&out, '\n');
+            for (const char *q = a; q < b; q++) rs_buf_append_char(&out, *q);
+        }
+        line = end;
+        while (*line == '\r' || *line == '\n') line++;
+    }
+    char *text = rs_buf_take(&out);
+    return text ? text : rs_strdup("");
+}
+
 static int fill_common_script_args(const rs_json *provider, const rs_json *stream,
                                    char **args, int n, int cap) {
     char sessiondir[512], cookies[640];
@@ -2244,8 +2302,10 @@ static int fill_common_script_args(const rs_json *provider, const rs_json *strea
     if (worker[0] && n < cap) args[n++] = rs_script_arg("worker", worker, false);
     // The stream's proxy scope decides whether the script itself goes through
     // the proxy, the same way it decides for the manifest and media fetches.
-    char *scoped = effective_proxy(provider, stream,
-                                   !stream || rs_json_obj_bool(stream, "proxyScript", true));
+    char *raw_scope = effective_proxy(provider, stream,
+                                      !stream || rs_json_obj_bool(stream, "proxyScript", true));
+    char *scoped = script_proxy_list(raw_scope, rs_json_obj_str(provider, "id", ""));
+    free(raw_scope);
     char *first = primary_proxy(scoped ? scoped : "");
     char *script_proxy = script_proxy_value(first);
     free(first);
@@ -2355,7 +2415,12 @@ static void run_provider_script(restream_server_t *s, struct mg_connection *c,
     log_record(s, sid, "info", "scriptCommand", NULL, 0, -1,
                command ? command : script);
     free(command);
-    dispatch_script_action(s, c, sid, action, script, args, n, (double)rs_provider_option_int(provider, "scriptTimeoutSeconds"));  // always replies
+    char *raw_proxies = effective_proxy(provider, stream,
+                                        !stream || rs_json_obj_bool(stream, "proxyScript", true));
+    char *proxies = script_proxy_list(raw_proxies, pid);
+    free(raw_proxies);
+    dispatch_script_action(s, c, sid, action, script, args, n,
+                           (double)rs_provider_option_int(provider, "scriptTimeoutSeconds"), proxies);  // always replies
 }
 
 // Removes a provider-owned script session recursively without invoking a shell.
@@ -4359,6 +4424,8 @@ struct rs_pending_job {
     char **script_args;            // SCRIPT only, each rs_script_arg-owned
     double script_timeout;
     int script_argc;               // SCRIPT only
+    char *script_proxies;          // SCRIPT only: the proxy list to fall over through, preferred first
+    char *script_proxy_used;       // SCRIPT only: the line the run got through (worker writes)
 
     // Result, filled by pending_job_worker.
     int rc;
@@ -4402,6 +4469,8 @@ static void pending_job_free(rs_pending_job *pf) {
     stream_start_free(pf->start);
     for (int i = 0; i < pf->script_argc; i++) free(pf->script_args[i]);
     free(pf->script_args);
+    free(pf->script_proxies);
+    free(pf->script_proxy_used);
     free(pf->body); free(pf->content_type); free(pf->content_range);
     free(pf->script_stdout); free(pf->script_stderr);
     rs_buf_dispose(&pf->script_stdout_line);
@@ -4649,6 +4718,7 @@ typedef struct rs_stream_start {
     char *cdm_mode, *cdm_type, *cached_keys;
     char *required_kid;  // KID the engine found the media encrypted under (wrongKeys)
     char *script_proxies;  // the script's whole proxy list, for falling over (see stream_start_run)
+    char *proxy_used;      // the line the script last got through, remembered for the provider
     char *key_limited_video;  // video rule chosen because the licence lacked the preferred quality's key
     double script_timeout;
     unsigned long long token;
@@ -4672,7 +4742,7 @@ static void stream_start_free(struct rs_stream_start *st) {
     free(st->kind); free(st->url); free(st->proxy); free(st->media_proxy); free(st->headers);
     free(st->media_fetch_headers); free(st->provider_headers);
     free(st->downloader); free(st->dl_params); free(st->rep); free(st->host);
-    free(st->cdm_mode); free(st->cdm_type); free(st->cached_keys); free(st->required_kid); free(st->script_proxies); free(st->key_limited_video);
+    free(st->cdm_mode); free(st->cdm_type); free(st->cached_keys); free(st->required_kid); free(st->script_proxies); free(st->proxy_used); free(st->key_limited_video);
     free(st->manifest_url); free(st->manifest_headers); free(st->media_headers);
     free(st->keys);
     rs_json_free(st->cdn_urls);
@@ -4802,12 +4872,10 @@ static int stream_start_run(restream_server_t *server, const char *sid,
         if (*tok) lines[nlines++] = tok;
         tok = rest;
     }
+    size_t current = 0;
     for (size_t next = 1; proxy_arg >= 0 && next < nlines; next++) {
         const char *said = err_text && err_text[0] ? err_text : (out && *out ? *out : "");
-        bool proxy_refused = strstr(said, "ProxyError") || strstr(said, "CONNECT tunnel failed") ||
-                             strstr(said, "PROXY_MAX_CONNS") || strstr(said, "SOCKS") ||
-                             strstr(said, "resolve proxy") || strstr(said, "Proxy Authentication");
-        if (!proxy_refused) break;
+        if (!script_said_proxy_refused(said)) break;
         // A script can catch the proxy error and still exit 0 with nothing
         // useful (the Disney+ script does: 429, then UnboundLocalError, exit
         // 0, no keys). Judge by what the action was asked to produce.
@@ -4841,12 +4909,17 @@ static int stream_start_run(restream_server_t *server, const char *sid,
         free(st->args[proxy_arg]);
         st->args[proxy_arg] = arg;
         argv[1 + proxy_arg] = arg;
+        current = next;
         if (out && *out) { rs_free(*out); *out = NULL; }
         rs_free(err_text); err_text = NULL;
         rc = rs_script_run_stream(st->script_path, argv, n, timeout, out, &err_text,
                                   stream_start_output_chunk, &log_ctx);
         stream_start_flush_line(&log_ctx, false);
         stream_start_flush_line(&log_ctx, true);
+    }
+    if (rc == 0 && proxy_arg >= 0 && current < nlines) {
+        free(st->proxy_used);
+        st->proxy_used = rs_strdup(lines[current]);
     }
     free(list);
     rs_buf_dispose(&log_ctx.stdout_line);
@@ -5929,7 +6002,9 @@ static rs_stream_start *stream_start_snapshot(const rs_json *provider, const rs_
     st->kind = rs_strdup(rs_json_obj_str(stream, "kind", "mpd"));
     st->url = rs_strdup(rs_json_obj_str(stream, "url", ""));
     st->proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyManifest", true));
-    st->script_proxies = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyScript", true));
+    char *raw_proxies = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyScript", true));
+    st->script_proxies = script_proxy_list(raw_proxies, rs_json_obj_str(provider, "id", ""));
+    free(raw_proxies);
     st->media_proxy = effective_proxy(provider, stream, rs_json_obj_bool(stream, "proxyMedia", true));
     st->headers = effective_headers(provider, stream, "manifestHeaders");
     st->media_fetch_headers = effective_headers(provider, stream, "mediaHeaders");
@@ -6186,17 +6261,62 @@ static void *pending_job_worker(void *arg) {
     case RS_PENDING_PROBE:
         pending_source_fetch(pf);
         break;
-    case RS_PENDING_SCRIPT:
-        pf->rc = rs_script_run_stream(pf->script_path, (const char **)pf->script_args, pf->script_argc,
-                                      pf->script_timeout, &pf->script_stdout, &pf->script_stderr,
-                                      script_output_chunk, pf);
-        script_log_pending_line(pf, false);
-        script_log_pending_line(pf, true);
-        if (pf->rc == 0 && script_action_imports(pf->script_action)) {
-            pf->script_import = parse_script_document(pf->script_stdout);
-            if (pf->script_import) pf->script_logos = resolve_import_logos(server, pf);
+    case RS_PENDING_SCRIPT: {
+        // Every proxy line in turn while the run fails because of its proxy —
+        // a refused login (407), a full plan, a dead tunnel — the same rule a
+        // stream start's script steps follow. Without it a provider whose
+        // first proxy stopped working could not load events at all, even
+        // with a working proxy right behind it.
+        char *lines[16];
+        size_t nlines = 0;
+        char *list = pf->script_proxies ? rs_strdup(pf->script_proxies) : NULL;
+        for (char *tok = list; tok && *tok && nlines < 16;) {
+            char *end = tok + strcspn(tok, "\r\n");
+            char *rest = *end ? end + 1 : end;
+            *end = '\0';
+            if (*tok) lines[nlines++] = tok;
+            tok = rest;
         }
+        int proxy_arg = -1;
+        for (int i = 0; i < pf->script_argc; i++)
+            if (pf->script_args[i] && !strncmp(pf->script_args[i], "proxy=", 6)) { proxy_arg = i; break; }
+        size_t current = 0;
+        for (;;) {
+            pf->rc = rs_script_run_stream(pf->script_path, (const char **)pf->script_args, pf->script_argc,
+                                          pf->script_timeout, &pf->script_stdout, &pf->script_stderr,
+                                          script_output_chunk, pf);
+            script_log_pending_line(pf, false);
+            script_log_pending_line(pf, true);
+            bool imports = script_action_imports(pf->script_action);
+            if (pf->rc == 0 && imports) {
+                pf->script_import = parse_script_document(pf->script_stdout);
+                if (pf->script_import) pf->script_logos = resolve_import_logos(server, pf);
+            }
+            // A script can catch the proxy error and still exit 0 with
+            // nothing to import; judge an import by its document.
+            bool produced = pf->rc == 0 && (!imports || pf->script_import);
+            const char *said = pf->script_stderr && pf->script_stderr[0] ? pf->script_stderr : pf->script_stdout;
+            if (produced || proxy_arg < 0 || current + 1 >= nlines || !script_said_proxy_refused(said)) break;
+            current++;
+            char *value = script_proxy_value(lines[current]);
+            char *arg = value ? rs_script_arg("proxy", value, false) : NULL;
+            if (!arg) { free(value); break; }
+            const char *at = strrchr(value, '@');
+            log_recordf(server, pf->stream_id, "info", "scriptProxy", NULL, 0, -1,
+                        "%s failed through its proxy — retrying through %s",
+                        pf->script_action ? pf->script_action : "script", at ? at + 1 : value);
+            free(value);
+            free(pf->script_args[proxy_arg]);
+            pf->script_args[proxy_arg] = arg;
+            if (pf->script_stdout) { rs_free(pf->script_stdout); pf->script_stdout = NULL; }
+            if (pf->script_stderr) { rs_free(pf->script_stderr); pf->script_stderr = NULL; }
+            if (pf->script_import) { rs_json_free(pf->script_import); pf->script_import = NULL; }
+            if (pf->script_logos) { rs_json_free(pf->script_logos); pf->script_logos = NULL; }
+        }
+        if (pf->rc == 0 && proxy_arg >= 0 && current < nlines) pf->script_proxy_used = rs_strdup(lines[current]);
+        free(list);
         break;
+    }
     case RS_PENDING_STREAM_START:
         stream_start_worker(server, pf->stream_id, pf->start);
         break;
@@ -6372,11 +6492,12 @@ static void dispatch_probe(restream_server_t *server, struct mg_connection *c,
 // array itself). Always replies to `c`.
 static void dispatch_script_action(restream_server_t *server, struct mg_connection *c,
                                    const char *sid, const char *action, const char *script_path,
-                                   char **args, int argc, double timeout) {
+                                   char **args, int argc, double timeout, char *proxies) {
     rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
     if (!pf) {
         for (int i = 0; i < argc; i++) free(args[i]);
         free(args);
+        free(proxies);
         reply_error(c, 500, "Out of memory.");
         return;
     }
@@ -6386,6 +6507,7 @@ static void dispatch_script_action(restream_server_t *server, struct mg_connecti
     pf->script_path = rs_strdup(script_path);
     pf->script_args = args;  // pf owns it now
     pf->script_argc = argc;
+    pf->script_proxies = proxies;  // and this
     pf->script_timeout = timeout;
     if (!pending_job_dispatch(server, c, pf)) {
         pending_job_free(pf);
@@ -6897,6 +7019,8 @@ static void pending_job_finish_probe(struct mg_connection *c, rs_pending_job *pf
 static void pending_job_finish_script(restream_server_t *server, struct mg_connection *c, rs_pending_job *pf) {
     log_record(server, pf->stream_id, pf->rc == 0 ? "info" : "error", "scriptEnd", NULL, pf->rc, -1,
                pf->rc == 0 ? "ok" : "script exited non-zero");
+    if (pf->script_proxy_used && pf->stream_id && !strncmp(pf->stream_id, "script:", 7))
+        script_proxy_remember(pf->stream_id + 7, pf->script_proxy_used);
     if (pf->rc != 0)
         webhook_script_failure(server, pf->stream_id, pf->script_action, pf->rc,
                                pf->script_stderr, pf->script_stdout);
@@ -6992,6 +7116,11 @@ static void pending_job_finish_stream_start(restream_server_t *server, struct mg
     }
 
     const char *err = NULL;
+    if (st->proxy_used) {
+        const rs_json *started = rs_panel_find_stream(&server->state, pf->stream_id);
+        const rs_json *owner = started ? provider_of(&server->state, started) : NULL;
+        if (owner) script_proxy_remember(rs_json_obj_str(owner, "id", ""), st->proxy_used);
+    }
     if (st->manifest_applied)
         rs_panel_apply_session_manifest(&server->state, pf->stream_id, st->manifest_url,
                                         st->cdn_urls, st->cdn_headers, st->manifest_headers, st->media_headers,
