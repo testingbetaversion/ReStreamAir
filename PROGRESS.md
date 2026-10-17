@@ -408,3 +408,29 @@ ssh root@moonmuaaz.xyz 'cd /tmp/rsa-test/kr && ./make.sh; packager ...; ./run.sh
 End-to-end on a throwaway server (127.0.0.1:8797). The same 120s video was packaged twice with shaka-packager (CENC, KID 1111… / KID 2222…) and served as a live HLS stream that switches init and key at segment 21 (~30s in), with a stub `cdm` script that answers only for the KIDs in `kids=`. Result: the key was requested at 28.2s and arrived 3.3s later, with no wrongKeys and no restart, and both keys were saved on the stream. A control run without a switch had 0 decoder errors. The whole output window across the switch decoded 2,900 frames with 0 errors, and 100% of them are identical to frames of the unencrypted source. (A first attempt with ffmpeg-encrypted media was invalid: ffmpeg cannot decrypt its own `-encryption_scheme` output.) Test files moved to /tmp/rsa-test/trash/kr-*.
 
 **Unfinished:** vpsrestream1 needs a rebuild to get this, along with the live-edge key fix (e3dbb56).
+
+### 2026-10-17 — Disney events stopped loading: provider scripts now fall over to the next proxy
+**What was done:** On vpsrestream1 the disney provider had 0 events and nothing running since about 01:00 UTC. Both seller proxies (`178.92.209.173:50100`, `79.127.168.43:50100`) have answered `407 Proxy Authentication Required / PROXY_AUTH_FAILED` since 00:36 UTC on 2026-10-17. The proxies are up, but their username/password is rejected (likely an expired or renewed plan). Provider script actions were always given the first proxy line, a seller proxy, so all 51 events runs failed with `CONNECT tunnel failed, response 407` even though NordVPN and pinggy work. Fixed in core/src/server.c and apps/server/net.c:
+- Provider script jobs (Load events/channels, login, …) retry through the next proxy line when the failure is the proxy's, the same as stream starts already did.
+- The proxy line a provider's script last got through is remembered (in memory) and tried first by later script runs and stream starts.
+- A proxy's 407 is reported as "The proxy rejected its username/password (HTTP 407)" instead of "Could not connect to server".
+
+**Files changed:** core/src/server.c, apps/server/net.c, PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@23.237.79.50 'curl -sv -x <each proxy> https://ipinfo.io/json; nc -vz <proxy> 50100; python3 <log scan>'
+```
+Read-only diagnosis: per-proxy live test from vpsrestream1 (both seller proxies 407 PROXY_AUTH_FAILED, the others OK), TCP checks from three hosts, when the failures started, and why events stopped loading.
+
+```bash
+ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build && cd build && ctest'
+```
+Builds on moonmuaaz and runs the test suites (2 of 2 passed).
+
+```bash
+ssh root@moonmuaaz.xyz 'cd /tmp/rsa-test/pf && ./run.sh'
+```
+Throwaway server with a proxy that answers 407 listed first, a working proxy second, and a stub events script that fails like the Disney one. Run 1: failed through the 407 proxy, retried through the next and imported 2 events. Run 2: went straight to the remembered working proxy. A probe through the 407 proxy (http and https) reported "The proxy rejected its username/password (HTTP 407)". Test files moved to /tmp/rsa-test/trash/pf-*.
+
+**Unfinished:** vpsrestream1 needs a rebuild to get this. Until then, move a working proxy (pinggy `kdwjgspsyy` or NordVPN `br53`) to the top of disney's proxy list and press Load events. The seller credentials need renewing either way.
