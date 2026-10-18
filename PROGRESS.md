@@ -454,3 +454,16 @@ ssh root@moonmuaaz.xyz '/tmp/rsa-test/pv.sh; /tmp/rsa-test/pv2.sh'
 Throwaway server: a running engine stream on proxy A, provider saved with proxy B. B had 4 connections within 5s, no restart; A's idle connections closed between 90s and 150s. (A first run was invalid: the save omitted the provider name and returned 400.) Test files moved to /tmp/rsa-test/trash/pv-*; one copy of them that the second run made was deleted with rm instead of moved.
 
 **Unfinished:** vpsrestream1 needs a rebuild to get this (until then, restart the running disney events to drop the removed proxy). Ask the seller why the proxy enforces 10 connections.
+
+### 2026-10-19 — scripts/proxy-conn-limit.py: measure a proxy's concurrent connection limit
+**What was done:** A stdlib-only script that opens CONNECT tunnels one by one and keeps them open until the proxy refuses (`429 PROXY_MAX_CONNS` on Proxy-Seller plans), repeating for `--rounds` and printing `limit N connections at once` per proxy. Takes several proxies; `-` reads them from stdin so passwords stay out of the process list; passwords are never printed. Exit 1 if a proxy is unreachable or rejects the login. Options: `--max`, `--rounds`, `--rest`, `--target`, `--timeout`. Other clients using the same proxy count against its cap, so the number is "what is free now".
+
+**Files changed:** scripts/proxy-conn-limit.py (new), PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@moonmuaaz.xyz 'printf "%s\n%s\n" <USA proxy> <BRA proxy> | python3 pcl.py - --rest 10'
+```
+Both gateways of aoCH4dyj_1 measured 10 in both rounds. Also checked: wrong password (407 PROXY_AUTH_FAILED, exit 1), closed port (cannot connect, exit 1), bad argument (exit 1). The test copy was moved to /tmp/rsa-test/trash/pcl-*.py.
+
+**Unfinished:** Nothing.
