@@ -434,3 +434,23 @@ ssh root@moonmuaaz.xyz 'cd /tmp/rsa-test/pf && ./run.sh'
 Throwaway server with a proxy that answers 407 listed first, a working proxy second, and a stub events script that fails like the Disney one. Run 1: failed through the 407 proxy, retried through the next and imported 2 events. Run 2: went straight to the remembered working proxy. A probe through the 407 proxy (http and https) reported "The proxy rejected its username/password (HTTP 407)". Test files moved to /tmp/rsa-test/trash/pf-*.
 
 **Unfinished:** vpsrestream1 needs a rebuild to get this. Until then, move a working proxy (pinggy `kdwjgspsyy` or NordVPN `br53`) to the top of disney's proxy list and press Load events. The seller credentials need renewing either way.
+
+### 2026-10-18 — Provider edits now reach running streams; seller proxy cap measured
+**What was done:** The proxy `109.204.36.9:50100` (login `aoCH4dyj_1`) was removed from disney's list, but vpsrestream1 still held 10 connections to it. Saving a provider only updated the stored config, so running engines kept the proxies they started with until each stream restarted. Now saving a provider re-applies its config to every running engine stream of that provider, which picks it up on the next poll without a restart (ffmpeg pipelines left alone). Connections to a removed proxy then close by themselves within ~2 min (libcurl's 118s idle limit).
+
+Proxy cap measured from moonmuaaz (nothing else uses the login): at the same moment vpsrestream1 held 4, I could open 6 before `429 PROXY_MAX_CONNS`; with 6 held, 4. So the proxy now enforces **10 connections in total**. It allowed 91 on 2026-10-17 ~18:30 and the engine held 37 without refusals at 19:43; it has refused since 00:08 UTC 2026-10-18. The other gateways of the same login (PRT 79.127.168.43, BRA 79.127.208.74, NZL 62.93.164.201) each gave 10 more. The plan shows active until 16.11.2026; the change is on the seller's side.
+
+**Files changed:** core/src/server.c, PROGRESS.md
+
+**Commands run:**
+```bash
+ssh root@moonmuaaz.xyz 'cd /root/ReStreamAir && git pull && cmake --build build && cd build && ctest'
+```
+Builds on moonmuaaz and runs the test suites (2 of 2 passed).
+
+```bash
+ssh root@moonmuaaz.xyz '/tmp/rsa-test/pv.sh; /tmp/rsa-test/pv2.sh'
+```
+Throwaway server: a running engine stream on proxy A, provider saved with proxy B. B had 4 connections within 5s, no restart; A's idle connections closed between 90s and 150s. (A first run was invalid: the save omitted the provider name and returned 400.) Test files moved to /tmp/rsa-test/trash/pv-*; one copy of them that the second run made was deleted with rm instead of moved.
+
+**Unfinished:** vpsrestream1 needs a rebuild to get this (until then, restart the running disney events to drop the removed proxy). Ask the seller why the proxy enforces 10 connections.
