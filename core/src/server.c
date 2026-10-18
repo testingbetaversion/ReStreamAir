@@ -3195,6 +3195,16 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         const char *err = NULL;
         int rc = rs_panel_update_provider(&s->state, id, body, &err);
         rs_json_free(body);
+        // Running engines took their proxies, headers and limits from the
+        // provider when they started; without this a removed proxy kept
+        // being used (and its connection slots held) until each stream
+        // restarted. They adopt the new settings on their next poll.
+        const rs_json *provider = rc == 0 ? find_provider_by_id(&s->state, id) : NULL;
+        const rs_json *streams = rs_json_obj_get(provider, "streams");
+        for (size_t i = 0; i < rs_json_arr_len(streams); i++) {
+            const char *sid = rs_json_obj_str(rs_json_arr_at(streams, i), "id", "");
+            if (sid[0] && rs_live_is_running(s->live, sid)) live_sync_stream(s, sid);
+        }
         free(id);
         reply_after_mutation(s, c, hm, rc, err);
         return true;
