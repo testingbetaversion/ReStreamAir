@@ -66,7 +66,7 @@ if not exist "%KEY%" (
 
 rem Already authorised? Then no password is needed.
 ssh %SSHOPTS% -o BatchMode=yes -o ConnectTimeout=15 %TUN_USER%@%TUN_HOST% exit >nul 2>&1
-if not errorlevel 1 goto :loop
+if not errorlevel 1 goto :autostart
 
 echo.
 echo Installing the key on %TUN_HOST%. Type the server password when ssh asks
@@ -80,6 +80,11 @@ if errorlevel 1 (
     exit /b 1
 )
 echo Key installed.
+
+:autostart
+rem Start this script at every logon of this user (re-created each run, so a moved
+rem script stays correct). Runs unattended: saved settings auto-accept after 8s.
+schtasks /create /tn ReverseSocksTunnel /tr "\"%~f0\"" /sc onlogon /delay 0000:30 /f >nul 2>&1 && echo Autostart enabled at logon. || echo Could not enable autostart - try running as administrator.
 
 :loop
 echo [%date% %time%] Connecting: %TUN_HOST% 127.0.0.1:%TUN_PORT% ^<- SOCKS via this PC
