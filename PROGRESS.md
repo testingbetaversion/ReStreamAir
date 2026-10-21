@@ -549,3 +549,16 @@ screen -dmS restream bash -c "cd /root/ReStreamAir/build && ./restreamair-server
 Starts the panel detached in the `restream` screen session on port 1234.
 
 **Unfinished:** NBA's proxy (timeout) and disney's NordVPN proxy (407) need fixing by the user. The panel does not start on boot (screen session only); port 8787 is now used by `/root/OmniTok/server.py`, so the panel must keep `-p 1234`.
+
+### 2026-10-21 — Windows reverse tunnel autostarts at logon
+**What was done:** `reverse-socks-tunnel.bat` now registers a Task Scheduler task (`ReverseSocksTunnel`, on logon, 30s delay) every run, once the key login works. Also explained that `curl -x` needs `socks5h://` for the tunnel port.
+
+**Files changed:** scripts/windows/reverse-socks-tunnel.bat, PROGRESS.md
+
+**Commands run:**
+```bash
+git commit && git push
+```
+Commits and pushes the change to main.
+
+**Unfinished:** Not run on Windows (no Windows machine here); runs at user logon, not before login.
