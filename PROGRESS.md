@@ -508,3 +508,26 @@ python3 scripts/sync-panel-docs.py
 Copies API.md into public/docs for the Help view.
 
 **Unfinished:** Not deployed to any live install (moonmuaaz's `/root/ReStreamAir` or 94.130.48.175). UI checked only with `node --check`, not in a browser.
+
+### 2026-10-21 — Deploy 8b793eb (proxy capacity view) to 94.130.48.175
+**What was done:** Built commit 8b793eb as a static musl binary (the release recipe: alpine:3.20 in Docker on moonmuaaz, `-DRS_STATIC=ON`, selftest 629/629 PASS, no shared-library dependencies), because moonmuaaz's glibc 2.43 build would not run on the target's glibc 2.35. Installed it with its `public/` in `/opt/restreamair-8b793eb` on 94.130.48.175 and pointed `restreamair.service` at it, still on 0.0.0.0:8080. Panel answers 200 locally and externally; the new `app.js` is served. The box has no proxies configured yet, so nothing has been auto-tested.
+
+**Files changed:** on 94.130.48.175 only — `/opt/restreamair-8b793eb/` (new), `/etc/systemd/system/restreamair.service` (ExecStart), backup `/root/restreamair.service.v1.5.0.bak`. Repo: PROGRESS.md.
+
+**Commands run:**
+```bash
+docker run --rm -v "$PWD:/src" -w /src alpine:3.20 sh -c 'apk add ... && cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DRS_STATIC=ON && cmake --build build-release && ./build-release/restream_selftest'
+```
+Builds the static Linux binary on moonmuaaz the same way release.yml does, and runs the selftest.
+
+```bash
+scp -3 root@moonmuaaz.xyz:/tmp/rsa-8b793eb.tgz scp://root@94.130.48.175:1991//root/rsa-8b793eb.tgz
+```
+Copies the binary and front-end to the target.
+
+```bash
+sed -i "s#^ExecStart=.*#ExecStart=/opt/restreamair-8b793eb/restreamair-server serve --bind 0.0.0.0 --port 8080 --root /opt/restreamair-8b793eb/public#" /etc/systemd/system/restreamair.service && systemctl daemon-reload && systemctl restart restreamair
+```
+Points the service at the new build and restarts it.
+
+**Unfinished:** Temporary build files left on the servers (no Trash on Linux): `/root/rsa-8b793eb.tgz` on 94.130.48.175; `/tmp/rsa-8b793eb.tgz` and `/tmp/rsa-test/` on moonmuaaz.
