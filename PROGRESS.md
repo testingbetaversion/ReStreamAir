@@ -531,3 +531,21 @@ sed -i "s#^ExecStart=.*#ExecStart=/opt/restreamair-8b793eb/restreamair-server se
 Points the service at the new build and restarts it.
 
 **Unfinished:** Temporary build files left on the servers (no Trash on Linux): `/root/rsa-8b793eb.tgz` on 94.130.48.175; `/tmp/rsa-8b793eb.tgz` and `/tmp/rsa-test/` on moonmuaaz.
+
+### 2026-10-21 — moonmuaaz back up on latest main
+**What was done:** moonmuaaz.xyz had rebooted at 09:08 (new SSH host key) and the panel had not come back. Pulled `/root/ReStreamAir` from 94c1e0d to b510b65, rebuilt (selftest 629/629 PASS) and started it in the `restream` screen session on :1234 as before. Panel answers 200 locally and at http://moonmuaaz.xyz:1234/. No stream was running before the reboot (all `stopped` in state.json); the three NBA `autostart` streams are started by their provider's auto-start events, not at boot. The new proxy tester measured all three configured proxies on its own: claro's (pinggy) 36.8 Mbps total, 200+ connections; NBA's `213.7.169.180:12323` times out; disney's NordVPN `br147` rejects its login (HTTP 407).
+
+**Files changed:** none in the repo besides PROGRESS.md; on moonmuaaz `/root/ReStreamAir` (pull + build), new `build/proxy-tests.json`.
+
+**Commands run:**
+```bash
+cd /root/ReStreamAir && git pull --ff-only && cmake --build build -j3 && ./build/restream_selftest
+```
+Updates the checkout, rebuilds and runs the self-test.
+
+```bash
+screen -dmS restream bash -c "cd /root/ReStreamAir/build && ./restreamair-server -p 1234; exec bash"
+```
+Starts the panel detached in the `restream` screen session on port 1234.
+
+**Unfinished:** NBA's proxy (timeout) and disney's NordVPN proxy (407) need fixing by the user. The panel does not start on boot (screen session only); port 8787 is now used by `/root/OmniTok/server.py`, so the panel must keep `-p 1234`.
