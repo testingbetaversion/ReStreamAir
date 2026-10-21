@@ -2050,3 +2050,332 @@ int rs_post_json(const char *url, const char *json, long *status,
     curl_easy_cleanup(curl);
     return rc == CURLE_OK ? 0 : -1;
 }
+
+// --- Proxy tests, for the panel's server view --------------------------------
+//
+// Measures what a proxy can carry before a provider leans on it: where it
+// exits, how long a fresh request takes, what one connection and eight
+// connections download, and how many connections it lets this machine hold
+// at once. One test runs at a time on a background thread. Results are kept
+// in proxy-tests.json beside state.json, keyed by the proxy URL, so a restart
+// does not re-measure every proxy.
+//
+// Speed is measured against Cloudflare's speed-test endpoint, not the origins:
+// it says what the proxy delivers, and a geo-blocked origin would say nothing.
+
+#include "rs_crypto.h"
+#include "rs_state.h"
+
+#define RS_PROXYTEST_PARALLEL 8
+#define RS_PROXYTEST_CONN_MAX 200
+static const char *const PROXYTEST_FILE = "proxy-tests.json";
+static const char *const PROXYTEST_META_URL = "https://speed.cloudflare.com/meta";
+static const char *const PROXYTEST_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=50000000";  // its ceiling: 100 MB answers 403
+// Plain http, so an HTTP proxy is asked for a CONNECT and nothing more.
+static const char *const PROXYTEST_TUNNEL_URL = "http://speed.cloudflare.com/";
+
+static rs_state g_ptests;
+static bool g_ptest_loaded;
+static bool g_ptest_worker;  // a worker thread is running
+static pthread_mutex_t g_ptest_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// A stable handle for a proxy that never carries its password to the panel.
+static void proxytest_id(const char *proxy, char out[17]) {
+    uint8_t digest[RS_SHA256_DIGEST_LEN];
+    rs_sha256((const uint8_t *)proxy, strlen(proxy), digest);
+    for (int i = 0; i < 8; i++) snprintf(out + i * 2, 3, "%02x", digest[i]);
+}
+
+static void proxytest_load_locked(void) {
+    if (g_ptest_loaded) return;
+    g_ptest_loaded = true;
+    if (rs_state_load(&g_ptests, PROXYTEST_FILE) != 0) {
+        rs_state_dispose(&g_ptests);
+        g_ptests.root = rs_json_new_obj();
+        g_ptests.path = rs_strdup(PROXYTEST_FILE);
+    }
+    // A test cut short by a restart starts again.
+    for (size_t i = 0; i < rs_json_obj_len(g_ptests.root); i++) {
+        rs_json *r = (rs_json *)rs_json_obj_value_at(g_ptests.root, i);
+        if (!strcmp(rs_json_obj_str(r, "state", ""), "testing")) rs_json_obj_set_str(r, "state", "queued");
+    }
+}
+
+// The stored entry whose URL or id is `key`, or NULL. Returns its URL in *url.
+static rs_json *proxytest_find_locked(const char *key, const char **url) {
+    for (size_t i = 0; i < rs_json_obj_len(g_ptests.root); i++) {
+        rs_json *r = (rs_json *)rs_json_obj_value_at(g_ptests.root, i);
+        const char *u = rs_json_obj_key_at(g_ptests.root, i);
+        if (!strcmp(u, key) || !strcmp(rs_json_obj_str(r, "id", ""), key)) {
+            if (url) *url = u;
+            return r;
+        }
+    }
+    return NULL;
+}
+
+static rs_json *proxytest_fresh(const char *proxy, const char *state) {
+    char label[80], id[17];
+    proxy_label(proxy, label, sizeof(label));
+    proxytest_id(proxy, id);
+    rs_json *r = rs_json_new_obj();
+    rs_json_obj_set_str(r, "id", id);
+    rs_json_obj_set_str(r, "label", label);
+    rs_json_obj_set_str(r, "state", state);
+    return r;
+}
+
+static CURL *proxytest_handle(const char *proxy, const char *url, long timeout_ms, char *errbuf) {
+    CURL *c = curl_easy_init();
+    if (!c) return NULL;
+    char dns[1100];  // libcurl copies option strings, so a local is enough
+    apply_ca_bundle(c);
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_PROXY, proxy_remote_dns(proxy, dns, sizeof(dns)));
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "ReStreamAir/1.0");
+    curl_easy_setopt(c, CURLOPT_ERRORBUFFER, errbuf);
+    errbuf[0] = '\0';
+    return c;
+}
+
+// Why a request through the proxy failed, in the words the panel shows.
+static void proxytest_error(CURL *c, CURLcode rc, const char *errbuf, char *out, size_t cap) {
+    long connect_code = 0, code = 0;
+    curl_easy_getinfo(c, CURLINFO_HTTP_CONNECTCODE, &connect_code);
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    if (connect_code == 407 || code == 407) snprintf(out, cap, "the proxy rejected its username/password (HTTP 407)");
+    else if (connect_code && connect_code != 200) snprintf(out, cap, "the proxy refused the connection (HTTP %ld)", connect_code);
+    else if (rc != CURLE_OK) snprintf(out, cap, "%s", errbuf[0] ? errbuf : curl_easy_strerror(rc));
+    else snprintf(out, cap, "HTTP %ld from the test server", code);
+}
+
+typedef struct { size_t bytes; double first; } proxytest_meter;
+
+static size_t proxytest_count(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    (void)ptr;
+    proxytest_meter *m = (proxytest_meter *)userdata;
+    if (!m->first) m->first = net_now();
+    m->bytes += size * nmemb;
+    return size * nmemb;
+}
+
+// Megabits per second over `streams` parallel downloads for `ms`, timed from
+// the first byte so connection setup does not count as slowness. -1 when no
+// download got an answer, with the reason in `why`.
+static double proxytest_speed(const char *proxy, int streams, long ms, char *why, size_t cap) {
+    CURLM *multi = curl_multi_init();
+    CURL *h[RS_PROXYTEST_PARALLEL];
+    char errs[RS_PROXYTEST_PARALLEL][CURL_ERROR_SIZE];
+    proxytest_meter meter[RS_PROXYTEST_PARALLEL];
+    memset(meter, 0, sizeof(meter));
+    int n = 0;
+    for (; n < streams && multi; n++) {
+        h[n] = proxytest_handle(proxy, PROXYTEST_SPEED_URL, ms + 10000, errs[n]);
+        if (!h[n]) break;
+        curl_easy_setopt(h[n], CURLOPT_WRITEFUNCTION, proxytest_count);
+        curl_easy_setopt(h[n], CURLOPT_WRITEDATA, &meter[n]);
+        curl_multi_add_handle(multi, h[n]);
+    }
+    double started = net_now(), first = 0, window = (double)ms / 1000.0;
+    int running = 1;
+    while (running && multi) {
+        curl_multi_perform(multi, &running);
+        first = 0;
+        for (int i = 0; i < n; i++) if (meter[i].first && (!first || meter[i].first < first)) first = meter[i].first;
+        // The window is `ms` from the first byte; give connection setup 10s.
+        if ((first && net_now() - first >= window) || net_now() - started > window + 10) break;
+        if (running) curl_multi_poll(multi, NULL, 0, 100, NULL);
+    }
+    double elapsed = first ? net_now() - first : 0;
+    CURLcode result[RS_PROXYTEST_PARALLEL];
+    for (int i = 0; i < n; i++) result[i] = CURLE_OK;
+    CURLMsg *msg;
+    int left;
+    while (multi && (msg = curl_multi_info_read(multi, &left)))
+        for (int i = 0; i < n; i++)
+            if (msg->msg == CURLMSG_DONE && msg->easy_handle == h[i]) result[i] = msg->data.result;
+    size_t total = 0;
+    int answered = 0;
+    why[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        long code = 0;
+        curl_easy_getinfo(h[i], CURLINFO_RESPONSE_CODE, &code);
+        if (code == 200 && meter[i].bytes) { total += meter[i].bytes; answered++; }
+        else if (!why[0]) proxytest_error(h[i], result[i], errs[i], why, cap);
+        curl_multi_remove_handle(multi, h[i]);
+        curl_easy_cleanup(h[i]);
+    }
+    if (multi) curl_multi_cleanup(multi);
+    if (!answered || elapsed <= 0) return -1;
+    return (double)total * 8 / elapsed / 1e6;
+}
+
+// Opens tunnels one after another and holds them until the proxy refuses.
+// Returns how many it held; `refused` gets why it stopped ("" if it never did).
+static int proxytest_connections(const char *proxy, char *refused, size_t cap) {
+    CURL *held[RS_PROXYTEST_CONN_MAX];
+    char errbuf[CURL_ERROR_SIZE];
+    int n = 0;
+    refused[0] = '\0';
+    for (; n < RS_PROXYTEST_CONN_MAX; n++) {
+        CURL *c = proxytest_handle(proxy, PROXYTEST_TUNNEL_URL, 10000, errbuf);
+        if (!c) break;
+        curl_easy_setopt(c, CURLOPT_HTTPPROXYTUNNEL, 1L);
+        curl_easy_setopt(c, CURLOPT_CONNECT_ONLY, 1L);
+        CURLcode rc = curl_easy_perform(c);
+        if (rc != CURLE_OK) {
+            proxytest_error(c, rc, errbuf, refused, cap);
+            curl_easy_cleanup(c);
+            break;
+        }
+        held[n] = c;
+        rs_proc_sleep_ms(30);  // some proxies rate-limit bursts of new connections
+    }
+    for (int i = 0; i < n; i++) curl_easy_cleanup(held[i]);
+    return n;
+}
+
+static rs_json *proxytest_run(const char *proxy) {
+    rs_json *r = proxytest_fresh(proxy, "done");
+    rs_json_obj_set_int(r, "testedAt", (long long)time(NULL));
+    char err[CURL_ERROR_SIZE], why[256];
+
+    // Where it exits, and how long a request on a new connection takes.
+    http_buf meta = {NULL, 0, 0};
+    CURL *c = proxytest_handle(proxy, PROXYTEST_META_URL, 20000, err);
+    if (!c) { rs_json_obj_set_str(r, "state", "failed"); rs_json_obj_set_str(r, "error", "out of memory"); return r; }
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &meta);
+    curl_easy_setopt(c, CURLOPT_REFERER, "https://speed.cloudflare.com/");  // /meta answers 403 without it
+    CURLcode rc = curl_easy_perform(c);
+    long code = 0, connect_code = 0;
+    double ttfb = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_getinfo(c, CURLINFO_HTTP_CONNECTCODE, &connect_code);
+    curl_easy_getinfo(c, CURLINFO_STARTTRANSFER_TIME, &ttfb);
+    // Only a proxy that cannot carry the request fails the test; a refused
+    // location lookup just leaves the exit columns empty.
+    if (rc != CURLE_OK || code == 407 || (connect_code && connect_code != 200)) {
+        proxytest_error(c, rc, err, why, sizeof(why));
+        curl_easy_cleanup(c);
+        free(meta.data);
+        rs_json_obj_set_str(r, "state", "failed");
+        rs_json_obj_set_str(r, "error", why);
+        return r;
+    }
+    curl_easy_cleanup(c);
+    rs_json_obj_set_int(r, "firstByteMs", (long long)(ttfb * 1000));
+    rs_json *m = code == 200 && meta.data ? rs_json_parse(meta.data, meta.len) : NULL;
+    free(meta.data);
+    rs_json_obj_set_str(r, "exitIp", rs_json_obj_str(m, "clientIp", ""));
+    rs_json_obj_set_str(r, "country", rs_json_obj_str(m, "country", ""));
+    rs_json_obj_set_str(r, "city", rs_json_obj_str(m, "city", ""));
+    rs_json_obj_set_str(r, "isp", rs_json_obj_str(m, "asOrganization", ""));
+    rs_json_free(m);
+
+    double one = proxytest_speed(proxy, 1, 8000, why, sizeof(why));
+    if (one >= 0) rs_json_obj_set(r, "singleMbps", rs_json_new_num(one));
+    else rs_json_obj_set_str(r, "speedError", why);
+    double many = proxytest_speed(proxy, RS_PROXYTEST_PARALLEL, 10000, why, sizeof(why));
+    if (many >= 0) rs_json_obj_set(r, "totalMbps", rs_json_new_num(many));
+    else if (!rs_json_obj_get(r, "speedError")) rs_json_obj_set_str(r, "speedError", why);
+    rs_json_obj_set_int(r, "parallel", RS_PROXYTEST_PARALLEL);
+
+    // Connections this machine already holds count against the same cap.
+    char label[80], host[256];
+    int port = 0;
+    proxy_label(proxy, label, sizeof(label));
+    int busy = label_host_port(label, proxy, host, sizeof(host), &port) ? os_open_connections(host, port) : -1;
+    rs_proc_sleep_ms(3000);  // let the proxy notice the speed test's connections closed
+    int opened = proxytest_connections(proxy, why, sizeof(why));
+    int limit = opened + (busy > 0 ? busy : 0);
+    rs_json_obj_set_int(r, "connections", limit);
+    rs_json_obj_set_bool(r, "connectionsCapped", why[0] != 0);  // false: no refusal up to the test's ceiling
+    if (why[0]) rs_json_obj_set_str(r, "connectionsStop", why);
+    if (busy > 0) rs_json_obj_set_int(r, "connectionsInUse", busy);
+    return r;
+}
+
+static void *proxytest_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_ptest_mu);
+        char *url = NULL;
+        for (size_t i = 0; i < rs_json_obj_len(g_ptests.root) && !url; i++) {
+            rs_json *r = (rs_json *)rs_json_obj_value_at(g_ptests.root, i);
+            if (strcmp(rs_json_obj_str(r, "state", ""), "queued")) continue;
+            url = rs_strdup(rs_json_obj_key_at(g_ptests.root, i));
+            rs_json_obj_set_str(r, "state", "testing");
+        }
+        if (!url) { g_ptest_worker = false; pthread_mutex_unlock(&g_ptest_mu); return NULL; }
+        pthread_mutex_unlock(&g_ptest_mu);
+
+        rs_json *result = proxytest_run(url);
+        pthread_mutex_lock(&g_ptest_mu);
+        rs_json *now = proxytest_find_locked(url, NULL);
+        // Forgotten while it ran: drop it. Asked to test again: leave it queued.
+        if (now && !strcmp(rs_json_obj_str(now, "state", ""), "testing")) {
+            rs_json_obj_set(g_ptests.root, url, result);
+            result = NULL;
+            rs_state_save(&g_ptests);
+        }
+        pthread_mutex_unlock(&g_ptest_mu);
+        rs_json_free(result);
+        free(url);
+    }
+}
+
+static void proxytest_queue_locked(const char *proxy) {
+    rs_json *r = proxytest_find_locked(proxy, NULL);
+    if (r) {
+        // A re-test keeps the last results on screen until new ones land.
+        if (strcmp(rs_json_obj_str(r, "state", ""), "testing")) rs_json_obj_set_str(r, "state", "queued");
+    } else {
+        rs_json_obj_set(g_ptests.root, proxy, proxytest_fresh(proxy, "queued"));
+    }
+    rs_state_save(&g_ptests);
+    if (g_ptest_worker) return;
+    pthread_t t;
+    if (pthread_create(&t, NULL, proxytest_worker, NULL) == 0) {
+        pthread_detach(t);
+        g_ptest_worker = true;
+    }
+}
+
+char *rs_net_proxy_test(const char *proxy, int mode) {
+    pthread_mutex_lock(&g_ptest_mu);
+    proxytest_load_locked();
+    rs_json *out = NULL;
+    if (mode == RS_PROXYTEST_LIST) {
+        out = rs_json_new_arr();
+        for (size_t i = 0; i < rs_json_obj_len(g_ptests.root); i++)
+            rs_json_arr_push(out, rs_json_clone(rs_json_obj_value_at(g_ptests.root, i)));
+    } else if (proxy && proxy[0]) {
+        const char *url = NULL;
+        rs_json *r = proxytest_find_locked(proxy, &url);
+        if (mode == RS_PROXYTEST_FORGET) {
+            char *key = r ? rs_strdup(url) : NULL;
+            if (key) { rs_json_obj_remove(g_ptests.root, key); rs_state_save(&g_ptests); }
+            free(key);
+            out = rs_json_new_obj();
+        } else if (!r && !strchr(proxy, ':')) {
+            // An id that names nothing stored; every proxy URL has a port.
+        } else if (mode == RS_PROXYTEST_RETEST || !r) {
+            // An id only names a proxy already stored; anything else is a URL.
+            char *key = rs_strdup(r ? url : proxy);
+            proxytest_queue_locked(key);
+            out = rs_json_clone(proxytest_find_locked(key, NULL));
+            free(key);
+        } else {
+            out = rs_json_clone(r);
+        }
+    }
+    pthread_mutex_unlock(&g_ptest_mu);
+    if (!out) return NULL;
+    char *text = rs_json_serialize(out, false);
+    rs_json_free(out);
+    return text;
+}
