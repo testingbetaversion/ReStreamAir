@@ -1883,3 +1883,11 @@ pre {
 .traffic-requests { max-height: 46vh; overflow: auto; }
 .traffic-bad { color: var(--danger, #e5484d); }
 .traffic-failed td { color: var(--danger, #e5484d); }
+
+/* Server view: proxy list */
+.proxy-quality { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.proxy-test-form { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
+.proxy-test-form input { flex: 1 1 260px; min-width: 0; }
+.proxy-pending { color: var(--muted); font-style: italic; }
+.proxy-failed { color: var(--danger); }
+.proxy-actions { white-space: nowrap; }

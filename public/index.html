@@ -479,6 +479,39 @@
               <div id="serverTiles" class="tile-grid"></div>
             </div>
           </div>
+          <div class="monitor-panel full-width">
+            <div class="panel-head">
+              <h3>Proxies</h3>
+              <label class="proxy-quality">Plan streams at
+                <select id="proxyQuality">
+                  <option value="1.5">480p (1.5 Mbps)</option>
+                  <option value="3" selected>720p (3 Mbps)</option>
+                  <option value="4.5">1080p (4.5 Mbps)</option>
+                  <option value="16">4K (16 Mbps)</option>
+                </select>
+              </label>
+            </div>
+            <div class="monitor-body">
+              <p class="field-hint">Every proxy a provider or stream uses is measured on its own a few seconds after it is added. A test takes two to three minutes and checks where the proxy exits, one connection's speed, eight connections' total speed, and how many connections it accepts at once. Streams is how many it can carry at the quality above with 25% headroom — limited by total speed, or by connections when the proxy's per-connection speed needs several per stream. Speeds are measured from this server to Cloudflare; a test briefly adds load to a proxy that is already carrying streams.</p>
+              <form id="proxyTestForm" class="proxy-test-form">
+                <input id="proxyTestInput" type="text" placeholder="Test a proxy: http://user:pass@host:port or socks5://host:port" autocomplete="off" spellcheck="false" aria-label="Proxy to test">
+                <button type="submit">Test proxy</button>
+              </form>
+              <div id="proxiesSummary" class="field-hint"></div>
+              <div class="connections-table-wrap">
+                <table class="connections-table">
+                  <thead>
+                    <tr>
+                      <th>Proxy</th><th>Used by</th><th>Exit</th><th>First byte</th><th>1 connection</th>
+                      <th>Total speed</th><th>Connections</th><th>Streams</th><th></th>
+                    </tr>
+                  </thead>
+                  <tbody id="proxiesTableBody"></tbody>
+                </table>
+                <div id="proxiesEmpty" class="empty-state">No proxies yet. Add one to a provider, or test one above.</div>
+              </div>
+            </div>
+          </div>
         </section>
 
         <section id="monitorView" class="hidden">

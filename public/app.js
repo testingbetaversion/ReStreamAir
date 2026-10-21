@@ -367,6 +367,7 @@ function switchView(view, { history: historyMode = "push" } = {}) {
     renderViewHeader();
     if (view === "grid") renderStreamsGrid();
     if (view === "server" || view === "monitor") repaintMonitorIfActive();
+    if (view === "server") startProxiesPoll(); else stopProxiesPoll();
     if (view === "settings") loadSettingsView();
     if (view === "help") renderHelpDoc();
     // Logs auto-refresh only while the tab is actually open, same reasoning
@@ -2846,6 +2847,137 @@ function stopProxyStatusPoll() {
   if (proxyStatusTimer) clearInterval(proxyStatusTimer);
   proxyStatusTimer = null;
 }
+
+// --- Server view: every proxy, measured ---------------------------------------
+
+let proxiesTimer = null;
+let lastProxies = [];
+
+// Streams one proxy can carry at `mbps` each, with 25% headroom. Bounded by
+// total speed, and by connections: a stream needs enough parallel downloads to
+// reach its bitrate at this proxy's one-connection speed, plus one for audio
+// and the manifest.
+function proxyCapacity(p, mbps) {
+  if (!p.totalMbps) return null;
+  const need = mbps * 1.25;
+  const bySpeed = Math.floor(p.totalMbps / need);
+  const perConnection = p.singleMbps || p.totalMbps / (p.parallel || 8);
+  const perStream = Math.ceil(need / Math.max(perConnection, 0.01)) + 1;
+  const byConnections = p.connectionsCapped ? Math.floor(p.connections / perStream) : Infinity;
+  return {
+    streams: Math.min(bySpeed, byConnections),
+    limit: byConnections < bySpeed ? "connections" : "speed",
+    perStream,
+  };
+}
+
+function formatMbps(value) {
+  return value === undefined || value === null ? "—" : `${Number(value).toFixed(value < 10 ? 1 : 0)} Mbps`;
+}
+
+function proxyQualityMbps() {
+  return Number($("#proxyQuality").value) || 3;
+}
+
+function proxyRow(p, mbps) {
+  const usedBy = (p.usedBy || []).length ? p.usedBy.map(escapeHtml).join("<br>") : `<span class="field-hint">tested by hand</span>`;
+  const forget = (p.usedBy || []).length ? "" : `<button type="button" class="ghost" data-proxy-forget="${escapeAttr(p.id)}">Forget</button>`;
+  const actions = `<td class="proxy-actions">${p.state === "testing" || p.state === "queued" ? "" : `<button type="button" class="ghost" data-proxy-retest="${escapeAttr(p.id)}">Retest</button>`}${forget}</td>`;
+  const head = `<td>${escapeHtml(p.label || "")}</td><td>${usedBy}</td>`;
+  const pending = p.state === "testing" ? "Testing… takes two to three minutes" : p.state === "queued" ? "Waiting for another test to finish" : "";
+  // A re-test keeps the previous numbers until the new ones land.
+  if (pending && !p.testedAt) return `<tr>${head}<td colspan="6" class="proxy-pending">${pending}</td>${actions}</tr>`;
+  if (p.state === "failed") return `<tr>${head}<td colspan="6" class="proxy-failed">Test failed: ${escapeHtml(p.error || "unknown error")}</td>${actions}</tr>`;
+  const exit = [p.exitIp, [p.city, p.country].filter(Boolean).join(", "), p.isp].filter(Boolean).map(escapeHtml).join("<br>");
+  const connections = p.connections === undefined ? "—"
+    : p.connectionsCapped ? `${p.connections}` : `${p.connections}+`;
+  const connectionsTitle = p.connectionsCapped
+    ? `Refused connection ${p.connections + 1}: ${p.connectionsStop || ""}${p.connectionsInUse ? ` (${p.connectionsInUse} were already in use by streams)` : ""}`
+    : "Never refused — the test stops at 200";
+  const cap = proxyCapacity(p, mbps);
+  const streams = cap
+    ? `<strong>${cap.streams}</strong> <span class="field-hint">${cap.limit === "connections" ? "connection-bound" : "speed-bound"}</span>`
+    : `<span class="proxy-failed">${escapeHtml(p.speedError || "no speed measured")}</span>`;
+  const streamsTitle = cap ? `${cap.perStream} connections per stream at this proxy's one-connection speed` : "";
+  const tested = p.testedAt ? `tested ${formatAgo(Date.now() / 1000 - p.testedAt)}` : "";
+  return `<tr>${head}
+    <td>${exit || "—"}</td>
+    <td>${p.firstByteMs !== undefined ? formatMs(p.firstByteMs) : "—"}</td>
+    <td>${formatMbps(p.singleMbps)}</td>
+    <td title="${p.parallel || 8} connections at once">${formatMbps(p.totalMbps)}</td>
+    <td title="${escapeAttr(connectionsTitle)}">${connections}</td>
+    <td title="${escapeAttr(streamsTitle)}">${streams}${pending ? `<br><span class="proxy-pending">${pending}</span>` : tested ? `<br><span class="field-hint">${tested}</span>` : ""}</td>
+    ${actions}</tr>`;
+}
+
+function renderProxies() {
+  const mbps = proxyQualityMbps();
+  $("#proxiesTableBody").innerHTML = lastProxies.map((p) => proxyRow(p, mbps)).join("");
+  $("#proxiesEmpty").classList.toggle("hidden", lastProxies.length > 0);
+  // Only proxies streams actually use count toward the server's total.
+  const used = lastProxies.filter((p) => (p.usedBy || []).length && p.totalMbps);
+  const quality = $("#proxyQuality").selectedOptions[0]?.textContent.split(" ")[0] || "";
+  $("#proxiesSummary").textContent = used.length
+    ? `Across ${used.length} measured proxies in use: ${formatMbps(used.reduce((n, p) => n + p.totalMbps, 0))} total, `
+      + `${used.reduce((n, p) => n + (p.connections || 0), 0)}${used.some((p) => !p.connectionsCapped) ? "+" : ""} connections, `
+      + `about ${used.reduce((n, p) => n + (proxyCapacity(p, mbps)?.streams || 0), 0)} streams at ${quality}.`
+    : "";
+}
+
+async function refreshProxies() {
+  try {
+    lastProxies = (await request("/api/proxies")).proxies || [];
+    renderProxies();
+  } catch {
+    // A failed refresh leaves the last table up; the next tick tries again.
+  }
+}
+
+function startProxiesPoll() {
+  stopProxiesPoll();
+  refreshProxies();
+  proxiesTimer = setInterval(refreshProxies, 3000);
+}
+
+function stopProxiesPoll() {
+  if (proxiesTimer) clearInterval(proxiesTimer);
+  proxiesTimer = null;
+}
+
+async function proxyAction(path, body, okText) {
+  try {
+    await request(path, { method: "POST", body: JSON.stringify(body) });
+    if (okText) showToast(okText);
+    refreshProxies();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+$("#proxyTestForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("#proxyTestInput");
+  const proxy = input.value.trim();
+  if (!proxy) return;
+  await proxyAction("/api/proxies/test", { proxy }, "Proxy test started — results in two to three minutes.");
+  input.value = "";
+});
+
+$("#proxiesTableBody").addEventListener("click", (event) => {
+  const retest = event.target.closest("[data-proxy-retest]");
+  const forget = event.target.closest("[data-proxy-forget]");
+  if (retest) proxyAction("/api/proxies/test", { id: retest.dataset.proxyRetest }, "Proxy test queued.");
+  if (forget) proxyAction("/api/proxies/forget", { id: forget.dataset.proxyForget });
+});
+
+try {
+  const savedQuality = localStorage.getItem("restreamair-proxy-quality");
+  if (savedQuality && [...$("#proxyQuality").options].some((o) => o.value === savedQuality)) $("#proxyQuality").value = savedQuality;
+} catch {}
+$("#proxyQuality").addEventListener("change", () => {
+  try { localStorage.setItem("restreamair-proxy-quality", $("#proxyQuality").value); } catch {}
+  renderProxies();
+});
 
 let trafficTimer = null;
 let trafficStreamId = null;

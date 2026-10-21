@@ -269,6 +269,7 @@ static restream_fetch_fn g_fetch_handler = NULL;
 static restream_webhook_fn g_webhook_handler = NULL;
 static restream_proxy_stats_fn g_proxy_stats_handler = NULL;
 static restream_stream_traffic_fn g_stream_traffic_handler = NULL;
+static restream_proxy_test_fn g_proxy_test_handler = NULL;
 static restream_dash_fn g_dash_handler = NULL;
 static restream_service_status_fn g_service_status = NULL;
 static restream_service_action_fn g_service_action = NULL;
@@ -2054,6 +2055,107 @@ static void file_gate_tick(void *arg) {
     rs_file_gate_tick(((restream_server_t *)arg)->file_gate);
 }
 
+// --- Proxies for the server view ---------------------------------------------
+
+// Calls fn for each proxy URL a provider or stream names, with who uses it.
+static void each_configured_proxy(restream_server_t *s,
+                                  void (*fn)(const char *url, const char *used_by, void *ctx), void *ctx) {
+    const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *p = rs_json_arr_at(providers, i);
+        const char *pname = rs_json_obj_str(p, "name", "");
+        const rs_json *streams = rs_json_obj_get(p, "streams");
+        for (size_t j = 0; j <= rs_json_arr_len(streams); j++) {
+            // j == 0 is the provider's own list; j > 0 a stream's override.
+            const rs_json *st = j ? rs_json_arr_at(streams, j - 1) : NULL;
+            char *copy = rs_strdup(rs_json_obj_str(st ? st : p, "proxy", ""));
+            char used_by[256];
+            if (st) snprintf(used_by, sizeof(used_by), "%s / %s", pname, rs_json_obj_str(st, "name", ""));
+            else snprintf(used_by, sizeof(used_by), "%s", pname);
+            for (char *line = copy; line && *line;) {
+                char *end = line + strcspn(line, "\r\n");
+                char *next = *end ? end + 1 : end;
+                *end = '\0';
+                while (*line == ' ' || *line == '\t') line++;
+                while (end > line && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+                if (*line) fn(line, used_by, ctx);
+                line = next;
+            }
+            free(copy);
+        }
+    }
+}
+
+static void queue_proxy_test(const char *url, const char *used_by, void *ctx) {
+    (void)used_by; (void)ctx;
+    if (g_proxy_test_handler) free(g_proxy_test_handler(url, RS_PROXYTEST_READ));
+}
+
+// Groups configured proxies by URL: {url: ["Provider", "Provider / Stream"]}.
+static void collect_proxy_user(const char *url, const char *used_by, void *ctx) {
+    rs_json *by_url = (rs_json *)ctx;
+    rs_json *users = (rs_json *)rs_json_obj_get(by_url, url);
+    if (!users) { rs_json_obj_set(by_url, url, rs_json_new_arr()); users = (rs_json *)rs_json_obj_get(by_url, url); }
+    for (size_t i = 0; i < rs_json_arr_len(users); i++)
+        if (!strcmp(rs_json_as_str(rs_json_arr_at(users, i), ""), used_by)) return;
+    rs_json_arr_push(users, rs_json_new_str(used_by));
+}
+
+static rs_json *proxy_test_call(const char *proxy, int mode) {
+    char *text = g_proxy_test_handler ? g_proxy_test_handler(proxy, mode) : NULL;
+    rs_json *out = text ? rs_json_parse(text, strlen(text)) : NULL;
+    free(text);
+    return out;
+}
+
+// Every proxy a provider or stream uses, plus ones tested by hand, each with
+// its latest test result. URLs (and their passwords) never leave the server.
+static rs_json *proxies_view(restream_server_t *s) {
+    rs_json *by_url = rs_json_new_obj();
+    each_configured_proxy(s, collect_proxy_user, by_url);
+    rs_json *list = rs_json_new_arr();
+    for (size_t i = 0; i < rs_json_obj_len(by_url); i++) {
+        rs_json *r = proxy_test_call(rs_json_obj_key_at(by_url, i), RS_PROXYTEST_READ);
+        if (!r) continue;
+        rs_json_obj_set(r, "usedBy", rs_json_clone(rs_json_obj_value_at(by_url, i)));
+        rs_json_arr_push(list, r);
+    }
+    rs_json *stored = proxy_test_call(NULL, RS_PROXYTEST_LIST);
+    for (size_t i = 0; i < rs_json_arr_len(stored); i++) {
+        const char *id = rs_json_obj_str(rs_json_arr_at(stored, i), "id", "");
+        bool shown = false;
+        for (size_t k = 0; k < rs_json_arr_len(list) && !shown; k++)
+            shown = !strcmp(rs_json_obj_str(rs_json_arr_at(list, k), "id", ""), id);
+        if (shown) continue;
+        rs_json *r = rs_json_clone(rs_json_arr_at(stored, i));
+        rs_json_obj_set(r, "usedBy", rs_json_new_arr());
+        rs_json_arr_push(list, r);
+    }
+    rs_json_free(stored);
+    rs_json_free(by_url);
+    rs_json *out = rs_json_new_obj();
+    rs_json_obj_set(out, "proxies", list);
+    return out;
+}
+
+// A proxy URL typed into the test box: one line, a known scheme (or none,
+// which libcurl reads as http), and a port.
+static bool proxy_url_ok(const char *url) {
+    static const char *const schemes[] = {"http://", "https://", "socks4://", "socks4a://", "socks5://", "socks5h://"};
+    size_t len = strlen(url);
+    if (!len || len > 1000 || strpbrk(url, "\r\n \t")) return false;
+    const char *sep = strstr(url, "://");
+    if (sep) {
+        bool known = false;
+        for (size_t i = 0; i < sizeof(schemes) / sizeof(*schemes) && !known; i++)
+            known = strncasecmp(url, schemes[i], strlen(schemes[i])) == 0;
+        if (!known) return false;
+    }
+    const char *host = sep ? sep + 3 : url;
+    const char *at = strrchr(host, '@');
+    return strchr(at ? at + 1 : host, ':') != NULL;
+}
+
 // Maintenance always runs once a second, even with snapshots paused.
 static void maintenance_tick(void *arg) {
     restream_server_t *s = (restream_server_t *)arg;
@@ -2077,6 +2179,10 @@ static void maintenance_tick(void *arg) {
     // instantly instead of waiting for an in-flight segment download.
     rs_live_reap(s->live);
     file_gate_report(s);
+    // A proxy added to a provider gets measured without anyone opening the
+    // server view; the tester ignores proxies it already knows.
+    static unsigned proxy_ticks;
+    if (++proxy_ticks >= 30) { proxy_ticks = 0; each_configured_proxy(s, queue_proxy_test, NULL); }
     // The day file is buffered; push it out once a second so it is current.
     log_lock(s);
     if (s->log_file) fflush(s->log_file);
@@ -3138,6 +3244,30 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
             rs_json_free(body);
             return true;
         }
+    }
+
+    // --- every proxy, its measured capacity, and testing new ones ---
+    if (mg_match(hm->uri, mg_str("/api/proxies"), NULL) && method_is(hm, "GET")) {
+        if (!g_proxy_test_handler) { reply_error(c, 501, "Proxy testing is not available in this build."); return true; }
+        reply_json(c, 200, proxies_view(s), NULL);
+        return true;
+    }
+    if ((mg_match(hm->uri, mg_str("/api/proxies/test"), NULL) || mg_match(hm->uri, mg_str("/api/proxies/forget"), NULL))
+        && method_is(hm, "POST")) {
+        if (!g_proxy_test_handler) { reply_error(c, 501, "Proxy testing is not available in this build."); return true; }
+        bool forget = mg_match(hm->uri, mg_str("/api/proxies/forget"), NULL);
+        rs_json *body = parse_body(hm);
+        char *id = body_str(body, "id");
+        char *proxy = body_str(body, "proxy");
+        rs_json_free(body);
+        rs_json *r = NULL;
+        if (id && id[0]) r = proxy_test_call(id, forget ? RS_PROXYTEST_FORGET : RS_PROXYTEST_RETEST);
+        else if (!forget && proxy && proxy_url_ok(proxy)) r = proxy_test_call(proxy, RS_PROXYTEST_RETEST);
+        else if (!forget) { free(id); free(proxy); reply_error(c, 400, "Expected a proxy like http://user:pass@host:port."); return true; }
+        free(id); free(proxy);
+        if (!r) { reply_error(c, 404, "Unknown proxy."); return true; }
+        reply_json(c, 200, r, NULL);
+        return true;
     }
 
     // --- live proxy connections and per-stream traffic (read-only) ---
@@ -10173,6 +10303,10 @@ void restream_server_set_traffic_handler(restream_proxy_stats_fn proxies,
                                          restream_stream_traffic_fn traffic) {
     g_proxy_stats_handler = proxies;
     g_stream_traffic_handler = traffic;
+}
+
+void restream_server_set_proxy_test_handler(restream_proxy_test_fn handler) {
+    g_proxy_test_handler = handler;
 }
 
 void restream_server_set_dash_handler(restream_dash_fn handler) {

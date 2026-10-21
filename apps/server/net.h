@@ -61,6 +61,9 @@ char *rs_net_proxy_stats(const char *list, int limit);
 // rs_net_stream_traffic: the requests made for one stream — rate, per-proxy
 // totals and the latest requests, newest first.
 char *rs_net_stream_traffic(const char *stream_id);
+// rs_net_proxy_test: the proxy tester (see restream_proxy_test_fn). Its
+// results carry an id and host:port, never the proxy URL.
+char *rs_net_proxy_test(const char *proxy, int mode);
 
 // POSTs a JSON document to an HTTP(S) endpoint. Used by the provider error
 // webhook worker; deliberately separate from rs_fetch_url so a configured

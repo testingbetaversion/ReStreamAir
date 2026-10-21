@@ -467,3 +467,44 @@ ssh root@moonmuaaz.xyz 'printf "%s\n%s\n" <USA proxy> <BRA proxy> | python3 pcl.
 Both gateways of aoCH4dyj_1 measured 10 in both rounds. Also checked: wrong password (407 PROXY_AUTH_FAILED, exit 1), closed port (cannot connect, exit 1), bad argument (exit 1). The test copy was moved to /tmp/rsa-test/trash/pcl-*.py.
 
 **Unfinished:** Nothing.
+
+### 2026-10-21 — Upgrade ReStreamAir on 94.130.48.175 to v1.5.0
+**What was done:** The box (SSH on port 1991) already ran `restreamair.service` from commit 37308a3, bound to 127.0.0.1:8787. Installed the v1.5.0 Linux release in `/opt/restreamair-v1.5.0`, repointed the service to it, and rebound it to 0.0.0.0:8080. State in `/var/lib/restreamair` was kept. Panel answers 200 locally and externally.
+
+**Files changed:** on the server only — `/opt/restreamair-v1.5.0/` (new), `/etc/systemd/system/restreamair.service` (ExecStart), backups `/root/restreamair.service.bak` and `/root/restreamair-state-backup-2026-10-21.json`.
+
+**Commands run:**
+```bash
+curl -fsSL -o r.zip .../releases/download/v1.5.0/restreamair-v1.5.0-linux-x86_64.zip && unzip -q r.zip
+```
+Downloads and unpacks the release.
+
+```bash
+sed -i "s#^ExecStart=.*#ExecStart=... serve --bind 0.0.0.0 --port 8080 --root .../public#" /etc/systemd/system/restreamair.service && systemctl daemon-reload && systemctl restart restreamair
+```
+Points the unit at the new binary and restarts it.
+
+**Unfinished:** Nothing.
+
+### 2026-10-21 — Server view lists every proxy with its measured capacity
+**What was done:** The Server page has a new Proxies panel. It lists every proxy a provider or stream uses (and proxies tested by hand) with exit IP/location/ISP, first-byte time, one-connection speed, 8-connection total speed, how many connections the proxy accepts at once, and how many streams it can carry at a selectable quality (480p/720p/1080p/4K, 25% headroom, bounded by speed or by connections). Totals across proxies in use are summed. New proxies are tested automatically (the server checks every 30 s); a box tests any proxy URL without adding it; rows have Retest/Forget. Tests run one at a time on a background thread in `net.c`, against Cloudflare's speed test, and persist in `proxy-tests.json`. New API: `GET /api/proxies`, `POST /api/proxies/test`, `POST /api/proxies/forget` (no credentials ever returned). Verified on moonmuaaz with a throwaway instance: claro's proxy measured BR exit, 43 Mbps single / 57 Mbps total, refused at 187 connections; dead proxy, 407 login and bad input all reported correctly. moonmuaaz's SSH host key had changed (user confirmed expected); old key backed up to `~/.ssh/known_hosts.bak-2026-10-21`.
+
+**Files changed:** apps/server/net.c, apps/server/net.h, apps/server/main.cpp, core/include/restream.h, core/src/server.c, public/index.html, public/app.js, public/styles.css, API.md, public/docs/API.md, PROGRESS.md
+
+**Commands run:**
+```bash
+git apply /tmp/proxytest.diff && cmake --build build -j3
+```
+Applies the change to the scratch checkout on moonmuaaz (`/tmp/rsa-test/ci`) and builds it.
+
+```bash
+python3 /tmp/rsa-test/smoke.py
+```
+Drives a throwaway instance on 127.0.0.1:18799: setup, a provider with a proxy, manual tests, waits for results, checks no credentials leak.
+
+```bash
+python3 scripts/sync-panel-docs.py
+```
+Copies API.md into public/docs for the Help view.
+
+**Unfinished:** Not deployed to any live install (moonmuaaz's `/root/ReStreamAir` or 94.130.48.175). UI checked only with `node --check`, not in a browser.
