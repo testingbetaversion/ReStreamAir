@@ -1891,3 +1891,10 @@ pre {
 .proxy-pending { color: var(--muted); font-style: italic; }
 .proxy-failed { color: var(--danger); }
 .proxy-actions { white-space: nowrap; }
+.connections-table tbody tr[data-proxy-id] { cursor: pointer; }
+.connections-table tbody tr[data-proxy-id]:hover { background: var(--hover, rgba(127, 127, 127, 0.1)); }
+.proxy-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px 18px; font-size: 13px; }
+.proxy-facts dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.proxy-facts dd { margin: 0; overflow-wrap: anywhere; }
+.proxy-quality-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
+.proxy-load { font-size: 13px; }

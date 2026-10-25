@@ -2108,6 +2108,68 @@ static rs_json *proxy_test_call(const char *proxy, int mode) {
     return out;
 }
 
+static const char *selected_video_rep(const rs_json *stream);
+
+// True when one of the newline-separated proxy URLs in `text` is `url`.
+static bool proxy_text_has(const char *text, const char *url) {
+    char *copy = rs_strdup(text ? text : "");
+    bool found = false;
+    for (char *line = copy; *line && !found;) {
+        char *end = line + strcspn(line, "\r\n");
+        char *next = *end ? end + 1 : end;
+        *end = '\0';
+        while (*line == ' ' || *line == '\t') line++;
+        while (end > line && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+        found = *line && !strcmp(line, url);
+        line = next;
+    }
+    free(copy);
+    return found;
+}
+
+static bool proxy_text_blank(const char *text) {
+    return !text || !text[strspn(text, " \t\r\n")];
+}
+
+// The streams that go through `url`: their own proxy list when they have one,
+// else their provider's. Each carries its video choices so the panel can switch
+// quality from the proxy's card. Ids, names and bitrates only; no URLs.
+static rs_json *proxy_streams_view(restream_server_t *s, const char *url) {
+    rs_json *out = rs_json_new_arr();
+    const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
+    for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
+        const rs_json *p = rs_json_arr_at(providers, i);
+        const rs_json *streams = rs_json_obj_get(p, "streams");
+        for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
+            const rs_json *st = rs_json_arr_at(streams, j);
+            const char *own = rs_json_obj_str(st, "proxy", "");
+            if (!proxy_text_has(proxy_text_blank(own) ? rs_json_obj_str(p, "proxy", "") : own, url)) continue;
+            rs_json *e = rs_json_new_obj();
+            rs_json_obj_set_str(e, "id", rs_json_obj_str(st, "id", ""));
+            rs_json_obj_set_str(e, "name", rs_json_obj_str(st, "name", ""));
+            rs_json_obj_set_str(e, "provider", rs_json_obj_str(p, "name", ""));
+            rs_json_obj_set_bool(e, "running", !strcmp(rs_json_obj_str(st, "status", "stopped"), "running"));
+            rs_json_obj_set_bool(e, "ownProxy", !proxy_text_blank(own));
+            rs_json_obj_set_str(e, "video", selected_video_rep(st));
+            rs_json *reps = rs_json_new_arr();
+            const rs_json *meta = rs_json_obj_get(st, "representationMeta");
+            for (size_t k = 0; meta && k < rs_json_obj_len(meta); k++) {
+                const rs_json *m = rs_json_obj_value_at(meta, k);
+                if (strcmp(rs_json_obj_str(m, "type", ""), "video") != 0) continue;
+                rs_json *r = rs_json_new_obj();
+                rs_json_obj_set_str(r, "id", rs_json_obj_key_at(meta, k));
+                rs_json_obj_set_int(r, "bandwidth", rs_json_obj_int(m, "bandwidth", 0));
+                rs_json_obj_set_int(r, "height", rs_json_obj_int(m, "height", 0));
+                rs_json_obj_set_int(r, "width", rs_json_obj_int(m, "width", 0));
+                rs_json_arr_push(reps, r);
+            }
+            rs_json_obj_set(e, "videoReps", reps);
+            rs_json_arr_push(out, e);
+        }
+    }
+    return out;
+}
+
 // Every proxy a provider or stream uses, plus ones tested by hand, each with
 // its latest test result. URLs (and their passwords) never leave the server.
 static rs_json *proxies_view(restream_server_t *s) {
@@ -2118,6 +2180,7 @@ static rs_json *proxies_view(restream_server_t *s) {
         rs_json *r = proxy_test_call(rs_json_obj_key_at(by_url, i), RS_PROXYTEST_READ);
         if (!r) continue;
         rs_json_obj_set(r, "usedBy", rs_json_clone(rs_json_obj_value_at(by_url, i)));
+        rs_json_obj_set(r, "streams", proxy_streams_view(s, rs_json_obj_key_at(by_url, i)));
         rs_json_arr_push(list, r);
     }
     rs_json *stored = proxy_test_call(NULL, RS_PROXYTEST_LIST);
@@ -2129,6 +2192,7 @@ static rs_json *proxies_view(restream_server_t *s) {
         if (shown) continue;
         rs_json *r = rs_json_clone(rs_json_arr_at(stored, i));
         rs_json_obj_set(r, "usedBy", rs_json_new_arr());
+        rs_json_obj_set(r, "streams", rs_json_new_arr());
         rs_json_arr_push(list, r);
     }
     rs_json_free(stored);
@@ -3415,14 +3479,15 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         const char *input_mode = rs_json_obj_str(fields, "inputMode", "");
         long long parallel = rs_json_obj_get(fields, "parallelDownloads")
             ? rs_json_obj_int(fields, "parallelDownloads", 0) : 0;
+        const char *video_rep = rs_json_obj_str(fields, "videoRepresentation", "");
         if (!del && !set && strcmp(action, "stop") != 0) {
             rs_json_free(body);
             reply_error(c, 400, "action must be \"stop\", \"delete\" or \"set\".");
             return true;
         }
-        if (set && !input_mode[0] && !parallel) {
+        if (set && !input_mode[0] && !parallel && !video_rep[0]) {
             rs_json_free(body);
-            reply_error(c, 400, "action \"set\" needs fields.inputMode or fields.parallelDownloads.");
+            reply_error(c, 400, "action \"set\" needs fields.inputMode, fields.parallelDownloads or fields.videoRepresentation.");
             return true;
         }
         if (set) {
@@ -3439,6 +3504,7 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
                 int rc = 0;
                 if (input_mode[0]) rc = rs_panel_set_stream_input_mode(&s->state, id, input_mode, &err);
                 if (rc == 0 && parallel) rc = rs_panel_set_stream_parallel_downloads(&s->state, id, parallel, &err);
+                if (rc == 0 && video_rep[0]) rc = rs_panel_set_stream_video_representation(&s->state, id, video_rep, &err);
                 if (rc == -400) break;  // invalid value: same for every stream
                 if (rc != 0) continue;
                 done++;
@@ -3456,9 +3522,10 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
                 return true;
             }
             log_recordf(s, "__panel__", "info", "streamUpdate", NULL, 0, -1,
-                        "bulk set%s%s%s on %lu stream(s) by %s (%lu requested)",
+                        "bulk set%s%s%s%s on %lu stream(s) by %s (%lu requested)",
                         input_mode[0] ? " input mode " : "", input_mode,
                         parallel ? " + parallel downloads" : "",
+                        video_rep[0] ? " + video quality" : "",
                         (unsigned long)done, ip, (unsigned long)n);
             rs_free(ip);
             rs_json_free(body);

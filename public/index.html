@@ -229,6 +229,17 @@
           </div>
         </dialog>
 
+        <!-- One proxy in full: measurements, who uses it, and the video quality
+             of each stream going through it. Opened by clicking a row of the
+             Server view's proxy table. -->
+        <dialog id="proxyDialog" class="stream-editor-dialog">
+          <div class="dialog-head">
+            <h3 id="proxyDialogTitle">Proxy</h3>
+            <button id="closeProxyDialogBtn" type="button" class="icon-btn ghost" title="Close"><span data-icon="close"></span></button>
+          </div>
+          <div class="traffic-body" id="proxyDialogBody"></div>
+        </dialog>
+
         <dialog id="streamEditorDialog" class="stream-editor-dialog">
           <div class="dialog-head">
             <h3 id="streamEditorTitle">Stream</h3>

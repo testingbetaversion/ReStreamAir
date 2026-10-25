@@ -135,6 +135,9 @@ int rs_panel_delete_key(rs_state *st, const char *id, const char **err);
 // Changes only a stream's input mode (validated like the stream editor's).
 int rs_panel_set_stream_parallel_downloads(rs_state *st, const char *stream_id, long long n,
                                            const char **err);
+// Picks the stream's video quality by representation id (must be typed video).
+int rs_panel_set_stream_video_representation(rs_state *st, const char *stream_id, const char *rep,
+                                             const char **err);
 int rs_panel_set_stream_input_mode(rs_state *st, const char *stream_id, const char *mode,
                                    const char **err);
 // Partial update: label, api (bool), expiresInHours (0 = never). Same fields

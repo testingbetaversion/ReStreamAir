@@ -2886,8 +2886,8 @@ function proxyRow(p, mbps) {
   const head = `<td>${escapeHtml(p.label || "")}</td><td>${usedBy}</td>`;
   const pending = p.state === "testing" ? "Testing… takes two to three minutes" : p.state === "queued" ? "Waiting for another test to finish" : "";
   // A re-test keeps the previous numbers until the new ones land.
-  if (pending && !p.testedAt) return `<tr>${head}<td colspan="6" class="proxy-pending">${pending}</td>${actions}</tr>`;
-  if (p.state === "failed") return `<tr>${head}<td colspan="6" class="proxy-failed">Test failed: ${escapeHtml(p.error || "unknown error")}</td>${actions}</tr>`;
+  if (pending && !p.testedAt) return `<tr data-proxy-id="${escapeAttr(p.id)}">${head}<td colspan="6" class="proxy-pending">${pending}</td>${actions}</tr>`;
+  if (p.state === "failed") return `<tr data-proxy-id="${escapeAttr(p.id)}">${head}<td colspan="6" class="proxy-failed">Test failed: ${escapeHtml(p.error || "unknown error")}</td>${actions}</tr>`;
   const exit = [p.exitIp, [p.city, p.country].filter(Boolean).join(", "), p.isp].filter(Boolean).map(escapeHtml).join("<br>");
   const connections = p.connections === undefined ? "—"
     : p.connectionsCapped ? `${p.connections}` : `${p.connections}+`;
@@ -2900,7 +2900,7 @@ function proxyRow(p, mbps) {
     : `<span class="proxy-failed">${escapeHtml(p.speedError || "no speed measured")}</span>`;
   const streamsTitle = cap ? `${cap.perStream} connections per stream at this proxy's one-connection speed` : "";
   const tested = p.testedAt ? `tested ${formatAgo(Date.now() / 1000 - p.testedAt)}` : "";
-  return `<tr>${head}
+  return `<tr data-proxy-id="${escapeAttr(p.id)}">${head}
     <td>${exit || "—"}</td>
     <td>${p.firstByteMs !== undefined ? formatMs(p.firstByteMs) : "—"}</td>
     <td>${formatMbps(p.singleMbps)}</td>
@@ -2928,6 +2928,7 @@ async function refreshProxies() {
   try {
     lastProxies = (await request("/api/proxies")).proxies || [];
     renderProxies();
+    refreshProxyDialog();
   } catch {
     // A failed refresh leaves the last table up; the next tick tries again.
   }
@@ -2967,8 +2968,116 @@ $("#proxiesTableBody").addEventListener("click", (event) => {
   const retest = event.target.closest("[data-proxy-retest]");
   const forget = event.target.closest("[data-proxy-forget]");
   if (retest) proxyAction("/api/proxies/test", { id: retest.dataset.proxyRetest }, "Proxy test queued.");
-  if (forget) proxyAction("/api/proxies/forget", { id: forget.dataset.proxyForget });
+  else if (forget) proxyAction("/api/proxies/forget", { id: forget.dataset.proxyForget });
+  else {
+    const row = event.target.closest("tr[data-proxy-id]");
+    if (row) openProxyDialog(row.dataset.proxyId);
+  }
 });
+
+// --- One proxy's card: every measurement, its streams, and their quality -------
+
+let proxyDialogId = null;
+
+const videoRepLabel = (rep) => [rep.height ? `${rep.height}p` : rep.id, rep.bandwidth ? formatMbps(rep.bandwidth / 1e6) : ""].filter(Boolean).join(" · ");
+
+// What a stream pulls: its chosen video, else the highest (what auto picks).
+function streamVideoRep(stream) {
+  const reps = stream.videoReps || [];
+  return reps.find((r) => r.id === stream.video) || reps.reduce((best, r) => (!best || r.bandwidth > best.bandwidth ? r : best), null);
+}
+
+function proxyDialogHtml(p) {
+  const mbps = proxyQualityMbps();
+  const streams = p.streams || [];
+  const fact = (label, value) => `<div><dt>${label}</dt><dd>${value || "—"}</dd></div>`;
+  const cap = proxyCapacity(p, mbps);
+  const connections = p.connections === undefined ? "" : p.connectionsCapped ? `${p.connections}` : `${p.connections}+`;
+  const facts = [
+    fact("State", escapeHtml(p.state === "failed" ? `Test failed: ${p.error || "unknown error"}` : p.state === "testing" ? "Testing…" : p.state === "queued" ? "Queued" : "Measured")),
+    fact("Exit address", escapeHtml(p.exitIp || "")),
+    fact("Location", escapeHtml([p.city, p.country].filter(Boolean).join(", "))),
+    fact("Network", escapeHtml(p.isp || "")),
+    fact("First byte", p.firstByteMs !== undefined ? formatMs(p.firstByteMs) : ""),
+    fact("1 connection", p.singleMbps !== undefined ? formatMbps(p.singleMbps) : ""),
+    fact(`Total speed (${p.parallel || 8} connections)`, p.totalMbps !== undefined ? formatMbps(p.totalMbps) : ""),
+    fact("Connections accepted", connections ? escapeHtml(connections) + (p.connectionsCapped ? "" : " (never refused)") : ""),
+    fact("Capacity", cap ? `${cap.streams} streams at ${formatMbps(mbps)} (${cap.limit}-bound, ${cap.perStream} connections each)` : escapeHtml(p.speedError || "")),
+    fact("Last tested", p.testedAt ? formatAgo(Date.now() / 1000 - p.testedAt) : ""),
+    fact("Used by", (p.usedBy || []).length ? p.usedBy.map(escapeHtml).join("<br>") : "tested by hand"),
+  ].join("");
+  const running = streams.filter((s) => s.running);
+  const demand = running.reduce((n, s) => n + (streamVideoRep(s)?.bandwidth || 0) / 1e6, 0);
+  const load = !streams.length ? ""
+    : `<div class="proxy-load">${running.length} of ${streams.length} streams running, pulling about ${formatMbps(demand)} of video${p.totalMbps ? ` from ${formatMbps(p.totalMbps)} available` : ""}.</div>`;
+  const heights = [...new Set(streams.flatMap((s) => (s.videoReps || []).map((r) => r.height)).filter(Boolean))].sort((a, b) => b - a);
+  const bulk = heights.length ? `<div class="proxy-quality-bar"><span>Set every stream here to</span>
+      <select id="proxyDialogBulk">${heights.map((h) => `<option value="${h}">${h}p</option>`).join("")}</select>
+      <button type="button" data-proxy-bulk>Apply</button>
+      <span class="field-hint">Streams without that height keep their quality. Running streams restart their video now.</span></div>` : "";
+  const rows = streams.map((s) => {
+    const reps = [...(s.videoReps || [])].sort((a, b) => b.bandwidth - a.bandwidth);
+    const options = (s.video ? "" : `<option value="" selected disabled>Auto (${reps[0] ? videoRepLabel(reps[0]) : "highest"})</option>`)
+      + reps.map((r) => `<option value="${escapeAttr(r.id)}"${r.id === s.video ? " selected" : ""}>${escapeHtml(videoRepLabel(r))}</option>`).join("");
+    const select = reps.length ? `<select data-stream-quality="${escapeAttr(s.id)}">${options}</select>` : `<span class="field-hint">no qualities detected — open the stream and detect</span>`;
+    return `<tr><td>${escapeHtml(s.name)}</td><td>${escapeHtml(s.provider)}${s.ownProxy ? "" : ` <span class="field-hint">(provider proxy)</span>`}</td><td>${s.running ? "running" : "stopped"}</td><td>${select}</td></tr>`;
+  }).join("");
+  const table = streams.length ? `<h4>Streams on this proxy</h4>${bulk}
+    <div class="connections-table-wrap"><table class="connections-table"><thead><tr><th>Stream</th><th>Provider</th><th>Status</th><th>Video quality</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    : `<p class="field-hint">No stream goes through this proxy.</p>`;
+  const buttons = `<div class="proxy-quality-bar">${p.state === "testing" || p.state === "queued" ? "" : `<button type="button" class="ghost" data-proxy-retest="${escapeAttr(p.id)}">Retest</button>`}${(p.usedBy || []).length ? "" : `<button type="button" class="ghost" data-proxy-forget="${escapeAttr(p.id)}">Forget</button>`}</div>`;
+  return `<dl class="proxy-facts">${facts}</dl>${load}${buttons}${table}`;
+}
+
+function refreshProxyDialog() {
+  const dialog = $("#proxyDialog");
+  if (!dialog.open) return;
+  const p = lastProxies.find((x) => x.id === proxyDialogId);
+  if (!p) { dialog.close(); return; }
+  // Leave the card alone while a menu inside it is open or being used.
+  if (dialog.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
+  $("#proxyDialogTitle").textContent = p.label || "Proxy";
+  $("#proxyDialogBody").innerHTML = proxyDialogHtml(p);
+}
+
+function openProxyDialog(id) {
+  proxyDialogId = id;
+  $("#proxyDialog").showModal();
+  refreshProxyDialog();
+}
+
+async function setStreamVideoQuality(streamId, rep) {
+  try {
+    state = await request("/api/streams/bulk", { method: "POST", body: JSON.stringify({ action: "set", ids: [streamId], fields: { videoRepresentation: rep } }) });
+    render();
+    showToast("Video quality changed");
+  } catch (error) {
+    showToast(`Couldn't change the quality: ${error.message || error}`, "error");
+  }
+  await refreshProxies();
+}
+
+$("#proxyDialogBody").addEventListener("change", (event) => {
+  const select = event.target.closest("[data-stream-quality]");
+  if (select && select.value) setStreamVideoQuality(select.dataset.streamQuality, select.value);
+});
+
+$("#proxyDialogBody").addEventListener("click", async (event) => {
+  const retest = event.target.closest("[data-proxy-retest]");
+  const forget = event.target.closest("[data-proxy-forget]");
+  if (retest) proxyAction("/api/proxies/test", { id: retest.dataset.proxyRetest }, "Proxy test queued.");
+  if (forget) { await proxyAction("/api/proxies/forget", { id: forget.dataset.proxyForget }); $("#proxyDialog").close(); }
+  if (!event.target.closest("[data-proxy-bulk]")) return;
+  const p = lastProxies.find((x) => x.id === proxyDialogId);
+  const height = Number($("#proxyDialogBulk").value);
+  const targets = (p?.streams || []).map((s) => ({ s, rep: (s.videoReps || []).find((r) => r.height === height) })).filter((t) => t.rep && t.rep.id !== t.s.video);
+  if (!targets.length) { showToast(`No stream here needs changing to ${height}p`); return; }
+  if (!confirm(`Switch ${targets.length} stream(s) to ${height}p? Running ones restart their video now.`)) return;
+  for (const t of targets) await setStreamVideoQuality(t.s.id, t.rep.id);
+});
+
+$("#closeProxyDialogBtn").addEventListener("click", () => $("#proxyDialog").close());
+$("#proxyDialog").addEventListener("close", () => { proxyDialogId = null; });
 
 try {
   const savedQuality = localStorage.getItem("restreamair-proxy-quality");
@@ -2977,6 +3086,7 @@ try {
 $("#proxyQuality").addEventListener("change", () => {
   try { localStorage.setItem("restreamair-proxy-quality", $("#proxyQuality").value); } catch {}
   renderProxies();
+  refreshProxyDialog();
 });
 
 let trafficTimer = null;

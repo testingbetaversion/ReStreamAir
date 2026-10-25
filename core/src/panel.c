@@ -1381,6 +1381,33 @@ int rs_panel_set_stream_parallel_downloads(rs_state *st, const char *stream_id, 
     return 0;
 }
 
+// Switches the stream's video rendition to `rep`, which must be a video id the
+// stream knows from representationMeta. Audio picks stay; the singular
+// `representation` is kept in step so older readers agree.
+int rs_panel_set_stream_video_representation(rs_state *st, const char *stream_id, const char *rep,
+                                             const char **err) {
+    rs_json *stream = find_stream(st, stream_id, NULL);
+    if (!stream) { *err = "Stream not found."; return -404; }
+    const rs_json *meta = rs_json_obj_get(stream, "representationMeta");
+    const rs_json *chosen = (rep && rep[0] && meta) ? rs_json_obj_get(meta, rep) : NULL;
+    if (!chosen || strcmp(rs_json_obj_str(chosen, "type", ""), "video") != 0) {
+        *err = "That is not a video quality this stream has.";
+        return -400;
+    }
+    rs_json *out = rs_json_new_arr();
+    rs_json_arr_push(out, rs_json_new_str(rep));
+    const rs_json *old = rs_json_obj_get(stream, "representations");
+    for (size_t i = 0; i < rs_json_arr_len(old); i++) {
+        const char *id = rs_json_as_str(rs_json_arr_at(old, i), "");
+        const rs_json *m = id[0] ? rs_json_obj_get(meta, id) : NULL;
+        if (!id[0] || strcmp(id, rep) == 0 || (m && strcmp(rs_json_obj_str(m, "type", ""), "video") == 0)) continue;
+        rs_json_arr_push(out, rs_json_new_str(id));
+    }
+    rs_json_obj_set(stream, "representations", out);
+    rs_json_obj_set_str(stream, "representation", rep);
+    return 0;
+}
+
 int rs_panel_delete_key(rs_state *st, const char *id, const char **err) {
     bool found = false;
     rs_json *kept = array_without_id(keys_array(st), id, &found);
