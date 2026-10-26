@@ -2879,16 +2879,39 @@ function proxyQualityMbps() {
   return Number($("#proxyQuality").value) || 3;
 }
 
+// "BR" -> "🇧🇷 Brazil".
+function countryName(code) {
+  if (!/^[A-Za-z]{2}$/.test(code || "")) return code || "";
+  const cc = code.toUpperCase();
+  const flag = String.fromCodePoint(...[...cc].map((ch) => 0x1f1e6 + ch.charCodeAt(0) - 65));
+  let name = cc;
+  try { name = new Intl.DisplayNames(["en"], { type: "region" }).of(cc) || cc; } catch {}
+  return `${flag} ${name}`;
+}
+
+const placeText = (country, city) => [countryName(country), city].filter(Boolean).join(" · ");
+
+const proxyCheckMark = (c) => (c.state === "ok" ? "✓" : c.state === "failed" ? "✗" : "…");
+const proxyCheckClass = (c) => (c.state === "ok" ? "proxy-check-ok" : c.state === "failed" ? "proxy-failed" : "proxy-pending");
+
+// One badge per provider checked through this proxy: ✓ works, ✗ does not.
+function proxyCheckBadges(p) {
+  const checks = p.providerChecks || [];
+  if (!checks.length) return `<span class="field-hint">not checked</span>`;
+  return checks.map((c) => `<span class="proxy-badge ${proxyCheckClass(c)}" title="${escapeAttr(`checked with ${c.stream || "a stream"}`)}">${proxyCheckMark(c)} ${escapeHtml(c.provider || "")}</span>`).join("");
+}
+
 function proxyRow(p, mbps) {
   const usedBy = (p.usedBy || []).length ? p.usedBy.map(escapeHtml).join("<br>") : `<span class="field-hint">tested by hand</span>`;
   const forget = (p.usedBy || []).length ? "" : `<button type="button" class="ghost" data-proxy-forget="${escapeAttr(p.id)}">Forget</button>`;
   const actions = `<td class="proxy-actions">${p.state === "testing" || p.state === "queued" ? "" : `<button type="button" class="ghost" data-proxy-retest="${escapeAttr(p.id)}">Retest</button>`}${forget}</td>`;
-  const head = `<td>${escapeHtml(p.label || "")}</td><td>${usedBy}</td>`;
+  const head = `<td>${escapeHtml(p.label || "")}</td><td>${usedBy}</td><td>${proxyCheckBadges(p)}</td>`;
   const pending = p.state === "testing" ? "Testing… takes two to three minutes" : p.state === "queued" ? "Waiting for another test to finish" : "";
   // A re-test keeps the previous numbers until the new ones land.
   if (pending && !p.testedAt) return `<tr data-proxy-id="${escapeAttr(p.id)}">${head}<td colspan="6" class="proxy-pending">${pending}</td>${actions}</tr>`;
-  if (p.state === "failed") return `<tr data-proxy-id="${escapeAttr(p.id)}">${head}<td colspan="6" class="proxy-failed">Test failed: ${escapeHtml(p.error || "unknown error")}</td>${actions}</tr>`;
-  const exit = [p.exitIp, [p.city, p.country].filter(Boolean).join(", "), p.isp].filter(Boolean).map(escapeHtml).join("<br>");
+  const server = p.proxyCountry ? `<br><span class="field-hint">proxy server in ${escapeHtml(placeText(p.proxyCountry, p.proxyCity))}</span>` : "";
+  if (p.state === "failed") return `<tr data-proxy-id="${escapeAttr(p.id)}">${head}<td colspan="6"><span class="proxy-failed">Test failed: ${escapeHtml(p.error || "unknown error")}</span>${server}</td>${actions}</tr>`;
+  const exit = [p.exitIp, placeText(p.country, p.city), p.isp].filter(Boolean).map(escapeHtml).join("<br>");
   const connections = p.connections === undefined ? "—"
     : p.connectionsCapped ? `${p.connections}` : `${p.connections}+`;
   const connectionsTitle = p.connectionsCapped
@@ -2993,19 +3016,27 @@ function proxyDialogHtml(p) {
   const fact = (label, value) => `<div><dt>${label}</dt><dd>${value || "—"}</dd></div>`;
   const cap = proxyCapacity(p, mbps);
   const connections = p.connections === undefined ? "" : p.connectionsCapped ? `${p.connections}` : `${p.connections}+`;
-  const facts = [
-    fact("State", escapeHtml(p.state === "failed" ? `Test failed: ${p.error || "unknown error"}` : p.state === "testing" ? "Testing…" : p.state === "queued" ? "Queued" : "Measured")),
-    fact("Exit address", escapeHtml(p.exitIp || "")),
-    fact("Location", escapeHtml([p.city, p.country].filter(Boolean).join(", "))),
-    fact("Network", escapeHtml(p.isp || "")),
+  const banner = p.state === "failed"
+    ? `<div class="proxy-banner proxy-banner-bad">Test failed: ${escapeHtml(p.error || "unknown error")}</div>`
+    : p.state === "testing" ? `<div class="proxy-banner proxy-pending">Testing… takes two to three minutes</div>`
+    : p.state === "queued" ? `<div class="proxy-banner proxy-pending">Waiting for another test to finish</div>` : "";
+  const place = (country, city, isp, ip) => [placeText(country, city), isp, ip].filter(Boolean).map(escapeHtml).join("<br>");
+  const where = [
+    fact("Proxy server", place(p.proxyCountry, p.proxyCity, p.proxyIsp, p.proxyIp) || (p.testedAt ? "" : "known after the first test")),
+    fact("Exits to the internet from", place(p.country, p.city, p.isp, p.exitIp)
+      || (p.state === "failed" ? "unknown — no request got through" : "")),
+    fact("Last tested", p.testedAt ? formatAgo(Date.now() / 1000 - p.testedAt) : ""),
+    fact("Used by", (p.usedBy || []).length ? p.usedBy.map(escapeHtml).join("<br>") : "tested by hand"),
+  ].join("");
+  const measured = p.firstByteMs !== undefined || p.totalMbps !== undefined || connections;
+  const speed = !measured ? "" : `<h4>Speed and capacity</h4><dl class="proxy-facts">${[
     fact("First byte", p.firstByteMs !== undefined ? formatMs(p.firstByteMs) : ""),
     fact("1 connection", p.singleMbps !== undefined ? formatMbps(p.singleMbps) : ""),
     fact(`Total speed (${p.parallel || 8} connections)`, p.totalMbps !== undefined ? formatMbps(p.totalMbps) : ""),
     fact("Connections accepted", connections ? escapeHtml(connections) + (p.connectionsCapped ? "" : " (never refused)") : ""),
     fact("Capacity", cap ? `${cap.streams} streams at ${formatMbps(mbps)} (${cap.limit}-bound, ${cap.perStream} connections each)` : escapeHtml(p.speedError || "")),
-    fact("Last tested", p.testedAt ? formatAgo(Date.now() / 1000 - p.testedAt) : ""),
-    fact("Used by", (p.usedBy || []).length ? p.usedBy.map(escapeHtml).join("<br>") : "tested by hand"),
-  ].join("");
+  ].join("")}</dl>`;
+  const facts = `${banner}<h4>Location</h4><dl class="proxy-facts">${where}</dl>${speed}`;
   const running = streams.filter((s) => s.running);
   const demand = running.reduce((n, s) => n + (streamVideoRep(s)?.bandwidth || 0) / 1e6, 0);
   const load = !streams.length ? ""
@@ -3026,7 +3057,43 @@ function proxyDialogHtml(p) {
     <div class="connections-table-wrap"><table class="connections-table"><thead><tr><th>Stream</th><th>Provider</th><th>Status</th><th>Video quality</th></tr></thead><tbody>${rows}</tbody></table></div>`
     : `<p class="field-hint">No stream goes through this proxy.</p>`;
   const buttons = `<div class="proxy-quality-bar">${p.state === "testing" || p.state === "queued" ? "" : `<button type="button" class="ghost" data-proxy-retest="${escapeAttr(p.id)}">Retest</button>`}${(p.usedBy || []).length ? "" : `<button type="button" class="ghost" data-proxy-forget="${escapeAttr(p.id)}">Forget</button>`}</div>`;
-  return `<dl class="proxy-facts">${facts}</dl>${load}${buttons}${table}`;
+  return `${facts}${load}${buttons}${proxyChecksHtml(p)}${table}`;
+}
+
+// Which stream each proxy's provider check runs with, kept across refreshes.
+const proxyCheckChoice = {};
+
+// Streams a check can use, grouped by provider; streams on this proxy first.
+function proxyCheckOptions(p) {
+  const onProxy = new Set((p.streams || []).map((s) => s.id));
+  const providers = (state?.providers || []).filter((pr) => (pr.streams || []).length);
+  const chosen = proxyCheckChoice[p.id]
+    || (p.streams || [])[0]?.id
+    || providers.find((pr) => pr.scriptPath)?.streams[0]?.id || providers[0]?.streams[0]?.id || "";
+  proxyCheckChoice[p.id] = chosen;
+  return providers.map((pr) => {
+    const streams = [...pr.streams].sort((a, b) => onProxy.has(b.id) - onProxy.has(a.id));
+    return `<optgroup label="${escapeAttr(`${pr.name}${pr.scriptPath ? "" : " (no script)"}`)}">${streams.map((s) =>
+      `<option value="${escapeAttr(s.id)}"${s.id === chosen ? " selected" : ""}>${escapeHtml(s.name)}${onProxy.has(s.id) ? " — on this proxy" : ""}</option>`).join("")}</optgroup>`;
+  }).join("");
+}
+
+function proxyChecksHtml(p) {
+  const checks = p.providerChecks || [];
+  const options = proxyCheckOptions(p);
+  const form = !options ? `<p class="field-hint">Add a stream to a provider to check it through this proxy.</p>`
+    : `<div class="proxy-quality-bar"><select id="proxyCheckStream" aria-label="Stream to check with">${options}</select>
+      <button type="button" data-proxy-check>Check provider</button></div>
+      <p class="field-hint">Runs the stream's provider script through only this proxy — its manifest action, the manifest fetch, then its cdm action with no saved keys — without changing the stream. Takes up to a minute or two.</p>`;
+  const rows = checks.map((c) => {
+    const steps = c.state === "running" ? `<span class="proxy-pending">Checking…</span>`
+      : `<div class="proxy-check-steps">${(c.steps || []).map((step) =>
+        `<div class="${step.state === "ok" ? "proxy-check-ok" : step.state === "failed" ? "proxy-failed" : "proxy-check-skip"}">${step.state === "ok" ? "✓" : step.state === "failed" ? "✗" : "–"} ${escapeHtml(step.name)}: ${escapeHtml(step.detail || "")}</div>`).join("")}</div>`;
+    const when = c.checkedAt ? formatAgo(Date.now() / 1000 - c.checkedAt) : "";
+    return `<tr><td><span class="${proxyCheckClass(c)}">${proxyCheckMark(c)}</span> ${escapeHtml(c.provider || "")}<br><span class="field-hint">${escapeHtml(c.stream || "")}</span></td><td>${steps}</td><td>${when}</td></tr>`;
+  }).join("");
+  const table = checks.length ? `<div class="connections-table-wrap"><table class="connections-table"><thead><tr><th>Provider</th><th>Script · manifest · keys</th><th>Checked</th></tr></thead><tbody>${rows}</tbody></table></div>` : "";
+  return `<h4>Does the provider work through it?</h4>${form}${table}`;
 }
 
 function refreshProxyDialog() {
@@ -3058,6 +3125,7 @@ async function setStreamVideoQuality(streamId, rep) {
 }
 
 $("#proxyDialogBody").addEventListener("change", (event) => {
+  if (event.target.id === "proxyCheckStream" && proxyDialogId) proxyCheckChoice[proxyDialogId] = event.target.value;
   const select = event.target.closest("[data-stream-quality]");
   if (select && select.value) setStreamVideoQuality(select.dataset.streamQuality, select.value);
 });
@@ -3067,6 +3135,9 @@ $("#proxyDialogBody").addEventListener("click", async (event) => {
   const forget = event.target.closest("[data-proxy-forget]");
   if (retest) proxyAction("/api/proxies/test", { id: retest.dataset.proxyRetest }, "Proxy test queued.");
   if (forget) { await proxyAction("/api/proxies/forget", { id: forget.dataset.proxyForget }); $("#proxyDialog").close(); }
+  if (event.target.closest("[data-proxy-check]") && proxyDialogId) {
+    proxyAction("/api/proxies/check", { id: proxyDialogId, streamId: $("#proxyCheckStream").value }, "Provider check started.");
+  }
   if (!event.target.closest("[data-proxy-bulk]")) return;
   const p = lastProxies.find((x) => x.id === proxyDialogId);
   const height = Number($("#proxyDialogBulk").value);

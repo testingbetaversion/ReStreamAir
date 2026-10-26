@@ -2238,6 +2238,42 @@ static int proxytest_connections(const char *proxy, char *refused, size_t cap) {
     return n;
 }
 
+// Where the proxy server itself sits, looked up directly (not through it) by
+// the address curl connected to. A proxy that refuses its login still has a
+// country this way; the exit columns stay empty until it lets a request out.
+static void proxytest_locate_server(CURL *c, const char *proxy, rs_json *r) {
+    char *ip = NULL, label[80], host[256];
+    int port = 0;
+    // A proxy that never answered leaves curl no address; use the proxy's own
+    // when it is written as one.
+    if (curl_easy_getinfo(c, CURLINFO_PRIMARY_IP, &ip) != CURLE_OK || !ip || !ip[0]) {
+        proxy_label(proxy, label, sizeof(label));
+        if (!label_host_port(label, proxy, host, sizeof(host), &port)) return;
+        bool v4 = strchr(host, '.') && strspn(host, "0123456789.") == strlen(host);
+        bool v6 = strchr(host, ':') && strspn(host, "0123456789abcdefABCDEF:.") == strlen(host);
+        if (!v4 && !v6) return;
+        ip = host;
+    }
+    rs_json_obj_set_str(r, "proxyIp", ip);
+    char url[128], err[CURL_ERROR_SIZE];
+    snprintf(url, sizeof(url), "https://ipinfo.io/%s/json", ip);
+    CURL *g = proxytest_handle("", url, 10000, err);
+    if (!g) return;
+    http_buf body = {NULL, 0, 0};
+    curl_easy_setopt(g, CURLOPT_PROXY, "");
+    curl_easy_setopt(g, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(g, CURLOPT_WRITEDATA, &body);
+    long code = 0;
+    if (curl_easy_perform(g) == CURLE_OK) curl_easy_getinfo(g, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_cleanup(g);
+    rs_json *m = code == 200 && body.data ? rs_json_parse(body.data, body.len) : NULL;
+    free(body.data);
+    if (rs_json_obj_str(m, "country", "")[0]) rs_json_obj_set_str(r, "proxyCountry", rs_json_obj_str(m, "country", ""));
+    if (rs_json_obj_str(m, "city", "")[0]) rs_json_obj_set_str(r, "proxyCity", rs_json_obj_str(m, "city", ""));
+    if (rs_json_obj_str(m, "org", "")[0]) rs_json_obj_set_str(r, "proxyIsp", rs_json_obj_str(m, "org", ""));
+    rs_json_free(m);
+}
+
 static rs_json *proxytest_run(const char *proxy) {
     rs_json *r = proxytest_fresh(proxy, "done");
     rs_json_obj_set_int(r, "testedAt", (long long)time(NULL));
@@ -2256,6 +2292,7 @@ static rs_json *proxytest_run(const char *proxy) {
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
     curl_easy_getinfo(c, CURLINFO_HTTP_CONNECTCODE, &connect_code);
     curl_easy_getinfo(c, CURLINFO_STARTTRANSFER_TIME, &ttfb);
+    proxytest_locate_server(c, proxy, r);
     // Only a proxy that cannot carry the request fails the test; a refused
     // location lookup just leaves the exit columns empty.
     if (rc != CURLE_OK || code == 407 || (connect_code && connect_code != 200)) {
@@ -2356,7 +2393,9 @@ char *rs_net_proxy_test(const char *proxy, int mode) {
     } else if (proxy && proxy[0]) {
         const char *url = NULL;
         rs_json *r = proxytest_find_locked(proxy, &url);
-        if (mode == RS_PROXYTEST_FORGET) {
+        if (mode == RS_PROXYTEST_URL) {
+            if (r) { out = rs_json_new_obj(); rs_json_obj_set_str(out, "url", url); }
+        } else if (mode == RS_PROXYTEST_FORGET) {
             char *key = r ? rs_strdup(url) : NULL;
             if (key) { rs_json_obj_remove(g_ptests.root, key); rs_state_save(&g_ptests); }
             free(key);

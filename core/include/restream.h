@@ -156,9 +156,10 @@ void restream_server_set_traffic_handler(restream_proxy_stats_fn proxies,
 // The proxy tester behind the server view's proxy list. `proxy` is a proxy URL
 // or a result's id. READ returns the stored result and queues a test for a
 // proxy never seen before; RETEST queues it again; FORGET drops it; LIST
-// (proxy NULL) returns every stored result as an array. Returns malloc'd JSON
-// (freed with free), or NULL for an id that names nothing.
-enum { RS_PROXYTEST_READ, RS_PROXYTEST_RETEST, RS_PROXYTEST_FORGET, RS_PROXYTEST_LIST };
+// (proxy NULL) returns every stored result as an array; URL returns {"url"}
+// for a stored proxy (server-side only, it carries the password). Returns
+// malloc'd JSON (freed with free), or NULL for an id that names nothing.
+enum { RS_PROXYTEST_READ, RS_PROXYTEST_RETEST, RS_PROXYTEST_FORGET, RS_PROXYTEST_LIST, RS_PROXYTEST_URL };
 typedef char *(*restream_proxy_test_fn)(const char *proxy, int mode);
 void restream_server_set_proxy_test_handler(restream_proxy_test_fn handler);
 

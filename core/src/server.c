@@ -2109,6 +2109,9 @@ static rs_json *proxy_test_call(const char *proxy, int mode) {
 }
 
 static const char *selected_video_rep(const rs_json *stream);
+static bool stream_wants_drm_discovery(const rs_json *provider, const rs_json *stream);
+static int proxy_check_start(restream_server_t *s, const char *proxy_id, const char *stream_id, const char **err);
+static rs_json *proxy_checks_for(const char *proxy_id);
 
 // True when one of the newline-separated proxy URLs in `text` is `url`.
 static bool proxy_text_has(const char *text, const char *url) {
@@ -2196,6 +2199,10 @@ static rs_json *proxies_view(restream_server_t *s) {
         rs_json_arr_push(list, r);
     }
     rs_json_free(stored);
+    for (size_t k = 0; k < rs_json_arr_len(list); k++) {
+        rs_json *r = (rs_json *)rs_json_arr_at(list, k);
+        rs_json_obj_set(r, "providerChecks", proxy_checks_for(rs_json_obj_str(r, "id", "")));
+    }
     rs_json_free(by_url);
     rs_json *out = rs_json_new_obj();
     rs_json_obj_set(out, "proxies", list);
@@ -3331,6 +3338,22 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         free(id); free(proxy);
         if (!r) { reply_error(c, 404, "Unknown proxy."); return true; }
         reply_json(c, 200, r, NULL);
+        return true;
+    }
+
+    // POST /api/proxies/check {id, streamId}: does the stream's provider script
+    // work through this proxy? Runs in the background; results show up in
+    // /api/proxies as each proxy's providerChecks.
+    if (mg_match(hm->uri, mg_str("/api/proxies/check"), NULL) && method_is(hm, "POST")) {
+        if (!g_proxy_test_handler) { reply_error(c, 501, "Proxy testing is not available in this build."); return true; }
+        rs_json *body = parse_body(hm);
+        const char *err = NULL;
+        int rc = proxy_check_start(s, rs_json_obj_str(body, "id", ""), rs_json_obj_str(body, "streamId", ""), &err);
+        rs_json_free(body);
+        if (rc != 0) { reply_error(c, -rc, err); return true; }
+        rs_json *ok = rs_json_new_obj();
+        rs_json_obj_set_bool(ok, "started", true);
+        reply_json(c, 202, ok, NULL);
         return true;
     }
 
@@ -6241,6 +6264,182 @@ static rs_stream_start *stream_start_snapshot(const rs_json *provider, const rs_
     st->required_kid = rs_strdup(rs_json_obj_str(stream, "requiredKid", ""));
 
     return st;
+}
+
+// --- Provider checks: does a provider's script work through one proxy? ---
+//
+// A dry run of the stream's own start (manifest action, manifest fetch, cdm
+// action) with one proxy forced for the script, the manifest and the media,
+// and no stored keys, so the cdm action must license through it. Nothing it
+// learns is saved to the stream. Results are kept in memory by proxy id and
+// provider id; the run is logged under "proxycheck:<proxy id>".
+
+static rs_json *g_proxy_checks;  // {proxyId: {providerId: result}}
+static pthread_mutex_t g_proxy_checks_mu = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+    restream_server_t *server;
+    rs_stream_start *st;
+    char *proxy_id, *provider_id, *sid;
+    rs_json *result;  // the running entry; filled in, then stored
+} proxy_check_job;
+
+static void proxy_check_store(const char *proxy_id, const char *provider_id, rs_json *result) {
+    pthread_mutex_lock(&g_proxy_checks_mu);
+    if (!g_proxy_checks) g_proxy_checks = rs_json_new_obj();
+    if (!rs_json_obj_get(g_proxy_checks, proxy_id)) rs_json_obj_set(g_proxy_checks, proxy_id, rs_json_new_obj());
+    rs_json_obj_set((rs_json *)rs_json_obj_get(g_proxy_checks, proxy_id), provider_id, result);
+    pthread_mutex_unlock(&g_proxy_checks_mu);
+}
+
+// Every check of one proxy, as an array. Caller frees.
+static rs_json *proxy_checks_for(const char *proxy_id) {
+    rs_json *out = rs_json_new_arr();
+    pthread_mutex_lock(&g_proxy_checks_mu);
+    const rs_json *by_provider = g_proxy_checks ? rs_json_obj_get(g_proxy_checks, proxy_id) : NULL;
+    for (size_t i = 0; by_provider && i < rs_json_obj_len(by_provider); i++)
+        rs_json_arr_push(out, rs_json_clone(rs_json_obj_value_at(by_provider, i)));
+    pthread_mutex_unlock(&g_proxy_checks_mu);
+    return out;
+}
+
+static void proxy_check_step(rs_json *steps, const char *name, const char *state, const char *detail) {
+    rs_json *step = rs_json_new_obj();
+    rs_json_obj_set_str(step, "name", name);
+    rs_json_obj_set_str(step, "state", state);  // ok | failed | skipped
+    rs_json_obj_set_str(step, "detail", detail);
+    rs_json_arr_push(steps, step);
+}
+
+static void *proxy_check_worker(void *arg) {
+    proxy_check_job *job = (proxy_check_job *)arg;
+    rs_stream_start *st = job->st;
+    rs_json *steps = rs_json_new_arr();
+    char detail[320];
+    bool ok = true;
+    const char *source = st->url;
+    bool want_cdm = st->want_cdm;
+    log_record(job->server, job->sid, "info", "proxyCheck", NULL, 0, -1,
+               rs_json_obj_str(job->result, "stream", ""));
+
+    if (st->want_manifest) {
+        st->want_cdm = false;  // the worker runs only the manifest action here
+        stream_start_worker(job->server, job->sid, st);
+        if (st->err[0]) {
+            proxy_check_step(steps, "Script", "failed", st->err);
+            ok = false;
+        } else {
+            if (st->manifest_applied) source = st->manifest_url;
+            proxy_check_step(steps, "Script", "ok", "the manifest action returned a session URL");
+        }
+    } else {
+        proxy_check_step(steps, "Script", "skipped", st->script_path[0]
+            ? "this stream does not get its URL from the manifest action"
+            : "this provider has no script");
+    }
+
+    if (ok) {
+        size_t len = 0;
+        char *doc = source && source[0] ? stream_start_fetch(st, source, &len) : NULL;
+        const char *kind = !doc ? NULL : strstr(doc, "<MPD") ? "MPD" : strstr(doc, "#EXTM3U") ? "HLS playlist" : NULL;
+        if (!source || !source[0]) snprintf(detail, sizeof(detail), "the stream has no source URL");
+        else if (!doc) snprintf(detail, sizeof(detail), "could not fetch the manifest through this proxy (refused, blocked or timed out)");
+        else if (!kind) snprintf(detail, sizeof(detail), "it answered, but not with a manifest (%lu bytes)", (unsigned long)len);
+        else snprintf(detail, sizeof(detail), "%s fetched, %lu bytes", kind, (unsigned long)len);
+        ok = kind != NULL;
+        proxy_check_step(steps, "Manifest", ok ? "ok" : "failed", detail);
+        free(doc);
+    } else {
+        proxy_check_step(steps, "Manifest", "skipped", "needs the script's session URL first");
+    }
+
+    if (ok && want_cdm) {
+        st->want_cdm = true;
+        stream_start_resolve_all_keys(job->server, job->sid, st, source);
+        int pairs = 0;
+        for (const char *k = st->keys ? st->keys : ""; *k; k++) pairs += *k == ':';
+        if (st->err[0]) { proxy_check_step(steps, "Keys", "failed", st->err); ok = false; }
+        else if (pairs) {
+            snprintf(detail, sizeof(detail), "the cdm action returned %d key(s) for the manifest's KIDs", pairs);
+            proxy_check_step(steps, "Keys", "ok", detail);
+        } else proxy_check_step(steps, "Keys", "skipped", "no DRM found in the manifest, so no keys are needed");
+    } else {
+        proxy_check_step(steps, "Keys", "skipped", !ok ? "needs the manifest first"
+            : "this provider's script has no cdm action");
+    }
+
+    rs_json_obj_set_str(job->result, "state", ok ? "ok" : "failed");
+    rs_json_obj_set_int(job->result, "checkedAt", (long long)time(NULL));
+    rs_json_obj_set(job->result, "steps", steps);
+    log_record(job->server, job->sid, ok ? "info" : "error", "proxyCheck", NULL, 0, -1,
+               ok ? "the provider works through this proxy" : "the provider does not work through this proxy");
+    proxy_check_store(job->proxy_id, job->provider_id, job->result);
+    stream_start_free(st);
+    free(job->proxy_id); free(job->provider_id); free(job->sid); free(job);
+    return NULL;
+}
+
+// Starts a check of `stream_id`'s provider through the proxy with `proxy_id`.
+// Returns 0, or a negative HTTP status with *err set.
+static int proxy_check_start(restream_server_t *s, const char *proxy_id, const char *stream_id, const char **err) {
+    rs_json *found = proxy_test_call(proxy_id, RS_PROXYTEST_URL);
+    char *url = rs_strdup(rs_json_obj_str(found, "url", ""));
+    rs_json_free(found);
+    const rs_json *stream = rs_panel_find_stream(&s->state, stream_id);
+    const rs_json *provider = stream ? provider_of(&s->state, stream) : NULL;
+    if (!url[0]) { free(url); *err = "Unknown proxy."; return -404; }
+    if (!provider) { free(url); *err = "Stream not found."; return -404; }
+    const char *pid = rs_json_obj_str(provider, "id", "");
+    pthread_mutex_lock(&g_proxy_checks_mu);
+    const rs_json *prev = g_proxy_checks ? rs_json_obj_get(rs_json_obj_get(g_proxy_checks, proxy_id), pid) : NULL;
+    bool busy = prev && !strcmp(rs_json_obj_str(prev, "state", ""), "running");
+    pthread_mutex_unlock(&g_proxy_checks_mu);
+    if (busy) { free(url); *err = "This provider is already being checked through this proxy."; return -409; }
+
+    rs_json *pc = rs_json_clone(provider), *sc = rs_json_clone(stream);
+    rs_json_obj_set_str(pc, "proxy", url);
+    rs_json_obj_set_str(sc, "proxy", url);
+    rs_json_obj_set_bool(sc, "proxyScript", true);
+    rs_json_obj_set_bool(sc, "proxyManifest", true);
+    rs_json_obj_set_bool(sc, "proxyMedia", true);
+    rs_json_obj_set_str(sc, "decryptionKeys", "");
+    rs_json_obj_set_str(sc, "requiredKid", "");
+    free(url);
+    bool want_manifest = rs_json_obj_bool(sc, "sessionManifest", false)
+        && rs_panel_script_action_allowed(pc, sc, "manifest");
+    rs_stream_start *st = stream_start_snapshot(pc, sc, want_manifest, stream_wants_drm_discovery(pc, sc));
+    rs_json_free(pc);
+    rs_json_free(sc);
+    proxy_check_job *job = (proxy_check_job *)calloc(1, sizeof(*job));
+    if (!st || !job) { stream_start_free(st); free(job); *err = "Out of memory."; return -500; }
+    st->reuse_manifest = false;  // the check is whether a new session works through it
+    st->rotate_proxies = false;
+    job->server = s;
+    job->st = st;
+    job->proxy_id = rs_strdup(proxy_id);
+    job->provider_id = rs_strdup(pid);
+    char sid[64];
+    snprintf(sid, sizeof(sid), "proxycheck:%s", proxy_id);
+    job->sid = rs_strdup(sid);
+    job->result = rs_json_new_obj();
+    rs_json_obj_set_str(job->result, "providerId", pid);
+    rs_json_obj_set_str(job->result, "provider", rs_json_obj_str(provider, "name", ""));
+    rs_json_obj_set_str(job->result, "streamId", stream_id);
+    rs_json_obj_set_str(job->result, "stream", rs_json_obj_str(stream, "name", ""));
+    rs_json_obj_set_str(job->result, "state", "running");
+    rs_json_obj_set_int(job->result, "startedAt", (long long)time(NULL));
+    proxy_check_store(proxy_id, pid, rs_json_clone(job->result));
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, proxy_check_worker, job) != 0) {
+        rs_json_obj_set_str(job->result, "state", "failed");
+        proxy_check_store(proxy_id, pid, job->result);
+        stream_start_free(st);
+        free(job->proxy_id); free(job->provider_id); free(job->sid); free(job);
+        *err = "Could not start the check.";
+        return -500;
+    }
+    pthread_detach(tid);
+    return 0;
 }
 
 // Preserve CDN order and skip duplicate/invalid entries. A variant is rebased
