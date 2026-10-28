@@ -66,7 +66,7 @@ The most useful controls are:
 | HLS segment | Approximate output segment duration. Ten seconds is a good default. |
 | Keep count | Old segments retained for players that fall behind. |
 | Download ahead | How far the engine prefetches. |
-| Parallel downloads | Origin media connections shared across the stream's renditions. |
+| Parallel downloads | Origin media requests in flight, shared across the stream's renditions. The DASH engine starts here and adapts (see the provider's Fixed parallel downloads option). |
 | Poll seconds | How often a live MPD is refreshed. |
 | Playout buffer | Extra delay used to ride through short origin outages. |
 | Audio delay | Positive or negative lip-sync correction in milliseconds. |
@@ -202,7 +202,7 @@ Start with the short working example in [SCRIPTING.md](SCRIPTING.md#five-minute-
 
 ## Decryption
 
-For DASH CENC, enter one or more `KID:KEY` hex pairs. A single pair is used for all samples; multiple pairs are matched by KID. Full-sample `cenc`/AES-CTR is supported. `cbcs` pattern encryption is not.
+For DASH CENC, enter one or more `KID:KEY` hex pairs. A single pair is used for all samples; multiple pairs are matched by KID. All four ISO/IEC 23001-7 schemes are decrypted in process, full-sample or per subsample: `cenc` (AES-CTR), `cens` (AES-CTR with a crypt/skip pattern), `cbc1` (AES-CBC) and `cbcs` (AES-CBC with a pattern, usually with a constant IV). The scheme, pattern and IV come from the init segment's `schm` and `tenc`. HLS SAMPLE-AES inside TS segments, and Smooth Streaming, are not supported.
 
 For HLS AES-128, enter the key and optional IV. If the IV is blank, the media sequence number is used as required by HLS.
 
@@ -335,7 +335,7 @@ Internal live segments are held in bounded memory, not written to disk.
 - **`/play` stays at 503:** open Logs and check the manifest fetch or pipeline start.
 - **Players request missing segments:** raise Keep count and possibly Playlist count.
 - **Origin returns 403/429:** inspect the logged response, reduce poll frequency or parallel downloads, and verify headers/proxy/account limits.
-- **No picture after downloading:** verify the stream's KID/key pair and confirm the encryption mode is `cenc`, not `cbcs`.
+- **No picture after downloading:** verify the stream's KID/key pair. The `initReady` log line names the track's scheme (`cenc`, `cens`, `cbc1` or `cbcs`), IV size and pattern.
 - **Audio is out of sync:** adjust Audio delay in the stream editor.
 - **`Too many open files` or `fileQueueFull` in Logs:** raise the hard limit (`LimitNOFILE=` in the systemd unit, `ulimit -Hn`, or Docker's `--ulimit nofile=`), or set `--max-open-files` explicitly.
 - **Static MPD is rejected:** enable Allow offline/static MPD.

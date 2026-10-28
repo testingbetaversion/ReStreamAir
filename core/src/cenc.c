@@ -243,18 +243,49 @@ static void neutralize_pssh(uint8_t *bytes, const rs_mp4_box *boxes, size_t coun
     for (size_t i = 0; i < count; i++) if (strcmp(boxes[i].type, "pssh") == 0) retype_to_free(bytes, &boxes[i]);
 }
 
+// tenc payload: [version 1][flags 3][reserved 1][crypt<<4|skip 1 (version
+// >= 1, else reserved)][isProtected 1][Per_Sample_IV_Size 1][KID 16], then,
+// when protected with an IV size of 0, [constant_IV_size 1][constant_IV].
+static void read_tenc(const uint8_t *b, const rs_mp4_box *tenc, rs_cenc_track *t) {
+    size_t p = tenc->payload_start;
+    uint8_t version = b[p];
+    t->iv_size = b[p + 7];
+    if (version >= 1) {
+        t->crypt_blocks = b[p + 5] >> 4;
+        t->skip_blocks = b[p + 5] & 0x0F;
+    }
+    if (b[p + 6] && t->iv_size == 0 && p + 25 <= tenc->end) {
+        size_t n = b[p + 24];
+        if (n > 16) n = 16;
+        if (p + 25 + n <= tenc->end) {
+            memcpy(t->constant_iv, b + p + 25, n);
+            t->constant_iv_size = (int)n;
+        }
+    }
+}
+
 uint8_t* rs_cenc_patch_init(const uint8_t *data, size_t len, size_t *out_len,
                             char **out_kid_hex, int *out_iv_size) {
+    rs_cenc_track track;
+    uint8_t *out = rs_cenc_patch_init_track(data, len, out_len, out_kid_hex, &track);
+    if (out_iv_size) *out_iv_size = track.iv_size;
+    return out;
+}
+
+uint8_t* rs_cenc_patch_init_track(const uint8_t *data, size_t len, size_t *out_len,
+                                  char **out_kid_hex, rs_cenc_track *out_track) {
     if (out_kid_hex) *out_kid_hex = NULL;
-    if (out_iv_size) *out_iv_size = 0;
+    rs_cenc_track cap_track;
+    memset(&cap_track, 0, sizeof(cap_track));
+    if (out_track) *out_track = cap_track;
     uint8_t *bytes = malloc(len);
     if (!bytes) return NULL;
     memcpy(bytes, data, len);
     size_t cur_len = len;
     // Captured once from the first protected track's tenc, before the sinf that
     // contains it is excised: the default KID (to pick the key) and per-sample
-    // IV size (to parse senc). Mirrors CENCDecryptor's defaultKIDHex/IVSize.
-    char *cap_kid = NULL; int cap_iv = 0;
+    // IV size (to parse senc), plus the scheme and its pattern or constant IV.
+    char *cap_kid = NULL;
     while (true) {
         size_t tc = 0; rs_mp4_box *top = parse_boxes(bytes, 0, cur_len, &tc);
         if (!top) break;
@@ -293,9 +324,13 @@ uint8_t* rs_cenc_patch_init(const uint8_t *data, size_t len, size_t *out_len,
                                 rs_mp4_box *schi = find_box(sinf->children, sinf->children_count, "schi");
                                 rs_mp4_box *tenc = schi ? find_box(schi->children, schi->children_count, "tenc") : NULL;
                                 if (tenc && tenc->payload_start + 24 <= tenc->end) {
-                                    cap_iv = bytes[tenc->payload_start + 7];
+                                    read_tenc(bytes, tenc, &cap_track);
                                     char hex[33]; hex_encode(bytes + tenc->payload_start + 8, 16, hex);
                                     cap_kid = rs_strdup(hex);
+                                    // schm: [version/flags 4][scheme_type 4][scheme_version 4]
+                                    rs_mp4_box *schm = find_box(sinf->children, sinf->children_count, "schm");
+                                    if (schm && schm->payload_start + 8 <= schm->end)
+                                        read_fourcc(bytes, schm->payload_start + 4, cap_track.scheme);
                                 }
                             }
                             ss = sinf->start; se = sinf->end; eto = e->start + 4;
@@ -334,7 +369,7 @@ uint8_t* rs_cenc_patch_init(const uint8_t *data, size_t len, size_t *out_len,
     }
     *out_len = cur_len;
     if (out_kid_hex) *out_kid_hex = cap_kid; else rs_free(cap_kid);
-    if (out_iv_size) *out_iv_size = cap_iv;
+    if (out_track) *out_track = cap_track;
     return bytes;
 }
 
@@ -365,7 +400,8 @@ static void free_samples(cenc_sample *s, size_t n) {
 }
 
 // Per-sample IVs (+ optional subsample clear/encrypted split) from a senc box.
-// `iv_size` is the tenc default (senc carries no IV size of its own).
+// `iv_size` is the tenc default (senc carries no IV size of its own); 0 with
+// a constant IV, when senc holds only the subsample split.
 static cenc_sample* parse_senc(const uint8_t *b, const rs_mp4_box *senc, int iv_size, size_t *out_n) {
     *out_n = 0;
     size_t off = senc->payload_start;
@@ -373,7 +409,7 @@ static cenc_sample* parse_senc(const uint8_t *b, const rs_mp4_box *senc, int iv_
     uint32_t flags = read_u32(b, off) & 0x00FFFFFF; off += 4;
     size_t count = read_u32(b, off); off += 4;
     bool has_sub = (flags & 0x2) != 0;
-    int ivs = iv_size > 0 ? iv_size : 8; if (ivs > 16) ivs = 16;
+    int ivs = iv_size < 0 ? 0 : iv_size > 16 ? 16 : iv_size;
     if (count == 0) return NULL;
     cenc_sample *res = calloc(count, sizeof(cenc_sample));
     if (!res) return NULL;
@@ -434,7 +470,7 @@ static cenc_sample* parse_saiz_saio(const uint8_t *b, const rs_mp4_box *saiz, co
     if (saio_ver == 0) { if (q + 4 > saio->end) { rs_free(sizes); return NULL; } first_off = read_u32(b, q); }
     else { if (q + 8 > saio->end) { rs_free(sizes); return NULL; } first_off = read_u64(b, q); }
 
-    int ivs = iv_size > 0 ? iv_size : 8; if (ivs > 16) ivs = 16;
+    int ivs = iv_size < 0 ? 0 : iv_size > 16 ? 16 : iv_size;
     size_t offset = moof_start + first_off;
     cenc_sample *res = calloc(count, sizeof(cenc_sample));
     if (!res) { rs_free(sizes); return NULL; }
@@ -512,30 +548,111 @@ static cenc_range* sample_byte_ranges(const uint8_t *b, const rs_mp4_box *trun, 
     return ranges;
 }
 
-// AES-CTR one sample. An empty subsample list means the whole sample is
-// encrypted (the norm for audio); the keystream carries across subsamples.
+// One protected byte range under AES-CTR. With a pattern, `crypt` blocks of
+// 16 bytes are encrypted and the next `skip` are clear, repeating; a tail
+// shorter than one encrypted run stays clear, and only encrypted bytes move
+// the keystream on (ISO/IEC 23001-7 'cens'; the same rule as FFmpeg).
+static void ctr_range(rs_aes_ctr *ctr, uint8_t *p, size_t n, int crypt, int skip) {
+    if (crypt <= 0) { rs_aes_ctr_process(ctr, p, n); return; }
+    size_t c = (size_t)crypt * 16, s = (size_t)skip * 16;
+    while (n >= c) {
+        rs_aes_ctr_process(ctr, p, c);
+        p += c; n -= c;
+        size_t k = n < s ? n : s;
+        p += k; n -= k;
+    }
+}
+
+// AES-CBC decrypt of whole blocks in place; `iv` carries the chain on.
+static void cbc_blocks(const rs_aes *aes, uint8_t *p, size_t nblocks, uint8_t iv[16]) {
+    uint8_t ct[16], pt[16];
+    for (size_t i = 0; i < nblocks; i++, p += 16) {
+        memcpy(ct, p, 16);
+        rs_aes_decrypt_block(aes, ct, pt);
+        for (int j = 0; j < 16; j++) p[j] = pt[j] ^ iv[j];
+        memcpy(iv, ct, 16);
+    }
+}
+
+// One protected byte range under AES-CBC, with the same pattern rule as
+// ctr_range ('cbcs'); without one, every whole block ('cbc1'). A partial last
+// block is always clear.
+static void cbc_range(const rs_aes *aes, uint8_t *p, size_t n, int crypt, int skip, uint8_t iv[16]) {
+    if (crypt <= 0) { cbc_blocks(aes, p, n / 16, iv); return; }
+    size_t c = (size_t)crypt * 16, s = (size_t)skip * 16;
+    while (n >= c) {
+        cbc_blocks(aes, p, (size_t)crypt, iv);
+        p += c; n -= c;
+        size_t k = n < s ? n : s;
+        p += k; n -= k;
+    }
+}
+
+typedef struct {
+    bool cbc;          // cbc1/cbcs, else cenc/cens (CTR)
+    bool iv_per_sub;   // cbcs: every subsample restarts from the sample's IV
+    int crypt, skip;   // pattern; 0 = none
+    rs_aes aes;        // the key schedule, for CBC
+} cenc_mode;
+
+// Decrypts one sample. An empty subsample list means the whole sample is
+// protected (the norm for audio), with no pattern. Under CTR the keystream,
+// and under 'cbc1' the CBC chain, carries across subsamples.
 static void decrypt_sample(uint8_t *b, size_t total, size_t start, size_t size,
-                           const uint8_t *iv, const cenc_sub *subs, size_t nsub, const uint8_t *key) {
+                           const uint8_t *iv, const cenc_sub *subs, size_t nsub,
+                           const uint8_t *key, const cenc_mode *mode) {
     if (start + size > total) return;
+    uint8_t chain[16];
+    memcpy(chain, iv, 16);
     rs_aes_ctr ctr;
-    if (rs_aes_ctr_init(&ctr, key, 16, iv, 16) != 0) return;
+    if (!mode->cbc && rs_aes_ctr_init(&ctr, key, 16, iv, 16) != 0) return;
     size_t cursor = start;
     if (nsub == 0) {
-        rs_aes_ctr_process(&ctr, b + cursor, size);
+        if (mode->cbc) cbc_blocks(&mode->aes, b + cursor, size / 16, chain);
+        else rs_aes_ctr_process(&ctr, b + cursor, size);
         return;
     }
     for (size_t j = 0; j < nsub; j++) {
         cursor += subs[j].clear;
-        if (subs[j].enc > 0) {
-            if (cursor + subs[j].enc > total) return;
-            rs_aes_ctr_process(&ctr, b + cursor, subs[j].enc);
-            cursor += subs[j].enc;
+        if (subs[j].enc == 0) continue;
+        if (cursor + subs[j].enc > total) return;
+        if (mode->cbc) {
+            if (mode->iv_per_sub) memcpy(chain, iv, 16);
+            cbc_range(&mode->aes, b + cursor, subs[j].enc, mode->crypt, mode->skip, chain);
+        } else {
+            ctr_range(&ctr, b + cursor, subs[j].enc, mode->crypt, mode->skip);
         }
+        cursor += subs[j].enc;
     }
 }
 
 uint8_t* rs_cenc_decrypt_segment(const uint8_t *data, size_t len, size_t *out_len,
                                  const uint8_t *key, int iv_size) {
+    rs_cenc_track track;
+    memset(&track, 0, sizeof(track));
+    track.iv_size = iv_size;
+    return rs_cenc_decrypt_segment_track(data, len, out_len, key, &track);
+}
+
+uint8_t* rs_cenc_decrypt_segment_track(const uint8_t *data, size_t len, size_t *out_len,
+                                       const uint8_t *key, const rs_cenc_track *track) {
+    rs_cenc_track none;
+    memset(&none, 0, sizeof(none));
+    if (!track) track = &none;
+    cenc_mode mode;
+    memset(&mode, 0, sizeof(mode));
+    const char *scheme = track->scheme;
+    mode.cbc = !strcmp(scheme, "cbc1") || !strcmp(scheme, "cbcs");
+    mode.iv_per_sub = !strcmp(scheme, "cbcs");
+    if (!strcmp(scheme, "cens") || !strcmp(scheme, "cbcs")) {
+        mode.crypt = track->crypt_blocks;
+        mode.skip = track->skip_blocks;
+    }
+    if (mode.cbc && key && rs_aes_init(&mode.aes, key, 16) != 0) key = NULL;
+    // IVs in senc are this long; 0 means every sample uses the constant IV.
+    bool constant = track->iv_size <= 0 && track->constant_iv_size > 0;
+    int iv_size = constant ? 0 : track->iv_size > 0 ? track->iv_size : 8;
+
     uint8_t *bytes = malloc(len ? len : 1);
     if (!bytes) return NULL;
     memcpy(bytes, data, len);
@@ -564,12 +681,20 @@ uint8_t* rs_cenc_decrypt_segment(const uint8_t *data, size_t len, size_t *out_le
                 rs_mp4_box *saio = find_box(traf->children, traf->children_count, "saio");
                 if (saiz && saio) info = parse_saiz_saio(bytes, saiz, saio, moof->start, iv_size, len, &ninfo);
             }
-            if (!info || ninfo == 0) { free_samples(info, ninfo); continue; }
-
+            // A constant IV with no senc at all: every sample is protected
+            // whole, so all that is missing is one IV entry per sample.
             rs_mp4_box *trun = find_box(traf->children, traf->children_count, "trun");
             rs_mp4_box *tfhd = find_box(traf->children, traf->children_count, "tfhd");
             size_t nrange = 0;
             cenc_range *ranges = trun ? sample_byte_ranges(bytes, trun, tfhd, moof->start, &nrange) : NULL;
+            if (!info && constant && nrange) {
+                info = calloc(nrange, sizeof(cenc_sample));
+                if (info) ninfo = nrange;
+            }
+            if (!info || ninfo == 0) { rs_free(ranges); free_samples(info, ninfo); continue; }
+            if (constant)
+                for (size_t s = 0; s < ninfo; s++) memcpy(info[s].iv, track->constant_iv, 16);
+
             // A sample-count mismatch means we can't safely align IVs to samples;
             // leave this traf encrypted (and its senc/saiz intact) rather than
             // strip the signalling off still-ciphertext samples.
@@ -577,7 +702,7 @@ uint8_t* rs_cenc_decrypt_segment(const uint8_t *data, size_t len, size_t *out_le
 
             for (size_t s = 0; s < nrange; s++) {
                 decrypt_sample(bytes, len, ranges[s].start, ranges[s].size,
-                               info[s].iv, info[s].subs, info[s].nsub, key);
+                               info[s].iv, info[s].subs, info[s].nsub, key, &mode);
             }
             rs_free(ranges);
             free_samples(info, ninfo);

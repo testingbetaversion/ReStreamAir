@@ -42,12 +42,36 @@ char** rs_cenc_detect_protection(const uint8_t *data, size_t len, size_t *count)
 uint8_t* rs_cenc_patch_init(const uint8_t *data, size_t len, size_t *out_len,
                             char **out_kid_hex, int *out_iv_size);
 
-// Decrypt a CENC 'cenc' (AES-128-CTR, full-sample or per-subsample) media
-// fragment in place. `key` is the 16-byte clear key for the track's KID;
-// `iv_size` is the tenc per-sample IV size from rs_cenc_patch_init (8 or 16;
-// <=0 falls back to 8). Neutralizes senc/saiz/saio/seig and pssh once samples
-// are clear. Returns malloc'd bytes (caller frees), or a copy of the input when
-// there is nothing to decrypt.
+// How a protected track is encrypted, read from its init segment's sinf (schm
+// and tenc). All zero means unknown, which decrypts as 'cenc' with 8-byte IVs:
+// what every stream assumed before the scheme was read.
+typedef struct {
+    char scheme[5];           // "cenc", "cens", "cbc1", "cbcs", or "" (unknown)
+    int iv_size;              // per-sample IV size; 0 when a constant IV is used
+    uint8_t crypt_blocks;     // pattern (cens, cbcs): this many 16-byte blocks
+    uint8_t skip_blocks;      // encrypted, then this many clear; 0/0 = no pattern
+    uint8_t constant_iv[16];  // zero-padded
+    int constant_iv_size;     // 0 when IVs are per sample
+} rs_cenc_track;
+
+// rs_cenc_patch_init that also reports the first protected track's scheme.
+// `out_track` may be NULL; it is zeroed when nothing is protected.
+uint8_t* rs_cenc_patch_init_track(const uint8_t *data, size_t len, size_t *out_len,
+                                  char **out_kid_hex, rs_cenc_track *out_track);
+
+// Decrypt a protected media fragment in place: 'cenc' (AES-CTR), 'cens'
+// (AES-CTR with a crypt/skip pattern), 'cbc1' (AES-CBC) or 'cbcs' (AES-CBC
+// with a pattern and usually a constant IV), each full-sample or per
+// subsample. `key` is the 16-byte clear key for the track's KID; `track`
+// comes from rs_cenc_patch_init_track (NULL = 'cenc', 8-byte IVs).
+// Neutralizes senc/saiz/saio/seig and pssh once samples are clear. Returns
+// malloc'd bytes (caller frees), or a copy of the input when there is nothing
+// to decrypt.
+uint8_t* rs_cenc_decrypt_segment_track(const uint8_t *data, size_t len, size_t *out_len,
+                                       const uint8_t *key, const rs_cenc_track *track);
+
+// rs_cenc_decrypt_segment_track for a 'cenc' track with IVs of `iv_size`
+// bytes (8 or 16; <=0 falls back to 8).
 uint8_t* rs_cenc_decrypt_segment(const uint8_t *data, size_t len, size_t *out_len,
                                  const uint8_t *key, int iv_size);
 

@@ -146,8 +146,9 @@ typedef struct {
     int hls_segment_seconds;        // output fragment group duration (default 10)
     int keep_segments;              // segments held in memory (default 60)
     int download_ahead;             // segments requested per poll (default 16)
-    int parallel_downloads;         // persistent media connections per stream, shared by every
-                                    // rendition, and the in-flight request cap (default 6, cap 8)
+    int parallel_downloads;         // media requests in flight per stream, shared by every
+                                    // rendition (default 6, cap 8); the adaptive limit starts here
+    int fixed_downloads;            // non-zero: never adapt; parallel_downloads is the exact cap
     int prioritize_oldest;          // if non-zero, download the oldest segment sequentially first
     int playback_delay_seconds;     // extra live-edge hold-back, in seconds
     int audio_delay_ms;             // lip-sync shift, applied to audio only

@@ -23,6 +23,7 @@ typedef struct {
 #define C(n,l,g,c,h,i) {n,l,g,RS_JSON_STR,0,0,64,h,i,c}
 static const option_field fields[] = {
     B("alwaysResetSession", "Always reset session", "Clear saved session files before login or the first stream start while the provider is idle. Concurrent streams share their active session.", ""),
+    B("fixedParallelDownloads", "Fixed parallel downloads", "DASH engine: keep exactly each stream's Parallel downloads in flight. Off, the engine adapts: it opens up to twice as many (at most 12) while segments are waiting and fetches succeed, halves on 429/5xx/timeouts, and settles back to the setting once caught up. Connections per proxy still applies either way.", ""),
     B("noRestartOnError", "No restart on error", "DASH and FFmpeg: stop automatic recovery after an exhausted request, process failure or stall. Manual starts still work.", ""),
     B("restartFinishedBroadcast", "Restart finished broadcast", "DASH and FFmpeg: restart after the broadcast ends, using Restart delay. DASH lets its buffered media drain first.", ""),
     B("noRestartOnTrackChange", "No restart on track change", "Internal DASH: switch discovered tracks in the running engine. When off, changing track IDs schedules a clean restart.", ""),

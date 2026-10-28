@@ -7792,8 +7792,40 @@ static void serve_hls_playlist(restream_server_t *server, struct mg_connection *
     }
 }
 
+// How each KID's track is encrypted (scheme, IV size, pattern), learned when
+// its init passes through apply_cenc: a media segment says none of it. Until
+// the init has been seen, segments decrypt as 'cenc' with 8-byte IVs.
+#define RS_CENC_TRACK_CACHE 64
+static struct { char kid[33]; rs_cenc_track enc; } g_cenc_tracks[RS_CENC_TRACK_CACHE];
+static size_t g_cenc_tracks_n, g_cenc_tracks_next;
+static pthread_mutex_t g_cenc_tracks_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void cenc_track_remember(const char *kid, const rs_cenc_track *enc) {
+    pthread_mutex_lock(&g_cenc_tracks_mu);
+    size_t slot = g_cenc_tracks_n;
+    for (size_t i = 0; i < g_cenc_tracks_n; i++)
+        if (stream_start_kid_equal(g_cenc_tracks[i].kid, kid)) slot = i;
+    if (slot == g_cenc_tracks_n) {
+        if (g_cenc_tracks_n < RS_CENC_TRACK_CACHE) g_cenc_tracks_n++;
+        else { slot = g_cenc_tracks_next; g_cenc_tracks_next = (g_cenc_tracks_next + 1) % RS_CENC_TRACK_CACHE; }
+    }
+    snprintf(g_cenc_tracks[slot].kid, sizeof(g_cenc_tracks[slot].kid), "%s", kid);
+    g_cenc_tracks[slot].enc = *enc;
+    pthread_mutex_unlock(&g_cenc_tracks_mu);
+}
+
+static rs_cenc_track cenc_track_for(const char *kid) {
+    rs_cenc_track enc;
+    memset(&enc, 0, sizeof(enc));
+    pthread_mutex_lock(&g_cenc_tracks_mu);
+    for (size_t i = 0; kid && kid[0] && i < g_cenc_tracks_n; i++)
+        if (stream_start_kid_equal(g_cenc_tracks[i].kid, kid)) { enc = g_cenc_tracks[i].enc; break; }
+    pthread_mutex_unlock(&g_cenc_tracks_mu);
+    return enc;
+}
+
 // Applies ClearKey CENC to a fetched DASH/HLS item in place: patches the init
-// segment (kind=map) or AES-CTR-decrypts a media segment using the stream's
+// segment (kind=map) or decrypts a media segment (any CENC scheme) using the stream's
 // configured KID:KEY. No-op (returns the input) when no key is set. Takes the
 // raw "KID:KEY" string rather than the stream object itself so it can run on
 // pending_job_worker's copy after the stream JSON may have changed underneath.
@@ -7806,7 +7838,11 @@ static uint8_t *apply_cenc(const char *decryption_keys, const char *selected_kid
     uint8_t *out = NULL;
     if (is_map) {
         // The init needs patching to a clear codec even before any key exists.
-        out = rs_cenc_patch_init(body, body_len, out_len, NULL, NULL);
+        char *kid = NULL;
+        rs_cenc_track enc;
+        out = rs_cenc_patch_init_track(body, body_len, out_len, &kid, &enc);
+        if (kid) cenc_track_remember(kid, &enc);
+        rs_free(kid);
     } else if (keys.count > 0) {
         size_t selected = keys.count == 1 && (!selected_kid || !selected_kid[0])
                             ? 0 : keys.count;
@@ -7818,8 +7854,10 @@ static uint8_t *apply_cenc(const char *decryption_keys, const char *selected_kid
                 }
             }
         }
-        if (selected < keys.count)
-            out = rs_cenc_decrypt_segment(body, body_len, out_len, keys.keys[selected], 8);
+        if (selected < keys.count) {
+            rs_cenc_track enc = cenc_track_for(selected_kid && selected_kid[0] ? selected_kid : keys.kids[selected]);
+            out = rs_cenc_decrypt_segment_track(body, body_len, out_len, keys.keys[selected], &enc);
+        }
     }
     rs_cenc_keys_free(&keys);
     if (out) {
@@ -8355,6 +8393,7 @@ static int live_sync_stream(restream_server_t *s, const char *stream_id) {
     cfg.keep_segments = (int)rs_json_obj_int(stream, "keepSegments", 10);
     cfg.download_ahead = (int)rs_json_obj_int(stream, "downloadAhead", 20);
     cfg.parallel_downloads = (int)rs_json_obj_int(stream, "parallelDownloads", 6);
+    cfg.fixed_downloads = rs_provider_option_bool(provider, "fixedParallelDownloads") ? 1 : 0;
     cfg.prioritize_oldest = rs_json_obj_bool(stream, "prioritizeOldest", false) ? 1 : 0;
     cfg.playback_delay_seconds = (int)rs_json_obj_int(stream, "playbackDelaySeconds", 0);
     if (rs_provider_option_int(provider, "playbackDelaySeconds") > 0)

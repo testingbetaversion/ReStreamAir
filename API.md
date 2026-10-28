@@ -391,6 +391,7 @@ backend behavior; pipeline-specific controls identify their scope in the schema.
 | `useSessionCookies` | Uses the provider script cookie jar for upstream requests, with serialized built-in HTTP requests to protect the jar. |
 | `httpGetTimeoutSeconds`, `httpGetAttempts` | Per-attempt timeout and attempt limit for manifest/media/probe downloaders. Permanent 4xx responses are not retried, except 408/429. FFmpeg receives the socket timeout and uses its own reconnect policy. |
 | `maxDownloadConcurrency` | Shared provider budget for manifest/media/probe downloaders; FFmpeg owns its internal connections. |
+| `fixedParallelDownloads` | Boolean, default false. False: the DASH engine adapts its in-flight media requests (AIMD). It starts at the stream's `parallelDownloads`, climbs by about one per round of fetches while segments are waiting and fetches succeed (up to twice the setting, at most 12), halves on a 429, a 5xx or a fetch with no answer (never below 2), holds for 10 s, and drifts back to the setting once caught up. Each change is logged as a `downloadLimit` event. True: exactly `parallelDownloads`, as before. `proxyConnectionLimit` applies either way. |
 | `proxyConnectionLimit` | 0 = unlimited. Most connections kept open through each proxy in the provider's list (also a single proxy). A request waits for a free slot, or uses another proxy, rather than going over; an idle kept-alive connection gives its slot up when a request is waiting. The provider script's own requests are not counted, so set it 1–2 below the plan's limit. While requests wait, `proxyLimit` is logged at most once a minute. |
 | `manifestStallSeconds` | Default 15, 0 = off. A manifest or playlist request that receives no data at all for this long is abandoned and retried on a fresh connection or the next proxy. Slow but progressing reads and segments are not affected. |
 | `detectJsonRedirect` | Follows recognized HTTP(S) JSON URL fields at the root or under `data`, at most five hops. Relative playlist paths resolve against the final URL. |
@@ -468,7 +469,7 @@ across PUT; it is not writable through the ordinary editor route.
 | `playbackDelaySeconds` | Integer seconds, default 0, clamped 0–120. |
 | `keepSegments` | Integer, default 10, clamped 1–240. |
 | `downloadAhead` | Integer, default 20, minimum 1. |
-| `parallelDownloads` | Integer, default 6, clamped 1–8. |
+| `parallelDownloads` | Integer, default 6, clamped 1–8. The internal engine's starting in-flight limit; it adapts unless the provider sets `fixedParallelDownloads`. |
 | `pollInterval` | Number of seconds, default 0; negative values normalize to 0. See source-polling constraints above. |
 | `forceOffline`, `reducedManifestPolling`, `prioritizeOldest` | Booleans, `false`. Static MPD permission, reduced polling and backlog preference. |
 | `audioDelayMs` | Signed integer milliseconds, default 0. |
@@ -496,8 +497,8 @@ means startup was accepted, not that a playable segment is already buffered.
 `engine` runs an HLS source (`kind: "m3u8"`) on the internal live engine, the
 same one DASH streams use, instead of per-request pass-through: it follows one
 video quality (the best the provider's `defaultVideo` allows) and its audio
-track, prefetches segments in parallel, decrypts CENC fMP4 with the stream's
-keys, and offers every engine output — fMP4 HLS (`/play/<id>/index.m3u8`),
+track, prefetches segments in parallel, decrypts CENC fMP4 (`cenc`, `cens`, `cbc1`,
+`cbcs`) with the stream's keys, and offers every engine output — fMP4 HLS (`/play/<id>/index.m3u8`),
 continuous muxed MPEG-TS (`/direct/<id>.ts`) and MPEG-TS HLS
 (`/play/<id>/ts.m3u8`). Whole-segment AES-128 and byte-range playlists are
 refused; use pass-through or `hlsBuffered` for those.

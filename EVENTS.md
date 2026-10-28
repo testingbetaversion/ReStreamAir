@@ -349,6 +349,7 @@ individual events may be info or error depending on the outcome.
 | `initFetch`, `initReady`, `downloadInit`, `downloadSegment` | Origin initialization/media acquisition. |
 | `decryptSegment`, `subtitleConvert`, `discontinuity` | Decryption, TTML/WebVTT conversion and stream timeline changes. |
 | `headOfLine`, `fallingBehind`, `lagWatch`, `liveEdgeSkip` | Queue/backlog or live-edge recovery. |
+| `downloadLimit` | The engine's adaptive in-flight request limit changed (climbing while segments wait, halving on 429/5xx/no answer, easing back once caught up); not logged with `fixedParallelDownloads`. |
 | `master`, `masterCold`, `playlist`, `playlistReady` | Playlist serving and readiness. |
 | `serveInit`, `serveSegment`, `cacheMissInit`, `cacheMissSegment`, `playbackDenied` | Playback delivery/cache window/authentication. |
 | `directOpen`, `directSlow`, `download` | fMP4 direct playback or buffered downloads. |

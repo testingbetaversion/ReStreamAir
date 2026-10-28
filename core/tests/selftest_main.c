@@ -1358,7 +1358,7 @@ static void test_provider_options(void) {
 
     rs_json *view = rs_panel_view(&st, "localhost");
     const rs_json *schema = rs_json_obj_get(view, "providerOptionFields");
-    check("options/screenshot-fields", rs_json_arr_len(schema) == 48);
+    check("options/screenshot-fields", rs_json_arr_len(schema) == 49);
     {
         rs_source_policy policy;
         rs_provider_source_policy(provider, &policy);
@@ -1689,6 +1689,198 @@ static size_t open_box(uint8_t *b, size_t *n, const char *type) {
     return at;
 }
 static void close_box(uint8_t *b, size_t n, size_t at) { PUT32(b + at, (uint32_t)(n - at)); }
+
+// --- The other CENC schemes: cens, cbc1, cbcs ---------------------------------
+//
+// Each case builds a one-fragment segment, encrypts it with an encryptor
+// written here from ISO/IEC 23001-7 (not from the decryptor, so one mistake
+// cannot hide on both sides), and requires the samples back exactly:
+//   cens: AES-CTR, pattern 1:9, the keystream moving only over encrypted blocks
+//   cbc1: AES-CBC, the chain continuing across a sample's subsamples
+//   cbcs: AES-CBC, pattern 1:9, a constant IV restarting every subsample
+//   cbcs audio: no subsamples, every whole block encrypted, tail clear
+// A trailing partial block, or a tail shorter than one encrypted run, stays
+// clear in every pattern case.
+
+typedef struct { const char *scheme; int iv_size, const_iv, crypt, skip, nsub; size_t clear[2], prot[2]; size_t whole; } scheme_case;
+
+static void test_cbc_encrypt(const rs_aes *aes, uint8_t *p, size_t nblocks, uint8_t iv[16]) {
+    for (size_t i = 0; i < nblocks; i++, p += 16) {
+        uint8_t x[16];
+        for (int j = 0; j < 16; j++) x[j] = p[j] ^ iv[j];
+        rs_aes_encrypt_block(aes, x, p);
+        memcpy(iv, p, 16);
+    }
+}
+
+// Encrypts one protected range in place, the packager's way.
+static void test_encrypt_range(const scheme_case *c, const rs_aes *aes, rs_aes_ctr *ctr,
+                               uint8_t *p, size_t n, uint8_t chain[16]) {
+    bool cbc = c->scheme[2] == 'c';  // cbc1, cbcs
+    if (!c->crypt) {
+        if (cbc) test_cbc_encrypt(aes, p, n / 16, chain);
+        else rs_aes_ctr_process(ctr, p, n);
+        return;
+    }
+    for (size_t off = 0; n - off >= (size_t)c->crypt * 16; ) {
+        if (cbc) test_cbc_encrypt(aes, p + off, (size_t)c->crypt, chain);
+        else rs_aes_ctr_process(ctr, p + off, (size_t)c->crypt * 16);
+        off += (size_t)c->crypt * 16;
+        off += n - off < (size_t)c->skip * 16 ? n - off : (size_t)c->skip * 16;
+    }
+}
+
+static void test_cenc_scheme(const scheme_case *c) {
+    enum { NSAMP = 2 };
+    uint8_t key[16], const_iv[16] = {0};
+    for (int i = 0; i < 16; i++) key[i] = (uint8_t)(0xA0 + i);
+    if (c->const_iv) for (int i = 0; i < 16; i++) const_iv[i] = (uint8_t)(0x30 + i);
+    rs_aes aes;
+    rs_aes_init(&aes, key, 16);
+    size_t sample_len = c->nsub ? c->clear[0] + c->prot[0] + (c->nsub > 1 ? c->clear[1] + c->prot[1] : 0) : c->whole;
+
+    uint8_t seg[4096], plain[NSAMP][640], ivs[NSAMP][16];
+    memset(ivs, 0, sizeof ivs);
+    for (int s = 0; s < NSAMP; s++) {
+        if (c->const_iv) memcpy(ivs[s], const_iv, 16);
+        else for (int i = 0; i < c->iv_size; i++) ivs[s][i] = (uint8_t)(s * 31 + i + 1);
+    }
+    size_t n = 0;
+    size_t moof = open_box(seg, &n, "moof");
+    size_t traf = open_box(seg, &n, "traf");
+    size_t tfhd = open_box(seg, &n, "tfhd");
+    PUT32(seg + n, 0x020000); PUT32(seg + n + 4, 1); n += 8;
+    close_box(seg, n, tfhd);
+    size_t trun = open_box(seg, &n, "trun");
+    size_t data_offset_at = n + 8;
+    PUT32(seg + n, 0x000201); PUT32(seg + n + 4, NSAMP); PUT32(seg + n + 8, 0); n += 12;
+    for (int s = 0; s < NSAMP; s++) { PUT32(seg + n, (uint32_t)sample_len); n += 4; }
+    close_box(seg, n, trun);
+    // senc: with a constant IV it carries only the subsample split; a constant
+    // IV with no subsamples needs no senc at all.
+    if (!(c->const_iv && !c->nsub)) {
+        size_t senc = open_box(seg, &n, "senc");
+        PUT32(seg + n, c->nsub ? 0x000002 : 0); PUT32(seg + n + 4, NSAMP); n += 8;
+        for (int s = 0; s < NSAMP; s++) {
+            if (!c->const_iv) { memcpy(seg + n, ivs[s], (size_t)c->iv_size); n += (size_t)c->iv_size; }
+            if (c->nsub) {
+                seg[n] = 0; seg[n + 1] = (uint8_t)c->nsub; n += 2;
+                for (int k = 0; k < c->nsub; k++) {
+                    seg[n] = (uint8_t)(c->clear[k] >> 8); seg[n + 1] = (uint8_t)c->clear[k]; n += 2;
+                    PUT32(seg + n, (uint32_t)c->prot[k]); n += 4;
+                }
+            }
+        }
+        close_box(seg, n, senc);
+    }
+    close_box(seg, n, traf);
+    close_box(seg, n, moof);
+    size_t mdat = open_box(seg, &n, "mdat");
+    PUT32(seg + data_offset_at, (uint32_t)(n - moof));
+    size_t payload = n;
+    bool cbcs = !strcmp(c->scheme, "cbcs");
+    for (int s = 0; s < NSAMP; s++) {
+        for (size_t i = 0; i < sample_len; i++) plain[s][i] = (uint8_t)(s * 53 + i * 7 + 3);
+        memcpy(seg + n, plain[s], sample_len);
+        uint8_t chain[16];
+        memcpy(chain, ivs[s], 16);
+        rs_aes_ctr ctr;
+        rs_aes_ctr_init(&ctr, key, 16, ivs[s], 16);
+        if (!c->nsub) {
+            scheme_case whole = *c;
+            whole.crypt = whole.skip = 0;  // no pattern on a whole sample
+            test_encrypt_range(&whole, &aes, &ctr, seg + n, sample_len, chain);
+        }
+        size_t at = n;
+        for (int k = 0; k < c->nsub; k++) {
+            at += c->clear[k];
+            if (cbcs) memcpy(chain, ivs[s], 16);
+            test_encrypt_range(c, &aes, &ctr, seg + at, c->prot[k], chain);
+            at += c->prot[k];
+        }
+        n += sample_len;
+    }
+    close_box(seg, n, mdat);
+
+    rs_cenc_track track;
+    memset(&track, 0, sizeof track);
+    snprintf(track.scheme, sizeof track.scheme, "%s", c->scheme);
+    track.iv_size = c->const_iv ? 0 : c->iv_size;
+    track.crypt_blocks = (uint8_t)c->crypt;
+    track.skip_blocks = (uint8_t)c->skip;
+    if (c->const_iv) { memcpy(track.constant_iv, const_iv, 16); track.constant_iv_size = 16; }
+    size_t out_len = 0;
+    uint8_t *out = rs_cenc_decrypt_segment_track(seg, n, &out_len, key, &track);
+    bool same = out && out_len == n;
+    for (int s = 0; same && s < NSAMP; s++)
+        same = memcmp(out + payload + (size_t)s * sample_len, plain[s], sample_len) == 0;
+    char name[64];
+    snprintf(name, sizeof name, "cenc/scheme-%s%s", c->scheme, c->nsub ? "" : "-whole-sample");
+    check(name, same);
+    rs_free(out);
+}
+
+// The init's schm and tenc reach rs_cenc_track: scheme, pattern, constant IV.
+static void test_cenc_init_track(void) {
+    uint8_t b[1024];
+    size_t n = 0;
+    size_t moov = open_box(b, &n, "moov");
+    size_t trak = open_box(b, &n, "trak");
+    size_t mdia = open_box(b, &n, "mdia");
+    size_t minf = open_box(b, &n, "minf");
+    size_t stbl = open_box(b, &n, "stbl");
+    size_t stsd = open_box(b, &n, "stsd");
+    PUT32(b + n, 0); PUT32(b + n + 4, 1); n += 8;
+    size_t encv = open_box(b, &n, "encv");
+    memset(b + n, 0, 78); n += 78;  // visual sample entry fields
+    size_t sinf = open_box(b, &n, "sinf");
+    size_t frma = open_box(b, &n, "frma");
+    memcpy(b + n, "avc1", 4); n += 4;
+    close_box(b, n, frma);
+    size_t schm = open_box(b, &n, "schm");
+    PUT32(b + n, 0); memcpy(b + n + 4, "cbcs", 4); PUT32(b + n + 8, 0x10000); n += 12;
+    close_box(b, n, schm);
+    size_t schi = open_box(b, &n, "schi");
+    size_t tenc = open_box(b, &n, "tenc");
+    b[n++] = 1; b[n++] = 0; b[n++] = 0; b[n++] = 0;  // version 1
+    b[n++] = 0; b[n++] = 0x19;                       // pattern 1:9
+    b[n++] = 1; b[n++] = 0;                          // protected, constant IV
+    for (int i = 0; i < 16; i++) b[n++] = (uint8_t)(0xC0 + i);  // KID
+    b[n++] = 16;
+    for (int i = 0; i < 16; i++) b[n++] = (uint8_t)(0x30 + i);  // constant IV
+    close_box(b, n, tenc);
+    close_box(b, n, schi);
+    close_box(b, n, sinf);
+    close_box(b, n, encv);
+    size_t ends[] = {stsd, stbl, minf, mdia, trak, moov};
+    for (size_t i = 0; i < sizeof ends / sizeof ends[0]; i++) close_box(b, n, ends[i]);
+
+    size_t out_len = 0;
+    char *kid = NULL;
+    rs_cenc_track t;
+    uint8_t *out = rs_cenc_patch_init_track(b, n, &out_len, &kid, &t);
+    check("cenc/init-track-scheme", out && !strcmp(t.scheme, "cbcs"));
+    check("cenc/init-track-pattern", t.crypt_blocks == 1 && t.skip_blocks == 9);
+    check("cenc/init-track-constant-iv", t.iv_size == 0 && t.constant_iv_size == 16 && t.constant_iv[0] == 0x30 && t.constant_iv[15] == 0x3F);
+    check("cenc/init-track-kid", kid && !strcmp(kid, "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"));
+    size_t sinf_len = (size_t)b[sinf] << 24 | (size_t)b[sinf + 1] << 16 | (size_t)b[sinf + 2] << 8 | b[sinf + 3];
+    check("cenc/init-track-sinf-removed", out && out_len == n - sinf_len);
+    rs_free(kid);
+    rs_free(out);
+}
+
+static void test_cenc_schemes(void) {
+    static const scheme_case cases[] = {
+        // scheme  iv  const crypt skip nsub  clear      prot         whole
+        {"cens",   8,  0,    1,    9,   2,    {10, 5},  {190, 165}, 0},
+        {"cbc1",   16, 0,    0,    0,   2,    {8, 4},   {192, 96},  0},
+        {"cbcs",   0,  1,    1,    9,   2,    {10, 5},  {190, 330}, 0},
+        {"cbcs",   0,  1,    0,    0,   0,    {0, 0},   {0, 0},     100},
+        {"cenc",   16, 0,    0,    0,   2,    {10, 5},  {190, 41},  0},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) test_cenc_scheme(&cases[i]);
+    test_cenc_init_track();
+}
 
 static void test_cenc_multifragment(void) {
     enum { NFRAG = 2, NSAMP = 3, SAMPLE_LEN = 96, CLEAR_PREFIX = 16, IV_SIZE = 8 };
@@ -2704,6 +2896,7 @@ int main(int argc, char **argv) {
     test_provider_options();
     test_cdm_pssh();
     test_cenc_multifragment();
+    test_cenc_schemes();
     test_mpegts();
     test_m3u8_filter_master();
     test_hls_engine_source();

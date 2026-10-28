@@ -55,6 +55,20 @@
 // throughput and starts costing congestion and CDN concurrency refusals.
 // streamlink defaults to one download thread and keeps up fine.
 #define RS_LIVE_MAX_DL_THREADS 8
+
+// Adaptive in-flight limit (AIMD), unless the provider sets Fixed parallel
+// downloads. The limit starts at parallelDownloads. While media is waiting and
+// fetches succeed, it climbs by about one per round of fetches, up to twice
+// the setting (never past RS_LIVE_ADAPTIVE_MAX). A 429, a 5xx or a fetch that
+// got no answer at all halves it (not below RS_LIVE_ADAPTIVE_FLOOR) and holds
+// it there for RS_LIVE_ADAPTIVE_HOLD seconds. With nothing waiting, it drifts
+// back to the setting. The pool has a thread for the ceiling; only `limit` of
+// them fetch at once. A proxy's connection limit still caps what goes through
+// each proxy (a request waits for a free slot), so climbing cannot break a
+// proxy plan.
+#define RS_LIVE_ADAPTIVE_MAX 12
+#define RS_LIVE_ADAPTIVE_FLOOR 2
+#define RS_LIVE_ADAPTIVE_HOLD 10.0
 // Hard ceiling on segments queued but not yet committed. The configured
 // downloadAhead sets the working depth; this only bounds the allocation.
 #define RS_LIVE_PENDING_MAX 128
@@ -398,7 +412,7 @@ typedef struct {
     // that key even after the playlist has moved to a newer one ("" = clear,
     // or no init).
     char kid[33];
-    int iv_size;
+    rs_cenc_track enc;  // how that init's samples are encrypted
     char err[192];
 } pend_item;
 
@@ -468,10 +482,10 @@ typedef struct {
     uint32_t timescale;    // mdhd timescale of the media track
     uint8_t key[16];
     bool have_key;
-    int iv_size;
-    // Every init this rendition has read, by identity: the KID and IV size its
-    // segments use. More than one while a key rotation is in the window.
-    struct { char key[288]; char kid[33]; int iv_size; } init_tab[RS_LIVE_INIT_TAB];
+    rs_cenc_track enc;  // the current init's scheme, IV size, pattern
+    // Every init this rendition has read, by identity: the KID and encryption
+    // its segments use. More than one while a key rotation is in the window.
+    struct { char key[288]; char kid[33]; rs_cenc_track enc; } init_tab[RS_LIVE_INIT_TAB];
     size_t init_tab_n, init_tab_next;
 
     seen_set seen;
@@ -537,6 +551,10 @@ typedef struct live_stream {
     // count of media connections this channel holds open at the origin.
     int worker_parallel_downloads;
     int active_downloads;  // active media requests across every rendition
+    int fixed_downloads;   // adaptive limit off: in flight = pool size
+    double dl_limit;       // adaptive in-flight limit, <= worker_parallel_downloads
+    double dl_hold_until;  // no climbing before this, after a back-off
+    double dl_last_cut;
     // The download pool, shared by every rendition. One thread is one
     // persistent HTTP connection (see the per-thread easy handle in the
     // server's net.c), so a per-rendition pool made the channel's connection
@@ -771,12 +789,12 @@ static pend_counts pend_counts_locked(live_rep *rep) {
 // Appends one segment. Caller has already checked there is room.
 static void pend_push_locked(live_rep *rep, const char *url, const char *idkey,
                              long long time_val, double duration, unsigned long plan_ts,
-                             const char *kid, int iv_size) {
+                             const char *kid, const rs_cenc_track *enc) {
     pend_item *it = pend_at_locked(rep, rep->pend_count);
     memset(it, 0, sizeof(*it));
     it->url = rs_strdup(url);
     snprintf(it->kid, sizeof(it->kid), "%s", kid ? kid : "");
-    it->iv_size = iv_size;
+    if (enc) it->enc = *enc;
     snprintf(it->idkey, sizeof(it->idkey), "%s", idkey);
     it->time_val = time_val;
     it->duration = duration;
@@ -894,6 +912,61 @@ static int effective_parallel_downloads(int configured) {
     return want;
 }
 
+// Threads in the stream's download pool: the setting, or the adaptive ceiling.
+static int pool_size(int configured, int fixed) {
+    int base = effective_parallel_downloads(configured);
+    if (fixed) return base;
+    int max = base * 2 > RS_LIVE_ADAPTIVE_MAX ? RS_LIVE_ADAPTIVE_MAX : base * 2;
+    return max > base ? max : base;
+}
+
+// Requests the stream may have in flight right now. Caller holds st->mu.
+static int dl_limit_locked(const live_stream *st) {
+    if (st->fixed_downloads) return st->worker_parallel_downloads;
+    int n = (int)st->dl_limit;
+    if (n < 1) n = 1;
+    return n > st->worker_parallel_downloads ? st->worker_parallel_downloads : n;
+}
+
+static bool pend_has_waiting_locked(live_rep *rep);
+
+// Moves the adaptive limit after one finished fetch (see RS_LIVE_ADAPTIVE_MAX).
+// `throttled` is a 429, a 5xx or no answer at all; a 404 or 403 says nothing
+// about load. Returns the old whole limit when it changed, else -1, with the
+// reason in `why`. Caller holds st->mu.
+static int dl_adapt_locked(live_stream *st, bool ok, bool throttled, char *why, size_t cap) {
+    if (st->fixed_downloads) return -1;
+    double now = now_seconds();
+    int before = dl_limit_locked(st);
+    int base = effective_parallel_downloads(st->parallel_downloads);
+    int floor = base < RS_LIVE_ADAPTIVE_FLOOR ? base : RS_LIVE_ADAPTIVE_FLOOR;
+    double limit = st->dl_limit;
+    if (throttled) {
+        // Every request in flight fails together when a path chokes; count
+        // that as one signal, not one halving each.
+        if (now - st->dl_last_cut < 2.0) return -1;
+        limit /= 2;
+        if (limit < floor) limit = floor;
+        st->dl_hold_until = now + RS_LIVE_ADAPTIVE_HOLD;
+        st->dl_last_cut = now;
+        snprintf(why, cap, "the origin or proxy is refusing or timing out — backing off for %.0fs", RS_LIVE_ADAPTIVE_HOLD);
+    } else if (ok && now >= st->dl_hold_until) {
+        bool waiting = false;
+        for (size_t i = 0; i < st->nreps && !waiting; i++) waiting = pend_has_waiting_locked(st->reps[i]);
+        if (waiting || limit < base) {
+            limit += 1.0 / (limit > 1 ? limit : 1);
+            snprintf(why, cap, waiting ? "segments are waiting and fetches are succeeding" : "recovering after a back-off");
+        } else if (limit > base) {
+            limit -= 0.25 / limit;
+            if (limit < base) limit = base;
+            snprintf(why, cap, "caught up — easing back toward parallelDownloads (%d)", base);
+        }
+    }
+    if (limit > st->worker_parallel_downloads) limit = st->worker_parallel_downloads;
+    st->dl_limit = limit;
+    return dl_limit_locked(st) != before ? before : -1;
+}
+
 // How many of the stream's shared connections this rendition may hold at once.
 //
 // The rule is a FLOOR for everyone else, not a ceiling here. It used to be the
@@ -905,8 +978,6 @@ static int effective_parallel_downloads(int configured) {
 // slot for each OTHER rendition that actually has work waiting, and let this
 // one have everything else.
 // Caller holds st->mu.
-static bool pend_has_waiting_locked(live_rep *rep);
-
 static int rep_active_limit_locked(live_rep *rep) {
     live_stream *st = rep->owner;
     int others = 0;
@@ -915,7 +986,7 @@ static int rep_active_limit_locked(live_rep *rep) {
         if (o == rep) continue;
         if (pend_has_waiting_locked(o)) others++;
     }
-    int limit = st->worker_parallel_downloads - others;
+    int limit = dl_limit_locked(st) - others;
     if (limit < 1) limit = 1;
     return limit;
 }
@@ -941,7 +1012,7 @@ static void *download_main(void *arg) {
         live_rep *rep = NULL;
         long idx = -1;
         while (!st->stop) {
-            if (st->active_downloads < st->worker_parallel_downloads) {
+            if (st->active_downloads < dl_limit_locked(st)) {
                 for (size_t k = 0; k < st->nreps && idx < 0; k++) {
                     live_rep *cand = st->reps[(st->dl_cursor + k) % st->nreps];
                     if (cand->active_downloads >= rep_active_limit_locked(cand)) continue;
@@ -975,6 +1046,7 @@ static void *download_main(void *arg) {
         long long ingest_bytes = 0;
         char err[192] = {0};
         bool ok = false;
+        long last_status = 0;
 
         // Retry before writing the segment off. Every abandoned segment becomes
         // a permanent hole in the media timeline, so a single transient 404 at
@@ -1027,6 +1099,7 @@ static void *download_main(void *arg) {
                 fetch_seconds = now_seconds() - attempt_start;
                 break;
             }
+            last_status = status;
             if (!err[0]) snprintf(err, sizeof(err), "fetch failed (status %ld)", status);
             free(body);
         }
@@ -1045,6 +1118,15 @@ static void *download_main(void *arg) {
             pend_item *c = pend_at_locked(rep, i);
             if (c == slot && c->gen == slot_gen && c->state == PEND_FETCHING) { dst = c; break; }
         }
+        // Only a fetch that still owned its slot says anything about load: one
+        // the writer abandoned, or a stop, was cut off on purpose.
+        char why[160] = "";
+        int was = -1, now_limit = 0;
+        if (dst && !st->stop) {
+            bool throttled = !ok && (last_status == 429 || last_status >= 500 || last_status == 0);
+            was = dl_adapt_locked(st, ok, throttled, why, sizeof(why));
+            now_limit = dl_limit_locked(st);
+        }
         if (dst) {
             dst->fetch_seconds = fetch_seconds;
             dst->data = data;
@@ -1057,6 +1139,9 @@ static void *download_main(void *arg) {
         }
         pthread_cond_broadcast(&st->cv);
         pthread_mutex_unlock(&st->mu);
+        if (was >= 0)
+            lgf(st, "info", "downloadLimit", NULL, last_status, -1,
+                "requests in flight %d -> %d: %s", was, now_limit, why);
     }
 }
 
@@ -1219,17 +1304,29 @@ static bool key_lookup(const char *keys_text, const char *kid_hex, uint8_t out[1
     return found;
 }
 
+// "8", "16", "constant 16", plus ", pattern 1:9" when one applies: how the
+// initReady log line names a track's IVs.
+static const char *enc_iv_text(const rs_cenc_track *enc, char *out, size_t cap) {
+    int n;
+    if (enc->iv_size > 0) n = snprintf(out, cap, "%d", enc->iv_size);
+    else if (enc->constant_iv_size) n = snprintf(out, cap, "constant %d", enc->constant_iv_size);
+    else n = snprintf(out, cap, "8");
+    if (enc->crypt_blocks && n > 0 && (size_t)n < cap)
+        snprintf(out + n, cap - (size_t)n, ", pattern %u:%u", enc->crypt_blocks, enc->skip_blocks);
+    return out;
+}
+
 // The init table entry for an init identity, or NULL. Caller holds st->mu.
-static const char *init_tab_kid_locked(const live_rep *rep, const char *idkey, int *iv_size) {
+static const char *init_tab_kid_locked(const live_rep *rep, const char *idkey, rs_cenc_track *enc) {
     for (size_t i = 0; i < rep->init_tab_n; i++)
         if (!strcmp(rep->init_tab[i].key, idkey)) {
-            if (iv_size) *iv_size = rep->init_tab[i].iv_size;
+            if (enc) *enc = rep->init_tab[i].enc;
             return rep->init_tab[i].kid;
         }
     return NULL;
 }
 
-static void init_tab_put_locked(live_rep *rep, const char *idkey, const char *kid, int iv_size) {
+static void init_tab_put_locked(live_rep *rep, const char *idkey, const char *kid, const rs_cenc_track *enc) {
     size_t slot = rep->init_tab_n;
     for (size_t i = 0; i < rep->init_tab_n; i++)
         if (!strcmp(rep->init_tab[i].key, idkey)) slot = i;
@@ -1239,7 +1336,7 @@ static void init_tab_put_locked(live_rep *rep, const char *idkey, const char *ki
     }
     snprintf(rep->init_tab[slot].key, sizeof(rep->init_tab[slot].key), "%s", idkey);
     snprintf(rep->init_tab[slot].kid, sizeof(rep->init_tab[slot].kid), "%s", kid ? kid : "");
-    rep->init_tab[slot].iv_size = iv_size > 0 ? iv_size : 8;
+    rep->init_tab[slot].enc = *enc;
 }
 
 // Asks the server for the key of `kid`, once, and again every
@@ -1296,8 +1393,8 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
 
     size_t out_len = 0;
     char *kid_hex = NULL;
-    int iv_size = 0;
-    uint8_t *patched = rs_cenc_patch_init((uint8_t *)body, len, &out_len, &kid_hex, &iv_size);
+    rs_cenc_track enc;
+    uint8_t *patched = rs_cenc_patch_init_track((uint8_t *)body, len, &out_len, &kid_hex, &enc);
     if (patched) { free(body); } else { patched = (uint8_t *)body; out_len = len; }
 
     uint32_t ts = rs_audio_mdhd_timescale(patched, out_len);
@@ -1323,7 +1420,7 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
 
     pthread_mutex_lock(&st->mu);
     // A stream with no keys at all plays as it is; its segments need no KID.
-    init_tab_put_locked(rep, idkey, any_keys && kid_hex ? kid_hex : "", iv_size);
+    init_tab_put_locked(rep, idkey, any_keys && kid_hex ? kid_hex : "", &enc);
     if (install) {
         free(rep->init_url);
         free(rep->init_key);
@@ -1334,7 +1431,7 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
         patched = NULL;
         rep->init_len = out_len;
         rep->timescale = ts;
-        rep->iv_size = iv_size > 0 ? iv_size : 8;
+        rep->enc = enc;
         rep->have_key = have_key;
         if (have_key) memcpy(rep->key, key, 16);
     }
@@ -1373,8 +1470,10 @@ static void rep_load_init(live_rep *rep, const char *init_url, const cfg_snap *c
     }
     // Info even on a mismatch: wrongKeys above is the error that names it, and
     // an error here would replace it as the stream's last error.
+    char ivtext[48];
     lgf(st, "info", "initReady", init_url, status, (long long)out_len,
-        "%s: timescale %u, iv %d, key %s%s%s%s%s", rep->rep_id, ts, iv_size > 0 ? iv_size : 8,
+        "%s: timescale %u, %s, iv %s, key %s%s%s%s%s", rep->rep_id, ts, enc.scheme[0] ? enc.scheme : "cenc",
+        enc_iv_text(&enc, ivtext, sizeof(ivtext)),
         have_key ? "yes" : "no", kid_hex ? ", kid " : "", kid_hex ? kid_hex : "",
         install ? "" : " (an older init still in the window)",
         key_mismatch ? (asked ? " — key requested" : " — none of the configured keys match this KID; segments will stay encrypted") : "");
@@ -1571,7 +1670,7 @@ static void rep_apply_plan(live_rep *rep, const cfg_snap *cfg, const rs_json *pl
     if (live_stopping(st)) return;
 
     // Collect the segments this poll has not already served, in timeline order.
-    typedef struct { const char *url; long long tv; double dur; char idkey[288]; char kid[33]; int iv; } cand;
+    typedef struct { const char *url; long long tv; double dur; char idkey[288]; char kid[33]; rs_cenc_track enc; } cand;
     cand *found = (cand *)calloc(total ? total : 1, sizeof(cand));
     if (!found) return;
     size_t n = 0;
@@ -1632,11 +1731,11 @@ static void rep_apply_plan(live_rep *rep, const cfg_snap *cfg, const rs_json *pl
         const char *si = rs_json_obj_str(sg, "initUrl", "");
         if (!si[0]) si = init_url;
         found[n].kid[0] = '\0';
-        found[n].iv = 0;
+        memset(&found[n].enc, 0, sizeof(found[n].enc));
         if (si[0]) {
             char sk[288];
             stable_key(si, -1, sk, sizeof(sk));
-            const char *kid = init_tab_kid_locked(rep, sk, &found[n].iv);
+            const char *kid = init_tab_kid_locked(rep, sk, &found[n].enc);
             if (kid) snprintf(found[n].kid, sizeof(found[n].kid), "%s", kid);
         }
         memcpy(found[n].idkey, idkey, sizeof(idkey));
@@ -1719,13 +1818,13 @@ static void rep_apply_plan(live_rep *rep, const cfg_snap *cfg, const rs_json *pl
         // marks it seen at the moment it leaves the queue, under the same lock,
         // so it is never both un-queued and un-seen.
         pend_push_locked(rep, found[i].url, found[i].idkey, found[i].tv, found[i].dur, plan_ts,
-                         found[i].kid, found[i].iv);
+                         found[i].kid, &found[i].enc);
         queued++;
     }
     size_t queue_depth = rep->pend_count;
     pend_counts queue = pend_counts_locked(rep);
     int stream_active = st->active_downloads;
-    int stream_budget = st->worker_parallel_downloads;
+    int stream_budget = dl_limit_locked(st);
     if (queued || evicted || stale) pthread_cond_broadcast(&st->cv);
     pthread_mutex_unlock(&st->mu);
     free(found);
@@ -1786,7 +1885,7 @@ static void commit_one(live_rep *rep, const cfg_snap *cfg, pend_item *it,
 
     pthread_mutex_lock(&st->mu);
     bool have_key = rep->have_key;
-    int iv_size = rep->iv_size > 0 ? rep->iv_size : 8;
+    rs_cenc_track enc = rep->enc;
     uint8_t key[16];
     if (have_key) memcpy(key, rep->key, 16);
     uint32_t ts = rep->timescale;
@@ -1795,7 +1894,7 @@ static void commit_one(live_rep *rep, const cfg_snap *cfg, pend_item *it,
     // the rendition holds now: across a key rotation the two differ.
     if (it->kid[0]) {
         have_key = key_lookup(cfg->keys, it->kid, key);
-        if (it->iv_size > 0) iv_size = it->iv_size;
+        if (it->enc.scheme[0] || it->enc.iv_size || it->enc.constant_iv_size) enc = it->enc;
     }
 
     uint8_t *data = it->data;
@@ -1803,10 +1902,10 @@ static void commit_one(live_rep *rep, const cfg_snap *cfg, pend_item *it,
     it->data = NULL;  // ownership moves here
     if (have_key) {
         size_t out_len = 0;
-        uint8_t *clear = rs_cenc_decrypt_segment(data, len, &out_len, key, iv_size);
+        uint8_t *clear = rs_cenc_decrypt_segment_track(data, len, &out_len, key, &enc);
         if (clear) { free(data); data = clear; len = out_len; }
         else lgf(st, "error", "decryptSegment", it->url, 0, -1,
-                 "%s: CENC decrypt failed, serving as-is", rep->rep_id);
+                 "%s: %s decrypt failed, serving as-is", rep->rep_id, enc.scheme[0] ? enc.scheme : "cenc");
     }
 
     // Lip-sync offset, audio track only — the same knob the panel's
@@ -2123,7 +2222,7 @@ static void *writer_main(void *arg) {
             long long skipped = rep->skipped;
             bool started = rep->ready;
             int stream_active = st->active_downloads;
-            int stream_budget = st->worker_parallel_downloads;
+            int stream_budget = dl_limit_locked(st);
             pthread_mutex_unlock(&st->mu);
 
             // Media published per second of wall clock. This is THE number for
@@ -2388,7 +2487,6 @@ static void rep_ensure_locked(live_stream *st, const char *rep_id, const char *k
     rep->selected = true;
     rep->rep_id = rs_strdup(rep_id);
     rep->kind = rs_strdup(kind && kind[0] ? kind : "video");
-    rep->iv_size = 8;
     rep->highest_time_val = -1;
     rep->index = (int)st->nreps;
     st->reps[st->nreps++] = rep;
@@ -2735,9 +2833,9 @@ static void *director_main(void *arg) {
                     "%s (%s): rendition could not start its writer", fresh->rep_id, fresh->kind);
             else
                 lgf(st, "info", "repStart", NULL, 0, -1,
-                    "%s (%s): rendition ready, sharing the stream's %d download connection%s",
-                    fresh->rep_id, fresh->kind, st->worker_parallel_downloads,
-                    st->worker_parallel_downloads == 1 ? "" : "s");
+                    "%s (%s): rendition ready, sharing the stream's %d download connection%s%s",
+                    fresh->rep_id, fresh->kind, dl_limit_locked(st), dl_limit_locked(st) == 1 ? "" : "s",
+                    st->fixed_downloads ? "" : " (adaptive, up to the pool's ceiling)");
         }
 
         // Hand every rendition its slice of this read. Renditions created just
@@ -3106,8 +3204,7 @@ int rs_live_add_keys(rs_live *live, const char *stream_id, const char *keys) {
     // The rendition's own init key, for status: it may be one of the new ones.
     for (size_t r = 0; r < st->nreps; r++) {
         live_rep *rep = st->reps[r];
-        int iv = 0;
-        const char *kid = rep->init_key ? init_tab_kid_locked(rep, rep->init_key, &iv) : NULL;
+        const char *kid = rep->init_key ? init_tab_kid_locked(rep, rep->init_key, NULL) : NULL;
         if (kid && kid[0] && !rep->have_key && key_lookup(st->keys, kid, rep->key)) rep->have_key = true;
     }
     pthread_cond_broadcast(&st->cv);
@@ -3128,8 +3225,8 @@ int rs_live_start(rs_live *live, const char *stream_id, const rs_live_config *cf
     live_stream *st = stream_find_locked(live, stream_id);
     if (st) {
         pthread_mutex_lock(&st->mu);
-        int desired_workers = effective_parallel_downloads(cfg->parallel_downloads);
-        if (st->worker_parallel_downloads == desired_workers) {
+        int desired_workers = pool_size(cfg->parallel_downloads, cfg->fixed_downloads);
+        if (st->worker_parallel_downloads == desired_workers && st->fixed_downloads == (cfg->fixed_downloads != 0)) {
             // Polling, headers and window settings are snapshots and can change
             // in place without throwing away the warm segment queue.
             stream_apply_config_locked(st, cfg);
@@ -3168,7 +3265,9 @@ int rs_live_start(rs_live *live, const char *stream_id, const rs_live_config *cf
     pthread_mutex_init(&st->err_mu, NULL);
     pthread_cond_init(&st->cv, NULL);
     stream_apply_config_locked(st, cfg);
-    st->worker_parallel_downloads = effective_parallel_downloads(cfg->parallel_downloads);
+    st->worker_parallel_downloads = pool_size(cfg->parallel_downloads, cfg->fixed_downloads);
+    st->fixed_downloads = cfg->fixed_downloads != 0;
+    st->dl_limit = effective_parallel_downloads(cfg->parallel_downloads);
     st->last_media_progress = now_seconds();
     live->streams[live->nstreams++] = st;
     pthread_mutex_unlock(&live->mu);
