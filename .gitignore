@@ -38,3 +38,13 @@ cmake_install.cmake
 Makefile
 *.a
 __pycache__/
+
+# Private work log: server addresses, tunnels and proxies. Kept locally only.
+PROGRESS.md
+
+# Captured provider commands, CDM devices, tokens and proxy test results —
+# real sessions and credentials, never commit.
+cdm-commands-*.txt
+*.wvd
+*.tokens
+proxy-tests.json
