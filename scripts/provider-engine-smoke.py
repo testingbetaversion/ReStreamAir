@@ -179,12 +179,18 @@ def run(binary):
             client.request("POST", f"/api/streams/{sid}/stop", {})
             print("PASS: named CDN selection and idle-provider session reset", flush=True)
             script.write_text("import time\ntime.sleep(1.2)\n" + script.read_text())
+            # The saved session from the start above still answers, and a start
+            # reuses it without running the manifest action, so the slow script
+            # would never run. Make this start fetch a fresh session.
+            options.update(alwaysRefreshManifest=True)
+            assert client.request("PUT", route, {"name": "Engine", "options": options, "scriptPath": str(script), "scriptActions": ["manifest"]})[0] == 200
             before = len(logs("scriptManifest"))
             with ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(client.request, "POST", f"/api/streams/{sid}/start", {})
                 wait_for(lambda: len(logs("scriptManifest")) > before)
                 assert client.request("POST", f"/api/streams/{sid}/stop", {})[0] == 200
-                assert future.result()[0] == 409
+                code = future.result()[0]
+                assert code == 409, f"the superseded start answered {code}, not 409"
             assert status() == "stopped"
             print("PASS: Stop supersedes an in-flight scripted start", flush=True)
 

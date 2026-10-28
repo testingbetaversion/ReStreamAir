@@ -7686,6 +7686,9 @@ static bool pending_source_finish(restream_server_t *server, struct mg_connectio
     pf->start = stream_start_snapshot(provider, stream, true,
         pf->kind == RS_PENDING_PLAYLIST && stream_wants_drm_discovery(provider, stream));
     if (!pf->start) return false;
+    // Every saved source just failed, so asking the saved session URL again
+    // before running `manifest` can only cost the origin one more refused request.
+    pf->start->reuse_manifest = false;
     rs_json_obj_set(timer, "manifestRefreshAt", rs_json_new_num(now));
     log_record(server, pf->stream_id, "info", "manifestRefresh", NULL, 0, -1,
                "All manifest sources failed; running manifest and retrying the fresh CDN list.");

@@ -229,7 +229,9 @@ def run(binary):
             started = wait_for(lambda: next((s for s in scheduled_streams() if s["status"] == "running"), None))
             assert started["name"] == "Auto one"
             configure_scheduled({"sequentialAutostartPeriodSeconds": 0, "autoRestartPeriodSeconds": 1, "restartDelaySeconds": 2})
-            wait_for(lambda: all(s["status"] == "stopped" for s in scheduled_streams()))
+            # A stream inside its restart delay reads "restarting", not "stopped".
+            wait_for(lambda: not any(s["status"] == "running" for s in scheduled_streams())
+                     and any(s["status"] == "restarting" for s in scheduled_streams()))
             wait_for(lambda: any(s["status"] == "running" for s in scheduled_streams()))
             configure_scheduled({"autoRestartPeriodSeconds": 0, "randomAutostartPeriodSeconds": 1})
             assert client.request("POST", f"/api/streams/{started['id']}/stop", {})[0] == 200
