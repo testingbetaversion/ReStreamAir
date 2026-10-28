@@ -4,6 +4,8 @@ ReStreamAir turns live DASH (`.mpd`) and HLS (`.m3u8`) sources into stable HLS p
 
 It is one C/C++ server with a built-in web panel and HTTP API. No JavaScript or Python runtime is required by the server. Provider scripts are optional and only needed for sources that require custom login, channel discovery, short-lived URLs, or external key handling.
 
+Questions, help and updates: join the [ReStreamAir Discord](https://discord.gg/bb59Scbv3g).
+
 ## Screenshots
 
 ![ReStreamAir panel](images/image.png)
@@ -349,6 +351,10 @@ Internal live segments are held in bounded memory, not written to disk.
 - `restream_selftest` runs deterministic core tests.
 - `scripts/api-smoke.py` starts a real server and tests the management and playback APIs end to end.
 
+## Community
+
+Join the [ReStreamAir Discord](https://discord.gg/bb59Scbv3g) for help, questions and announcements.
+
 ## License
 
-See [LICENSE](LICENSE).
+ReStreamAir is MIT-licensed; see [LICENSE](LICENSE). Vendored third-party code keeps its own license; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
