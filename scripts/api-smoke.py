@@ -105,6 +105,9 @@ class Server:
             [self.binary, "--port", str(self.port), "--bind", "127.0.0.1",
              "--no-download", "--root", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "public"))],
             cwd=self.workdir,
+            # A stream alerts "down" only after a grace period (90 s by
+            # default); the webhook test cannot wait that long.
+            env={**os.environ, "RESTREAMAIR_ALERT_DOWN_SECONDS": "3"},
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
         )
@@ -836,12 +839,27 @@ def test_provider_webhooks(client, sink):
     if stream:
         status, _, _ = client.request("POST", f"/api/streams/{stream['id']}/start", body={})
         check("the broken stream starts in the background", status == 200, f"got {status}")
-        check("a real stream error reaches the webhook", sink.wait_for(2), f"received {len(sink.received)}")
+        # Streams alert on outages, not on every error line: nothing at
+        # once, then "down" (or "restart loop") once the grace period passes.
+        check("a failing stream does not alert immediately", not sink.wait_for(2, timeout=1.5),
+              f"received {len(sink.received)}")
+        check("a stream that stays down reaches the webhook", sink.wait_for(2, timeout=20),
+              f"received {len(sink.received)}")
         error_text = json.dumps(sink.received[1] if len(sink.received) > 1 else {})
+        check("the alert says the stream is down",
+              '"Stream down"' in error_text or '"Stream restart loop"' in error_text, error_text)
         check("the alert identifies provider and stream",
               "Webhook Provider" in error_text and "Broken stream" in error_text, error_text)
         check("the alert redacts the source URL", "127.0.0.1:1" not in error_text, error_text)
+        time.sleep(6)
+        check("a down stream is alerted once, not on every failure", len(sink.received) == 2,
+              json.dumps(sink.received[2:]))
         client.request("POST", f"/api/streams/{stream['id']}/stop", body={})
+        check("stopping a down stream sends a closing alert", sink.wait_for(3, timeout=10),
+              f"received {len(sink.received)}")
+        stop_text = json.dumps(sink.received[2] if len(sink.received) > 2 else {})
+        check("the closing alert says it was stopped while down",
+              '"Stream stopped while down"' in stop_text, stop_text)
 
 
 def test_hls_playback_routes(client, origin):

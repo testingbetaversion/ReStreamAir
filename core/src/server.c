@@ -111,17 +111,51 @@ typedef struct rs_webhook_target {
     struct rs_webhook_target *next;
 } rs_webhook_target;
 
+// What an alert says about a stream. Streams alert only on outages (see
+// "outage alerts" below); RS_ALERT_ERROR is the plain per-error alert that
+// provider-script failures (not tied to one stream) still use.
+enum {
+    RS_ALERT_ERROR = 0,
+    RS_ALERT_DOWN,
+    RS_ALERT_RECOVERED,
+    RS_ALERT_LOOP,
+    RS_ALERT_STOPPED,
+};
+
 typedef struct rs_webhook_job {
     char *url;
     char *provider_name;
     char *stream_name;
     char *event;
     char *message;
+    char *extra_name;   // optional fourth field, e.g. "Down for"
+    char *extra_value;
     long status;
     unsigned suppressed;
+    int kind;
     bool test;
     struct rs_webhook_job *next;
 } rs_webhook_job;
+
+// Per-stream outage tracking, guarded by webhook_mu. Exists only for a stream
+// that has reported a failure since it last started.
+#define RS_ALERT_LOOP_N 3
+typedef struct rs_alert_state {
+    char *sid;
+    bool failing;            // a failure seen and not yet cleared by healthy media
+    bool down;               // the down (or restart-loop) alert went out
+    bool loop_alerted;
+    double bad_since_ms;     // start of this failure episode
+    double last_bad_ms;
+    double last_ok_ms;       // last sign of media flowing
+    double restarts[RS_ALERT_LOOP_N];  // most recent restart times, a ring
+    unsigned restart_next;
+    unsigned episode_restarts;
+    char *reason_event;
+    char *reason;
+    char *detail;            // a failed script's output, shown under the reason
+    struct rs_alert_state *next;
+} rs_alert_state;
 
 #define RS_FETCH_POOL 24
 
@@ -207,6 +241,7 @@ struct restream_server {
     rs_webhook_job *webhook_head;
     rs_webhook_job *webhook_tail;
     size_t webhook_count;
+    rs_alert_state *alerts;
 };
 
 // A live Server-Sent Events subscriber is marked in mongoose's per-connection
@@ -416,7 +451,18 @@ static void webhook_job_free(rs_webhook_job *job) {
     free(job->stream_name);
     free(job->event);
     free(job->message);
+    free(job->extra_name);
+    free(job->extra_value);
     free(job);
+}
+
+static void alert_state_free(rs_alert_state *a) {
+    if (!a) return;
+    free(a->sid);
+    free(a->reason_event);
+    free(a->reason);
+    free(a->detail);
+    free(a);
 }
 
 static bool webhook_url_valid(const char *url) {
@@ -523,7 +569,8 @@ static rs_webhook_target *webhook_target_for_sid_locked(restream_server_t *s, co
 
 static bool webhook_queue_locked(restream_server_t *s, rs_webhook_target *target,
                                  const char *stream_name, const char *event,
-                                 const char *message, long status, bool test) {
+                                 const char *message, long status, bool test,
+                                 int kind, const char *extra_name, const char *extra_value) {
     if (!target || s->webhook_count >= RS_WEBHOOK_QUEUE_CAP) return false;
     rs_webhook_job *job = (rs_webhook_job *)calloc(1, sizeof(*job));
     if (!job) return false;
@@ -533,13 +580,20 @@ static bool webhook_queue_locked(restream_server_t *s, rs_webhook_target *target
     job->event = rs_strdup(event ? event : "error");
     job->message = webhook_redact_message(message);
     job->status = status;
-    job->suppressed = target->suppressed;
+    // Outage alerts are rare by construction; only plain errors share the
+    // provider's burst window and report what it swallowed.
+    job->suppressed = kind == RS_ALERT_ERROR ? target->suppressed : 0;
+    job->kind = kind;
     job->test = test;
+    if (extra_name && extra_value) {
+        job->extra_name = rs_strdup(extra_name);
+        job->extra_value = rs_strdup(extra_value);
+    }
     if (!job->url || !job->provider_name || !job->stream_name || !job->event || !job->message) {
         webhook_job_free(job);
         return false;
     }
-    target->suppressed = 0;
+    if (kind == RS_ALERT_ERROR) target->suppressed = 0;
     if (s->webhook_tail) s->webhook_tail->next = job;
     else s->webhook_head = job;
     s->webhook_tail = job;
@@ -548,20 +602,255 @@ static bool webhook_queue_locked(restream_server_t *s, rs_webhook_target *target
     return true;
 }
 
-static void webhook_enqueue_error(restream_server_t *s, const char *sid, const char *event,
-                                  const char *message, long status) {
-    pthread_mutex_lock(&s->webhook_mu);
+// --- outage alerts -------------------------------------------------------------
+// A stream used to send every error-level log line to its provider's webhook,
+// so a channel saw a "fallingBehind" at 0.94x every few minutes per stream and
+// the alerts that mattered drowned. A stream now alerts only on transitions:
+//   down       a failure has lasted RS_ALERT_DOWN_MS with no media since
+//   restart loop  RS_ALERT_LOOP_N restarts inside RS_ALERT_LOOP_MS
+//   recovered  media flowing again with no failure for RS_ALERT_QUIET_MS
+//   stopped    a stream that was down was stopped or reached its end
+// A failure that clears inside the grace period (one restart that works, one
+// slow minute) sends nothing. Degradation that keeps media flowing stays in
+// the log. Provider-script failures not tied to one stream still alert at once.
+// Grace before "down"; RESTREAMAIR_ALERT_DOWN_SECONDS overrides it (read at
+// startup), e.g. a test that cannot wait 90 s.
+#define RS_ALERT_DOWN_MS (90.0 * 1000.0)
+static double g_alert_down_ms = RS_ALERT_DOWN_MS;
+// Longer than the engine's 60s throughput window (RS_LIVE_SUSTAIN_INTERVAL),
+// so a stream still reporting "media stopped" each window cannot look quiet
+// between two reports and flap recovered/down.
+#define RS_ALERT_QUIET_MS (150.0 * 1000.0)
+#define RS_ALERT_LOOP_MS (10.0 * 60.0 * 1000.0)
+#define RS_ALERT_TICK_MS 5000.0
+// A sustained-throughput report below this is "media stopped", not "slow".
+#define RS_ALERT_STALL_X 0.5
+
+static rs_alert_state *alert_find_locked(restream_server_t *s, const char *sid, bool create) {
+    for (rs_alert_state *a = s->alerts; a; a = a->next)
+        if (strcmp(a->sid, sid) == 0) return a;
+    if (!create) return NULL;
+    rs_alert_state *a = (rs_alert_state *)calloc(1, sizeof(*a));
+    if (!a || !(a->sid = rs_strdup(sid))) { free(a); return NULL; }
+    a->next = s->alerts;
+    s->alerts = a;
+    return a;
+}
+
+static void alert_drop_locked(restream_server_t *s, rs_alert_state *gone) {
+    for (rs_alert_state **pp = &s->alerts; *pp; pp = &(*pp)->next) {
+        if (*pp == gone) {
+            *pp = gone->next;
+            alert_state_free(gone);
+            return;
+        }
+    }
+}
+
+static void alert_format_duration(double ms, char *out, size_t cap) {
+    long secs = ms > 0 ? (long)(ms / 1000.0 + 0.5) : 0;
+    if (secs >= 3600) snprintf(out, cap, "%ldh %02ldm", secs / 3600, (secs % 3600) / 60);
+    else if (secs >= 60) snprintf(out, cap, "%ldm %02lds", secs / 60, secs % 60);
+    else snprintf(out, cap, "%lds", secs);
+}
+
+static void alert_send_locked(restream_server_t *s, rs_alert_state *a, int kind, double now) {
     const char *stream_name = NULL;
-    rs_webhook_target *target = webhook_target_for_sid_locked(s, sid, &stream_name);
-    if (target) {
-        double now = now_ms();
-        if (target->last_queued_ms > 0 && now - target->last_queued_ms < RS_WEBHOOK_BURST_MS) {
-            target->suppressed++;
-        } else if (webhook_queue_locked(s, target, stream_name, event, message, status, false)) {
-            target->last_queued_ms = now;
+    rs_webhook_target *target = webhook_target_for_sid_locked(s, a->sid, &stream_name);
+    if (!target) return;
+    const char *reason = a->reason && a->reason[0] ? a->reason : "The stream stopped delivering media.";
+    char duration[32], count[64];
+    alert_format_duration(now - a->bad_since_ms, duration, sizeof(duration));
+    rs_buf m = RS_BUF_INIT;
+    const char *event = a->reason_event ? a->reason_event : "error";
+    const char *extra_name = NULL, *extra_value = NULL;
+    switch (kind) {
+    case RS_ALERT_DOWN:
+        rs_buf_append_str(&m, reason);
+        if (a->episode_restarts > 0) {
+            snprintf(count, sizeof(count), "%u", a->episode_restarts);
+            extra_name = "Restarts"; extra_value = count;
+        }
+        break;
+    case RS_ALERT_LOOP:
+        rs_buf_appendf(&m, "Restarted %d times in %d minutes and still failing. Last error: %s",
+                       RS_ALERT_LOOP_N, (int)(RS_ALERT_LOOP_MS / 60000.0), reason);
+        extra_name = "Down for"; extra_value = duration;
+        break;
+    case RS_ALERT_RECOVERED:
+        rs_buf_appendf(&m, "Media is flowing again. It was down for %s.", duration);
+        event = "recovered";
+        extra_name = "Down for"; extra_value = duration;
+        break;
+    default:  // RS_ALERT_STOPPED
+        rs_buf_appendf(&m, "The stream was stopped while it was down. Last error: %s", reason);
+        event = "stopped";
+        extra_name = "Down for"; extra_value = duration;
+        break;
+    }
+    // A failed script's output goes last: the payload keeps the first line
+    // and the end of a multi-line message, where a traceback names the error.
+    if ((kind == RS_ALERT_DOWN || kind == RS_ALERT_LOOP) && a->detail && a->detail[0]) {
+        rs_buf_append_char(&m, '\n');
+        rs_buf_append_str(&m, a->detail);
+    }
+    char *message = rs_buf_take(&m);
+    webhook_queue_locked(s, target, stream_name, event, message ? message : reason, 0, false,
+                         kind, extra_name, extra_value);
+    rs_free(message);
+}
+
+static void alert_bad_locked(restream_server_t *s, rs_alert_state *a, const char *event,
+                             const char *message, bool restart, double now) {
+    if (!a->failing) {
+        a->failing = true;
+        a->bad_since_ms = now;
+        a->episode_restarts = 0;
+    }
+    a->last_bad_ms = now;
+    free(a->reason_event);
+    a->reason_event = rs_strdup(event);
+    free(a->reason);
+    a->reason = rs_strdup(message ? message : "");
+    if (!restart) return;
+    a->episode_restarts++;
+    a->restarts[a->restart_next % RS_ALERT_LOOP_N] = now;
+    a->restart_next++;
+    if (a->loop_alerted || a->restart_next < RS_ALERT_LOOP_N) return;
+    // The ring holds the last N restarts; the oldest is the slot about to be
+    // overwritten next. All N inside the window is a loop.
+    double oldest = a->restarts[a->restart_next % RS_ALERT_LOOP_N];
+    if (now - oldest <= RS_ALERT_LOOP_MS) {
+        alert_send_locked(s, a, RS_ALERT_LOOP, now);
+        a->loop_alerted = true;
+        a->down = true;
+    }
+}
+
+// Runs every RS_ALERT_TICK_MS on the webhook thread: fires "down" once a
+// failure has outlasted the grace period, and "recovered" once media has
+// flowed with no failure for RS_ALERT_QUIET_MS.
+static void alert_tick_locked(restream_server_t *s, double now) {
+    rs_alert_state *a = s->alerts;
+    while (a) {
+        rs_alert_state *next = a->next;
+        const char *unused = NULL;
+        if (!webhook_target_for_sid_locked(s, a->sid, &unused)) {
+            // Stream deleted, or its provider's webhook removed.
+            alert_drop_locked(s, a);
+            a = next;
+            continue;
+        }
+        if (a->failing) {
+            bool healthy = a->last_ok_ms > a->last_bad_ms && now - a->last_bad_ms >= RS_ALERT_QUIET_MS;
+            if (healthy) {
+                if (a->down) alert_send_locked(s, a, RS_ALERT_RECOVERED, now);
+                a->failing = a->down = a->loop_alerted = false;
+                free(a->detail);
+                a->detail = NULL;
+            } else if (!a->down && now - a->bad_since_ms >= g_alert_down_ms) {
+                alert_send_locked(s, a, RS_ALERT_DOWN, now);
+                a->down = true;
+            }
+        } else if (now - a->last_bad_ms > RS_ALERT_LOOP_MS) {
+            // Healthy and long past its last restart: nothing left to track.
+            alert_drop_locked(s, a);
+        }
+        a = next;
+    }
+}
+
+// "START of <stream id> from <who> failed: …" is logged under __panel__.
+static bool alert_start_failure_sid(const char *message, char *sid, size_t cap) {
+    if (!message || strncmp(message, "START of ", 9) != 0) return false;
+    const char *p = message + 9;
+    size_t n = strcspn(p, " ");
+    if (n == 0 || n >= cap || strncmp(p, "stream_", 7) != 0) return false;
+    memcpy(sid, p, n);
+    sid[n] = '\0';
+    return true;
+}
+
+// Fed every log line (cheap string checks before the lock). Decides what a
+// stream's line means for its outage state; only provider-script errors take
+// the old immediate path.
+static void alert_observe(restream_server_t *s, const char *sid, const char *level,
+                          const char *event, const char *message, long status) {
+    if (!sid || !event) return;
+    bool error = level && strcmp(level, "error") == 0;
+    char started_sid[96];
+    if (error && strcmp(event, "streamStart") == 0 &&
+        alert_start_failure_sid(message, started_sid, sizeof(started_sid)))
+        sid = started_sid;
+
+    enum { A_IGNORE, A_PLAIN, A_BAD, A_RESTART, A_OK, A_STOP, A_SCRIPT } what = A_IGNORE;
+    if (strncmp(sid, "stream_", 7) != 0) {
+        // A failed script logs its stderr line by line and once whole
+        // (webhook_script_failure); only the whole one is alerted.
+        if (error && strcmp(event, "scriptError") != 0 && strcmp(event, "scriptEnd") != 0)
+            what = A_PLAIN;
+    } else if (strcmp(event, "pollDone") == 0) {
+        // "<rep>: +N segments …" with N > 0 is media flowing.
+        const char *plus = message ? strstr(message, ": +") : NULL;
+        if (plus && strtoul(plus + 3, NULL, 10) > 0) what = A_OK;
+    } else if (!error) {
+        if (strcmp(event, "ffmpegStart") == 0) what = A_OK;
+        else if (strcmp(event, "streamStop") == 0 || strcmp(event, "eventRemoved") == 0 ||
+                 strcmp(event, "streamDelete") == 0)
+            what = A_STOP;
+    } else if (strcmp(event, "scriptFailed") == 0) {
+        what = A_SCRIPT;
+    } else if (strcmp(event, "streamStart") == 0 || strcmp(event, "ffmpegStart") == 0 ||
+               strcmp(event, "ffmpegSpawn") == 0 || strcmp(event, "ffmpegStalled") == 0 ||
+               (message && strstr(message, "giving up on this engine"))) {
+        what = A_RESTART;
+    } else if (strcmp(event, "ffmpegHalted") == 0) {
+        what = A_BAD;
+    } else if (strcmp(event, "fallingBehind") == 0) {
+        const char *x = message ? strstr(message, "publishing ") : NULL;
+        if (x && strtod(x + 11, NULL) < RS_ALERT_STALL_X) what = A_BAD;
+    }
+    if (what == A_IGNORE) return;
+
+    double now = now_ms();
+    pthread_mutex_lock(&s->webhook_mu);
+    if (what == A_PLAIN) {
+        const char *stream_name = NULL;
+        rs_webhook_target *target = webhook_target_for_sid_locked(s, sid, &stream_name);
+        if (target) {
+            if (target->last_queued_ms > 0 && now - target->last_queued_ms < RS_WEBHOOK_BURST_MS) {
+                target->suppressed++;
+            } else if (webhook_queue_locked(s, target, stream_name, event, message, status, false,
+                                            RS_ALERT_ERROR, NULL, NULL)) {
+                target->last_queued_ms = now;
+            }
+        }
+    } else if (what == A_OK || what == A_STOP) {
+        rs_alert_state *a = alert_find_locked(s, sid, false);
+        if (a && what == A_OK) a->last_ok_ms = now;
+        if (a && what == A_STOP) {
+            if (a->down) alert_send_locked(s, a, RS_ALERT_STOPPED, now);
+            alert_drop_locked(s, a);
+        }
+    } else {
+        const char *unused = NULL;
+        rs_alert_state *a = webhook_target_for_sid_locked(s, sid, &unused)
+                                ? alert_find_locked(s, sid, true) : NULL;
+        if (a && what == A_SCRIPT) {
+            // The start failure that follows names the failure; keep the
+            // script's own output to show under it.
+            free(a->detail);
+            a->detail = rs_strdup(message ? message : "");
+        } else if (a) {
+            alert_bad_locked(s, a, event, message, what == A_RESTART, now);
         }
     }
     pthread_mutex_unlock(&s->webhook_mu);
+}
+
+static void webhook_enqueue_error(restream_server_t *s, const char *sid, const char *event,
+                                  const char *message, long status) {
+    alert_observe(s, sid, "error", event, message, status);
 }
 
 // One alert per failed script run: its exit status and everything it wrote to
@@ -592,7 +881,7 @@ static bool webhook_enqueue_test(restream_server_t *s, const char *provider_id) 
         if (strcmp(t->provider_id, provider_id ? provider_id : "") == 0) {
             queued = webhook_queue_locked(s, t, "Webhook test", "test",
                                            "The provider error webhook is configured correctly.",
-                                           0, true);
+                                           0, true, RS_ALERT_ERROR, NULL, NULL);
             break;
         }
     }
@@ -608,8 +897,18 @@ static char *webhook_payload(const rs_webhook_job *job) {
     rs_json_obj_set(root, "allowed_mentions", allowed);
     rs_json *embeds = rs_json_new_arr();
     rs_json *embed = rs_json_new_obj();
-    rs_json_obj_set_str(embed, "title", job->test ? "Webhook test" : "Provider error");
-    rs_json_obj_set_int(embed, "color", job->test ? 5763719 : 15548997);
+    const char *title = "Provider error";
+    long color = 15548997;  // red
+    switch (job->kind) {
+    case RS_ALERT_DOWN:      title = "Stream down"; break;
+    case RS_ALERT_LOOP:      title = "Stream restart loop"; color = 15105570; break;   // orange
+    case RS_ALERT_RECOVERED: title = "Stream recovered"; color = 5763719; break;       // green
+    case RS_ALERT_STOPPED:   title = "Stream stopped while down"; color = 9807270; break;  // grey
+    default: break;
+    }
+    if (job->test) { title = "Webhook test"; color = 5763719; }
+    rs_json_obj_set_str(embed, "title", title);
+    rs_json_obj_set_int(embed, "color", color);
     // Discord caps an embed description at 4096 characters. A script failure
     // carries its whole stderr; when even that is too long, keep the first
     // line and the end, where a traceback names the actual exception.
@@ -649,6 +948,13 @@ static char *webhook_payload(const rs_webhook_job *job) {
         rs_json_obj_set_bool(field, "inline", true);
         rs_json_arr_push(fields, field);
     }
+    if (job->extra_name && job->extra_value) {
+        rs_json *field = rs_json_new_obj();
+        rs_json_obj_set_str(field, "name", job->extra_name);
+        rs_json_obj_set_str(field, "value", job->extra_value);
+        rs_json_obj_set_bool(field, "inline", true);
+        rs_json_arr_push(fields, field);
+    }
     if (job->status > 0) {
         char status[32];
         snprintf(status, sizeof(status), "%ld", job->status);
@@ -678,8 +984,15 @@ static void *webhook_worker(void *opaque) {
     restream_server_t *s = (restream_server_t *)opaque;
     for (;;) {
         pthread_mutex_lock(&s->webhook_mu);
-        while (!s->webhook_stop && !s->webhook_head)
-            pthread_cond_wait(&s->webhook_cv, &s->webhook_mu);
+        // Wakes every RS_ALERT_TICK_MS even when idle: a stream going down is
+        // the absence of log lines, so no log line can trigger that alert.
+        while (!s->webhook_stop && !s->webhook_head) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += (time_t)(RS_ALERT_TICK_MS / 1000.0);
+            pthread_cond_timedwait(&s->webhook_cv, &s->webhook_mu, &deadline);
+            alert_tick_locked(s, now_ms());
+        }
         if (s->webhook_stop) {
             pthread_mutex_unlock(&s->webhook_mu);
             break;
@@ -928,12 +1241,9 @@ static void log_record(restream_server_t *s, const char *sid, const char *level,
     s->log_head = (s->log_head + 1) % RS_LOG_CAP;
     if (s->log_count < RS_LOG_CAP) s->log_count++;
     log_unlock(s);
-    // A failed script is alerted once with its whole output (webhook_script_
-    // failure); its per-line stderr records and exit record would otherwise
-    // each claim the burst window and Discord got only the traceback's top line.
-    if (level && strcmp(level, "error") == 0 && event &&
-        strcmp(event, "scriptError") != 0 && strcmp(event, "scriptEnd") != 0)
-        webhook_enqueue_error(s, sid ? sid : "__panel__", event, message, status);
+    // Every line, not only errors: a stream's recovery is told by its healthy
+    // lines (see "outage alerts").
+    alert_observe(s, sid ? sid : "__panel__", level, event, message, status);
 }
 
 // printf-style log_record, for the many call sites that have to assemble a
@@ -10536,6 +10846,8 @@ restream_server_t* restream_server_create(void) {
         return NULL;
     }
     webhook_rebuild_targets(server);
+    const char *down_env = getenv("RESTREAMAIR_ALERT_DOWN_SECONDS");
+    if (down_env && down_env[0] && atof(down_env) >= 0) g_alert_down_ms = atof(down_env) * 1000.0;
     g_debug_server = server;
     if (g_webhook_handler && pthread_create(&server->webhook_thread, NULL, webhook_worker, server) == 0)
         server->webhook_thread_started = true;
@@ -10753,6 +11065,11 @@ void restream_server_destroy(restream_server_t* server) {
         pthread_mutex_destroy(&server->webhook_mu);
         pthread_cond_destroy(&server->webhook_cv);
         webhook_targets_free(server->webhook_targets);
+        while (server->alerts) {
+            rs_alert_state *a = server->alerts;
+            server->alerts = a->next;
+            alert_state_free(a);
+        }
         while (server->webhook_head) {
             rs_webhook_job *job = server->webhook_head;
             server->webhook_head = job->next;

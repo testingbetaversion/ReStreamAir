@@ -8,8 +8,8 @@ ReStreamAir exposes three different kinds of events:
 | `GET /api/logs` | Diagnostic, lifecycle and script log entries. |
 | Provider `events` script action | Scheduled programme/event metadata imported as streams. |
 
-An optional provider error webhook pushes selected errors to an external HTTP
-receiver. These interfaces do not share a common message format. Management
+An optional provider error webhook pushes stream outages (down, restart loop,
+recovered) and provider-script errors to an external HTTP receiver. These interfaces do not share a common message format. Management
 routes require a panel account; playback keys do not authenticate them.
 See [API.md](API.md) for authentication, CORS and the full route reference.
 
@@ -517,8 +517,8 @@ decision. The script protocol is in [SCRIPTING.md](SCRIPTING.md).
 
 ## Outgoing error webhooks
 
-Set a provider's `errorWebhookUrl` to an HTTP(S) receiver. Stream errors and that
-provider's script errors enqueue a Discord-compatible JSON POST. Use
+Set a provider's `errorWebhookUrl` to an HTTP(S) receiver. Stream outages and
+that provider's script errors enqueue a Discord-compatible JSON POST. Use
 `POST /api/providers/<id>/webhook/test` to queue a test; `202` means queued,
 not delivered. No webhook or a full queue produces `400`.
 
@@ -542,12 +542,34 @@ not delivered. No webhook or a full queue produces `400`.
 
 HTTP status is optional. A test uses title `Webhook test` and color `5763719`.
 
+### Stream outage alerts
+
+A stream does not alert on every error line. Errors that leave media flowing
+(`fallingBehind` above 0.5x, `tsMuxStalled`, `pollSlow`, `liveEdgeSkip`, a
+single download or key failure) stay in the log. A stream alerts only when its
+state changes:
+
+| Title | Color | When |
+|---|---|---|
+| `Stream down` | `15548997` | A failure has lasted 90 s with no media since: a start that failed, the engine giving up, FFmpeg halting or stalling, or `fallingBehind` below 0.5x. The description is the last error, followed by a failed script's output; a `Restarts` field counts restarts so far. |
+| `Stream restart loop` | `15105570` | Three restarts within 10 minutes, even if it ran briefly in between. Sent instead of `Stream down` when it comes first. |
+| `Stream recovered` | `5763719` | After a down or loop alert: media flowing with no failure for 150 s. `Event` is `recovered`; `Down for` gives the outage length. |
+| `Stream stopped while down` | `9807270` | A stream that was down was stopped or reached its scheduled end. A deleted stream is dropped silently. |
+
+A failure that clears inside the 90 s grace period, such as one restart that
+works, sends nothing. Each outage sends one down (or loop) alert and one
+closing alert. `RESTREAMAIR_ALERT_DOWN_SECONDS`, read at startup, changes the
+grace period. Errors from a provider script that are not tied to one stream
+still alert immediately with title `Provider error`, subject to the burst
+window below.
+
 A proxy that fails one request is set aside for 15 s and logged as `info`; free
-tunnels drop single requests while working. The `proxyHealth` error, and its
-webhook, comes only when the proxy has been set aside three times in a row,
-having failed its re-checks after each cooldown. It is sent once per outage.
+tunnels drop single requests while working. The `proxyHealth` error comes only
+when the proxy has been set aside three times in a row, having failed its
+re-checks after each cooldown, once per outage. It is not alerted itself; when
+the proxy's loss stops a stream, that stream's outage alert reports it.
 Descriptions are truncated to approximately 1000 characters and URLs in error
-text are redacted. Extra burst errors are collapsed: one provider error is
+text are redacted. Extra burst `Provider error` alerts are collapsed: one is
 queued per 5-second window, and a subsequent alert may carry `footer.text`
 reporting the suppressed count. The shared queue is capped at 64 pending jobs.
 Delivery is best-effort in a background worker; failures appear as
