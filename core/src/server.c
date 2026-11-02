@@ -9121,19 +9121,35 @@ static void provider_maintenance(restream_server_t *s) {
                     for (int k = 1; k < failures && delay < cap; k++) delay *= 2;
                     if (delay > cap) delay = cap;
                 }
-                if (restart) rs_json_obj_set(stimer, "restartAt", rs_json_new_num(now + delay));
+                if (restart) {
+                    rs_json_obj_set(stimer, "restartAt", rs_json_new_num(now + delay));
+                    rs_panel_set_stream_restart_pending(&s->state, id, true);
+                }
                 log_record(s, id, condition == 1 ? "error" : "info", "providerRestart", NULL, 0, -1,
                     restart ? "pipeline restart scheduled by provider policy" : "pipeline stopped; no restart on error is enabled");
+            }
+            // The timer lives in memory; restartPending is its saved twin. A
+            // restart, deploy or reboot inside restartDelaySeconds used to
+            // leave the stream stopped for good.
+            if (!running && rs_json_obj_bool(stream, "restartPending", false) &&
+                rs_json_obj_num(stimer, "restartAt", 0) <= 0) {
+                rs_json_obj_set(stimer, "restartAt",
+                                rs_json_new_num(now + (double)rs_provider_option_int(provider, "restartDelaySeconds")));
+                log_record(s, id, "info", "providerRestart", NULL, 0, -1,
+                           "restart scheduled before the server restarted; restarting");
             }
             double restart_at = rs_json_obj_num(stimer, "restartAt", 0);
             if (restart_at > 0 && restart_at <= now && !provider_job_busy(s, provider)) {
                 rs_json_obj_remove(stimer, "restartAt");
+                rs_panel_set_stream_restart_pending(&s->state, id, false);
+                changed = true;
                 scheduled_stream_start(s, id, "provider restart timer");
             } else if (provider_timer_due(stimer, "restart", running ? rs_provider_option_int(provider, "autoRestartPeriodSeconds") : 0, now)) {
                 live_stop_stream(s, id); pipeline_stop_stream(id);
                 const char *err = NULL;
                 rs_panel_set_stream_running(&s->state, id, false, &err);
                 rs_json_obj_set(stimer, "restartAt", rs_json_new_num(now + (double)rs_provider_option_int(provider, "restartDelaySeconds")));
+                rs_panel_set_stream_restart_pending(&s->state, id, true);
                 rs_json_obj_remove(stimer, "fallback");
                 log_record(s, id, "info", "scheduledRestart", NULL, 0, -1, "provider autorestart period elapsed");
                 changed = true;

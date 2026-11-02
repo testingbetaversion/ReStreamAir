@@ -760,7 +760,7 @@ int rs_panel_update_stream(rs_state *st, const char *stream_id, const rs_json *b
     // the existing stream rather than resetting them (a PUT merges, not replaces).
     static const char *carried[] = {"sourceType", "mode", "scriptVideoSelector", "scriptAudioSelector",
                                     "onDemand", "speedUp", "autostart", "scriptStart", "scriptEnd",
-                                    "recordEvent", "cdnHeaders", "stoppedByUser"};
+                                    "recordEvent", "cdnHeaders", "stoppedByUser", "restartPending"};
     for (size_t i = 0; i < sizeof(carried) / sizeof(carried[0]); i++) {
         const rs_json *v = rs_json_obj_get(existing, carried[i]);
         if (v) rs_json_obj_set(updated, carried[i], rs_json_clone(v));
@@ -1039,6 +1039,13 @@ void rs_panel_set_stream_user_stopped(rs_state *st, const char *stream_id, bool 
     else rs_json_obj_remove(stream, "stoppedByUser");
 }
 
+void rs_panel_set_stream_restart_pending(rs_state *st, const char *stream_id, bool pending) {
+    rs_json *stream = find_stream(st, stream_id, NULL);
+    if (!stream) return;
+    if (pending) rs_json_obj_set_bool(stream, "restartPending", true);
+    else rs_json_obj_remove(stream, "restartPending");
+}
+
 void rs_panel_set_stream_key_limited_video(rs_state *st, const char *stream_id, const char *rule) {
     rs_json *stream = find_stream(st, stream_id, NULL);
     if (!stream) return;
@@ -1074,6 +1081,9 @@ int rs_panel_set_stream_running(rs_state *st, const char *stream_id, bool runnin
     }
     rs_json_obj_set_str(stream, "status", running ? "running" : "stopped");
     rs_json_obj_set(stream, "lastError", rs_json_new_null());
+    // Any start or stop settles a pending automatic restart; the supervisor
+    // marks it again after a stop it means to undo.
+    rs_json_obj_remove(stream, "restartPending");
     return 0;
 }
 

@@ -1407,6 +1407,17 @@ static void test_provider_options(void) {
     check("options/limit-enforced", rs_panel_set_stream_running(&st, sid[1], true, &err) == -409);
     check("options/stop-releases-slot", rs_panel_set_stream_running(&st, sid[0], false, &err) == 0 &&
           rs_panel_set_stream_running(&st, sid[1], true, &err) == 0);
+    // A restart the supervisor scheduled is saved on the stream, survives an
+    // edit, and is settled by any start or stop.
+    char *rid = rs_strdup(sid[0]);  // an update replaces the stream object
+    rs_panel_set_stream_restart_pending(&st, rid, true);
+    body = parse_json("{\"name\":\"Channel renamed\",\"kind\":\"m3u8\",\"url\":\"http://example.test/live.m3u8\"}");
+    check("options/restart-pending-survives-edit", rs_panel_update_stream(&st, rid, body, &err) == 0 &&
+          rs_json_obj_bool(rs_panel_find_stream(&st, rid), "restartPending", false));
+    rs_json_free(body);
+    check("options/restart-pending-cleared-by-stop", rs_panel_set_stream_running(&st, rid, false, &err) == 0 &&
+          !rs_json_obj_get(rs_panel_find_stream(&st, rid), "restartPending"));
+    free(rid);
     body = parse_json("{\"Events\":[{}, {\"Name\":\"Event one\"}, {\"Name\":\"Event two\"}]}");
     int count = 0;
     check("options/event-cap", rs_panel_import_script_entries(&st, pid, "events", body, NULL, &count, &err) == 0 && count == 1);

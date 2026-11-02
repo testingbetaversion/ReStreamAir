@@ -67,6 +67,10 @@ void rs_panel_set_stream_key_limited_video(rs_state *st, const char *stream_id, 
 // Marks a stream as stopped by a person (Stop button / bulk stop), or clears
 // it on a manual start. Auto-start events never restarts a marked stream.
 void rs_panel_set_stream_user_stopped(rs_state *st, const char *stream_id, bool stopped);
+// Saves that the supervisor stopped a stream to restart it after
+// restartDelaySeconds, so a server restart in that window still restarts it.
+// rs_panel_set_stream_running clears it.
+void rs_panel_set_stream_restart_pending(rs_state *st, const char *stream_id, bool pending);
 
 // Applies a `manifest` action's reply to a stream: the fresh source URL, its
 // CDN mirrors, and — when the script supplied them — the per-category headers
