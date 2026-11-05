@@ -1370,7 +1370,7 @@ function streamPayload() {
   return {
     name: form.elements.name.value,
     kind: form.elements.kind.value,
-    url: form.elements.url.value,
+    url: form.elements.url.value.trim(),
     logo: form.elements.logo.value,
     cdnUrls: collectCdnMirrors(),
     representation: form.elements.representation.value,
