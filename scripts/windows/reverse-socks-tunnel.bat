@@ -19,6 +19,12 @@ rem A second tunnel from the same PC (e.g. port 1888): copy this script under
 rem another name (reverse-socks-tunnel-1888.bat); it gets its own .cfg and its
 rem own logon task.
 rem
+rem Log: reverse-socks-tunnel.log next to this script (same name, .log) records
+rem each start, connect and drop, plus ssh's own messages such as why it
+rem disconnected. "Script started" with no "Tunnel dropped" line before it means
+rem the window was closed, ssh was killed or the PC restarted. Past 5 MB it is
+rem renamed to .log.old at the next connect.
+rem
 rem Needs the Windows OpenSSH client (built into Windows 10 1809+ / 11).
 rem ---------------------------------------------------------------------------
 
@@ -92,6 +98,17 @@ echo Saved the settings to "%CFG%".
 :haveconfig
 set "SSHOPTS=-i "%KEY%" -p %TUN_SSHPORT% -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
 
+rem ssh writes to this file instead of the console, so its reason for a
+rem disconnect outlives the window, and a console paused by selecting text
+rem cannot hold ssh up. An unwritable log must not stop the tunnel.
+set "LOG=%~dpn0.log"
+set "LOGOPT=-E "%LOG%""
+(>>"%LOG%" echo [%date% %time%] Script started) 2>nul || (
+    echo Could not write "%LOG%" - running without a log file.
+    set "LOGOPT="
+)
+if defined LOGOPT echo Log file:      "%LOG%"
+
 if not exist "%KEY%" (
     echo Creating SSH key %KEY% ...
     ssh-keygen -q -t ed25519 -N "" -C "reverse-tunnel@%COMPUTERNAME%" -f "%KEY%" || (pause & exit /b 1)
@@ -123,14 +140,18 @@ rem <nul: if schtasks wants a password it fails instead of waiting unseen.
 schtasks /create /tn "%TASK%" /tr "\"%~f0\"" /sc onlogon /delay 0000:30 /f <nul >nul 2>&1 && echo Autostart enabled at logon ^(task %TASK%^). || echo Could not enable autostart - try running as administrator.
 
 :loop
+if exist "%LOG%" for %%F in ("%LOG%") do if %%~zF GTR 5000000 move /y "%LOG%" "%LOG%.old" >nul 2>&1
 echo [%date% %time%] Connecting: %TUN_HOST% 127.0.0.1:%TUN_PORT% ^<- SOCKS via this PC
+(>>"%LOG%" echo [%date% %time%] Connecting to %TUN_HOST% tunnel port %TUN_PORT%) 2>nul
 rem ServerAlive*: notice a dead link in ~45s instead of hanging.
 rem ExitOnForwardFailure: if the port is still held on the server, exit and
 rem retry rather than sit connected with no tunnel.
-ssh %SSHOPTS% -N -o BatchMode=yes -o ConnectTimeout=20 ^
+ssh %SSHOPTS% %LOGOPT% -N -o BatchMode=yes -o ConnectTimeout=20 ^
     -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes ^
     -o ExitOnForwardFailure=yes ^
     -R 127.0.0.1:%TUN_PORT% %TUN_USER%@%TUN_HOST%
-echo [%date% %time%] Tunnel dropped (exit %errorlevel%). Reconnecting in 5s - close this window to stop.
+set "RC=%errorlevel%"
+echo [%date% %time%] Tunnel dropped (exit %RC%). Reconnecting in 5s - close this window to stop.
+(>>"%LOG%" echo [%date% %time%] Tunnel dropped, exit %RC%) 2>nul
 timeout /t 5 /nobreak >nul
 goto :loop
