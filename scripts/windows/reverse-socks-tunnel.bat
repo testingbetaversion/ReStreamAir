@@ -98,11 +98,12 @@ echo Saved the settings to "%CFG%".
 :haveconfig
 set "SSHOPTS=-i "%KEY%" -p %TUN_SSHPORT% -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
 
-rem ssh writes to this file instead of the console, so its reason for a
+rem ssh's messages go to this file instead of the console, so its reason for a
 rem disconnect outlives the window, and a console paused by selecting text
-rem cannot hold ssh up. An unwritable log must not stop the tunnel.
+rem cannot hold ssh up. A cmd redirect, not ssh -E: with -E, Notepad refuses to
+rem open the file while ssh runs. An unwritable log must not stop the tunnel.
 set "LOG=%~dpn0.log"
-set "LOGOPT=-E "%LOG%""
+set "LOGOPT=2>>"%LOG%""
 (>>"%LOG%" echo [%date% %time%] Script started) 2>nul || (
     echo Could not write "%LOG%" - running without a log file.
     set "LOGOPT="
@@ -146,10 +147,10 @@ echo [%date% %time%] Connecting: %TUN_HOST% 127.0.0.1:%TUN_PORT% ^<- SOCKS via t
 rem ServerAlive*: notice a dead link in ~45s instead of hanging.
 rem ExitOnForwardFailure: if the port is still held on the server, exit and
 rem retry rather than sit connected with no tunnel.
-ssh %SSHOPTS% %LOGOPT% -N -o BatchMode=yes -o ConnectTimeout=20 ^
+ssh %SSHOPTS% -N -o BatchMode=yes -o ConnectTimeout=20 ^
     -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes ^
     -o ExitOnForwardFailure=yes ^
-    -R 127.0.0.1:%TUN_PORT% %TUN_USER%@%TUN_HOST%
+    -R 127.0.0.1:%TUN_PORT% %TUN_USER%@%TUN_HOST% %LOGOPT%
 set "RC=%errorlevel%"
 echo [%date% %time%] Tunnel dropped (exit %RC%). Reconnecting in 5s - close this window to stop.
 (>>"%LOG%" echo [%date% %time%] Tunnel dropped, exit %RC%) 2>nul
