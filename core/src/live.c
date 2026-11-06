@@ -2052,7 +2052,7 @@ static void *writer_main(void *arg) {
     // genuinely falling behind. See RS_LIVE_SUSTAIN_INTERVAL.
     double sustain_anchor = report_anchor;
     double sustain_seconds = 0;
-    int slow_sustain_windows = 0;
+    rs_live_lag_state lag_state = {0};
     long long last_sustain_skipped = 0;
 
     for (;;) {
@@ -2221,6 +2221,8 @@ static void *writer_main(void *arg) {
             rep->pruned_total = 0;
             long long skipped = rep->skipped;
             bool started = rep->ready;
+            bool static_complete = st->static_complete;
+            double seg_duration = rep->seg_duration > 0 ? rep->seg_duration : 2.0;
             int stream_active = st->active_downloads;
             int stream_budget = dl_limit_locked(st);
             pthread_mutex_unlock(&st->mu);
@@ -2257,8 +2259,9 @@ static void *writer_main(void *arg) {
                 double srt = sustained > 0 ? sustain_seconds / sustained : 0;
                 long long newly_skipped = skipped > last_sustain_skipped
                                              ? skipped - last_sustain_skipped : 0;
-                int lag = rs_live_lag_level(started ? 1 : 0, srt, newly_skipped,
-                                            &slow_sustain_windows);
+                // A finished static manifest has nothing left to publish.
+                int lag = rs_live_lag_level(started && !static_complete, sustain_seconds, sustained,
+                                            seg_duration, newly_skipped, &lag_state);
 
                 // Burst-published sources routinely have one quiet 30-60s
                 // interval followed by a >1x catch-up burst. Treat the first
@@ -2277,7 +2280,7 @@ static void *writer_main(void *arg) {
                             "%s: publishing %.2fx realtime (%.1fs of media in %.1fs) for %d "
                             "consecutive windows — the advertised window will shrink and players "
                             "will stall; no new loss yet, %lld segments skipped previously",
-                            rep->rep_id, srt, sustain_seconds, sustained, slow_sustain_windows,
+                            rep->rep_id, srt, sustain_seconds, sustained, lag_state.slow_windows,
                             skipped);
                 }
                 else if (lag == 1)

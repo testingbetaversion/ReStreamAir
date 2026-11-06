@@ -21,6 +21,11 @@
 
 #include "rs_live.h"
 
+#include <stdbool.h>
+
+// RS_LIVE_REPORT_INTERVAL in live.c: throughput windows only close on a report.
+#define RS_LIVE_LAG_TICK_SLACK 5.0
+
 int rs_live_window_size(int download_ahead, double since_last, double seg_duration) {
     int want = download_ahead > 0 ? download_ahead : 1;
     if (seg_duration <= 0) seg_duration = 2.0;
@@ -38,15 +43,21 @@ int rs_live_window_size(int download_ahead, double since_last, double seg_durati
     return want;
 }
 
-int rs_live_lag_level(int started, double realtime, long long newly_skipped,
-                      int *consecutive_slow_windows) {
-    if (!consecutive_slow_windows) return 0;
-    if (!started || realtime >= 0.95) {
-        *consecutive_slow_windows = 0;
+int rs_live_lag_level(int started, double media_seconds, double window_seconds, double seg_duration,
+                      long long newly_skipped, rs_live_lag_state *state) {
+    if (!state) return 0;
+    double media = state->prev_media + media_seconds;
+    double window = state->prev_window + window_seconds;
+    state->prev_media = media_seconds;
+    state->prev_window = window_seconds;
+    bool below = started && window_seconds > 0 && media_seconds / window_seconds < 0.95;
+    bool short_overall = window - media > 0.05 * window + seg_duration + RS_LIVE_LAG_TICK_SLACK;
+    if (!below || !(short_overall || newly_skipped > 0)) {
+        state->slow_windows = 0;
         return 0;
     }
-    if (*consecutive_slow_windows < 1000) (*consecutive_slow_windows)++;
-    if (newly_skipped > 0 || *consecutive_slow_windows >= 2) return 2;
+    if (state->slow_windows < 1000) state->slow_windows++;
+    if (newly_skipped > 0 || state->slow_windows >= 2) return 2;
     return 1;
 }
 

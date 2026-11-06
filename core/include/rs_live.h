@@ -174,13 +174,22 @@ typedef struct {
 // segments it holds.
 int rs_live_window_size(int download_ahead, double since_last, double seg_duration);
 
+// What rs_live_lag_level remembers between windows; zero it to start.
+typedef struct {
+    double prev_media, prev_window;  // the previous window, in seconds
+    int slow_windows;                // consecutive low windows so far
+} rs_live_lag_state;
+
 // Classifies one long throughput window: 0 = healthy/not started, 1 = watch,
-// 2 = genuinely falling behind. During a low-throughput window, a newly
-// skipped segment is immediately an error; otherwise two consecutive windows
-// below 0.95x are required. The caller owns `consecutive_slow_windows`, which
-// this function updates.
-int rs_live_lag_level(int started, double realtime, long long newly_skipped,
-                      int *consecutive_slow_windows);
+// 2 = genuinely falling behind. A window is low when it is below 0.95x and this
+// window plus the previous one are short by more than 5% and one segment plus
+// one report interval. That slack is what whole segments and report ticks can
+// account for on a source that is exactly on time: twelve 5s segments in a 64s
+// window read 0.94x, and the next window holds thirteen. A low window with a
+// newly skipped segment is immediately an error; otherwise two consecutive low
+// windows are required.
+int rs_live_lag_level(int started, double media_seconds, double window_seconds, double seg_duration,
+                      long long newly_skipped, rs_live_lag_state *state);
 
 // What to throw away so a representation's pending queue always holds the
 // NEWEST segments it knows about, never more than `depth` of them.

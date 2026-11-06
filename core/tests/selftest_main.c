@@ -14,6 +14,7 @@
 // all ctest and CI need.
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2346,19 +2347,47 @@ static void test_live_window(void) {
 }
 
 static void test_live_lag_level(void) {
-    int slow = 0;
-    check("live-lag/not-started", rs_live_lag_level(0, 0.0, 0, &slow) == 0 && slow == 0);
-    check("live-lag/first-low-is-watch",
-          rs_live_lag_level(1, 0.80, 0, &slow) == 1 && slow == 1);
-    check("live-lag/second-low-is-error",
-          rs_live_lag_level(1, 0.90, 0, &slow) == 2 && slow == 2);
-    check("live-lag/recovery-resets",
-          rs_live_lag_level(1, 1.02, 0, &slow) == 0 && slow == 0);
-    check("live-lag/new-loss-is-immediate",
-          rs_live_lag_level(1, 0.94, 1, &slow) == 2 && slow == 1);
-    check("live-lag/healthy-with-old-loss",
-          rs_live_lag_level(1, 1.0, 5, &slow) == 0 && slow == 0);
-    check("live-lag/null-state-safe", rs_live_lag_level(1, 0.5, 1, NULL) == 0);
+    rs_live_lag_state lag = {0};
+    check("live-lag/not-started", rs_live_lag_level(0, 0, 60, 2, 0, &lag) == 0 && lag.slow_windows == 0);
+    lag = (rs_live_lag_state){0};
+    check("live-lag/first-low-is-watch", rs_live_lag_level(1, 40, 60, 2, 0, &lag) == 1 && lag.slow_windows == 1);
+    check("live-lag/second-low-is-error", rs_live_lag_level(1, 40, 60, 2, 0, &lag) == 2 && lag.slow_windows == 2);
+    check("live-lag/recovery-resets", rs_live_lag_level(1, 62, 60, 2, 0, &lag) == 0 && lag.slow_windows == 0);
+    lag = (rs_live_lag_state){0};
+    check("live-lag/new-loss-is-immediate", rs_live_lag_level(1, 56, 60, 2, 1, &lag) == 2 && lag.slow_windows == 1);
+    lag = (rs_live_lag_state){0};
+    check("live-lag/healthy-with-old-loss", rs_live_lag_level(1, 60, 60, 2, 5, &lag) == 0 && lag.slow_windows == 0);
+    check("live-lag/null-state-safe", rs_live_lag_level(1, 30, 60, 2, 1, NULL) == 0);
+
+    // Seen in production: an on-time source with 5s segments, judged over 64s
+    // windows, reads 0.94x whenever a window holds twelve of them.
+    lag = (rs_live_lag_state){0};
+    bool on_time_quiet = true;
+    double published = 0;
+    for (int w = 1; w <= 200; w++) {
+        double total = floor(w * 64.0 / 5.005) * 5.005;
+        if (rs_live_lag_level(1, total - published, 64, 5.005, 0, &lag) != 0) on_time_quiet = false;
+        published = total;
+    }
+    check("live-lag/on-time-whole-segments-quiet", on_time_quiet);
+    // Two whole segments late in one window, on time again in the next.
+    lag = (rs_live_lag_state){0};
+    check("live-lag/one-late-burst-quiet",
+          rs_live_lag_level(1, 55.1, 64, 5.005, 0, &lag) == 0 && rs_live_lag_level(1, 70.1, 64, 5.005, 0, &lag) == 0);
+
+    // A real sustained 0.85x still gets through: watch, then error.
+    lag = (rs_live_lag_state){0};
+    int l1 = rs_live_lag_level(1, 54.4, 64, 5.005, 0, &lag);
+    int l2 = rs_live_lag_level(1, 54.4, 64, 5.005, 0, &lag);
+    int l3 = rs_live_lag_level(1, 54.4, 64, 5.005, 0, &lag);
+    check("live-lag/sustained-085-detected", l1 == 0 && l2 == 1 && l3 == 2);
+    // Media stopping is an error by the second window, and the first window
+    // back on time says nothing further.
+    lag = (rs_live_lag_state){0};
+    l1 = rs_live_lag_level(1, 0, 60, 5.005, 0, &lag);
+    l2 = rs_live_lag_level(1, 0, 60, 5.005, 0, &lag);
+    l3 = rs_live_lag_level(1, 60, 60, 5.005, 0, &lag);
+    check("live-lag/stall-detected-then-quiet", l1 == 1 && l2 == 2 && l3 == 0);
 }
 
 // The catch-up policy (live_window.c).
