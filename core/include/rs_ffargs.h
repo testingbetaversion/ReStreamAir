@@ -46,6 +46,9 @@ typedef struct {
     int segment_seconds;
     int http_timeout_seconds; // 0 keeps the legacy 15s default
     bool no_reconnect;
+    // ffmpeg before 4.4 rejects -reconnect_on_network_error and exits at once
+    // ("Option not found"); set from rs_ffmpeg_version_at_least.
+    bool no_network_error_reconnect;
     bool report_progress;
     bool muxed_audio;  // HLS variant CODECS advertises embedded audio
 } rs_ffargs_inputs;
@@ -106,6 +109,12 @@ int rs_ffmpeg_probe_caps(const char *path, rs_ffmpeg_caps *out);
 void rs_ffmpeg_caps_dispose(rs_ffmpeg_caps *caps);
 // Generate installation plan for ffmpeg (returns malloc'd shell command string or NULL).
 char *rs_ffmpeg_install_plan(void);
+// True when the first line of `ffmpeg -version` names a release at least
+// major.minor. Git snapshots ("N-…", dates) and lines it can't read count as new.
+bool rs_ffmpeg_version_at_least(const char *version_line, int major, int minor);
+// Runs `path -version` and applies rs_ffmpeg_version_at_least. One subprocess;
+// cache the answer per binary.
+bool rs_ffmpeg_binary_at_least(const char *path, int major, int minor);
 
 #ifdef __cplusplus
 }

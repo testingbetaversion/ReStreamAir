@@ -290,8 +290,10 @@ int rs_ffargs_build(const rs_ffargs_inputs *in, rs_ffargs_command *out) {
             rs_strv_push(&args, "1");
             rs_strv_push(&args, "-reconnect_streamed");
             rs_strv_push(&args, "1");
-            rs_strv_push(&args, "-reconnect_on_network_error");
-            rs_strv_push(&args, "1");
+            if (!in->no_network_error_reconnect) {
+                rs_strv_push(&args, "-reconnect_on_network_error");
+                rs_strv_push(&args, "1");
+            }
             rs_strv_push(&args, "-reconnect_delay_max");
             rs_strv_push(&args, "2");
         }
@@ -631,6 +633,33 @@ int rs_ffmpeg_probe_caps(const char *path, rs_ffmpeg_caps *out) {
 
     free(owned);
     return 0;
+}
+
+bool rs_ffmpeg_version_at_least(const char *line, int major, int minor) {
+    if (!line) return true;
+    const char *v = strstr(line, "version ");
+    if (!v) return true;
+    v += 8;
+    if (*v == 'n') v++;  // "n4.4.2" tags from git builds
+    if (*v < '0' || *v > '9') return true;  // "N-112345-g…" snapshot
+    char *end = NULL;
+    long maj = strtol(v, &end, 10);
+    if (!end || *end != '.') return true;  // "2024-01-01-git-…" style dates
+    long min = strtol(end + 1, NULL, 10);
+    if (maj > 1000) return true;  // a year, not a release
+    return maj > major || (maj == major && min >= minor);
+}
+
+bool rs_ffmpeg_binary_at_least(const char *path, int major, int minor) {
+    if (!path || !path[0]) return true;
+    const char *ver_args[] = {"-hide_banner", "-version", NULL};
+    char *ver = ff_capture(path, ver_args);
+    if (!ver) return true;
+    char *nl = strchr(ver, '\n');
+    if (nl) *nl = '\0';
+    bool ok = rs_ffmpeg_version_at_least(ver, major, minor);
+    free(ver);
+    return ok;
 }
 
 void rs_ffmpeg_caps_dispose(rs_ffmpeg_caps *caps) {

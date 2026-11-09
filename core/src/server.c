@@ -8120,6 +8120,28 @@ static struct { char kid[33]; rs_cenc_track enc; } g_cenc_tracks[RS_CENC_TRACK_C
 static size_t g_cenc_tracks_n, g_cenc_tracks_next;
 static pthread_mutex_t g_cenc_tracks_mu = PTHREAD_MUTEX_INITIALIZER;
 
+// -reconnect_on_network_error arrived in ffmpeg 4.4; older builds (Ubuntu
+// 20.04 ships 4.2) exit on it. Asked once per binary path, then cached.
+static pthread_mutex_t g_ffmpeg_ver_mu = PTHREAD_MUTEX_INITIALIZER;
+static char *g_ffmpeg_ver_path;
+static bool g_ffmpeg_ver_new;
+
+static bool ffmpeg_has_network_error_reconnect(const char *path) {
+    if (!path) return true;
+    pthread_mutex_lock(&g_ffmpeg_ver_mu);
+    bool cached = g_ffmpeg_ver_path && strcmp(g_ffmpeg_ver_path, path) == 0;
+    bool answer = g_ffmpeg_ver_new;
+    pthread_mutex_unlock(&g_ffmpeg_ver_mu);
+    if (cached) return answer;
+    answer = rs_ffmpeg_binary_at_least(path, 4, 4);
+    pthread_mutex_lock(&g_ffmpeg_ver_mu);
+    rs_free(g_ffmpeg_ver_path);
+    g_ffmpeg_ver_path = rs_strdup(path);
+    g_ffmpeg_ver_new = answer;
+    pthread_mutex_unlock(&g_ffmpeg_ver_mu);
+    return answer;
+}
+
 static void cenc_track_remember(const char *kid, const rs_cenc_track *enc) {
     pthread_mutex_lock(&g_cenc_tracks_mu);
     size_t slot = g_cenc_tracks_n;
@@ -8556,6 +8578,7 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
     in.http_timeout_seconds = (int)rs_provider_option_int(provider, "httpGetTimeoutSeconds");
     if (buffered && in.http_timeout_seconds < 120) in.http_timeout_seconds = 120;
     in.no_reconnect = rs_provider_option_bool(provider, "noRestartOnError");
+    in.no_network_error_reconnect = !ffmpeg_has_network_error_reconnect(ffmpeg);
     in.report_progress = true;
     in.muxed_audio = muxed_audio;
 

@@ -189,6 +189,15 @@ static void test_hls_engine_source(void) {
     rs_hls_media_dispose(&m);
     check("hls-engine/sample-aes-ts-refused",
           rs_hls_media_parse("#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://k\"\n#EXTINF:4,\na.ts\n", "https://x/y.m3u8", 0, &m, err, sizeof(err)) != 0);
+    check("ffmpeg/version-gate",
+          !rs_ffmpeg_version_at_least("ffmpeg version 4.2.7-0ubuntu0.1 Copyright (c) 2000-2022", 4, 4) &&
+          rs_ffmpeg_version_at_least("ffmpeg version 4.4.2-0ubuntu0.22.04.1", 4, 4) &&
+          rs_ffmpeg_version_at_least("ffmpeg version 7.1 Copyright", 4, 4) &&
+          rs_ffmpeg_version_at_least("ffmpeg version n4.4.1", 4, 4) &&
+          !rs_ffmpeg_version_at_least("ffmpeg version n4.3", 4, 4) &&
+          rs_ffmpeg_version_at_least("ffmpeg version N-112345-gabcdef", 4, 4) &&
+          rs_ffmpeg_version_at_least("ffmpeg version 2024-03-01-git-abc-full_build", 4, 4) &&
+          rs_ffmpeg_version_at_least(NULL, 4, 4));
     check("hls-engine/ended", rs_hls_media_parse("#EXTM3U\n#EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n", "https://x/y.m3u8", 0, &m, err, sizeof(err)) == 0 && m.ended && m.count == 1);
     rs_hls_media_dispose(&m);
     // A key rotation in the window: each segment keeps the MAP it is under,
