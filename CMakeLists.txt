@@ -108,6 +108,10 @@ endif()
 add_executable(restream_selftest core/tests/selftest_main.c)
 target_link_libraries(restream_selftest PRIVATE restream_base)
 target_compile_options(restream_selftest PRIVATE ${RS_WARNINGS})
+# The tests call floor() and friends; glibc keeps them in libm.
+if(NOT WIN32 AND NOT APPLE)
+    target_link_libraries(restream_selftest PRIVATE m)
+endif()
 
 enable_testing()
 add_test(NAME selftest COMMAND restream_selftest)
