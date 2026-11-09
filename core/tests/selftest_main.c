@@ -182,6 +182,13 @@ static void test_hls_engine_source(void) {
     check("hls-engine/aes128-refused",
           rs_hls_media_parse("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:4,\na.ts\n", "https://x/y.m3u8", 0, &m, err, sizeof(err)) != 0 &&
           strstr(err, "AES-128"));
+    // fMP4 cbcs with EXT-X-KEY written before EXT-X-MAP (TV4's packager).
+    check("hls-engine/sample-aes-key-before-map",
+          rs_hls_media_parse("#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://k\"\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\na.m4s\n", "https://x/y.m3u8", 0, &m, err, sizeof(err)) == 0 &&
+          m.count == 1 && m.init_url);
+    rs_hls_media_dispose(&m);
+    check("hls-engine/sample-aes-ts-refused",
+          rs_hls_media_parse("#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://k\"\n#EXTINF:4,\na.ts\n", "https://x/y.m3u8", 0, &m, err, sizeof(err)) != 0);
     check("hls-engine/ended", rs_hls_media_parse("#EXTM3U\n#EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n", "https://x/y.m3u8", 0, &m, err, sizeof(err)) == 0 && m.ended && m.count == 1);
     rs_hls_media_dispose(&m);
     // A key rotation in the window: each segment keeps the MAP it is under,

@@ -835,6 +835,10 @@ int rs_hls_media_parse(const char *text, const char *base_url, int want, rs_hls_
     double pending_duration = -1;
     size_t cap = 0;
     int rc = 0;
+    // Packagers write EXT-X-KEY before or after EXT-X-MAP, so whether a
+    // SAMPLE-AES playlist is fMP4 (cbcs, decryptable) or TS is only known once
+    // every line has been read.
+    bool sample_aes = false;
     for (size_t i = 0; i < l.count && rc == 0; i++) {
         slice t = slice_trimmed(l.items[i]);
         if (!t.len) continue;
@@ -858,8 +862,8 @@ int rs_hls_media_parse(const char *text, const char *base_url, int want, rs_hls_
             // CENC (SAMPLE-AES-CTR, cbcs) lives inside fMP4 and the engine
             // decrypts it with the stream's keys; whole-segment AES-128 and
             // TS SAMPLE-AES do not.
-            if (method && (!strcmp(method, "AES-128") ||
-                           (!strcmp(method, "SAMPLE-AES") && !out->init_url))) rc = -3;
+            if (method && !strcmp(method, "AES-128")) rc = -3;
+            else if (method && !strcmp(method, "SAMPLE-AES")) sample_aes = true;
             attrs_dispose(&a);
         } else if (slice_has_prefix(t, "#EXTINF:")) {
             pending_duration = strtod(t.ptr + 8, NULL);
@@ -882,8 +886,9 @@ int rs_hls_media_parse(const char *text, const char *base_url, int want, rs_hls_
         }
     }
     lines_dispose(&l);
+    if (rc == 0 && sample_aes && !out->init_url) rc = -3;
     if (rc == -2 && err) snprintf(err, err_len, "Byte-range HLS playlists aren't supported by the internal engine; use pass-through.");
-    if (rc == -3 && err) snprintf(err, err_len, "AES-128 HLS isn't supported by the internal engine (only CENC fMP4); use pass-through or Buffered HLS.");
+    if (rc == -3 && err) snprintf(err, err_len, "AES-128 and MPEG-TS SAMPLE-AES HLS aren't supported by the internal engine (only CENC fMP4); use pass-through or Buffered HLS.");
     if (rc != 0) { rs_hls_media_dispose(out); return -1; }
     // Keep only the newest `want` segments.
     if (want > 0 && out->count > (size_t)want) {
