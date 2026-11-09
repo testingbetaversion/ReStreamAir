@@ -138,7 +138,27 @@ static void test_hls_engine_source(void) {
     rs_hls_pick pick;
     check("hls-engine/pick", rs_hls_pick_renditions(master, "https://cdn.example/live/master.m3u8", "height<=720", "", &pick) == 0);
     check_str("hls-engine/video-uri", pick.video_uri, "https://cdn.example/live/v720.m3u8?t=1");
-    check_str("hls-engine/video-id-stable", pick.video_id, "hlsv-720p-4000000");
+    check_str("hls-engine/video-id-stable", pick.video_id, "hlsv-720p-1");
+    rs_hls_pick_dispose(&pick);
+    // A live packager re-measures BANDWIDTH on every fetch; the id must not
+    // follow it, or each poll reads as a track change and restarts the stream.
+    {
+        const char *drift =
+            "#EXTM3U\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=7490000,RESOLUTION=1280x720,CODECS=\"avc1.640028,mp4a.40.2\"\n"
+            "tracks-v1a1/mono.m3u8?token=a\n";
+        const char *drift2 =
+            "#EXTM3U\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=7660000,RESOLUTION=1280x720,CODECS=\"avc1.640028,mp4a.40.2\"\n"
+            "tracks-v1a1/mono.m3u8?token=a\n";
+        rs_hls_pick p1, p2;
+        bool ok = rs_hls_pick_renditions(drift, "https://cdn.example/x/index.m3u8", "", "", &p1) == 0 &&
+                  rs_hls_pick_renditions(drift2, "https://cdn.example/x/index.m3u8", "", "", &p2) == 0;
+        check("hls-engine/video-id-ignores-bandwidth-drift", ok && p1.video_id && p2.video_id &&
+              strcmp(p1.video_id, p2.video_id) == 0);
+        if (ok) { rs_hls_pick_dispose(&p1); rs_hls_pick_dispose(&p2); }
+    }
+    check("hls-engine/pick", rs_hls_pick_renditions(master, "https://cdn.example/live/master.m3u8", "height<=720", "", &pick) == 0);
     check_str("hls-engine/video-codecs", pick.video_codecs, "avc1.64001f");
     check_str("hls-engine/audio-default", pick.audio_uri, "https://cdn.example/live/a/pt.m3u8?t=1");
     check_str("hls-engine/audio-codecs", pick.audio_codecs, "mp4a.40.2");

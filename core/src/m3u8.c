@@ -702,6 +702,38 @@ static char *hls_id(const char *prefix, const char *a, const char *b) {
     return rs_buf_take(&out);
 }
 
+// 1-based position of the variant whose URI line is `uri` among the master's
+// variants of the same height. Together with the height it names a variant
+// without BANDWIDTH: live-packager origins (Flussonic and the like) report a
+// measured BANDWIDTH that drifts on every fetch, so an id built from it changed
+// each poll and the engine restarted the stream as a track change, forever.
+static int variant_ordinal(const char *master, const char *uri, int64_t height) {
+    lines l;
+    if (!uri || !split_lines(master, &l)) return 1;
+    int seen = 0, found = 0;
+    for (size_t i = 0; i < l.count && !found; i++) {
+        slice t = slice_trimmed(l.items[i]);
+        if (!slice_has_prefix(t, "#EXT-X-STREAM-INF:")) continue;
+        size_t u = i + 1;
+        for (; u < l.count; u++) {
+            slice s = slice_trimmed(l.items[u]);
+            if (s.len && s.ptr[0] != '#') break;
+        }
+        if (u >= l.count) break;
+        attrs a;
+        parse_attributes(t, &a);
+        int64_t w, h;
+        attr_resolution(&a, &w, &h);
+        attrs_dispose(&a);
+        if ((h > 0 ? h : 0) != (height > 0 ? height : 0)) continue;
+        seen++;
+        slice s = slice_trimmed(l.items[u]);
+        if (s.len == strlen(uri) && !memcmp(s.ptr, uri, s.len)) found = seen;
+    }
+    lines_dispose(&l);
+    return found ? found : 1;
+}
+
 int rs_hls_pick_renditions(const char *master, const char *base_url, const char *video_filter,
                            const char *audio_filter, rs_hls_pick *out) {
     if (!master || !base_url || !out) return -1;
@@ -726,15 +758,15 @@ int rs_hls_pick_renditions(const char *master, const char *base_url, const char 
         parse_attributes(t, &a);
         char *rel = slice_dup(slice_trimmed(l.items[uri]));
         out->video_uri = rel ? rs_url_resolve(base_url, rel) : NULL;
-        free(rel);
         int64_t w, h;
         attr_resolution(&a, &w, &h);
         out->bandwidth = attr_int(&a, "BANDWIDTH");
         out->height = h;
-        char bw[32], ht[32];
-        snprintf(bw, sizeof(bw), "%lld", (long long)(out->bandwidth > 0 ? out->bandwidth : 0));
+        char ord[16], ht[32];
+        snprintf(ord, sizeof(ord), "%d", variant_ordinal(master, rel, h));
         snprintf(ht, sizeof(ht), "%lldp", (long long)(h > 0 ? h : 0));
-        out->video_id = hls_id("hlsv-", ht, bw);
+        out->video_id = hls_id("hlsv-", ht, ord);
+        free(rel);
         out->video_codecs = codecs_part(attrs_get(&a, "CODECS"), false);
         out->audio_codecs = codecs_part(attrs_get(&a, "CODECS"), true);
         audio_group = dup_or_null(attrs_get(&a, "AUDIO"));
