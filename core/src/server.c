@@ -10949,6 +10949,18 @@ restream_server_t* restream_server_create(void) {
         free(server);
         return NULL;
     }
+    // First launch (no state.json, or an empty one): seed a key labelled
+    // "first" so playback and Xtream logins are gated from the start and the
+    // API Keys page has a ready-made login. Never on a later start, so a user
+    // who revoked every key keeps playback open.
+    if (rs_json_obj_len(server->state.root) == 0) {
+        rs_json *seed = rs_json_new_obj();
+        rs_json_obj_set_str(seed, "label", "first");
+        const char *seed_err = NULL;
+        if (rs_panel_create_key(&server->state, seed, &seed_err) == 0)
+            rs_state_save(&server->state);
+        rs_json_free(seed);
+    }
     webhook_rebuild_targets(server);
     const char *down_env = getenv("RESTREAMAIR_ALERT_DOWN_SECONDS");
     if (down_env && down_env[0] && atof(down_env) >= 0) g_alert_down_ms = atof(down_env) * 1000.0;
