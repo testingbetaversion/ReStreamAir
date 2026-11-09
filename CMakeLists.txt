@@ -106,7 +106,8 @@ endif()
 
 # ---- restream_selftest: known-answer vectors for the core modules ----------
 add_executable(restream_selftest core/tests/selftest_main.c)
-target_link_libraries(restream_selftest PRIVATE restream_base)
+# The selftest spins up threads itself; glibc before 2.34 keeps them in libpthread.
+target_link_libraries(restream_selftest PRIVATE restream_base Threads::Threads)
 target_compile_options(restream_selftest PRIVATE ${RS_WARNINGS})
 # The tests call floor() and friends; glibc keeps them in libm.
 if(NOT WIN32 AND NOT APPLE)
