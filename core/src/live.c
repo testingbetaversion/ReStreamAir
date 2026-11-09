@@ -3609,6 +3609,28 @@ long long rs_live_drain_ingest(rs_live *live, const char *stream_id) {
     return bytes;
 }
 
+bool rs_live_resume(rs_live *live, const char *stream_id) {
+    if (!live || !stream_id) return false;
+    pthread_mutex_lock(&live->mu);
+    live_stream *st = stream_find_locked(live, stream_id);
+    bool resumed = false;
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        if (st->terminal == 1) {
+            st->terminal = 0;
+            // A new source gets a new stall clock: the time spent parked while
+            // the session was refreshed is not the source failing to deliver.
+            st->last_media_progress = now_seconds();
+            resumed = true;
+            pthread_cond_broadcast(&st->cv);
+        }
+        pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_unlock(&live->mu);
+    if (resumed) lg(st, "info", "liveResume", NULL, 0, -1, "new session source applied — polling again without a restart");
+    return resumed;
+}
+
 int rs_live_condition(rs_live *live, const char *stream_id) {
     if (!live || !stream_id) return 0;
     pthread_mutex_lock(&live->mu);

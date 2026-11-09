@@ -283,6 +283,12 @@ bool rs_live_is_running(rs_live *live, const char *stream_id);
 // Lifecycle observation: 0 healthy, 1 error/stall, 2 finished and drained, 3 tracks changed.
 int rs_live_condition(rs_live *live, const char *stream_id);
 
+// Un-parks a stream whose engine gave up on its manifest (condition 1), once
+// rs_live_start has re-applied a config with a new source URL. Buffered
+// segments and the playlists viewers are reading are kept. Returns false when
+// the stream is not running or was not parked on an error.
+bool rs_live_resume(rs_live *live, const char *stream_id);
+
 // Joins and frees engines whose threads have exited. Cheap; call it from the
 // server's one-second timer.
 void rs_live_reap(rs_live *live);

@@ -4914,6 +4914,7 @@ typedef enum {
     RS_PENDING_STREAM_START,
     RS_PENDING_BUFFER,
     RS_PENDING_KEY_ROTATION,  // a running stream's cdm action for a new KID
+    RS_PENDING_MANIFEST_REFRESH,  // a running stream's manifest action after its source failed
 } rs_pending_kind;
 
 struct rs_pending_job {
@@ -7040,6 +7041,11 @@ static void *pending_job_worker(void *arg) {
         // Only the key step: the session manifest is the running one.
         stream_start_resolve_all_keys(server, pf->stream_id, pf->start, pf->start->url);
         break;
+    case RS_PENDING_MANIFEST_REFRESH:
+        // Only the manifest step, always run: the saved URL is the one that
+        // just failed, so probing it again would only cost a round trip.
+        stream_start_worker(server, pf->stream_id, pf->start);
+        break;
     }
 
     pthread_mutex_lock(&server->pending_mu);
@@ -8043,6 +8049,7 @@ static void pending_job_finish(restream_server_t *server, struct mg_connection *
     case RS_PENDING_STREAM_START: pending_job_finish_stream_start(server, c, pf); break;
     case RS_PENDING_BUFFER: pending_job_finish_buffer(server, c, pf); break;
     case RS_PENDING_KEY_ROTATION: break;  // no connection; finished on the poll loop
+    case RS_PENDING_MANIFEST_REFRESH: break;  // ditto
     }
     pending_job_free(pf);
 }
@@ -8846,6 +8853,82 @@ static void pending_job_finish_key_rotation(restream_server_t *s, rs_pending_job
                 added == 1 ? "" : "s");
 }
 
+// A running stream's manifest refresh came back. On success the engine gets the
+// new session URL (and headers, mirrors) through the ordinary config re-apply,
+// then resumes polling with its buffered segments intact, so viewers keep
+// playing. On failure nothing changes here: the engine stays parked, and the
+// supervisor's next tick sees the refresh was already tried and restarts the
+// stream the usual way.
+static void pending_job_finish_manifest_refresh(restream_server_t *s, rs_pending_job *pf) {
+    rs_stream_start *st = pf->start;
+    const rs_json *stream = rs_panel_find_stream(&s->state, pf->stream_id);
+    if (!stream || !rs_live_is_running(s->live, pf->stream_id)) return;
+    if (st->err[0] || !st->manifest_applied) {
+        log_recordf(s, pf->stream_id, "error", "manifestRefresh", NULL, 0, -1,
+                    "could not refresh the session while running: %s — restarting instead",
+                    st->err[0] ? st->err : "the manifest action returned no URL");
+        return;
+    }
+    const char *err = NULL;
+    if (rs_panel_apply_session_manifest(&s->state, pf->stream_id, st->manifest_url, st->cdn_urls,
+                                        st->cdn_headers, st->manifest_headers, st->media_headers,
+                                        st->heartbeat_seconds, &err) != 0) {
+        log_recordf(s, pf->stream_id, "error", "manifestRefresh", NULL, 0, -1,
+                    "could not store the refreshed session: %s — restarting instead", err ? err : "?");
+        return;
+    }
+    if (rs_state_save(&s->state) != 0)
+        log_record(s, pf->stream_id, "error", "manifestRefresh", NULL, 0, -1,
+                   "could not save the refreshed session URL");
+    if (st->proxy_used) {
+        const rs_json *owner = provider_of(&s->state, stream);
+        if (owner) script_proxy_remember(rs_json_obj_str(owner, "id", ""), st->proxy_used);
+    }
+    if (live_sync_stream(s, pf->stream_id) != 0 || !rs_live_resume(s->live, pf->stream_id)) {
+        log_record(s, pf->stream_id, "error", "manifestRefresh", NULL, 0, -1,
+                   "the engine did not take the refreshed session — restarting instead");
+        return;
+    }
+    log_record(s, pf->stream_id, "info", "manifestRefresh", st->manifest_url, 0, -1,
+               "session refreshed without restarting the stream");
+}
+
+// The engine gave up on a running stream's manifest. For a session-manifest
+// stream that is usually an expired signed URL (403 after a few minutes), and
+// stopping, waiting restartDelaySeconds and starting cold cost viewers tens of
+// seconds of black screen. Run the manifest action in the background instead
+// and hand the engine the new URL. Returns true when a refresh is in flight,
+// so the caller holds off restarting. One attempt per minute per stream: a
+// refresh that does not help falls through to the ordinary restart.
+static bool manifest_refresh_try(restream_server_t *s, const rs_json *provider, const rs_json *stream,
+                                 rs_json *stimer, double now) {
+    const char *id = rs_json_obj_str(stream, "id", "");
+    bool busy = false;
+    pthread_mutex_lock(&s->pending_mu);
+    for (rs_pending_job *pf = s->pending_head; pf && !busy; pf = pf->next)
+        busy = !pf->cancelled && pf->stream_id && !strcmp(pf->stream_id, id) &&
+               pf->kind == RS_PENDING_MANIFEST_REFRESH;
+    pthread_mutex_unlock(&s->pending_mu);
+    if (busy) return true;
+    if (!rs_json_obj_bool(stream, "sessionManifest", false) ||
+        !rs_panel_script_action_allowed(provider, stream, "manifest") ||
+        !rs_panel_effective_script_path(provider, stream)[0]) return false;
+    if (now - rs_json_obj_num(stimer, "manifestRefreshAt", 0) < 60) return false;
+    rs_stream_start *st = stream_start_snapshot(provider, stream, true, false);
+    rs_pending_job *pf = (rs_pending_job *)calloc(1, sizeof(*pf));
+    if (!st || !pf) { stream_start_free(st); free(pf); return false; }
+    st->reuse_manifest = false;
+    pf->kind = RS_PENDING_MANIFEST_REFRESH;
+    pf->stream_id = rs_strdup(id);
+    pf->client_ip = rs_strdup("manifest refresh");
+    pf->start = st;
+    rs_json_obj_set(stimer, "manifestRefreshAt", rs_json_new_num(now));
+    if (!pending_job_dispatch(s, NULL, pf)) { pending_job_free(pf); return false; }
+    log_record(s, id, "info", "manifestRefresh", NULL, 0, -1,
+               "source stopped answering — fetching a new session from the script while the stream keeps playing");
+    return true;
+}
+
 // Turns the engine's queued key requests into cdm jobs: one per stream at a
 // time, through the same key step a start uses, with the KID the engine
 // needs. A stream without a cdm action cannot be helped here; the engine
@@ -8866,7 +8949,8 @@ static void key_requests_dispatch(restream_server_t *s) {
         pthread_mutex_lock(&s->pending_mu);
         for (rs_pending_job *pf = s->pending_head; pf && !busy; pf = pf->next)
             busy = !pf->cancelled && pf->stream_id && !strcmp(pf->stream_id, reqs[i].sid) &&
-                   (pf->kind == RS_PENDING_KEY_ROTATION || pf->kind == RS_PENDING_STREAM_START);
+                   (pf->kind == RS_PENDING_KEY_ROTATION || pf->kind == RS_PENDING_STREAM_START ||
+                    pf->kind == RS_PENDING_MANIFEST_REFRESH);
         pthread_mutex_unlock(&s->pending_mu);
         if (busy) continue;  // the engine asks again in 20 s if it still needs it
         if (!stream_wants_drm_discovery(provider, stream)) {
@@ -9010,6 +9094,7 @@ static void provider_maintenance(restream_server_t *s) {
             if (pf->kind == RS_PENDING_SCRIPT) pending_job_finish_script(s, NULL, pf);
             if (pf->kind == RS_PENDING_STREAM_START) pending_job_finish_stream_start(s, NULL, pf);
             if (pf->kind == RS_PENDING_KEY_ROTATION) pending_job_finish_key_rotation(s, pf);
+            if (pf->kind == RS_PENDING_MANIFEST_REFRESH) pending_job_finish_manifest_refresh(s, pf);
             if (pending_job_is_source_recovery(pf)) pending_source_finish(s, NULL, pf);
         }
         pending_job_free(pf);
@@ -9077,6 +9162,9 @@ static void provider_maintenance(restream_server_t *s) {
             bool restart = condition == 1 ? !rs_provider_option_bool(provider, "noRestartOnError") :
                            condition == 2 ? rs_provider_option_bool(provider, "restartFinishedBroadcast") : condition == 3;
             if (fallback_active && condition) restart = true;
+            // Errors on a session-manifest stream get a refresh in place first.
+            if (condition == 1 && !fallback_active && manifest_refresh_try(s, provider, stream, stimer, now))
+                condition = 0;
             if (condition && (restart || condition == 1)) {
                 // Read the engine's last error before stopping it frees it.
                 char engine_err[256] = "";
