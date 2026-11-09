@@ -244,6 +244,33 @@ would refuse to start with `version GLIBC_2.38 not found`. It still trusts the
 host's own CA certificates: the trust store is located at startup, so `curl`
 working on the box means upstream HTTPS works here too.
 
+One line to download the latest Linux release into `/root` and start it in the
+background on port 1234 (needs `curl` and `unzip`). It runs from `/root`, so
+`state.json`, `runtime/` and `logs/` stay in `/root` across upgrades, and output
+goes to `/root/restreamair.log`:
+
+```bash
+cd /root && v=$(curl -fsSL https://api.github.com/repos/testingbetaversion/ReStreamAir/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4) && curl -fLO "https://github.com/testingbetaversion/ReStreamAir/releases/download/$v/restreamair-$v-linux-x86_64.zip" && unzip -oq "restreamair-$v-linux-x86_64.zip" && chmod +x "restreamair-$v-linux-x86_64/restreamair" && nohup "./restreamair-$v-linux-x86_64/restreamair" -p 1234 --root "restreamair-$v-linux-x86_64/public" > restreamair.log 2>&1 &
+```
+
+### Install from source with one command
+
+[`scripts/install.sh`](scripts/install.sh) installs the build dependencies
+(apt, dnf, yum, apk or pacman), clones the repository, builds it, and starts the
+server in the background. Pass the port and the install location:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/testingbetaversion/ReStreamAir/main/scripts/install.sh | sh -s -- --port 1234 --dir /root
+```
+
+The source goes in `<dir>/ReStreamAir-src`. The server runs from `<dir>`, so
+`state.json`, `runtime/` and `logs/` live there; output goes to
+`<dir>/restreamair.log`, and the process id to `<dir>/restreamair.pid`. Run the
+same line again to update: it pulls, rebuilds, and restarts the server that the
+previous run started, leaving your data alone. Other options: `--bind ADDR`
+(default `0.0.0.0`), `--ref REF` (a branch, tag or commit; default `main`), and
+`--no-start` to build only.
+
 ### Build requirements
 
 - CMake 3.16+
