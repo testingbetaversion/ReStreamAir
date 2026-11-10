@@ -1007,113 +1007,128 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
 
     char *xml = NULL; size_t len = 0; char *effurl = NULL;
     
-    pthread_mutex_lock(&g_dash_mu);
-    if (!g_dash_cache_init) {
-        for (int i = 0; i < DASH_CACHE_SIZE; i++) pthread_cond_init(&g_dash_cache[i].cv, NULL);
-        g_dash_cache_init = true;
-    }
-
-    dash_cache_entry *entry = NULL;
-    dash_cache_entry *empty = NULL;
-    dash_cache_entry *oldest = NULL;
-
-    for (int i = 0; i < DASH_CACHE_SIZE; i++) {
-        if (g_dash_cache[i].url && strcmp(g_dash_cache[i].url, url) == 0) {
-            entry = &g_dash_cache[i];
-            break;
-        }
-        if (!g_dash_cache[i].url && !empty) empty = &g_dash_cache[i];
-        if (g_dash_cache[i].url && (!oldest || g_dash_cache[i].time < oldest->time)) oldest = &g_dash_cache[i];
-    }
-
-    if (!entry) {
-        entry = empty ? empty : oldest;
-        while (entry->fetching) pthread_cond_wait(&entry->cv, &g_dash_mu);
-        free(entry->url); free(entry->proxy); free(entry->headers);
-        free(entry->xml); free(entry->effurl);
-        entry->url = rs_strdup(url);
-        entry->proxy = NULL; entry->headers = NULL; entry->xml = NULL; entry->effurl = NULL;
-        entry->len = 0; entry->time = 0; entry->failed = false; entry->error[0] = '\0';
-    }
-
-    while (entry->fetching) pthread_cond_wait(&entry->cv, &g_dash_mu);
-
-    bool match = !policy && !entry->private_response && entry->force_ipv6 == force_ipv6 &&
-                 ((!proxy && !entry->proxy) || (proxy && entry->proxy && strcmp(proxy, entry->proxy) == 0)) &&
-                 ((!headers && !entry->headers) || (headers && entry->headers && strcmp(headers, entry->headers) == 0));
-    
-    if (match && (time(NULL) - entry->time <= 2) && (entry->xml || entry->failed)) {
-        if (entry->failed) {
-            snprintf(errbuf, errbuf_len, "%s",
-                     entry->error[0] ? entry->error : "The shared MPD fetch failed.");
-            pthread_mutex_unlock(&g_dash_mu);
+    if (policy) {
+        // A provider's stream never reads this cache (a response fetched under
+        // a provider policy is private to that stream), so it must not queue
+        // for a slot in it either. It used to: with more live streams than
+        // DASH_CACHE_SIZE, every poll evicted another stream's slot and first
+        // waited for whatever fetch was in flight there. All of them picked the
+        // same oldest slot, so the manifest reads of the whole server went
+        // through it one at a time — 22 streams turned a 1.5 s read into a
+        // 20-60 s wait, segments aged out of the window, and streams stalled
+        // into restarts while the network was idle.
+        if (fetch_playlist(url, proxy, headers, force_ipv6, rotate_proxies,
+                           &xml, &len, &effurl, errbuf, errbuf_len, policy) != 0)
             return NULL;
-        }
-        // memcpy, not rs_strdup: `len` is a byte count and the body is not
-        // guaranteed to be NUL-free. Copying with strdup while carrying the
-        // original length forward left xmlReadMemory and rs_dash_plan_build
-        // reading `len` bytes out of a shorter allocation.
-        xml = (char *)malloc(entry->len + 1);
-        if (!xml) {
-            pthread_mutex_unlock(&g_dash_mu);
-            snprintf(errbuf, errbuf_len, "Out of memory copying the cached MPD.");
-            return NULL;
-        }
-        memcpy(xml, entry->xml, entry->len);
-        xml[entry->len] = '\0';
-        len = entry->len;
-        effurl = entry->effurl ? rs_strdup(entry->effurl) : NULL;
-        pthread_mutex_unlock(&g_dash_mu);
     } else {
-        entry->fetching = true;
-        entry->private_response = policy != NULL;
-        pthread_mutex_unlock(&g_dash_mu);
-
-        int rc = fetch_playlist(url, proxy, headers, force_ipv6, rotate_proxies,
-                                &xml, &len, &effurl, errbuf, errbuf_len, policy);
-
         pthread_mutex_lock(&g_dash_mu);
-        entry->fetching = false;
-        if (rc == 0) {
-            free(entry->proxy); free(entry->headers);
-            free(entry->xml); free(entry->effurl);
-            entry->proxy = proxy ? rs_strdup(proxy) : NULL;
-            entry->headers = headers ? rs_strdup(headers) : NULL;
-            entry->xml = NULL;
-            entry->len = 0;
-            if (xml) {
-                entry->xml = (char *)malloc(len + 1);
-                if (entry->xml) {
-                    memcpy(entry->xml, xml, len);
-                    entry->xml[len] = '\0';
-                    entry->len = len;
-                }
-            }
-            entry->effurl = effurl ? rs_strdup(effurl) : NULL;
-            entry->force_ipv6 = force_ipv6;
-            entry->time = time(NULL);
-            entry->failed = false;
-            entry->error[0] = '\0';
-        } else {
-            // Keep a short negative cache just like the successful MPD cache.
-            // Video, audio and the director all ask for the same manifest; if
-            // one 30-second fetch fails, the waiters must receive that result
-            // instead of serially starting two more identical 30-second calls.
-            free(entry->proxy); free(entry->headers);
-            free(entry->xml); free(entry->effurl);
-            entry->proxy = proxy ? rs_strdup(proxy) : NULL;
-            entry->headers = headers ? rs_strdup(headers) : NULL;
-            entry->force_ipv6 = force_ipv6;
-            entry->xml = NULL; entry->effurl = NULL; entry->len = 0;
-            entry->time = time(NULL);
-            entry->failed = true;
-            snprintf(entry->error, sizeof(entry->error), "%s",
-                     errbuf[0] ? errbuf : "The MPD fetch failed.");
+        if (!g_dash_cache_init) {
+            for (int i = 0; i < DASH_CACHE_SIZE; i++) pthread_cond_init(&g_dash_cache[i].cv, NULL);
+            g_dash_cache_init = true;
         }
-        pthread_cond_broadcast(&entry->cv);
-        pthread_mutex_unlock(&g_dash_mu);
 
-        if (rc != 0) return NULL;
+        dash_cache_entry *entry = NULL;
+        dash_cache_entry *empty = NULL;
+        dash_cache_entry *oldest = NULL;
+
+        for (int i = 0; i < DASH_CACHE_SIZE; i++) {
+            if (g_dash_cache[i].url && strcmp(g_dash_cache[i].url, url) == 0) {
+                entry = &g_dash_cache[i];
+                break;
+            }
+            if (!g_dash_cache[i].url && !empty) empty = &g_dash_cache[i];
+            if (g_dash_cache[i].url && (!oldest || g_dash_cache[i].time < oldest->time)) oldest = &g_dash_cache[i];
+        }
+
+        if (!entry) {
+            entry = empty ? empty : oldest;
+            while (entry->fetching) pthread_cond_wait(&entry->cv, &g_dash_mu);
+            free(entry->url); free(entry->proxy); free(entry->headers);
+            free(entry->xml); free(entry->effurl);
+            entry->url = rs_strdup(url);
+            entry->proxy = NULL; entry->headers = NULL; entry->xml = NULL; entry->effurl = NULL;
+            entry->len = 0; entry->time = 0; entry->failed = false; entry->error[0] = '\0';
+        }
+
+        while (entry->fetching) pthread_cond_wait(&entry->cv, &g_dash_mu);
+
+        bool match = !policy && !entry->private_response && entry->force_ipv6 == force_ipv6 &&
+                     ((!proxy && !entry->proxy) || (proxy && entry->proxy && strcmp(proxy, entry->proxy) == 0)) &&
+                     ((!headers && !entry->headers) || (headers && entry->headers && strcmp(headers, entry->headers) == 0));
+    
+        if (match && (time(NULL) - entry->time <= 2) && (entry->xml || entry->failed)) {
+            if (entry->failed) {
+                snprintf(errbuf, errbuf_len, "%s",
+                         entry->error[0] ? entry->error : "The shared MPD fetch failed.");
+                pthread_mutex_unlock(&g_dash_mu);
+                return NULL;
+            }
+            // memcpy, not rs_strdup: `len` is a byte count and the body is not
+            // guaranteed to be NUL-free. Copying with strdup while carrying the
+            // original length forward left xmlReadMemory and rs_dash_plan_build
+            // reading `len` bytes out of a shorter allocation.
+            xml = (char *)malloc(entry->len + 1);
+            if (!xml) {
+                pthread_mutex_unlock(&g_dash_mu);
+                snprintf(errbuf, errbuf_len, "Out of memory copying the cached MPD.");
+                return NULL;
+            }
+            memcpy(xml, entry->xml, entry->len);
+            xml[entry->len] = '\0';
+            len = entry->len;
+            effurl = entry->effurl ? rs_strdup(entry->effurl) : NULL;
+            pthread_mutex_unlock(&g_dash_mu);
+        } else {
+            entry->fetching = true;
+            entry->private_response = policy != NULL;
+            pthread_mutex_unlock(&g_dash_mu);
+
+            int rc = fetch_playlist(url, proxy, headers, force_ipv6, rotate_proxies,
+                                    &xml, &len, &effurl, errbuf, errbuf_len, policy);
+
+            pthread_mutex_lock(&g_dash_mu);
+            entry->fetching = false;
+            if (rc == 0) {
+                free(entry->proxy); free(entry->headers);
+                free(entry->xml); free(entry->effurl);
+                entry->proxy = proxy ? rs_strdup(proxy) : NULL;
+                entry->headers = headers ? rs_strdup(headers) : NULL;
+                entry->xml = NULL;
+                entry->len = 0;
+                if (xml) {
+                    entry->xml = (char *)malloc(len + 1);
+                    if (entry->xml) {
+                        memcpy(entry->xml, xml, len);
+                        entry->xml[len] = '\0';
+                        entry->len = len;
+                    }
+                }
+                entry->effurl = effurl ? rs_strdup(effurl) : NULL;
+                entry->force_ipv6 = force_ipv6;
+                entry->time = time(NULL);
+                entry->failed = false;
+                entry->error[0] = '\0';
+            } else {
+                // Keep a short negative cache just like the successful MPD cache.
+                // Video, audio and the director all ask for the same manifest; if
+                // one 30-second fetch fails, the waiters must receive that result
+                // instead of serially starting two more identical 30-second calls.
+                free(entry->proxy); free(entry->headers);
+                free(entry->xml); free(entry->effurl);
+                entry->proxy = proxy ? rs_strdup(proxy) : NULL;
+                entry->headers = headers ? rs_strdup(headers) : NULL;
+                entry->force_ipv6 = force_ipv6;
+                entry->xml = NULL; entry->effurl = NULL; entry->len = 0;
+                entry->time = time(NULL);
+                entry->failed = true;
+                snprintf(entry->error, sizeof(entry->error), "%s",
+                         errbuf[0] ? errbuf : "The MPD fetch failed.");
+            }
+            pthread_cond_broadcast(&entry->cv);
+            pthread_mutex_unlock(&g_dash_mu);
+
+            if (rc != 0) return NULL;
+        }
     }
 
     const char *base = (effurl && effurl[0]) ? effurl : url;
