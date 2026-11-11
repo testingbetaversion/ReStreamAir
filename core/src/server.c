@@ -8844,14 +8844,31 @@ static void live_stop_stream(restream_server_t *s, const char *stream_id) {
 static void live_sync_all(restream_server_t *s) {
     if (!s) return;
     const rs_json *providers = rs_json_obj_get(s->state.root, "providers");
-    int started = 0;
+    int started = 0, deferred = 0;
     for (size_t i = 0; i < rs_json_arr_len(providers); i++) {
-        const rs_json *streams = rs_json_obj_get(rs_json_arr_at(providers, i), "streams");
+        const rs_json *provider = rs_json_arr_at(providers, i);
+        const rs_json *streams = rs_json_obj_get(provider, "streams");
         for (size_t j = 0; j < rs_json_arr_len(streams); j++) {
             const rs_json *st = rs_json_arr_at(streams, j);
             const char *id = rs_json_obj_str(st, "id", "");
             if (!id[0]) continue;
             if (strcmp(rs_json_obj_str(st, "status", "stopped"), "running") != 0) continue;
+            // A stream whose source only ever comes from its `manifest` action
+            // has nothing saved to resume from. Starting the engine on it would
+            // leave it "running" with nothing to poll, for good; hand it to
+            // the restart timer instead, whose start runs the script.
+            if (!stream_source_target(st)[0] && rs_json_obj_bool(st, "sessionManifest", false) &&
+                rs_panel_script_action_allowed(provider, st, "manifest") &&
+                rs_panel_effective_script_path(provider, st)[0]) {
+                const char *ignored = NULL;
+                rs_json_obj_set(provider_timer(s, id), "restartAt", rs_json_new_num(1));  // due on the next tick
+                log_record(s, id, "info", "serverStart", NULL, 0, -1,
+                           "was running before the restart with no saved source; starting it through the manifest action");
+                rs_panel_set_stream_running(&s->state, id, false, &ignored);
+                rs_panel_set_stream_restart_pending(&s->state, id, true);
+                deferred++;
+                continue;
+            }
             live_sync_stream(s, id);
             char pipeline_err[256] = {0};
             int prc = pipeline_sync_stream(s, id, pipeline_err, sizeof(pipeline_err));
@@ -8865,6 +8882,7 @@ static void live_sync_all(restream_server_t *s) {
         log_recordf(s, "__panel__", "info", "serverStart", NULL, 0, -1,
                     "resuming %d stream%s that were running before the restart",
                     started, started == 1 ? "" : "s");
+    if (deferred > 0) rs_state_save(&s->state);
 }
 
 // "KID:KEY" pairs of `old` plus every pair of `add` whose KID it lacks, one
