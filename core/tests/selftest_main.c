@@ -1395,7 +1395,7 @@ static void test_provider_options(void) {
 
     rs_json *view = rs_panel_view(&st, "localhost");
     const rs_json *schema = rs_json_obj_get(view, "providerOptionFields");
-    check("options/screenshot-fields", rs_json_arr_len(schema) == 49);
+    check("options/screenshot-fields", rs_json_arr_len(schema) == 50);
     {
         rs_source_policy policy;
         rs_provider_source_policy(provider, &policy);
@@ -1600,6 +1600,31 @@ static void test_panel(void) {
     check("panel/import-event-end", rs_json_obj_int(event, "scriptEnd", 0) == 1700003600);
     check("panel/import-event-record", rs_json_obj_bool(event, "recordEvent", false));
     rs_json_free(evs);
+
+    // Auto-remove missing events: an imported event the script no longer lists
+    // goes; channels and the same-named channel stay.
+    {
+        rs_json *prov = (rs_json *)rs_json_arr_at(rs_json_obj_get(st.root, "providers"), 0);
+        rs_json *opts = (rs_json *)rs_json_obj_get(prov, "options");
+        if (!opts) { rs_json_obj_set(prov, "options", rs_json_new_obj()); opts = (rs_json *)rs_json_obj_get(prov, "options"); }
+        rs_json_obj_set_bool(opts, "autoRemoveMissingEvents", true);
+        rs_json *next = parse_json("{\"Events\":[{\"Name\":\"Cup Final\"}]}");
+        check("panel/missing-events-import", rs_panel_import_script_entries(&st, pid, "events", next,
+                                                                            NULL, &imported, &err) == 0);
+        const rs_json *now_streams = rs_json_obj_get(prov, "streams");
+        int ev = 0, ch = 0; bool old_gone = true;
+        for (size_t i = 0; i < rs_json_arr_len(now_streams); i++) {
+            const rs_json *x = rs_json_arr_at(now_streams, i);
+            bool is_event = !strcmp(rs_json_obj_str(x, "sourceType", ""), "event");
+            if (is_event) ev++; else ch++;
+            if (is_event && !strcmp(rs_json_obj_str(x, "name", ""), "News")) old_gone = false;
+        }
+        check("panel/missing-events-removed", ev == 1 && old_gone);
+        check("panel/missing-events-keeps-channels", ch == 3);
+        rs_json_obj_set_bool(opts, "autoRemoveMissingEvents", false);
+        streams = rs_json_obj_get(prov, "streams");
+        rs_json_free(next);
+    }
 
     // A document without the expected array is a 400, and an unknown provider a 404.
     rs_json *empty_doc = parse_json("{\"Nope\":[]}");

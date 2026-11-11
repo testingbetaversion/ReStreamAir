@@ -423,6 +423,7 @@ timer, with or without the panel open:
 | `reuseEventIndex` | A new event may take over the stream ID of a stopped, ended event, so a player's saved URL keeps working. The old source and keys are cleared. |
 | `sequentialAutostartPeriodSeconds`, `randomAutostartPeriodSeconds` | Every period, start one stopped stream that has `autostart: true` **and** is inside its window (`scriptStart <= now < scriptEnd`; a missing bound is open). Sequential walks the provider in order; random picks one. |
 | `autoRemoveFinishedEvents` | Once `scriptEnd` has passed, stop the event and delete it. Events without an end are kept. |
+| `autoRemoveMissingEvents` | After a successful events import, stop and delete imported events the script no longer lists. Use it when the source gives no end time. |
 | `autoRestartPeriodSeconds`, `restartDelaySeconds`, `noRestartOnError`, `restartFinishedBroadcast` | The usual restart policy, applied to running events like any other stream. |
 
 Not done automatically: starting an event at exactly `scriptStart` (autostart

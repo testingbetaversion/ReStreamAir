@@ -7816,7 +7816,10 @@ static void pending_job_finish_script(restream_server_t *server, struct mg_conne
             if (!rs_panel_find_stream(&server->state, id)) {
                 live_stop_stream(server, id);
                 pipeline_stop_stream(id);
-                log_record(server, id, "info", "channelRemoved", NULL, 0, -1, "channel absent from latest provider import");
+                bool was_event = !strcmp(pf->script_action, "events");
+                log_record(server, id, "info", was_event ? "eventRemoved" : "channelRemoved", NULL, 0, -1,
+                           was_event ? "event absent from latest provider import"
+                                     : "channel absent from latest provider import");
             }
         }
         rs_json_free(before);

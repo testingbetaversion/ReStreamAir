@@ -415,6 +415,7 @@ backend behavior; pipeline-specific controls identify their scope in the schema.
 | `autoRefreshEvents`, `eventsRefreshSeconds` | Background events-script imports on the server timer, waiting while other provider script jobs are active. Requires a script and declared events action. |
 | `autoRemoveMissingChannels` | Successful imports stop/delete missing imported channels; manually added streams remain. |
 | `autoRemoveFinishedEvents` | Stops/deletes imported events at their epoch `End`; no end means retain. |
+| `autoRemoveMissingEvents` | Successful events imports stop/delete imported events absent from the list (for sources with no `End`); manually added streams remain. |
 | `reuseEventIndex` | Reuses an ended, stopped event's public ID for a new event, clearing its old source and keys. Matching names retain identity. |
 | `autoRestartPeriodSeconds` | Periodically restarts running streams, with the configured restart delay. Zero disables. |
 | `sequentialAutostartPeriodSeconds`, `randomAutostartPeriodSeconds` | Starts one eligible stopped stream each interval in provider order or randomly. Requires stream `autostart: true`, respects event windows and provider concurrency. Zero disables. |

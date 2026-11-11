@@ -976,11 +976,15 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
         free(name);
         count++;
     }
-    if (!events && rs_provider_option_bool(p, "autoRemoveMissingChannels")) {
+    // The list a script returns is the whole truth for its kind: an imported
+    // entry that is no longer in it has gone from the source. For events this
+    // is what ends one whose source publishes no end time — it simply stops
+    // being listed. The other kind, and streams added by hand, are untouched.
+    if (rs_provider_option_bool(p, events ? "autoRemoveMissingEvents" : "autoRemoveMissingChannels")) {
         rs_json *kept = rs_json_new_arr();
         for (size_t i = 0; i < rs_json_arr_len(streams); i++) {
             const rs_json *stream = rs_json_arr_at(streams, i);
-            if (strcmp(rs_json_obj_str(stream, "sourceType", ""), "channel") != 0 ||
+            if (strcmp(rs_json_obj_str(stream, "sourceType", ""), source_type) != 0 ||
                 import_contains_name(list, rs_json_obj_str(stream, "name", "")))
                 rs_json_arr_push(kept, rs_json_clone(stream));
         }
