@@ -2200,6 +2200,45 @@ static size_t build_frag(uint8_t *b, uint32_t track_id, uint64_t base_time,
     return n;
 }
 
+// MPEG-TS hidden behind an image header, the way some CDNs serve it.
+static void test_ts_image_wrapper(void) {
+    // A complete 1x1 PNG: signature, IHDR, IDAT, IEND — 69 bytes.
+    static const uint8_t png[69] = {
+        0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A,
+        0, 0, 0, 13, 'I', 'H', 'D', 'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 0x90, 0x77, 0x53, 0xDE,
+        // The IDAT payload carries a 0x47 on purpose: a lone sync byte inside
+        // the image must not be taken for the start of the stream.
+        0, 0, 0, 12, 'I', 'D', 'A', 'T', 0x47, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0, 0, 3, 1, 1, 0, 0x18, 0xDD, 0x8D, 0xB0,
+        0, 0, 0, 0, 'I', 'E', 'N', 'D', 0xAE, 0x42, 0x60, 0x82
+    };
+    static uint8_t buf[69 + 188 * 6];
+    memcpy(buf, png, sizeof png);
+    for (int k = 0; k < 6; k++) {
+        uint8_t *pkt = buf + sizeof png + k * 188;
+        memset(pkt, 0xFF, 188);
+        pkt[0] = 0x47;
+    }
+    check("ts-wrapper/png-len", rs_png_file_len(buf, sizeof buf) == 69);
+    check("ts-wrapper/png", rs_ts_image_wrapper_len(buf, sizeof buf) == 69);
+    check("ts-wrapper/plain-ts", rs_ts_image_wrapper_len(buf + 69, sizeof buf - 69) == 0);
+    check("ts-wrapper/real-png", rs_ts_image_wrapper_len(png, sizeof png) == 0);
+    check("ts-wrapper/truncated-png", rs_png_file_len(png, sizeof png - 1) == 0);
+
+    // A JPEG-style header of arbitrary length: found by the sync scan alone.
+    static uint8_t jpg[40 + 188 * 3];
+    memset(jpg, 0x47, 40);                 // sync-looking bytes off the grid
+    jpg[0] = 0xFF; jpg[1] = 0xD8; jpg[2] = 0xFF; jpg[39] = 0x00;
+    for (int k = 0; k < 3; k++) {
+        uint8_t *pkt = jpg + 40 + k * 188;
+        memset(pkt, 0x00, 188);
+        pkt[0] = 0x47;
+    }
+    check("ts-wrapper/jpeg", rs_ts_image_wrapper_len(jpg, sizeof jpg) == 40);
+    // Not an image at the front: left alone even though TS follows.
+    jpg[0] = 0x00;
+    check("ts-wrapper/no-magic", rs_ts_image_wrapper_len(jpg, sizeof jpg) == 0);
+}
+
 static void test_mpegts(void) {
     // The MPEG-2 section CRC over a known PAT body. Same polynomial ffmpeg and
     // every broadcast muxer stamp their sections with; a wrong CRC makes every
@@ -2974,6 +3013,7 @@ int main(int argc, char **argv) {
     test_cenc_multifragment();
     test_cenc_schemes();
     test_mpegts();
+    test_ts_image_wrapper();
     test_m3u8_filter_master();
     test_hls_engine_source();
     test_metrics_connections();

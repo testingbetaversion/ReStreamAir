@@ -92,6 +92,22 @@ bool rs_ts_mux_started(const rs_ts_mux *m);
 // PMT are stamped with. Exposed for the self-test's known-answer check.
 uint32_t rs_ts_crc32(const uint8_t *data, size_t len);
 
+// Some CDNs disguise MPEG-TS segments as images: a small valid PNG (or a JPEG,
+// GIF or BMP header) followed by the real transport stream, served as
+// image/png. hls.js copes because it scans ahead for TS sync; ffmpeg and VLC
+// trust the first bytes and see a picture.
+//
+// rs_ts_image_wrapper_len returns how many leading bytes to drop so the body
+// starts on a TS packet — 0 when the body doesn't begin with an image
+// signature, or when no run of sync bytes on the 188-byte grid follows it.
+size_t rs_ts_image_wrapper_len(const uint8_t *data, size_t len);
+
+// Length of a complete PNG file at the start of `data` (signature through the
+// IEND chunk), or 0 if there isn't one. For the case the TS scan can't settle:
+// a wrapper in front of a still-encrypted (AES-128) segment has no sync bytes
+// to find, but the PNG says where it ends.
+size_t rs_png_file_len(const uint8_t *data, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

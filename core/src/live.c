@@ -16,6 +16,7 @@
 #include "rs_audio_delay.h"
 #include "rs_cenc.h"
 #include "rs_json.h"
+#include "rs_mpegts.h"
 #include "rs_ttml.h"
 
 #include <errno.h>
@@ -577,6 +578,7 @@ typedef struct live_stream {
     // catch-up policy still shows up as bandwidth spent — it was. Guarded by
     // `mu`; the download threads add to it as they finish.
     long long ingest_bytes;
+    bool image_wrapper_noted;  // imageWrappedSegments logged for this run
     double last_media_progress, finished_at;
     int terminal; // 1 error, 2 finished broadcast, 3 track change
     bool static_complete;
@@ -1047,6 +1049,7 @@ static void *download_main(void *arg) {
         char err[192] = {0};
         bool ok = false;
         long last_status = 0;
+        size_t wrapper_len = 0;  // fake image header removed from the front
 
         // Retry before writing the segment off. Every abandoned segment becomes
         // a permanent hole in the media timeline, so a single transient 404 at
@@ -1092,7 +1095,22 @@ static void *download_main(void *arg) {
             // Every attempt that put bytes on the wire counts, including the
             // failed ones — a retried segment really was paid for twice.
             ingest_bytes += (long long)blen;
+            // MPEG-TS disguised as an image (see rs_mpegts.h). An image with
+            // nothing behind it is the CDN's placeholder for a segment that
+            // isn't published yet: no media to keep, and worth another try.
+            if (rc == 0 && body && blen && rs_png_file_len((const uint8_t *)body, blen) == blen) {
+                last_status = status;
+                snprintf(err, sizeof(err), "the CDN answered with a placeholder image instead of media");
+                free(body);
+                continue;
+            }
             if (rc == 0 && body) {
+                size_t wrap = rs_ts_image_wrapper_len((const uint8_t *)body, blen);
+                if (wrap) {
+                    memmove(body, body + wrap, blen - wrap);
+                    blen -= wrap;
+                    wrapper_len = wrap;
+                }
                 data = (uint8_t *)body;
                 len = blen;
                 ok = true;
@@ -1109,6 +1127,10 @@ static void *download_main(void *arg) {
         st->ingest_bytes += ingest_bytes;
         if (st->active_downloads > 0) st->active_downloads--;
         if (rep->active_downloads > 0) rep->active_downloads--;
+        // Said once per run: it explains why the source's segments look like
+        // images to anyone comparing them with what this serves.
+        bool note_wrapper = wrapper_len && !st->image_wrapper_noted;
+        if (note_wrapper) st->image_wrapper_noted = true;
         // The slot may no longer be ours: a stop can have cleared the queue,
         // and the writer can have abandoned this item for holding up everything
         // behind it. The generation stamp is what makes that safe to check —
@@ -1142,6 +1164,10 @@ static void *download_main(void *arg) {
         if (was >= 0)
             lgf(st, "info", "downloadLimit", NULL, last_status, -1,
                 "requests in flight %d -> %d: %s", was, now_limit, why);
+        if (note_wrapper)
+            lgf(st, "info", "imageWrappedSegments", NULL, 0, -1,
+                "this source hides its MPEG-TS behind a %lu-byte image header; removing it from every segment",
+                (unsigned long)wrapper_len);
     }
 }
 

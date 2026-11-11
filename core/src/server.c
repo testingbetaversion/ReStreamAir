@@ -7630,6 +7630,7 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
         record_delivery_speed(server, pf);
     }
 
+    size_t wrapper_len = 0;  // bytes of fake image header removed from the front
     if (pf->decrypt) {
         size_t new_len = 0;
         bool transformed = false;
@@ -7656,7 +7657,12 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
     if (pf->hls_key && pf->hls_key[0] != '\0' && !pf->is_key) {
         uint8_t *dec_out = NULL;
         size_t dec_len = 0;
-        if (rs_hls_decrypt(body, body_len, pf->hls_key, pf->hls_iv ? pf->hls_iv : "", pf->seq, &dec_out, &dec_len) == 0 && dec_out) {
+        // An image wrapper in front of the ciphertext (see rs_mpegts.h) has to
+        // come off before decryption: it isn't part of the CBC stream.
+        size_t skip = rs_png_file_len(body, body_len);
+        if (skip >= body_len || (body_len - skip) % 16 != 0) skip = 0;
+        wrapper_len = skip;
+        if (rs_hls_decrypt(body + skip, body_len - skip, pf->hls_key, pf->hls_iv ? pf->hls_iv : "", pf->seq, &dec_out, &dec_len) == 0 && dec_out) {
             free(body);
             body = dec_out;
             body_len = dec_len;
@@ -7673,6 +7679,29 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
         }
     }
 
+    // MPEG-TS disguised as an image: drop the fake header so every player gets
+    // a segment that starts on a TS packet. A ranged reply is a slice of the
+    // upstream object and is left exactly as it came.
+    if (!pf->is_key && !pf->is_map && status != 206) {
+        // An image with nothing behind it is the CDN's placeholder for a
+        // segment it hasn't published yet; a player can retry a 404, but it
+        // cannot do anything with a picture.
+        if (body_len && rs_png_file_len(body, body_len) == body_len) {
+            log_record(server, pf->stream_id, "warn", "downloadSegment", pf->url, status, (long long)body_len,
+                       "the CDN answered with a placeholder image instead of media");
+            free(body);
+            pf->body = NULL;
+            reply_error(c, 404, "The source has not published this segment yet.");
+            return;
+        }
+        size_t off = rs_ts_image_wrapper_len(body, body_len);
+        if (off) {
+            memmove(body, body + off, body_len - off);
+            body_len -= off;
+            wrapper_len += off;
+        }
+    }
+
     // Network monitor: attribute the served bytes to this stream + client, and
     // log the fetch so the stream's Logs tab shows download activity.
     const char *peer = pf->client_ip ? pf->client_ip : "";
@@ -7680,10 +7709,17 @@ static void pending_job_finish_item(restream_server_t *server, struct mg_connect
     if (!pf->playback_key_str || strcmp(pf->playback_key_str, server->pipeline_feed_key))
         rs_metrics_record(server->metrics, pf->stream_id, identity, peer,
                           pf->user_agent ? pf->user_agent : "", (int)body_len);
-    log_recordf(server, pf->stream_id, "info", pf->is_map ? "serveInit" : "serveSegment",
-                pf->url, status, (long long)body_len, "fetched for %s", peer);
+    if (wrapper_len)
+        log_recordf(server, pf->stream_id, "info", "serveSegment", pf->url, status, (long long)body_len,
+                    "fetched for %s (removed a %lu-byte image header in front of the MPEG-TS)",
+                    peer, (unsigned long)wrapper_len);
+    else
+        log_recordf(server, pf->stream_id, "info", pf->is_map ? "serveInit" : "serveSegment",
+                    pf->url, status, (long long)body_len, "fetched for %s", peer);
 
     const char *type = (pf->content_type && pf->content_type[0]) ? pf->content_type : content_type_from_ext(pf->url);
+    // The upstream called it image/png; what is being sent now is not.
+    if (wrapper_len) type = "video/mp2t";
     // Relay the upstream's 206 + Content-Range so the player's byte-range
     // request is answered as a partial response, not a 200 of the wrong length.
     if (status == 206 && pf->content_range && pf->content_range[0]) {

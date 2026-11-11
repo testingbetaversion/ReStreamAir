@@ -1042,3 +1042,55 @@ void rs_ts_mux_destroy(rs_ts_mux *m) {
     free(m->joins);
     free(m);
 }
+
+// --- image-wrapped MPEG-TS ---------------------------------------------------
+
+static bool starts_with_image_magic(const uint8_t *d, size_t len) {
+    static const uint8_t png[] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (len >= sizeof png && memcmp(d, png, sizeof png) == 0) return true;
+    if (len >= 3 && d[0] == 0xFF && d[1] == 0xD8 && d[2] == 0xFF) return true;                  // JPEG
+    if (len >= 6 && (memcmp(d, "GIF87a", 6) == 0 || memcmp(d, "GIF89a", 6) == 0)) return true;
+    if (len >= 2 && d[0] == 'B' && d[1] == 'M') return true;                                    // BMP
+    return false;
+}
+
+size_t rs_png_file_len(const uint8_t *data, size_t len) {
+    static const uint8_t sig[] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (!data || len < sizeof sig || memcmp(data, sig, sizeof sig) != 0) return 0;
+    size_t off = sizeof sig;
+    // Each chunk: 4-byte big-endian length, 4-byte type, data, 4-byte CRC.
+    while (len - off >= 12) {
+        size_t clen = ((size_t)data[off] << 24) | ((size_t)data[off + 1] << 16)
+                    | ((size_t)data[off + 2] << 8) | (size_t)data[off + 3];
+        if (clen > len - off - 12) return 0;
+        bool end = memcmp(data + off + 4, "IEND", 4) == 0;
+        off += 12 + clen;
+        if (end) return off;
+    }
+    return 0;
+}
+
+// A lone 0x47 turns up in image data all the time, so one byte proves nothing.
+// Five in a row on the packet grid does; a shorter body must be sync all the
+// way to its end, and hold at least two packets.
+#define RS_TS_SYNC_RUN 5
+
+static bool ts_sync_at(const uint8_t *d, size_t len, size_t off) {
+    size_t packets = (len - off) / RS_TS_PACKET_SIZE;
+    if (packets < 2) return false;
+    if (packets > RS_TS_SYNC_RUN) packets = RS_TS_SYNC_RUN;
+    for (size_t k = 0; k < packets; k++)
+        if (d[off + k * RS_TS_PACKET_SIZE] != 0x47) return false;
+    return true;
+}
+
+size_t rs_ts_image_wrapper_len(const uint8_t *data, size_t len) {
+    if (!data || !starts_with_image_magic(data, len)) return 0;
+    // The end of a well-formed PNG is the likeliest place, and checking it
+    // first keeps a sync-looking run inside the image data from winning.
+    size_t png = rs_png_file_len(data, len);
+    if (png && png < len && ts_sync_at(data, len, png)) return png;
+    for (size_t off = 1; off + 2 * RS_TS_PACKET_SIZE <= len; off++)
+        if (data[off] == 0x47 && ts_sync_at(data, len, off)) return off;
+    return 0;
+}
