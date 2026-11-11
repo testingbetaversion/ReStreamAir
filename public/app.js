@@ -865,7 +865,7 @@ function renderStreamsGrid() {
         <span class="stream-title-name">
           <strong>${escapeHtml(stream.name)}</strong>
         </span>
-        <span class="badge ${stream.running ? "running" : stream.status === "restarting" ? "restarting" : ""}">${escapeHtml(stream.status || "stopped")}</span>
+        <span class="badge ${stream.running ? "running" : stream.status === "restarting" ? "restarting" : ""}">${escapeHtml(!stream.running && stream.onDemand && (stream.status || "stopped") === "stopped" ? "on demand" : stream.status || "stopped")}</span>
       </div>
       <div class="stream-url">${escapeHtml(stream.kind.toUpperCase())} · ${escapeHtml(stream.url)}</div>
       ${eventWindow ? `<div class="stream-url">${escapeHtml(eventWindow)}${stream.autostart ? " · autostart" : ""}</div>` : ""}
@@ -1243,6 +1243,7 @@ function renderEditor() {
   form.elements.forceOffline.checked = Boolean(stream.forceOffline);
   form.elements.reducedManifestPolling.checked = Boolean(stream.reducedManifestPolling);
   form.elements.autostart.checked = Boolean(stream.autostart);
+  form.elements.onDemand.checked = Boolean(stream.onDemand);
   form.elements.directSource.checked = Boolean(stream.directSource);
   form.elements.manifestHeaders.value = stream.manifestHeaders || "";
   form.elements.mediaHeaders.value = stream.mediaHeaders || "";
@@ -1394,6 +1395,7 @@ function streamPayload() {
     forceOffline: form.elements.forceOffline.checked,
     reducedManifestPolling: form.elements.reducedManifestPolling.checked,
     autostart: form.elements.autostart.checked,
+    onDemand: form.elements.onDemand.checked,
     directSource: form.elements.inputMode.value === "hlsBuffered" ? false : form.elements.directSource.checked,
     manifestHeaders: form.elements.manifestHeaders.value,
     mediaHeaders: form.elements.mediaHeaders.value,
@@ -1532,7 +1534,6 @@ function newStream() {
 const INACTIVE_FIELDS = {
   period: "the engine reads every DASH period; selection isn't implemented",
   forceOffline: "not implemented in this build",
-  onDemand: "not implemented in this build",
   speedUp: "not implemented in this build",
   recordEvent: "not implemented in this build",
   nm3u8dlreParams: "the N_m3u8DL-RE input mode isn't in this build",

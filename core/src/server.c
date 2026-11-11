@@ -215,6 +215,8 @@ struct restream_server {
     rs_direct_client *direct_head;  // open fMP4 byte-tail viewers
     rs_ts_client *ts_head;          // open muxed-MPEG-TS viewers
     rs_ts_session *ts_sessions;     // one mux per stream with .ts viewers on it
+    struct rs_od_waiter *od_waiters; // viewers held while an On Demand stream starts
+    size_t od_count, od_cap;
     rs_logo_cache *logo_cache;
     rs_file_gate *file_gate;        // bounds served files: open limit, wait queue, open timeout
     uint64_t file_gate_rejected_logged;
@@ -323,6 +325,11 @@ static int pipeline_sync_stream(restream_server_t *s, const char *stream_id,
 static void pipeline_stop_stream(const char *stream_id);
 static void live_sync_all(restream_server_t *s);
 static void provider_maintenance(restream_server_t *s);
+// On Demand streams; see on_demand_intercept.
+#define RS_OD_WAIT_S 45.0     // how long a viewer is held for a start
+#define RS_OD_IDLE_S 60.0     // no viewer this long -> an On Demand stream stops
+#define RS_OD_MAX_WAITERS 256
+static void on_demand_free(restream_server_t *s);
 static void backup_tick(restream_server_t *s);
 static double stream_delivery_speed(restream_server_t *server, const char *stream_id);
 static void speed_prune(restream_server_t *server);
@@ -3068,7 +3075,8 @@ static void serve_m3u_playlist(restream_server_t *s, struct mg_connection *c,
             bool running = strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0;
             if (type_filter && type_filter[0] &&
                 strcmp(source_type[0] ? source_type : "manual", type_filter) != 0) continue;
-            if (only_running && !running) continue;
+            // An On Demand stream is available whenever someone opens it.
+            if (only_running && !running && !rs_json_obj_bool(stream, "onDemand", false)) continue;
             if (name_filter && name_filter[0] && !ci_contains(name, name_filter)) continue;
             bool engine_stream = stream_uses_engine(stream);
             char *slug = rs_panel_slugify(name);
@@ -9159,6 +9167,28 @@ static void provider_maintenance(restream_server_t *s) {
             const char *id = rs_json_obj_str(stream, "id", "");
             rs_json *stimer = provider_timer(s, id);
             bool running = !strcmp(rs_json_obj_str(stream, "status", "stopped"), "running");
+            // On Demand: stop once nobody has requested or been served anything
+            // for RS_OD_IDLE_S. A stream started from the panel gets the same
+            // grace from the moment it is first seen running.
+            if (running && rs_json_obj_bool(stream, "onDemand", false) &&
+                !rs_json_obj_bool(stream, "directSource", false)) {
+                double seen = rs_json_obj_num(stimer, "onDemandSeenAt", 0);
+                if (seen <= 0) {
+                    rs_json_obj_set(stimer, "onDemandSeenAt", rs_json_new_num(now));
+                } else if (now - seen >= RS_OD_IDLE_S && rs_metrics_active_clients(s->metrics, id) == 0) {
+                    char *sid = rs_strdup(id);
+                    rs_json_obj_remove(s->provider_timers, sid);  // drops stimer too
+                    live_stop_stream(s, sid);
+                    pipeline_stop_stream(sid);
+                    const char *err = NULL;
+                    rs_panel_set_stream_running(&s->state, sid, false, &err);
+                    log_recordf(s, sid, "info", "onDemandStop", NULL, 0, -1,
+                                "On Demand: no viewers for %.0f seconds; stream stopped", RS_OD_IDLE_S);
+                    free(sid);
+                    changed = true;
+                    continue;
+                }
+            }
             double viewer_at = rs_json_obj_num(stimer, "bufferedViewerAt", 0);
             if (viewer_at > 0 && (!running || now - viewer_at >= 30.0)) {
                 rs_json_obj_remove(stimer, "bufferedViewerAt");
@@ -10567,6 +10597,155 @@ static void log_playback_request(restream_server_t *server, struct mg_connection
     rs_free(ip); free(ua); free(range);
 }
 
+// --- On Demand streams -------------------------------------------------------
+//
+// A stream with "onDemand" set doesn't have to be started from the panel: the
+// first viewer request starts it, and it stops itself once nobody has watched
+// for RS_OD_IDLE_S. While the start runs (a provider script can take a while
+// to fetch a manifest and keys), the viewer's request is held rather than
+// refused, then re-dispatched as if it had just arrived — so a player that
+// never retries still gets the playlist.
+
+struct rs_od_waiter {
+    unsigned long conn_id;
+    double deadline;
+    char *sid;
+    char *msg;      // the raw request, re-parsed on re-dispatch
+    size_t len;
+};
+
+static void ev_handler(struct mg_connection *c, int ev, void *ev_data);
+
+// The stream a playback URL names: the first path component after the route
+// prefix, tried as given and then without its extension (/direct/<slug>.ts).
+static const rs_json *on_demand_stream_for(restream_server_t *s, struct mg_http_message *hm) {
+    static const char *prefixes[] = {"/play/", "/restream/", "/direct/", "/download/", "/source/"};
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        size_t plen = strlen(prefixes[i]);
+        if (hm->uri.len <= plen || strncmp(hm->uri.buf, prefixes[i], plen) != 0) continue;
+        const char *ref = hm->uri.buf + plen;
+        size_t n = 0;
+        while (plen + n < hm->uri.len && ref[n] != '/' && ref[n] != '?') n++;
+        if (n == 0 || n >= 512) return NULL;
+        char buf[512];
+        memcpy(buf, ref, n); buf[n] = '\0';
+        const rs_json *stream = rs_panel_find_stream(&s->state, buf);
+        char *dot = strrchr(buf, '.');
+        if (!stream && dot) { *dot = '\0'; stream = rs_panel_find_stream(&s->state, buf); }
+        return stream;
+    }
+    return NULL;
+}
+
+// Called for every authorised, non-feed playback request. Notes the viewer,
+// and for a stopped On Demand stream starts it and holds the request.
+// Returns true when the request was taken (held or answered).
+static bool on_demand_intercept(restream_server_t *s, struct mg_connection *c,
+                                struct mg_http_message *hm) {
+    const rs_json *stream = on_demand_stream_for(s, hm);
+    if (!stream || !rs_json_obj_bool(stream, "onDemand", false) ||
+        rs_json_obj_bool(stream, "directSource", false)) return false;
+    char *sid = rs_strdup(rs_json_obj_str(stream, "id", ""));
+    if (!sid || !sid[0]) { free(sid); return false; }
+    double now = now_ms() / 1000.0;
+    rs_json *timer = provider_timer(s, sid);
+    rs_json_obj_set(timer, "onDemandSeenAt", rs_json_new_num(now));
+    if (!strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) { free(sid); return false; }
+
+    double kicked = rs_json_obj_num(timer, "onDemandStartAt", 0);
+    if (kicked <= 0 || now - kicked > RS_OD_WAIT_S) {
+        rs_panel_set_stream_error(&s->state, sid, NULL);
+        rs_panel_set_stream_user_stopped(&s->state, sid, false);
+        char *ip = client_ip(s, c, hm);
+        log_recordf(s, sid, "info", "onDemandStart", NULL, 0, -1,
+                    "On Demand: %.*s from %s — starting the stream",
+                    (int)hm->uri.len, hm->uri.buf, ip);
+        rs_free(ip);
+        scheduled_stream_start(s, sid, "On Demand: started for a viewer");
+        // Stop and the scheduler drop the stream's timer; take it afresh.
+        timer = provider_timer(s, sid);
+        rs_json_obj_set(timer, "onDemandStartAt", rs_json_new_num(now));
+        rs_json_obj_set(timer, "onDemandSeenAt", rs_json_new_num(now));
+    }
+    stream = rs_panel_find_stream(&s->state, sid);
+    if (!stream) { free(sid); reply_error(c, 404, "Stream not found."); return true; }
+    if (!strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) { free(sid); return false; }
+    const char *err = rs_json_obj_str(stream, "lastError", "");
+    if (err[0]) {
+        rs_json_obj_remove(timer, "onDemandStartAt");
+        reply_error(c, 502, err);
+        free(sid);
+        return true;
+    }
+    if (s->od_count >= RS_OD_MAX_WAITERS) {
+        free(sid);
+        mg_http_reply(c, 503, RS_CORS_HEADERS "Content-Type: application/json\r\nRetry-After: 2\r\n",
+                      "{\"error\":\"Stream is starting on demand; retry shortly.\"}");
+        return true;
+    }
+    if (s->od_count == s->od_cap) {
+        size_t cap = s->od_cap ? s->od_cap * 2 : 16;
+        struct rs_od_waiter *grown = realloc(s->od_waiters, cap * sizeof(*grown));
+        if (!grown) { free(sid); reply_error(c, 500, "Out of memory."); return true; }
+        s->od_waiters = grown; s->od_cap = cap;
+    }
+    char *msg = malloc(hm->message.len + 1);
+    if (!msg) { free(sid); reply_error(c, 500, "Out of memory."); return true; }
+    memcpy(msg, hm->message.buf, hm->message.len);
+    msg[hm->message.len] = '\0';
+    s->od_waiters[s->od_count++] = (struct rs_od_waiter){
+        c->id, now + RS_OD_WAIT_S, sid, msg, hm->message.len};
+    return true;
+}
+
+// Answers held viewers: re-dispatches each once its stream runs, or replies
+// with why it didn't start. Runs on the event loop every 250 ms.
+static void on_demand_tick(void *arg) {
+    restream_server_t *s = (restream_server_t *)arg;
+    if (!s->od_count) return;
+    struct rs_od_waiter *list = s->od_waiters;
+    size_t n = s->od_count;
+    s->od_waiters = NULL; s->od_count = 0; s->od_cap = 0;
+    double now = now_ms() / 1000.0;
+    for (size_t i = 0; i < n; i++) {
+        struct rs_od_waiter *w = &list[i];
+        struct mg_connection *c = open_conn_by_id(s, w->conn_id);
+        const rs_json *stream = c ? rs_panel_find_stream(&s->state, w->sid) : NULL;
+        bool done = true;
+        if (!c) {
+            // The player gave up.
+        } else if (!stream) {
+            reply_error(c, 404, "Stream not found.");
+        } else if (!strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) {
+            struct mg_http_message hm;
+            if (mg_http_parse(w->msg, w->len, &hm) > 0) ev_handler(c, MG_EV_HTTP_MSG, &hm);
+            else reply_error(c, 400, "Bad request.");
+        } else if (rs_json_obj_str(stream, "lastError", "")[0]) {
+            reply_error(c, 502, rs_json_obj_str(stream, "lastError", ""));
+        } else if (now >= w->deadline) {
+            reply_error(c, 504, "The On Demand start took too long; check the stream logs.");
+        } else {
+            done = false;
+        }
+        if (done) { free(w->sid); free(w->msg); continue; }
+        // Still waiting: back onto the (possibly re-grown) list.
+        if (s->od_count == s->od_cap) {
+            size_t cap = s->od_cap ? s->od_cap * 2 : 16;
+            struct rs_od_waiter *grown = realloc(s->od_waiters, cap * sizeof(*grown));
+            if (!grown) { reply_error(c, 500, "Out of memory."); free(w->sid); free(w->msg); continue; }
+            s->od_waiters = grown; s->od_cap = cap;
+        }
+        s->od_waiters[s->od_count++] = *w;
+    }
+    free(list);
+}
+
+static void on_demand_free(restream_server_t *s) {
+    for (size_t i = 0; i < s->od_count; i++) { free(s->od_waiters[i].sid); free(s->od_waiters[i].msg); }
+    free(s->od_waiters);
+    s->od_waiters = NULL; s->od_count = s->od_cap = 0;
+}
+
 static bool handle_playback(restream_server_t *server, struct mg_connection *c,
                             struct mg_http_message *hm) {
     bool is_source = mg_match(hm->uri, mg_str("/source/*"), NULL);
@@ -10592,6 +10771,10 @@ static bool handle_playback(restream_server_t *server, struct mg_connection *c,
         return true;
     }
     free(key);
+
+    // An On Demand stream that isn't running yet is started here, and the
+    // request held until it is. The pipeline's own feed never counts as a viewer.
+    if (!feed && on_demand_intercept(server, c, hm)) return true;
 
     if (is_restream) {
         if (!g_fetch_handler) { reply_error(c, 501, "Restreaming isn't in this build."); return true; }
@@ -11126,6 +11309,7 @@ bool restream_server_start(restream_server_t* server, uint16_t port, const char*
     mg_timer_add(&server->mgr, RS_DIRECT_PUMP_MS, MG_TIMER_REPEAT, pump_direct_links, server);
     // Hands freed file slots to waiting requests promptly; cheap when idle.
     mg_timer_add(&server->mgr, 100, MG_TIMER_REPEAT, file_gate_tick, server);
+    mg_timer_add(&server->mgr, 250, MG_TIMER_REPEAT, on_demand_tick, server);
     server->is_running = true;
     // Streams that state.json says were running come back up on their own, so a
     // restart does not silently leave every stream dark until someone notices.
@@ -11173,6 +11357,7 @@ void restream_server_destroy(restream_server_t* server) {
             server->ts_head = t->next;
             ts_client_free(t);
         }
+        on_demand_free(server);
         while (server->ts_sessions) {
             rs_ts_session *s = server->ts_sessions;
             server->ts_sessions = s->next;

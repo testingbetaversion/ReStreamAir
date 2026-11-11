@@ -252,7 +252,7 @@ static rs_json *stream_build(const rs_json *body, const char *id) {
     rs_json_obj_set_str(s, "mode", "live");
     rs_json_obj_set_str(s, "scriptVideoSelector", "");
     rs_json_obj_set_str(s, "scriptAudioSelector", "");
-    rs_json_obj_set_bool(s, "onDemand", false);
+    rs_json_obj_set_bool(s, "onDemand", rs_json_obj_bool(body, "onDemand", false));
     rs_json_obj_set_bool(s, "speedUp", false);
     rs_json_obj_set_bool(s, "autostart", rs_json_obj_bool(body, "autostart", false));
     rs_json_obj_set(s, "scriptStart", rs_json_new_null());
@@ -767,6 +767,8 @@ int rs_panel_update_stream(rs_state *st, const char *stream_id, const rs_json *b
     }
     if (rs_json_obj_get(body, "autostart"))
         rs_json_obj_set_bool(updated, "autostart", rs_json_obj_bool(body, "autostart", false));
+    if (rs_json_obj_get(body, "onDemand"))
+        rs_json_obj_set_bool(updated, "onDemand", rs_json_obj_bool(body, "onDemand", false));
     // For an imported stream with no per-stream override, the scripting toggles
     // the editor didn't send stay as they were.
     bool imported = rs_json_obj_str(existing, "sourceType", "")[0] != '\0';

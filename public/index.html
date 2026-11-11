@@ -262,6 +262,7 @@
               <button type="button" id="addCdnMirrorBtn" class="ghost add-cdn-btn"><span data-icon="plus"></span>Add CDN mirror</button>
             </div>
             <label class="check"><input name="autostart" type="checkbox"> Include in provider autostart<span class="field-hint">Eligible for the provider’s sequential or random start schedule, within the event’s start/end window.</span></label>
+            <label class="check"><input name="onDemand" type="checkbox"> On Demand<span class="field-hint">Starts when a viewer opens the stream (the request waits while it starts) and stops after 60 seconds with no viewers. No need to press Start.</span></label>
             <label class="check"><input name="directSource" type="checkbox"> Direct source — the play link 302-redirects players straight to the source URL (or its current CDN mirror) instead of proxying through the panel</label>
             <div id="representationPicker" class="representation-picker hidden"></div>
             <div class="form-row">
