@@ -10616,6 +10616,14 @@ struct rs_od_waiter {
 
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data);
 
+// Ready to serve: running, and when the internal engine carries it, the
+// engine has a master and every media playlist — otherwise the request would
+// just get the engine's "still starting up" 503, which some players never retry.
+static bool on_demand_ready(restream_server_t *s, const rs_json *stream, const char *sid) {
+    if (strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") != 0) return false;
+    return !s->live || !rs_live_is_running(s->live, sid) || rs_live_is_ready(s->live, sid);
+}
+
 // The stream a playback URL names: the first path component after the route
 // prefix, tried as given and then without its extension (/direct/<slug>.ts).
 static const rs_json *on_demand_stream_for(restream_server_t *s, struct mg_http_message *hm) {
@@ -10650,10 +10658,11 @@ static bool on_demand_intercept(restream_server_t *s, struct mg_connection *c,
     double now = now_ms() / 1000.0;
     rs_json *timer = provider_timer(s, sid);
     rs_json_obj_set(timer, "onDemandSeenAt", rs_json_new_num(now));
-    if (!strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) { free(sid); return false; }
+    bool running = !strcmp(rs_json_obj_str(stream, "status", "stopped"), "running");
+    if (on_demand_ready(s, stream, sid)) { free(sid); return false; }
 
     double kicked = rs_json_obj_num(timer, "onDemandStartAt", 0);
-    if (kicked <= 0 || now - kicked > RS_OD_WAIT_S) {
+    if (!running && (kicked <= 0 || now - kicked > RS_OD_WAIT_S)) {
         rs_panel_set_stream_error(&s->state, sid, NULL);
         rs_panel_set_stream_user_stopped(&s->state, sid, false);
         char *ip = client_ip(s, c, hm);
@@ -10669,7 +10678,10 @@ static bool on_demand_intercept(restream_server_t *s, struct mg_connection *c,
     }
     stream = rs_panel_find_stream(&s->state, sid);
     if (!stream) { free(sid); reply_error(c, 404, "Stream not found."); return true; }
-    if (!strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) { free(sid); return false; }
+    if (on_demand_ready(s, stream, sid)) { free(sid); return false; }
+    // Warming, but not from an On Demand start (started from the panel), or
+    // for longer than a hold lasts: let the engine answer as it always has.
+    if (running && (kicked <= 0 || now - kicked > RS_OD_WAIT_S)) { free(sid); return false; }
     const char *err = rs_json_obj_str(stream, "lastError", "");
     if (err[0]) {
         rs_json_obj_remove(timer, "onDemandStartAt");
@@ -10716,7 +10728,10 @@ static void on_demand_tick(void *arg) {
             // The player gave up.
         } else if (!stream) {
             reply_error(c, 404, "Stream not found.");
-        } else if (!strcmp(rs_json_obj_str(stream, "status", "stopped"), "running")) {
+        } else if (on_demand_ready(s, stream, w->sid) ||
+                   (now >= w->deadline && !strcmp(rs_json_obj_str(stream, "status", "stopped"), "running"))) {
+            // Ready — or out of time but running, so the engine's own reply
+            // (a warm-up 503) goes back instead of a bare timeout.
             struct mg_http_message hm;
             if (mg_http_parse(w->msg, w->len, &hm) > 0) ev_handler(c, MG_EV_HTTP_MSG, &hm);
             else reply_error(c, 400, "Bad request.");
