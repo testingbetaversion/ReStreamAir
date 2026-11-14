@@ -3649,8 +3649,11 @@ async function loadLogs() {
   } catch (error) {
     list.className = "log-list empty-state";
     list.textContent = String(error.message || error);
+  } finally {
+    // In finally so the empty-list returns above refresh it too; otherwise a
+    // stream with no entries kept the previous selection's Stop/Start label.
+    updateLogStreamToggleBtn();
   }
-  updateLogStreamToggleBtn();
 }
 
 function updateLogStreamToggleBtn() {
