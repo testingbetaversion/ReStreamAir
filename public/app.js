@@ -538,9 +538,9 @@ function updateStreamCardDynamic(card, stream) {
   if (!card) return;
   const badge = card.querySelector(".badge");
   if (badge) {
-    badge.textContent = stream.status || "stopped";
+    badge.textContent = streamStatusLabel(stream);
     badge.classList.toggle("running", Boolean(stream.running));
-    badge.classList.toggle("restarting", stream.status === "restarting");
+    badge.classList.toggle("restarting", stream.status === "restarting" || isStreamStarting(stream));
   }
   const stats = card.querySelectorAll(".stream-stats span");
   if (stats.length >= 3) {
@@ -556,9 +556,7 @@ function updateStreamCardDynamic(card, stream) {
   if (box) box.checked = selected;
   const toggle = card.querySelector('[data-action="toggle"]');
   if (toggle) {
-    toggle.className = stream.running ? "danger" : "success";
-    toggle.innerHTML = `<span data-icon="${stream.running ? "stop" : "play"}"></span>${stream.running ? "Stop" : "Start"}`;
-    applyIcons(toggle);
+    applyRunToggle(toggle, stream);
   }
 }
 
@@ -865,7 +863,7 @@ function renderStreamsGrid() {
         <span class="stream-title-name">
           <strong>${escapeHtml(stream.name)}</strong>
         </span>
-        <span class="badge ${stream.running ? "running" : stream.status === "restarting" ? "restarting" : ""}">${escapeHtml(!stream.running && stream.onDemand && (stream.status || "stopped") === "stopped" ? "on demand" : stream.status || "stopped")}</span>
+        <span class="badge ${stream.running ? "running" : stream.status === "restarting" || isStreamStarting(stream) ? "restarting" : ""}">${escapeHtml(streamStatusLabel(stream))}</span>
       </div>
       <div class="stream-url">${escapeHtml(stream.kind.toUpperCase())} · ${escapeHtml(stream.url)}</div>
       ${eventWindow ? `<div class="stream-url">${escapeHtml(eventWindow)}${stream.autostart ? " · autostart" : ""}</div>` : ""}
@@ -882,7 +880,7 @@ function renderStreamsGrid() {
         <button type="button" class="ghost mini-icon-btn" data-action="play" title="Play in Picture-in-Picture"><span data-icon="pip"></span></button>
         <button type="button" class="ghost mini-icon-btn" data-action="traffic" title="Live traffic for this channel: proxies, connections and requests"><span data-icon="eye"></span></button>
         <button type="button" class="ghost mini-icon-btn" data-action="logs" title="View logs for this stream"><span data-icon="logs"></span></button>
-        <button type="button" class="${stream.running ? "danger" : "success"}" data-action="toggle"><span data-icon="${stream.running ? "stop" : "play"}"></span>${stream.running ? "Stop" : "Start"}</button>
+        <button type="button" class="${stream.running ? "danger" : "success"}" data-action="toggle" ${isStreamStarting(stream) ? "disabled" : ""}><span data-icon="${isStreamStarting(stream) ? "play" : stream.running ? "stop" : "play"}"></span>${isStreamStarting(stream) ? "Starting…" : stream.running ? "Stop" : "Start"}</button>
         <button type="button" class="icon-btn ghost" data-action="delete" title="Delete stream"><span data-icon="trash"></span></button>
       </div>
     `;
@@ -1133,12 +1131,32 @@ function updateKindVisibility() {
   });
 }
 
-function updateRunToggleButton(stream) {
-  const button = $("#toggleRunBtn");
+// Streams whose Start request is still in flight. /start only answers once
+// the manifest script (and any DRM lookup) has finished, which can take many
+// seconds; without this the card kept saying "stopped" while logs streamed in.
+const startingStreams = new Set();
+
+function isStreamStarting(stream) {
+  return Boolean(stream && !stream.running && startingStreams.has(stream.id));
+}
+
+function streamStatusLabel(stream) {
+  if (isStreamStarting(stream)) return "starting";
+  const status = stream.status || "stopped";
+  return !stream.running && stream.onDemand && status === "stopped" ? "on demand" : status;
+}
+
+function applyRunToggle(button, stream) {
+  const starting = isStreamStarting(stream);
   const running = Boolean(stream?.running);
   button.className = running ? "danger" : "success";
-  button.innerHTML = `<span data-icon="${running ? "stop" : "play"}"></span>${running ? "Stop" : "Start"}`;
+  button.innerHTML = `<span data-icon="${running ? "stop" : "play"}"></span>${starting ? "Starting…" : running ? "Stop" : "Start"}`;
+  button.disabled = !stream || starting;
   applyIcons(button);
+}
+
+function updateRunToggleButton(stream) {
+  applyRunToggle($("#toggleRunBtn"), stream);
 }
 
 function renderEditor() {
@@ -1152,7 +1170,6 @@ function renderEditor() {
   const form = $("#streamForm");
   const disabled = !selectedProvider();
   for (const el of form.elements) el.disabled = disabled;
-  $("#toggleRunBtn").disabled = !stream;
   $("#deleteStreamBtn").disabled = !stream;
   updateRunToggleButton(stream);
 
@@ -1421,10 +1438,27 @@ function streamPayload() {
   };
 }
 
+let savingStream = false;
+
 async function saveStream(event) {
   event.preventDefault();
+  // Each click POSTed a new stream before the first reply came back, so
+  // clicking Save two or three times created that many duplicate channels.
+  if (savingStream) return;
   const provider = selectedProvider();
   if (!provider) return;
+  const submitButton = $("#streamForm").querySelector('button[type="submit"]');
+  savingStream = true;
+  if (submitButton) submitButton.disabled = true;
+  try {
+    await saveStreamNow(provider);
+  } finally {
+    savingStream = false;
+    if (submitButton) submitButton.disabled = !selectedProvider();
+  }
+}
+
+async function saveStreamNow(provider) {
   const id = $("#streamForm").elements.id.value;
   const isNewStream = !id;
   // A rejected save (e.g. the server 400s on an empty/invalid URL) used to
@@ -1450,13 +1484,17 @@ async function saveStream(event) {
 }
 
 async function toggleStreamRun(id, running) {
+  if (!running && startingStreams.has(id)) return; // a Start is already in flight
+  if (!running) { startingStreams.add(id); render(); }
   try {
     stateMutationEpoch++;
     state = await request(`/api/streams/${id}/${running ? "stop" : "start"}`, { method: "POST", body: "{}" });
     stateMutationEpoch++;
-    render();
   } catch (error) {
     alert(`Failed to ${running ? "stop" : "start"} stream: ${error.message || error}`);
+  } finally {
+    if (!running) startingStreams.delete(id);
+    render();
   }
 }
 
