@@ -628,7 +628,11 @@ function filteredStreamRows() {
       if (streamsGridRunningOnly && !stream.running) return false;
       if (query && !stream.name.toLowerCase().includes(query) && !stream.url.toLowerCase().includes(query)) return false;
       return true;
-    });
+    })
+    // Running channels first, so they don't have to be hunted for among the
+    // stopped ones. The sort is stable: within each group the provider's own
+    // order is kept.
+    .sort((a, b) => Boolean(b.stream.running) - Boolean(a.stream.running));
 }
 
 // Enable/disable the bulk buttons to match what the filtered set can do, and
