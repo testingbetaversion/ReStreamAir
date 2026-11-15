@@ -557,6 +557,7 @@ typedef struct {
     char *text_id, *text_codecs, *text_lang, *text_mime;
     cc_track cc[RS_DASH_MAX_CC];
     size_t cc_count;
+    rs_json *audio_tracks;  // every audio Representation id -> its lang ("" if none)
 } rendition_set;
 
 static void rendition_set_dispose(rendition_set *r) {
@@ -564,6 +565,7 @@ static void rendition_set_dispose(rendition_set *r) {
     free(r->audio_id); free(r->audio_codecs); free(r->audio_lang);
     free(r->text_id); free(r->text_codecs); free(r->text_lang); free(r->text_mime);
     for (size_t i = 0; i < r->cc_count; i++) { free(r->cc[i].instream_id); free(r->cc[i].lang); }
+    if (r->audio_tracks) rs_json_free(r->audio_tracks);
     memset(r, 0, sizeof(*r));
 }
 
@@ -747,6 +749,12 @@ static void pick_default_reps(xmlNode *root, rendition_set *out, const rs_source
                 bool worst = false;
                 const char *filter = !policy ? "" : strcmp(type, "audio") == 0 ? policy->audio_filter : policy->video_filter;
                 int rank = rendition_rank(filter, rid, lang, codecs, bwv, height, &worst);
+                if (strcmp(type, "audio") == 0) {
+                    // The engine needs the whole list to notice a saved audio
+                    // pin whose id the CDN has since handed to another track.
+                    if (!out->audio_tracks) out->audio_tracks = rs_json_new_obj();
+                    if (out->audio_tracks) rs_json_obj_set_str(out->audio_tracks, rid, lang ? lang : "");
+                }
                 if (strcmp(type, "video") == 0) {
                     scan_cc_descriptors(rep, out);
                     if (rank >= 0 && (rank < video_rank || (rank == video_rank && (worst ? bwv < out->video_bw : bwv > out->video_bw)))) {
@@ -1197,6 +1205,7 @@ char *rs_dash_describe(const char *url, const char *proxy, const char *headers,
         else rs_json_obj_set(a, "lang", rs_json_new_null());
         rs_json_obj_set(obj, "audio", a);
     } else rs_json_obj_set(obj, "audio", rs_json_new_null());
+    if (reps.audio_tracks) { rs_json_obj_set(obj, "audioTracks", reps.audio_tracks); reps.audio_tracks = NULL; }
     if (reps.text_id) {
         rs_json *t = rs_json_new_obj();
         rs_json_obj_set_str(t, "id", reps.text_id);

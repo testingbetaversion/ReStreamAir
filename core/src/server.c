@@ -8755,7 +8755,15 @@ static int live_sync_stream(restream_server_t *s, const char *stream_id) {
     cfg.representation_count = live_rep_count;
     if (cfg.representation && cfg.representation[0]) cfg.source_policy.video_filter[0] = 0;
     for (size_t i = 0; i < live_rep_count; i++) {
-        if (!strcmp(live_reps[i].type, "audio")) cfg.source_policy.audio_filter[0] = 0;
+        if (!strcmp(live_reps[i].type, "audio")) {
+            // Ask for the saved language, so the manifest's own audio pick is
+            // the right track even after the CDN renumbers its renditions
+            // (the director then follows it instead of the stale id).
+            const char *lang = live_reps[i].language;
+            if (lang && lang[0] && !strpbrk(lang, ", "))
+                snprintf(cfg.source_policy.audio_filter, sizeof(cfg.source_policy.audio_filter), "lang=%s,best", lang);
+            else cfg.source_policy.audio_filter[0] = 0;
+        }
         else cfg.source_policy.video_filter[0] = 0;
     }
     cfg.manifest_proxy = mproxy;

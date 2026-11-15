@@ -2722,13 +2722,26 @@ static void *director_main(void *arg) {
         const char *aid = have_audio ? rs_json_obj_str(audio, "id", "") : "";
         const char *acodecs = have_audio ? rs_json_obj_str(audio, "codecs", "") : "";
         const char *alang = have_audio ? rs_json_obj_str(audio, "lang", "") : "";
+        const rs_json *audio_tracks = rs_json_obj_get(root, "audioTracks");
+        const char *remapped_from = NULL;
         const rs_live_representation *video_choices[RS_LIVE_MAX_REPS];
         size_t video_choice_count = 0;
         for (size_t i = 0; i < cfg.representation_count; i++) {
             const rs_live_representation *choice = &cfg.representations[i];
             if (!choice->id || !choice->id[0]) continue;
             if (choice->type && strcmp(choice->type, "audio") == 0) {
-                if (have_audio) { aid = choice->id; acodecs = choice->codecs; alang = choice->language; }
+                if (!have_audio) continue;
+                // A saved pin is an id plus the language it had when it was
+                // picked. CDNs renumber (claro dropped a video rendition and
+                // every id after it shifted, so the "por" pin became "sap"):
+                // when the pinned id now carries another language, or is gone,
+                // and the manifest's own pick has the saved language, keep that.
+                const char *now_lang = audio_tracks ? rs_json_obj_str(audio_tracks, choice->id, NULL) : NULL;
+                bool stale = audio_tracks && choice->language && choice->language[0] &&
+                             (!now_lang || strcmp(now_lang, choice->language) != 0) &&
+                             alang && !strcmp(alang, choice->language) && strcmp(aid, choice->id) != 0;
+                if (stale) remapped_from = choice->id;
+                else { aid = choice->id; acodecs = choice->codecs; alang = choice->language; }
             } else if (!choice->type || strcmp(choice->type, "video") == 0) {
                 if (video_choice_count < RS_LIVE_MAX_REPS) video_choices[video_choice_count++] = choice;
             }
@@ -2751,6 +2764,15 @@ static void *director_main(void *arg) {
             continue;
         }
 
+        pthread_mutex_lock(&st->mu);
+        bool new_remap = remapped_from && (!st->last_audio || strcmp(st->last_audio, aid));
+        pthread_mutex_unlock(&st->mu);
+        if (new_remap) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "saved audio %s no longer carries language \"%s\" in the manifest; playing %s, which does",
+                     remapped_from, alang ? alang : "", aid);
+            lg(st, "warn", "audioRemapped", NULL, 0, -1, msg);
+        }
         pthread_mutex_lock(&st->mu);
         bool changed_tracks = st->last_video && (strcmp(st->last_video, vid) || strcmp(st->last_audio, aid));
         if (changed_tracks && !cfg.source_policy.no_restart_track) st->terminal = 3;
