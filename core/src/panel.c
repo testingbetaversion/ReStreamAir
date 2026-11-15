@@ -957,7 +957,13 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
         rs_json_obj_set_bool(stream, "useCdm", entry_bool(entry, "UseCdm", "useCdm", false));
         rs_json_obj_set_str(stream, "scriptVideoSelector", entry_str(entry, "Video", "video"));
         rs_json_obj_set_str(stream, "scriptAudioSelector", entry_str(entry, "Audio", "audio"));
-        rs_json_obj_set_bool(stream, "onDemand", entry_bool(entry, "OnDemand", "onDemand", false));
+        // On Demand: the script's word wins when it gives one. Otherwise a new
+        // stream takes the provider's import default and an existing one keeps
+        // what the operator set, so a re-import doesn't untick it.
+        if (entry_get(entry, "OnDemand", "onDemand"))
+            rs_json_obj_set_bool(stream, "onDemand", entry_bool(entry, "OnDemand", "onDemand", false));
+        else if (created)
+            rs_json_obj_set_bool(stream, "onDemand", rs_provider_option_bool(p, "importOnDemand"));
         rs_json_obj_set_bool(stream, "speedUp", entry_bool(entry, "SpeedUp", "speedUp", false));
         rs_json_obj_set_bool(stream, "autostart", entry_bool(entry, "Autostart", "autostart", false));
         rs_json_obj_set_bool(stream, "recordEvent", entry_bool(entry, "RecordEvent", "recordEvent", false));
@@ -1394,6 +1400,13 @@ int rs_panel_set_stream_parallel_downloads(rs_state *st, const char *stream_id, 
     rs_json *stream = find_stream(st, stream_id, NULL);
     if (!stream) { *err = "Stream not found."; return -404; }
     rs_json_obj_set_int(stream, "parallelDownloads", n);
+    return 0;
+}
+
+int rs_panel_set_stream_on_demand(rs_state *st, const char *stream_id, bool on, const char **err) {
+    rs_json *stream = find_stream(st, stream_id, NULL);
+    if (!stream) { *err = "Stream not found."; return -404; }
+    rs_json_obj_set_bool(stream, "onDemand", on);
     return 0;
 }
 

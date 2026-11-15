@@ -3821,14 +3821,17 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
         long long parallel = rs_json_obj_get(fields, "parallelDownloads")
             ? rs_json_obj_int(fields, "parallelDownloads", 0) : 0;
         const char *video_rep = rs_json_obj_str(fields, "videoRepresentation", "");
+        const rs_json *od_field = rs_json_obj_get(fields, "onDemand");
+        bool has_od = od_field && rs_json_type_of(od_field) == RS_JSON_BOOL;
+        bool on_demand = has_od && rs_json_obj_bool(fields, "onDemand", false);
         if (!del && !set && strcmp(action, "stop") != 0) {
             rs_json_free(body);
             reply_error(c, 400, "action must be \"stop\", \"delete\" or \"set\".");
             return true;
         }
-        if (set && !input_mode[0] && !parallel && !video_rep[0]) {
+        if (set && !input_mode[0] && !parallel && !video_rep[0] && !has_od) {
             rs_json_free(body);
-            reply_error(c, 400, "action \"set\" needs fields.inputMode, fields.parallelDownloads or fields.videoRepresentation.");
+            reply_error(c, 400, "action \"set\" needs fields.inputMode, fields.parallelDownloads, fields.videoRepresentation or fields.onDemand.");
             return true;
         }
         if (set) {
@@ -3846,9 +3849,12 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
                 if (input_mode[0]) rc = rs_panel_set_stream_input_mode(&s->state, id, input_mode, &err);
                 if (rc == 0 && parallel) rc = rs_panel_set_stream_parallel_downloads(&s->state, id, parallel, &err);
                 if (rc == 0 && video_rep[0]) rc = rs_panel_set_stream_video_representation(&s->state, id, video_rep, &err);
+                if (rc == 0 && has_od) rc = rs_panel_set_stream_on_demand(&s->state, id, on_demand, &err);
                 if (rc == -400) break;  // invalid value: same for every stream
                 if (rc != 0) continue;
                 done++;
+                // On Demand alone changes no pipeline setting: nothing to re-sync.
+                if (!input_mode[0] && !parallel && !video_rep[0]) continue;
                 const rs_json *stream = rs_panel_find_stream(&s->state, id);
                 if (stream && strcmp(rs_json_obj_str(stream, "status", "stopped"), "running") == 0) {
                     live_sync_stream(s, id);
@@ -3863,10 +3869,11 @@ static bool handle_api(restream_server_t *s, struct mg_connection *c, struct mg_
                 return true;
             }
             log_recordf(s, "__panel__", "info", "streamUpdate", NULL, 0, -1,
-                        "bulk set%s%s%s%s on %lu stream(s) by %s (%lu requested)",
+                        "bulk set%s%s%s%s%s on %lu stream(s) by %s (%lu requested)",
                         input_mode[0] ? " input mode " : "", input_mode,
                         parallel ? " + parallel downloads" : "",
                         video_rep[0] ? " + video quality" : "",
+                        !has_od ? "" : on_demand ? " + On Demand enabled" : " + On Demand disabled",
                         (unsigned long)done, ip, (unsigned long)n);
             rs_free(ip);
             rs_json_free(body);

@@ -2562,6 +2562,25 @@ async function applyParallelDownloadsToAllStreams(count) {
   }
 }
 
+// Turns On Demand on or off for every one of the provider's existing streams.
+async function applyOnDemandToAllStreams(on) {
+  const provider = selectedProvider();
+  if (!provider) return;
+  const ids = provider.streams.map((stream) => stream.id);
+  if (!ids.length) { showToast("This provider has no streams yet."); return; }
+  const effect = on
+    ? "They start when a viewer opens them; running ones stop after 60 seconds with no viewers."
+    : "Stopped ones then need Start (or autostart) again; running ones keep running.";
+  if (!confirm(`Turn On Demand ${on ? "on" : "off"} for all ${ids.length} stream(s) of "${provider.name}"? ${effect}`)) return;
+  try {
+    state = await request("/api/streams/bulk", { method: "POST", body: JSON.stringify({ action: "set", ids, fields: { onDemand: on } }) });
+    render();
+    showToast(`On Demand turned ${on ? "on" : "off"} for ${ids.length} stream(s)`);
+  } catch (error) {
+    showToast(`Couldn't change the streams: ${error.message || error}`, "error");
+  }
+}
+
 function updateSegmentUrlParamsVisibility() {
   const form = $("#providerSettingsForm");
   $("#segmentUrlParamsField").classList.toggle("hidden", form.elements.inheritUrlParams.checked);
@@ -2813,6 +2832,14 @@ function renderProviderOptions(provider) {
       label.className = "check";
       input.checked = Boolean(value);
       label.append(input, document.createTextNode(field.label));
+      if (field.name === "importOnDemand") {
+        const apply = document.createElement("button");
+        apply.type = "button";
+        apply.className = "ghost";
+        apply.textContent = `Apply to all ${provider.streams.length} existing stream(s) now`;
+        apply.addEventListener("click", (event) => { event.preventDefault(); applyOnDemandToAllStreams(input.checked); });
+        label.append(apply);
+      }
     } else {
       label.append(document.createTextNode(field.label), input);
       input.value = value;

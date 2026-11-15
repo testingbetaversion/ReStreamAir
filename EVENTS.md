@@ -395,7 +395,7 @@ The provider script prints an object containing an `Events` array to stdout:
 | `SessionManifest` | `sessionManifest`, boolean default false. |
 | `UseCdm`, `CdmType` | `useCdm` boolean false (legacy: DRM is now detected automatically, see below), `cdmType` string empty by default. |
 | `Video`, `Audio` | `scriptVideoSelector`, `scriptAudioSelector` strings. |
-| `OnDemand`, `SpeedUp`, `Autostart`, `RecordEvent` | Corresponding lower-camel-case booleans, default false. |
+| `OnDemand`, `SpeedUp`, `Autostart`, `RecordEvent` | Corresponding lower-camel-case booleans, default false. When `OnDemand` is left out, a new stream takes the provider's **On Demand for imported streams** option and an existing one keeps its current setting. |
 | `Start`, `End` | `scriptStart`, `scriptEnd`: numeric Unix epoch **seconds**, or null if omitted/nonnumeric. |
 
 Lower-camel-case aliases (`name`, `sessionManifest`, `start`, etc.) are accepted;

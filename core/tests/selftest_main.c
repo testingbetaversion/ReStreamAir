@@ -1395,7 +1395,7 @@ static void test_provider_options(void) {
 
     rs_json *view = rs_panel_view(&st, "localhost");
     const rs_json *schema = rs_json_obj_get(view, "providerOptionFields");
-    check("options/screenshot-fields", rs_json_arr_len(schema) == 50);
+    check("options/screenshot-fields", rs_json_arr_len(schema) == 51);
     {
         rs_source_policy policy;
         rs_provider_source_policy(provider, &policy);
