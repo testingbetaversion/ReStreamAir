@@ -124,13 +124,24 @@ function applyRefreshSettings(settings) {
 
 
 async function request(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: {
-      "content-type": "application/json",
-      ...(options.headers || {}),
-    },
-  });
+  // Any change marks the state as moved on, before and after it lands, so a
+  // background refresh that was already in flight can't paint its older
+  // snapshot over the result (a deleted provider reappearing until the next
+  // poll, for one).
+  const mutating = Boolean(options.method) && options.method !== "GET";
+  if (mutating) stateMutationEpoch++;
+  let response;
+  try {
+    response = await fetch(path, {
+      ...options,
+      headers: {
+        "content-type": "application/json",
+        ...(options.headers || {}),
+      },
+    });
+  } finally {
+    if (mutating) stateMutationEpoch++;
+  }
   if (response.status === 401) {
     authenticated = false;
     showAuthScreen();
@@ -3423,7 +3434,13 @@ async function deleteSelectedProvider() {
     ? `Delete provider "${provider.name}" and all ${streamCount} of its stream${streamCount === 1 ? "" : "s"}? This stops them and cannot be undone.`
     : `Delete provider "${provider.name}"?`;
   if (!confirm(warning)) return;
-  state = await request(`/api/providers/${provider.id}`, { method: "DELETE" });
+  try {
+    state = await request(`/api/providers/${provider.id}`, { method: "DELETE" });
+  } catch (error) {
+    // Already gone (deleted from another tab, or a stale card): just resync.
+    if (error.status !== 404) { showToast(`Couldn't delete the provider: ${error.message || error}`, "error"); return; }
+    state = await request("/api/state");
+  }
   selectedProviderId = state.providers[0]?.id || null;
   selectedStreamId = selectedProvider()?.streams[0]?.id || null;
   lastEditorStreamId = null;
@@ -4768,16 +4785,27 @@ $("#importProviderFile").addEventListener("change", async (event) => {
 $("#closeNewProviderBtn").addEventListener("click", closeNewProviderDialog);
 closeOnBackdropClick($("#newProviderDialog"), closeNewProviderDialog);
 
+// A second click or Enter while the first save is still on its way used to
+// create the provider twice.
+let providerCreateRunning = false;
 $("#providerForm").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (providerCreateRunning) return;
+  providerCreateRunning = true;
   const form = event.currentTarget;
-  state = await request("/api/providers", {
-    method: "POST",
-    body: JSON.stringify({ name: form.elements.name.value, logo: form.elements.logo.value }),
-  });
-  selectedProviderId = state.providers.at(-1)?.id || selectedProviderId;
-  closeNewProviderDialog();
-  render();
+  try {
+    state = await request("/api/providers", {
+      method: "POST",
+      body: JSON.stringify({ name: form.elements.name.value, logo: form.elements.logo.value }),
+    });
+    selectedProviderId = state.providers.at(-1)?.id || selectedProviderId;
+    closeNewProviderDialog();
+    render();
+  } catch (error) {
+    showToast(`Couldn't create the provider: ${error.message || error}`, "error");
+  } finally {
+    providerCreateRunning = false;
+  }
 });
 
 $("#streamForm").addEventListener("submit", saveStream);
