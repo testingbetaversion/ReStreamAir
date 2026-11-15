@@ -1124,6 +1124,14 @@ function collectCdnMirrors() {
 
 $("#addCdnMirrorBtn")?.addEventListener("click", () => addCdnMirrorRow(""));
 
+// A pasted source URL can carry stray spaces: around it (copy slop), inside
+// it (a path or query with a literal space) or a line break from a wrapped
+// paste. Trim the ends, drop line breaks, and encode inner spaces so the save
+// passes validation and the origin fetch gets a valid URL.
+function cleanSourceUrl(value) {
+  return String(value || "").trim().replace(/[\r\n\t]+/g, "").replace(/ /g, "%20");
+}
+
 function updateKindVisibility() {
   const kind = $("#streamForm").elements.kind.value;
   document.querySelectorAll("[data-kind-group]").forEach((group) => {
@@ -1350,7 +1358,7 @@ async function enlistQualitiesForEditor(stream) {
     });
     // The user may have switched to another stream (or started editing the
     // URL, which triggers its own detect) while the probe was in flight.
-    if (lastEditorStreamId !== streamId || detecting || $("#streamForm").elements.url.value.trim() !== url) return;
+    if (lastEditorStreamId !== streamId || detecting || cleanSourceUrl($("#streamForm").elements.url.value) !== url) return;
     applyProbeSession(stream, result);
     const detected = result.representations || [];
     const byId = new Map(detected.map((rep) => [rep.id, rep]));
@@ -1388,7 +1396,7 @@ function streamPayload() {
   return {
     name: form.elements.name.value,
     kind: form.elements.kind.value,
-    url: form.elements.url.value.trim(),
+    url: cleanSourceUrl(form.elements.url.value),
     logo: form.elements.logo.value,
     cdnUrls: collectCdnMirrors(),
     representation: form.elements.representation.value,
@@ -2265,7 +2273,7 @@ let detecting = false;
 // never has to remember to press Detect themselves.
 function autoDetectFromUrlField() {
   const form = $("#streamForm");
-  const url = form.elements.url.value.trim();
+  const url = cleanSourceUrl(form.elements.url.value);
   if (!url || !/^https?:\/\//i.test(url) || url === lastAutoDetectedUrl || detecting) return;
   lastAutoDetectedUrl = url;
   detectSource();
@@ -2294,7 +2302,7 @@ function selectAllRepresentationsByDefault() {
 
 async function detectSource() {
   const form = $("#streamForm");
-  const url = form.elements.url.value.trim();
+  const url = cleanSourceUrl(form.elements.url.value);
   if (!url) { $("#detectStatus").textContent = "Enter a source URL first."; return; }
   lastAutoDetectedUrl = url;
   detecting = true;
@@ -2308,7 +2316,7 @@ async function detectSource() {
       method: "POST",
       body: JSON.stringify({ streamId, cdnUrls: collectCdnMirrors(), providerId: selectedProvider()?.id || "", url, proxy, headers: providerProbeHeaders(form.elements.manifestHeaders.value), forceIpv6: Boolean(selectedProvider()?.forceIpv6), rotateProxies: Boolean(selectedProvider()?.rotateProxies) }),
     });
-    if (form.elements.url.value.trim() !== url || (streamId && selectedStream()?.id !== streamId)) return;
+    if (cleanSourceUrl(form.elements.url.value) !== url || (streamId && selectedStream()?.id !== streamId)) return;
     applyProbeSession(savedStream, result);
     probeResult = result;
     selectedRepIds = new Set();
