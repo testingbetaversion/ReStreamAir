@@ -711,8 +711,8 @@ async function bulkStreamAction(kind) {
       }
     } catch (error) {
       stateMutationEpoch++;
-      $("#streamsGridImportStatus").classList.remove("hidden");
       $("#streamsGridImportStatus").textContent = `${kind} failed: ${error.message || error}`;
+      setGridImportHidden(false);
       return;
     }
   }
@@ -731,8 +731,8 @@ async function bulkStreamAction(kind) {
       await request(path, { method, body: method === "POST" ? "{}" : undefined });
       count++;
     } catch (error) {
-      $("#streamsGridImportStatus").classList.remove("hidden");
       $("#streamsGridImportStatus").textContent = `${kind} failed on "${stream.name}": ${error.message || error}`;
+      setGridImportHidden(false);
     }
   }
   if (count > 0) state = await request("/api/state");
@@ -2745,6 +2745,24 @@ async function runProviderScript(action) {
 // reports it exited.
 let gridImportPollTimer = null;
 
+// The status line and terminal under the bulk bar used to stay on screen for
+// good once shown. The "Hide terminal" button in the bar puts them away (and
+// brings them back); while hidden, a running script keeps filling them but
+// doesn't pop them open again. A new run or a new failure shows them.
+let gridImportHidden = false;
+function setGridImportHidden(hidden) {
+  gridImportHidden = hidden;
+  const button = $("#gridImportTerminalBtn");
+  let any = false;
+  for (const el of [$("#streamsGridImportStatus"), $("#streamsGridImportOutput")]) {
+    if (el.textContent) any = true;
+    el.classList.toggle("hidden", hidden || !el.textContent);
+  }
+  button.classList.toggle("hidden", !any);
+  button.innerHTML = `<span data-icon="logs"></span>${hidden ? "Show" : "Hide"} terminal`;
+  applyIcons(button);
+}
+
 async function pollGridImportStatus(providerId) {
   const status = $("#streamsGridImportStatus");
   const term = $("#streamsGridImportOutput");
@@ -2760,16 +2778,12 @@ async function pollGridImportStatus(providerId) {
       term.textContent = text;
       if (wasAtBottom) term.scrollTop = term.scrollHeight;
     }
-    term.classList.remove("hidden");
     const latest = entries[0];
-    if (latest) {
-      status.textContent = latest.message || latest.event;
-      status.classList.remove("hidden");
-    }
+    if (latest) status.textContent = latest.message || latest.event;
   } catch (error) {
     status.textContent = `Couldn't check import status: ${error.message || error}`;
-    status.classList.remove("hidden");
   }
+  setGridImportHidden(gridImportHidden);
 }
 
 async function runProviderScriptForGrid(action) {
@@ -2778,10 +2792,9 @@ async function runProviderScriptForGrid(action) {
   if (!provider.scriptPath) { alert("This provider has no script configured — set one in Provider settings."); return; }
   const status = $("#streamsGridImportStatus");
   const term = $("#streamsGridImportOutput");
-  status.classList.remove("hidden");
   status.textContent = `Starting ${action}…`;
-  term.classList.remove("hidden");
   term.textContent = "Starting…";
+  setGridImportHidden(false);
   try {
     // Keep the terminal moving while the long-running request is in flight.
     // Waiting first made even line-streamed server logs appear only at exit.
@@ -2799,6 +2812,7 @@ async function runProviderScriptForGrid(action) {
     status.textContent = `Couldn't start ${action}: ${error.message || error}`;
     const prior = term.textContent && term.textContent !== "Starting…" ? `${term.textContent}\n\n` : "";
     term.textContent = `${prior}[failed: ${error.message || error}]`;
+    setGridImportHidden(false);
     return;
   } finally {
     stopRefreshPoll(gridImportPollTimer);
@@ -4889,6 +4903,7 @@ $("#clearScriptSessionBtn").addEventListener("click", async () => {
     alert(`Couldn't clear the session store: ${error.message || error}`);
   }
 });
+$("#gridImportTerminalBtn").addEventListener("click", () => setGridImportHidden(!gridImportHidden));
 $("#toggleScriptOutputBtn").addEventListener("click", () => {
   $("#scriptOutputBox").classList.toggle("hidden");
   updateScriptOutputToggleLabel();
