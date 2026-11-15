@@ -22,6 +22,10 @@
 #include "rs_file_gate.h"
 #include "rs_sysstats.h"
 #include "../deps/mongoose.h"
+#ifdef RS_HAVE_ZLIB
+#define ZLIB_CONST
+#include <zlib.h>
+#endif
 #include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1555,6 +1559,81 @@ static void reply_error_headers(struct mg_connection *c, int status, const char 
     mg_http_reply(c, status, headers, "{\"error\":%m}", MG_ESC(message));
 }
 
+// --- gzip -------------------------------------------------------------------
+//
+// The panel's files and its JSON are text that shrinks several times over, and
+// on a slow link to the server that is most of the time a page load takes.
+// Compression is used only when the build found zlib and the request offered
+// gzip. Whether it did is remembered per connection (set for every request in
+// ev_handler), because reply_json has no request to look at and some replies
+// are sent later, from a finished job. The last byte of c->data is free for
+// this: the stream markers live in the first bytes, and mongoose's own use of
+// the tail (static file sends) starts only after the request has been read.
+#define RS_GZIP_FLAG (MG_DATA_SIZE - 1)
+#define RS_GZIP_MIN_BYTES 1024
+
+static bool accepts_gzip(struct mg_http_message *hm) {
+#ifdef RS_HAVE_ZLIB
+    struct mg_str *ae = mg_http_get_header(hm, "Accept-Encoding");
+    if (!ae) return false;
+    for (size_t i = 0; i + 4 <= ae->len; i++) {
+        if (tolower((unsigned char)ae->buf[i]) != 'g' || tolower((unsigned char)ae->buf[i + 1]) != 'z' ||
+            tolower((unsigned char)ae->buf[i + 2]) != 'i' || tolower((unsigned char)ae->buf[i + 3]) != 'p')
+            continue;
+        // "gzip;q=0" is an explicit refusal.
+        size_t j = i + 4;
+        while (j < ae->len && ae->buf[j] == ' ') j++;
+        if (j < ae->len && ae->buf[j] == ';') {
+            j++;
+            while (j < ae->len && ae->buf[j] == ' ') j++;
+            if (j + 2 <= ae->len && tolower((unsigned char)ae->buf[j]) == 'q' && ae->buf[j + 1] == '=') {
+                char num[8] = {0};
+                size_t k = 0;
+                for (j += 2; j < ae->len && k < sizeof(num) - 1 &&
+                             (isdigit((unsigned char)ae->buf[j]) || ae->buf[j] == '.'); j++)
+                    num[k++] = ae->buf[j];
+                if (atof(num) <= 0.0) return false;
+            }
+        }
+        return true;
+    }
+    return false;
+#else
+    (void)hm;
+    return false;
+#endif
+}
+
+#ifdef RS_HAVE_ZLIB
+// gzip-compresses `n` bytes. Returns a malloc'd buffer, or NULL on failure.
+static unsigned char *gzip_bytes(const void *in, size_t n, int level, size_t *out_len) {
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    if (n > 0x7fffffffu ||
+        deflateInit2(&zs, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) return NULL;
+    uLong cap = deflateBound(&zs, (uLong)n);
+    unsigned char *out = (unsigned char *)malloc((size_t)cap);
+    if (!out) { deflateEnd(&zs); return NULL; }
+    zs.next_in = (const Bytef *)in;
+    zs.avail_in = (uInt)n;
+    zs.next_out = out;
+    zs.avail_out = (uInt)cap;
+    int rc = deflate(&zs, Z_FINISH);
+    *out_len = (size_t)zs.total_out;
+    deflateEnd(&zs);
+    if (rc != Z_STREAM_END) { free(out); return NULL; }
+    return out;
+}
+
+// Sends a complete 200 response whose body is already gzip.
+static void send_gzip(struct mg_connection *c, const char *headers, const unsigned char *gz, size_t len) {
+    mg_printf(c, "HTTP/1.1 200 OK\r\n%sContent-Encoding: gzip\r\nVary: Accept-Encoding\r\n"
+                 "Content-Length: %lu\r\n\r\n", headers ? headers : "", (unsigned long)len);
+    mg_send(c, gz, len);
+    c->is_resp = 0;
+}
+#endif
+
 // Serializes and sends a JSON DOM, then frees it. `extra_headers` may be NULL.
 static void reply_json(struct mg_connection *c, int status, rs_json *value,
                        const char *extra_headers) {
@@ -1568,6 +1647,22 @@ static void reply_json(struct mg_connection *c, int status, rs_json *value,
     char headers[640 + sizeof(RS_CORS_HEADERS)];
     snprintf(headers, sizeof(headers), "%sCache-Control: no-store\r\n%s%s",
              JSON_HEADERS, g_request_security, extra_headers ? extra_headers : "");
+#ifdef RS_HAVE_ZLIB
+    size_t body_len = strlen(body);
+    if (status == 200 && c->data[RS_GZIP_FLAG] == 1 && body_len >= RS_GZIP_MIN_BYTES) {
+        // A low level: /api/state is rebuilt for every poll, so speed matters
+        // more than the last few percent.
+        size_t gz_len = 0;
+        unsigned char *gz = gzip_bytes(body, body_len, 3, &gz_len);
+        if (gz && gz_len < body_len) {
+            send_gzip(c, headers, gz, gz_len);
+            free(gz);
+            rs_free(body);
+            return;
+        }
+        free(gz);
+    }
+#endif
     mg_http_reply(c, status, headers, "%s", body);
     rs_free(body);
 }
@@ -11066,6 +11161,114 @@ static bool is_panel_view_path(struct mg_str uri) {
     return false;
 }
 
+#ifdef RS_HAVE_ZLIB
+// The panel's text files, compressed once and kept: the same few files are
+// asked for on every page load. An entry is reused while the file's size and
+// modification time are unchanged.
+struct gz_static_entry {
+    char path[1024];
+    long long mtime, size;
+    unsigned char *gz;
+    size_t len;
+};
+static struct gz_static_entry g_gz_static[16];
+static size_t g_gz_static_next;
+
+static const char *gz_static_type(const char *path) {
+    static const char *const types[][2] = {
+        {".html", "text/html; charset=utf-8"}, {".js", "text/javascript; charset=utf-8"},
+        {".css", "text/css; charset=utf-8"}, {".json", "application/json"},
+        {".webmanifest", "application/manifest+json"}, {".md", "text/markdown; charset=utf-8"},
+        {".svg", "image/svg+xml"}, {".txt", "text/plain; charset=utf-8"},
+    };
+    size_t n = strlen(path);
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        size_t e = strlen(types[i][0]);
+        if (n > e && strcmp(path + n - e, types[i][0]) == 0) return types[i][1];
+    }
+    return NULL;
+}
+#endif
+
+// Answers a GET for one of the panel's text files with a gzip body. Returns
+// false, having sent nothing, for anything it does not handle (no gzip offered,
+// a Range request, another file type, a path it would rather not judge), and
+// the ordinary static file path then serves it exactly as before.
+static bool serve_static_gzip(restream_server_t *s, struct mg_connection *c, struct mg_http_message *hm) {
+#ifdef RS_HAVE_ZLIB
+    if (!method_is(hm, "GET") || c->data[RS_GZIP_FLAG] != 1 || mg_http_get_header(hm, "Range")) return false;
+    char rel[512];
+    if (is_panel_view_path(hm->uri) || mg_strcmp(hm->uri, mg_str("/")) == 0) {
+        snprintf(rel, sizeof(rel), "/index.html");
+    } else {
+        if (hm->uri.len < 2 || hm->uri.len >= sizeof(rel) || hm->uri.buf[0] != '/') return false;
+        for (size_t i = 0; i < hm->uri.len; i++) {
+            unsigned char ch = (unsigned char)hm->uri.buf[i];
+            if (!(isalnum(ch) || ch == '/' || ch == '.' || ch == '-' || ch == '_')) return false;
+            if (ch == '.' && i > 0 && (hm->uri.buf[i - 1] == '.' || hm->uri.buf[i - 1] == '/')) return false;
+        }
+        snprintf(rel, sizeof(rel), "%.*s", (int)hm->uri.len, hm->uri.buf);
+    }
+    const char *type = gz_static_type(rel);
+    if (!type) return false;
+    char path[1024];
+    int plen = snprintf(path, sizeof(path), "%s%s", s->web_root, rel);
+    if (plen <= 0 || (size_t)plen >= sizeof(path)) return false;
+    struct stat st;
+    if (stat(path, &st) != 0 || (st.st_mode & S_IFMT) != S_IFREG ||
+        st.st_size < RS_GZIP_MIN_BYTES || st.st_size > 8 * 1024 * 1024) return false;
+
+    char etag[64];
+    snprintf(etag, sizeof(etag), "\"gz-%llx-%llx\"", (unsigned long long)st.st_mtime,
+             (unsigned long long)st.st_size);
+    char headers[sizeof(g_request_security) + sizeof(RS_CORS_HEADERS) + 256];
+    snprintf(headers, sizeof(headers), "%s%sContent-Type: %s\r\nETag: %s\r\n",
+             RS_CORS_HEADERS, g_request_security, type, etag);
+    struct mg_str *inm = mg_http_get_header(hm, "If-None-Match");
+    if (inm && mg_strcmp(*inm, mg_str(etag)) == 0) {
+        mg_printf(c, "HTTP/1.1 304 Not Modified\r\n%sVary: Accept-Encoding\r\nContent-Length: 0\r\n\r\n", headers);
+        c->is_resp = 0;
+        return true;
+    }
+
+    struct gz_static_entry *hit = NULL;
+    for (size_t i = 0; i < sizeof(g_gz_static) / sizeof(g_gz_static[0]); i++) {
+        struct gz_static_entry *e = &g_gz_static[i];
+        if (e->gz && strcmp(e->path, path) == 0 && e->mtime == (long long)st.st_mtime &&
+            e->size == (long long)st.st_size) { hit = e; break; }
+    }
+    if (!hit) {
+        FILE *f = fopen(path, "rb");
+        if (!f) return false;
+        size_t size = (size_t)st.st_size, gz_len = 0;
+        char *raw = (char *)malloc(size);
+        bool read_ok = raw && fread(raw, 1, size, f) == size;
+        fclose(f);
+        unsigned char *gz = read_ok ? gzip_bytes(raw, size, 6, &gz_len) : NULL;
+        free(raw);
+        if (!gz || gz_len >= size) { free(gz); return false; }
+        // Replace this file's older copy if there is one, else the next slot.
+        for (size_t i = 0; i < sizeof(g_gz_static) / sizeof(g_gz_static[0]) && !hit; i++)
+            if (g_gz_static[i].gz && strcmp(g_gz_static[i].path, path) == 0) hit = &g_gz_static[i];
+        if (!hit) {
+            hit = &g_gz_static[g_gz_static_next];
+            g_gz_static_next = (g_gz_static_next + 1) % (sizeof(g_gz_static) / sizeof(g_gz_static[0]));
+        }
+        free(hit->gz);
+        snprintf(hit->path, sizeof(hit->path), "%s", path);
+        hit->mtime = (long long)st.st_mtime;
+        hit->size = (long long)st.st_size;
+        hit->gz = gz;
+        hit->len = gz_len;
+    }
+    send_gzip(c, headers, hit->gz, hit->len);
+    return true;
+#else
+    (void)s; (void)c; (void)hm;
+    return false;
+#endif
+}
+
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     restream_server_t *server = (restream_server_t *)c->fn_data;
     // A connection with an in-flight async job (see pending_job_dispatch)
@@ -11093,6 +11296,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     }
     if (ev != MG_EV_HTTP_MSG) return;
     struct mg_http_message *hm = (struct mg_http_message *)ev_data;
+    c->data[RS_GZIP_FLAG] = accepts_gzip(hm) ? 1 : 0;
 
     if (server) security_headers(server, c, hm, g_request_security, sizeof(g_request_security));
     else g_request_security[0] = '\0';
@@ -11179,6 +11383,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         char static_headers[sizeof(g_request_security) + sizeof(RS_CORS_HEADERS)];
         snprintf(static_headers, sizeof(static_headers), "%s%s", RS_CORS_HEADERS, g_request_security);
         opts.extra_headers = static_headers;
+        if (serve_static_gzip(server, c, hm)) return;
         // The panel is a single page that gives every view its own address, so
         // each of those addresses has to return index.html and let the
         // front-end router pick the view up from the path. A fixed list, not a

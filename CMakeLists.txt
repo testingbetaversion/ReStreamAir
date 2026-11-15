@@ -165,6 +165,24 @@ else()
     set(RS_XML_LIBS  LibXml2::LibXml2)
     set(RS_HTTP_INCLUDES "")
 endif()
+# zlib is optional: with it the server gzips the panel's files and API replies,
+# without it they go out as they always have. A static build takes it from
+# pkg-config like its other libraries; a cross build skips it rather than risk
+# picking up the host's copy.
+if(RS_STATIC)
+    pkg_check_modules(PC_ZLIB zlib)
+    if(PC_ZLIB_FOUND)
+        target_compile_definitions(restream_core PRIVATE RS_HAVE_ZLIB=1)
+        target_include_directories(restream_core PRIVATE ${PC_ZLIB_STATIC_INCLUDE_DIRS})
+        list(APPEND RS_CURL_LIBS ${PC_ZLIB_STATIC_LDFLAGS})
+    endif()
+elseif(NOT CMAKE_CROSSCOMPILING)
+    find_package(ZLIB)
+    if(ZLIB_FOUND)
+        target_compile_definitions(restream_core PRIVATE RS_HAVE_ZLIB=1)
+        target_link_libraries(restream_core PUBLIC ZLIB::ZLIB)
+    endif()
+endif()
 add_executable(restreamair-server
     apps/server/main.cpp
     apps/server/webroot.cpp
