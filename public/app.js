@@ -908,7 +908,7 @@ function renderStreamsGrid() {
     });
     card.querySelector('[data-action="play"]').addEventListener("click", async (event) => {
       event.stopPropagation();
-      await playInPictureInPicture(stream);
+      await playInPictureInPicture(findStreamById(stream.id) || stream);
     });
     card.querySelector('[data-action="logs"]').addEventListener("click", (event) => {
       event.stopPropagation();
@@ -1886,9 +1886,16 @@ async function playInPictureInPicture(stream) {
     alert("This browser doesn't support Picture-in-Picture.");
     return;
   }
+  hidePipPrompt();
+  // The browser only opens a PiP window within a few seconds of a click.
+  // Starting a stopped stream runs its manifest script first, which outlasts
+  // that window — so the old flow always failed with "Must be handling a user
+  // gesture". Ask as soon as the video has metadata, and when the click has
+  // expired by then, offer a one-click button that carries a fresh gesture.
   if (!stream.running) {
     await toggleStreamRun(stream.id, false);
-    await new Promise((resolve) => setTimeout(resolve, 1500)); // give the worker a moment to produce the first segment
+    stream = findStreamById(stream.id) || stream;
+    if (!stream.running) return; // the start failed and already said why
   }
   const video = $("#pipVideo");
   if (pipHls) {
@@ -1897,17 +1904,17 @@ async function playInPictureInPicture(stream) {
   }
   pipStreamId = stream.id;
   try {
+    const metadata = waitForVideoMetadata(video, 30000);
     if (window.Hls && window.Hls.isSupported()) {
       pipHls = new window.Hls(HLS_CONFIG);
       pipHls.loadSource(streamPlaybackUrl(stream));
       pipHls.attachMedia(video);
-      // No reload loop here like the main player's — requestPictureInPicture()
-      // below only runs once, on this user gesture, and reopening the floating
-      // window on its own later wouldn't be allowed without another one. Once
-      // hls.js truly gives up, just tear it down so the window doesn't sit
-      // there frozen on a dead frame.
+      // No reload loop here like the main player's — the PiP window can't be
+      // reopened later without another click. Once hls.js truly gives up,
+      // tear it down so the window doesn't sit frozen on a dead frame.
       attachHlsErrorRecovery(pipHls, (data) => {
         console.error("hls.js gave up on PiP playback for", stream.name, data);
+        hidePipPrompt();
         stopPipPlayer();
       });
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
@@ -1916,11 +1923,71 @@ async function playInPictureInPicture(stream) {
       alert("This browser cannot play HLS and hls.js is unavailable.");
       return;
     }
-    await video.play();
-    await video.requestPictureInPicture();
+    video.play().catch(() => {}); // muted, so autoplay is allowed; PiP below doesn't wait on buffering
+    await metadata;
+    if (pipStreamId !== stream.id) return; // another PiP request replaced this one
+    await openPipWindow(video, stream);
   } catch (error) {
     alert(`Couldn't start playback: ${error.message || error}`);
   }
+}
+
+function waitForVideoMetadata(video, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const done = () => { clearTimeout(timer); video.removeEventListener("loadedmetadata", done); resolve(); };
+    const timer = setTimeout(() => {
+      video.removeEventListener("loadedmetadata", done);
+      reject(new Error("the stream didn't produce video in time — try again in a few seconds"));
+    }, timeoutMs);
+    video.addEventListener("loadedmetadata", done);
+  });
+}
+
+async function openPipWindow(video, stream) {
+  if (document.pictureInPictureElement === video) return;
+  const gestureLive = navigator.userActivation ? navigator.userActivation.isActive : true;
+  if (gestureLive) {
+    try {
+      await video.requestPictureInPicture();
+      return;
+    } catch (error) {
+      if (error.name !== "NotAllowedError") throw error;
+    }
+  }
+  showPipPrompt(video, stream);
+}
+
+function showPipPrompt(video, stream) {
+  hidePipPrompt();
+  const prompt = document.createElement("div");
+  prompt.id = "pipPrompt";
+  prompt.className = "toast ok pip-prompt";
+  prompt.setAttribute("role", "status");
+  const label = document.createElement("span");
+  label.textContent = `${stream.name} is ready`;
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "success";
+  open.textContent = "Open Picture-in-Picture";
+  open.addEventListener("click", async () => {
+    hidePipPrompt();
+    try {
+      await video.requestPictureInPicture();
+    } catch (error) {
+      alert(`Couldn't start playback: ${error.message || error}`);
+    }
+  });
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "ghost";
+  close.textContent = "Dismiss";
+  close.addEventListener("click", () => { hidePipPrompt(); if (!document.pictureInPictureElement) stopPipPlayer(); });
+  prompt.append(label, open, close);
+  (document.querySelector("dialog[open]") || document.body).append(prompt);
+}
+
+function hidePipPrompt() {
+  document.getElementById("pipPrompt")?.remove();
 }
 
 // MARK: - Stream detect / probe

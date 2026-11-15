@@ -1861,6 +1861,8 @@ pre {
 .toast.ok { border-color: var(--success); }
 .toast.error { border-color: var(--danger); color: var(--danger); }
 .toast.hidden { display: none; }
+.toast.pip-prompt { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.toast.pip-prompt button { padding: 6px 12px; font-size: 13px; }
 
 /* A stopped stream's last start failure, one line, full text on hover. */
 .stream-error {
