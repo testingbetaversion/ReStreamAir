@@ -9617,8 +9617,14 @@ typedef struct rs_direct_client {
 
 #define RS_TS_HLS_WAITERS 32
 #define RS_TS_HLS_SEGMENTS 6      // segments listed in the TS-HLS playlist
-#define RS_TS_HLS_MIN_READY 2     // complete segments before the first playlist is served
-#define RS_TS_HLS_WAIT_S 20.0     // how long a first playlist request is held
+// The first playlist waits for a cushion: players start three segments from
+// the end, so a list of two put them at the first segment with ~8 s in hand
+// (TV4's 3.84 s segments) and every late origin publish froze playback. Three
+// segments, or two that already add up to RS_TS_HLS_MIN_SECONDS for sources
+// with long segments, so those don't wait longer than they need to.
+#define RS_TS_HLS_MIN_READY 3     // complete segments before the first playlist is served
+#define RS_TS_HLS_MIN_SECONDS 12.0
+#define RS_TS_HLS_WAIT_S 30.0     // how long a first playlist request is held
 #define RS_TS_HLS_ALIVE_S 15.0    // a TS-HLS player counts as a viewer this long after a request
 
 typedef struct rs_ts_session {
@@ -10245,6 +10251,20 @@ static double ts_hls_duration(const rs_ts_session *sess, size_t k, double fallba
     return (a >= 0 && b >= 0 && d > 0.05 && d < 30) ? d : fallback;
 }
 
+// Enough complete segments to hand a player its first playlist.
+static bool ts_hls_ready(const rs_ts_session *sess) {
+    size_t complete = ts_hls_complete(sess);
+    if (complete >= RS_TS_HLS_MIN_READY) return true;
+    if (complete < 2) return false;
+    double total = 0, fallback = 2.0;
+    for (size_t k = 0; k < complete; k++) {
+        double d = ts_hls_duration(sess, k, fallback);
+        fallback = d;
+        total += d;
+    }
+    return total >= RS_TS_HLS_MIN_SECONDS;
+}
+
 static char *ts_hls_playlist(const rs_ts_session *sess, const char *stream_id, const char *key) {
     size_t complete = ts_hls_complete(sess);
     size_t first = complete > RS_TS_HLS_SEGMENTS ? complete - RS_TS_HLS_SEGMENTS : 0;
@@ -10286,7 +10306,7 @@ static void ts_hls_reply_playlist(struct mg_connection *c, const rs_ts_session *
 // a 503 when the wait runs out. Runs on every pump.
 static void ts_hls_answer_waiters(restream_server_t *s, rs_ts_session *sess) {
     if (!sess->nhls_wait) return;
-    bool ready = ts_hls_complete(sess) >= RS_TS_HLS_MIN_READY;
+    bool ready = ts_hls_ready(sess);
     double now = (double)mg_millis() / 1000.0;
     int keep = 0;
     for (int i = 0; i < sess->nhls_wait; i++) {
@@ -10312,7 +10332,7 @@ static void serve_ts_hls_playlist(restream_server_t *server, struct mg_connectio
     if (!sess) { reply_error(c, 500, "Out of memory."); return; }
     sess->hls_seen = (double)mg_millis() / 1000.0;
     char *key = playback_key(hm);
-    if (ts_hls_complete(sess) >= RS_TS_HLS_MIN_READY) {
+    if (ts_hls_ready(sess)) {
         ts_hls_reply_playlist(c, sess, stream_id, key);
         free(key);
         return;
