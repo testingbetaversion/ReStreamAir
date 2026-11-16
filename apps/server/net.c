@@ -723,6 +723,46 @@ static int fetch_libcurl(const char *url, const char *proxy, const char *headers
                             &rc, errbuf, errbuf_len);
     }
 
+    // A 403 can belong to the connection rather than to the request. A CDN
+    // that signs the client address into its token (Claro's `cip`) rejects the
+    // same URL from this machine's other address family, and a dual-stack
+    // SOCKS exit picks the family per connection: seen live, one segment URL
+    // was 403 over the exit's IPv4 and 200 over its IPv6, three times out of
+    // three. Keep-alive then pins the rejected connection to this thread, so
+    // every segment it carried failed for hours. So a 403 never keeps its
+    // connection: close it, ask once more on a new one, and if that is
+    // refused too, close that one as well so the next request starts clean.
+    long first_code = 0;
+    if (result != 0 && rc == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &first_code);
+    if (first_code == 403) {
+        if (borrowed) {
+            thread_handle_discard();
+            curl = thread_handle();
+            if (!curl) { snprintf(errbuf, errbuf_len, "Could not initialise HTTP client."); return -1; }
+            apply_ca_bundle(curl);
+        } else {
+            curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1L);
+        }
+        if (errbuf_len) errbuf[0] = '\0';  // the first answer's message is not this one's
+        result = fetch_once(curl, url, proxy, headers, range, force11 || h2_denied(host), force_ipv6,
+                            timeout_ms, should_cancel, cancel_ctx,
+                            out, out_len, status, content_type, content_range, effective_url,
+                            &rc, errbuf, errbuf_len);
+        long second_code = 0;
+        if (rc == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &second_code);
+        if (result == 0) {
+            char note[400];
+            snprintf(note, sizeof(note),
+                     "%s answered 403, then %ld on a new connection — "
+                     "the refused connection was closed", host, second_code);
+            restream_log_event("info", "connectionReplaced", note);
+        } else if (second_code == 403 && borrowed) {
+            thread_handle_discard();
+            proxy_hold_drop();
+            return result;
+        }
+    }
+
     if (!borrowed) curl_easy_cleanup(curl);
     // With one cached connection per handle, a fetch that did not go through
     // the held proxy has replaced the connection the hold counted.
