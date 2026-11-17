@@ -1897,6 +1897,10 @@ static int fetch_with_proxies(const char *url, const char *proxy, const char *he
 typedef struct provider_budget {
     char id[128];
     int active, users;
+    int waiting;          // requests held back right now because every slot is taken
+    int held;             // requests that had to wait since the last warning
+    double longest;       // the longest of those waits, seconds
+    double warned_at;     // when the queue was last reported
     struct provider_budget *next;
 } provider_budget;
 static provider_budget *budgets;
@@ -1915,6 +1919,46 @@ static void budget_drop_locked(provider_budget *b) {
     if (*link) *link = b->next;
     free(b);
 }
+// A full budget used to be silent: requests waited for a slot, every channel of
+// the provider slowed down together, and the log only showed the downloads
+// that came out late (seen on production: 21 channels behind a limit of 50,
+// already 35-45 in flight on a calm minute). Say so, at most once a minute per
+// provider, with how many are waiting and for how long, and name the setting.
+#define RS_BUDGET_WARN_WAIT_S 1.0
+#define RS_BUDGET_WARN_EVERY_S 60.0
+static void budget_note_wait_locked(provider_budget *b, double waited, bool gave_up, int limit,
+                                    char *note, size_t cap) {
+    b->held++;
+    if (waited > b->longest) b->longest = waited;
+    double now = net_now();
+    if ((waited < RS_BUDGET_WARN_WAIT_S && !gave_up) ||
+        (b->warned_at > 0 && now - b->warned_at < RS_BUDGET_WARN_EVERY_S)) return;
+    snprintf(note, cap,
+             "Max download concurrency (%d) is full: %d request%s waiting for a free slot right now, "
+             "%d had to wait since the last report, the longest %.1fs%s. Every channel of this "
+             "provider is slowed by it — raise Max download concurrency in the provider's options, "
+             "or run fewer channels on it",
+             limit, b->waiting, b->waiting == 1 ? " is" : "s are", b->held, b->longest,
+             gave_up ? " (this one gave up waiting)" : "");
+    b->warned_at = now;
+    b->held = 0;
+    b->longest = 0;
+}
+
+// The queue belongs to the provider, so it goes in the provider's own log (the
+// one its script output uses) as well as in the log of the channel whose
+// request happened to be the one waiting.
+static void budget_report(const char *provider_id, const char *note) {
+    if (!note[0]) return;
+    restream_log_event("error", "downloadQueue", note);
+    char mine[160], provider_log[160];
+    snprintf(mine, sizeof(mine), "%s", restream_log_current_stream());
+    snprintf(provider_log, sizeof(provider_log), "script:%s", provider_id);
+    restream_log_set_stream(provider_log);
+    restream_log_event("error", "downloadQueue", note);
+    restream_log_set_stream(mine);
+}
+
 static provider_budget *budget_enter(const rs_source_policy *policy,
                                      int (*cancel)(void *, size_t), void *ctx) {
     if (!policy || !policy->provider_id[0]) return NULL;
@@ -1938,11 +1982,25 @@ static provider_budget *budget_enter(const rs_source_policy *policy,
         b->next = budgets; budgets = b;
     }
     b->users++;
+    double began = 0;
+    char note[512] = "";
+    // The cookie jar's limit of one is deliberate serialization, not a queue to report.
+    bool report = !policy->use_cookies;
     while (b->active >= limit) {
+        if (began <= 0) { began = net_now(); b->waiting++; }
         pthread_mutex_unlock(&budget_mu);
-        bool expired = net_now() >= deadline || (cancel && cancel(ctx, 0));
+        bool timed_out = net_now() >= deadline;
+        bool expired = timed_out || (cancel && cancel(ctx, 0));
         pthread_mutex_lock(&budget_mu);
-        if (expired) { budget_drop_locked(b); pthread_mutex_unlock(&budget_mu); return NULL; }
+        if (expired) {
+            b->waiting--;
+            if (report && timed_out)
+                budget_note_wait_locked(b, net_now() - began, true, limit, note, sizeof(note));
+            budget_drop_locked(b);
+            pthread_mutex_unlock(&budget_mu);
+            budget_report(policy->provider_id, note);
+            return NULL;
+        }
         struct timespec until;
         clock_gettime(CLOCK_REALTIME, &until);
         until.tv_nsec += 100000000;
@@ -1950,7 +2008,12 @@ static provider_budget *budget_enter(const rs_source_policy *policy,
         pthread_cond_timedwait(&budget_cv, &budget_mu, &until);
     }
     b->active++;
+    if (began > 0) {
+        b->waiting--;
+        if (report) budget_note_wait_locked(b, net_now() - began, false, limit, note, sizeof(note));
+    }
     pthread_mutex_unlock(&budget_mu);
+    budget_report(policy->provider_id, note);
     return b;
 }
 static void budget_leave(provider_budget *b) {
