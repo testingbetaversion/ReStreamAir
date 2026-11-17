@@ -106,6 +106,19 @@
 
 #define RS_LIVE_HEAD_STALL_FACTOR 6.0
 #define RS_LIVE_HEAD_STALL_MIN 12.0
+// The same question when later segments are already downloaded and waiting
+// behind the head. That is proof the path works and this one request is the
+// problem, so it does not get the long benefit of the doubt. With the 12 s
+// rule a request that went silent in the tunnel held its channel for 12 s,
+// was retried, and was written off about 15 s after that: 27 s of nothing
+// published, twenty-odd times an hour per channel on production (669
+// abandoned segments in 75 minutes across 21 channels, median "abandoned
+// after 15.6s"), and each one froze every viewer and dropped a segment.
+// A healthy request through that tunnel answers in under a second, so a few
+// silent seconds with finished work queued behind is already a dead request:
+// cancel it, which closes its connection, and ask again on a new one.
+#define RS_LIVE_HEAD_QUICK_FACTOR 2.5
+#define RS_LIVE_HEAD_QUICK_MIN 5.0
 
 // Attempts per segment before it is written off. A segment right at the live
 // edge is routinely requested a moment before the origin has finished writing
@@ -118,7 +131,12 @@
 // and a half on it. A second attempt still covers the case this exists for —
 // the live edge arriving a moment late — and nothing beyond that is worth the
 // wall clock on a stream that has to stay in real time.
-#define RS_LIVE_FETCH_TRIES 2
+//
+// Three since the head-of-line rule got its quick bound: a try that goes
+// silent with finished work behind it now costs about 5 s, not 12, so three
+// of them fit in less wall clock than two used to, and the third is what
+// turns a dropped segment into a late one.
+#define RS_LIVE_FETCH_TRIES 3
 #define RS_LIVE_FETCH_RETRY_DELAY 0.4
 // Backstop for one media request. NOT the liveness guard — that is the
 // head-of-line rule, which asks the question that actually matters ("is this
@@ -2100,6 +2118,11 @@ static void *writer_main(void *arg) {
             ts_deadline.tv_sec += 1;
             pthread_cond_timedwait(&st->cv, &st->mu, &ts_deadline);
             if (now_seconds() - report_anchor >= RS_LIVE_REPORT_INTERVAL) break;
+            // A head still being fetched with other work queued behind it is
+            // what the head-of-line rule below judges. Leaving this loop only
+            // on the report interval meant that rule ran once every 5 s, so a
+            // request it should have cancelled at 5 s was cancelled at 10.
+            if (rep->pend_count > 1 && pend_at_locked(rep, 0)->state == PEND_FETCHING) break;
         }
 
         double seg_dur = rep->seg_duration > 0 ? rep->seg_duration : 2.0;
@@ -2131,9 +2154,16 @@ static void *writer_main(void *arg) {
             // requests nothing ever becomes ready, so there is a second, looser
             // bound: past a few times the stall threshold the segment is too
             // old to be worth having whatever the rest of the queue is doing.
+            double quick = seg_dur * RS_LIVE_HEAD_QUICK_FACTOR;
+            if (quick < RS_LIVE_HEAD_QUICK_MIN) quick = RS_LIVE_HEAD_QUICK_MIN;
+            if (quick > stall) quick = stall;
+            // With nothing finished behind it there is no proof the path is
+            // fine, so the head gets twice as long — but not the 36 s it used
+            // to: N_m3u8DL-RE cuts a live segment after two segment lengths
+            // without data, unconditionally, and retries.
             bool overdue = ready_behind
-                               ? waited > stall && silent > stall
-                               : waited > stall * 3.0 && silent > stall;
+                               ? waited > quick && silent > quick
+                               : waited > quick * 2.0 && silent > quick * 2.0;
             if (head->state == PEND_FETCHING && overdue && head->started > 0) {
                 if (head->attempts < RS_LIVE_FETCH_TRIES) {
                     // Abort only this request. The worker keeps ownership of
