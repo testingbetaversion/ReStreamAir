@@ -158,6 +158,7 @@ typedef struct {
     bool ended;
     bool have_high_water;
     int64_t high_water;   // largest DTS pushed so far
+    int64_t dts_lead;     // 90 kHz the DTS is pulled back by, see traf_dts_lead
     bool have_last_dts;
     int64_t last_dts;     // last DTS actually emitted, for discontinuity detection
 
@@ -484,6 +485,37 @@ static int64_t to_90k(uint64_t v, uint32_t timescale) {
     return (int64_t)((v * 90000ull) / timescale);
 }
 
+// The largest amount, in track timescale ticks, by which any sample of this
+// traf is presented *before* its own decode time. A version 1 trun may carry
+// negative composition offsets — packagers of hierarchical B-frames use them so
+// the presentation timeline starts at the tfdt — and MPEG-TS cannot say that: a
+// PES needs DTS <= PTS. The DTS of the whole track is pulled back by this much
+// instead, which keeps every PTS exactly where the source put it (and so keeps
+// it in step with the audio). Clamping the PTS up to the DTS, as this once did,
+// gave two frames in every four the same timestamp in the wrong order: the
+// picture juddered as if a quarter of the frames were missing.
+static uint64_t traf_dts_lead(const mp4span *traf) {
+    mp4span trun;
+    size_t cursor = 0;
+    int64_t lowest = 0;
+    while (box_next(traf->data, traf->len, "trun", &cursor, &trun, NULL)) {
+        if (trun.len < 8 || trun.data[0] == 0) continue;   // version 0: unsigned
+        uint32_t fl = rd_u24(trun.data + 1);
+        if (!(fl & 0x000800u)) continue;
+        uint32_t count = rd_u32(trun.data + 4);
+        size_t off = 8 + ((fl & 0x000001u) ? 4u : 0u) + ((fl & 0x000004u) ? 4u : 0u);
+        size_t before = ((fl & 0x000100u) ? 4u : 0u) + ((fl & 0x000200u) ? 4u : 0u)
+                      + ((fl & 0x000400u) ? 4u : 0u);
+        for (uint32_t i = 0; i < count; i++) {
+            if (off + before + 4 > trun.len) break;
+            int32_t cts = (int32_t)rd_u32(trun.data + off + before);
+            if (cts < lowest) lowest = cts;
+            off += before + 4;
+        }
+    }
+    return (uint64_t)(-lowest);
+}
+
 // Parses one traf: its tfhd defaults, its tfdt decode time, and every trun it
 // carries. Returns the number of samples queued.
 static int push_traf(rs_ts_mux *m, ts_track *t, const uint8_t *frag, size_t frag_len,
@@ -524,6 +556,12 @@ static int push_traf(rs_ts_mux *m, ts_track *t, const uint8_t *frag, size_t frag
     if (box_child(traf, "tfdt", &tfdt) && tfdt.len >= 8) {
         base_media_decode_time = tfdt.data[0] == 1 ? rd_u64(tfdt.data + 4) : rd_u32(tfdt.data + 4);
     }
+
+    // Known before the first sample goes out, so the DTS never steps back
+    // within a fragment; it only ever grows, and in practice is settled by the
+    // first fragment.
+    int64_t lead = to_90k(traf_dts_lead(traf), t->timescale);
+    if (lead > t->dts_lead) t->dts_lead = lead;
 
     uint64_t dts_ticks = base_media_decode_time;
     // Where the next trun's samples start when it declares no data-offset of its
@@ -605,8 +643,10 @@ static int push_traf(rs_ts_mux *m, ts_track *t, const uint8_t *frag, size_t frag
             ts_sample out;
             out.payload = payload;
             out.len = payload_len;
-            out.dts = raw_dts - m->origin + RS_TS_START_PTS;
+            out.dts = raw_dts - m->origin + RS_TS_START_PTS - t->dts_lead;
             out.pts = raw_pts - m->origin + RS_TS_START_PTS;
+            // Only if the lead grew mid-stream: the DTS must still not go back.
+            if (t->have_high_water && out.dts <= t->high_water) out.dts = t->high_water + 1;
             if (out.pts < out.dts) out.pts = out.dts;
             out.key = key;
             if (queue_push(t, out)) {
