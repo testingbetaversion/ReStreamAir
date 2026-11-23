@@ -837,6 +837,36 @@ static const char *entry_script_params(const rs_json *entry) {
     return entry_str(entry, "ManifestScript", "manifestScript");
 }
 
+// A provider whose manifests never change can name the source right in the
+// import entry (`ManifestUrl`, plus `Cdn` mirrors in the same shapes the
+// `manifest` action accepts: strings or {"ManifestUrl": ...} objects), so the
+// stream plays without Session manifest and without a script call per start.
+// An entry with no usable URL leaves the stream's stored source alone — one the
+// operator typed in, or one an earlier import or manifest call saved.
+static void entry_apply_source(rs_json *stream, const rs_json *entry) {
+    const char *raw = entry_str(entry, "ManifestUrl", "manifestUrl");
+    if (!raw[0]) raw = entry_str(entry, "Url", "url");
+    char *url = rs_trim_dup(raw, strlen(raw), true);
+    if (!url || !is_http_url(url)) { free(url); return; }
+    rs_json_obj_set_str(stream, "url", url);
+    if (strstr(url, ".m3u8")) rs_json_obj_set_str(stream, "kind", "m3u8");
+    else if (strstr(url, ".mpd")) rs_json_obj_set_str(stream, "kind", "mpd");
+    rs_json *cdn = rs_json_new_arr();
+    const rs_json *mirrors = entry_get(entry, "Cdn", "cdn");
+    for (size_t i = 0; mirrors && rs_json_type_of(mirrors) == RS_JSON_ARR && i < rs_json_arr_len(mirrors); i++) {
+        const rs_json *m = rs_json_arr_at(mirrors, i);
+        const char *mraw = rs_json_type_of(m) == RS_JSON_OBJ
+                               ? entry_str(m, "ManifestUrl", "manifestUrl")
+                               : rs_json_as_str(m, "");
+        char *mirror = rs_trim_dup(mraw, strlen(mraw), true);
+        if (mirror && is_http_url(mirror) && strcmp(mirror, url) != 0)
+            rs_json_arr_push(cdn, rs_json_new_str(mirror));
+        free(mirror);
+    }
+    rs_json_obj_set(stream, "cdnUrls", cdn);
+    free(url);
+}
+
 // Matches an already-imported entry: (name, sourceType) is all the protocol
 // gives us — entries carry no stable id — so that pair is the identity a
 // re-import updates in place.
@@ -940,8 +970,12 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
         long long import_parallel = rs_provider_option_int(p, "importParallelDownloads");
         if (created && import_parallel >= 1 && import_parallel <= 8)
             rs_json_obj_set_int(stream, "parallelDownloads", import_parallel);
-        // A logo the operator set by hand (or a previous import resolved) wins
-        // over the freshly looked-up one; only an empty slot is filled.
+        // A Logo the script names is set as given, like any other field it
+        // sends. Otherwise a logo the operator set by hand (or a previous import
+        // resolved) wins over the freshly looked-up one; only an empty slot is
+        // filled.
+        const char *entry_logo = entry_str(entry, "Logo", "logo");
+        if (entry_logo[0]) rs_json_obj_set_str(stream, "logo", entry_logo);
         const char *existing_logo = rs_json_obj_str(stream, "logo", "");
         if (!existing_logo[0] && logos) {
             const char *found = rs_json_obj_str(logos, name, "");
@@ -953,6 +987,12 @@ int rs_panel_import_script_entries(rs_state *st, const char *provider_id, const 
         rs_json_obj_set_bool(stream, "sessionManifest",
                              entry_bool(entry, "SessionManifest", "sessionManifest", false));
         rs_json_obj_set_str(stream, "scriptParams", entry_script_params(entry));
+        entry_apply_source(stream, entry);
+        // TvgId binds the stream to an XMLTV channel in the M3U export. Only a
+        // value the script sends replaces one the operator typed.
+        const char *tvg = entry_str(entry, "TvgId", "tvgId");
+        if (!tvg[0]) tvg = entry_str(entry, "TvgID", "tvg-id");
+        if (tvg[0]) rs_json_obj_set_str(stream, "tvgId", tvg);
         rs_json_obj_set_str(stream, "cdmType", entry_str(entry, "CdmType", "cdmType"));
         rs_json_obj_set_bool(stream, "useCdm", entry_bool(entry, "UseCdm", "useCdm", false));
         rs_json_obj_set_str(stream, "scriptVideoSelector", entry_str(entry, "Video", "video"));

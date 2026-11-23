@@ -1587,6 +1587,31 @@ static void test_panel(void) {
               rs_json_obj_str(rs_json_arr_at(streams, 1), "cdmType", ""), "");
     rs_json_free(again);
 
+    // A static ManifestUrl (and Cdn mirrors) in an entry becomes the stream's
+    // source; a later entry without one leaves that source in place.
+    rs_json *with_url = parse_json(
+        "{\"Channels\":[{\"Name\":\"Sport\",\"ManifestUrl\":\" https://cdn.example/sport/master.m3u8 \","
+        "\"Cdn\":[\"https://b1.example/sport/master.m3u8\",{\"ManifestUrl\":\"https://b2.example/x.m3u8\"},"
+        "\"ftp://nope\"],\"Logo\":\"https://img.example/sport.png\",\"TvgId\":\"sport.uk\"},"
+        "{\"Name\":\"News\",\"ScriptParams\":\"id=202\"}]}");
+    check("panel/import-url", rs_panel_import_script_entries(&st, pid, "channels", with_url,
+                                                             NULL, &imported, &err) == 0);
+    const rs_json *sport = rs_json_arr_at(streams, 2);
+    check_str("panel/import-url-set", rs_json_obj_str(sport, "url", ""),
+              "https://cdn.example/sport/master.m3u8");
+    check_str("panel/import-url-kind", rs_json_obj_str(sport, "kind", ""), "m3u8");
+    check("panel/import-url-cdn", rs_json_arr_len(rs_json_obj_get(sport, "cdnUrls")) == 2);
+    check_str("panel/import-logo", rs_json_obj_str(sport, "logo", ""), "https://img.example/sport.png");
+    check_str("panel/import-tvg-id", rs_json_obj_str(sport, "tvgId", ""), "sport.uk");
+    rs_json_free(with_url);
+    rs_json *no_url = parse_json("{\"Channels\":[{\"Name\":\"Sport\"},{\"Name\":\"News\",\"ScriptParams\":\"id=202\"}]}");
+    check("panel/import-no-url", rs_panel_import_script_entries(&st, pid, "channels", no_url,
+                                                                NULL, &imported, &err) == 0);
+    check_str("panel/import-url-kept", rs_json_obj_str(rs_json_arr_at(streams, 2), "url", ""),
+              "https://cdn.example/sport/master.m3u8");
+    check_str("panel/import-tvg-kept", rs_json_obj_str(rs_json_arr_at(streams, 2), "tvgId", ""), "sport.uk");
+    rs_json_free(no_url);
+
     // An events import is a separate namespace: the same name imported as an
     // event is its own stream, and carries the Start/End window.
     rs_json *evs = parse_json("{\"Events\":[{\"Name\":\"News\",\"Start\":1700000000,"

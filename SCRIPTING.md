@@ -183,7 +183,11 @@ print(json.dumps({
 stream and passed to stream actions such as `manifest` and `cdm`. A value that
 needs it is `b64:`-encoded on the way through, the same as any other argument.
 
-Re-running an import matches entries by name and updates them instead of creating duplicates. Imported entries normally need either a source URL entered later or `SessionManifest: true` with a working `manifest` action.
+Re-running an import matches entries by name and updates them instead of creating duplicates. An imported entry gets its source in one of three ways:
+
+- `ManifestUrl` (or `Url`) on the entry, for a provider whose manifests never change, with optional `Cdn` mirrors (URL strings or `{"ManifestUrl": ...}` objects). It is saved as the stream's source, and the stream plays with `SessionManifest: false`, with no script call on start. A later import that leaves the URL out keeps the saved one.
+- `SessionManifest: true` with a working `manifest` action, for URLs that are tokenized or expire.
+- A source URL entered in the panel later.
 
 Events use the same basic shape under `Events` and may include `Start`, `End`, and `RecordEvent`. Start/End are Unix epoch seconds. Matching uses name plus source type within the provider; event and channel entries of the same name remain distinct. These are imported metadata, not an automatic start/stop or recording schedule. See [EVENTS.md](EVENTS.md#scheduled-provider-events) for every field and an external scheduler workflow.
 
@@ -394,7 +398,7 @@ python3 provider.py action=channels sessiondir=$S
 
 This imports two streams, or updates them if they already exist. Each one keeps `channel=...` as its script params, and gets its URL from `manifest` at start. **Example Sport** also gets its keys from `cdm`.
 
-Channel and event entries accept these fields: `Name` (required), `Mode`, `ScriptParams`, `SessionManifest`, `UseCdm`, `CdmType`, `OnDemand`, `SpeedUp`, `Autostart` and `RecordEvent`. Events also accept `Start` and `End`. Lower-camel-case spellings such as `sessionManifest` are accepted too. An import never sets a source URL.
+Channel and event entries accept these fields: `Name` (required), `Mode`, `ScriptParams`, `SessionManifest`, `UseCdm`, `CdmType`, `OnDemand`, `SpeedUp`, `Autostart`, `RecordEvent`, `ManifestUrl`, `Cdn`, `Logo` and `TvgId`. `Logo` (an image URL) replaces the stream's logo. `TvgId` sets the XMLTV id exported as `tvg-id` in the M3U. Leaving either out keeps what the stream already has. Events also accept `Start` and `End`. Lower-camel-case spellings such as `sessionManifest` are accepted too. An import sets a source URL only when the entry carries `ManifestUrl`.
 
 ### `events`
 
