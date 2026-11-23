@@ -1,0 +1,105 @@
+name: Docker image
+
+# Publishes the repository's Dockerfile as a ready-to-pull image, so running
+# the panel in Docker no longer needs a local `docker build`.
+#
+# Always pushed to the GitHub Container Registry, which needs no setup beyond
+# the workflow's own token:   ghcr.io/testingbetaversion/restreamair
+# Also pushed to Docker Hub when the repository has the secrets
+# DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (an access token with Read & Write):
+#                             docker.io/<DOCKERHUB_USERNAME>/restreamair
+#
+# Runs on the same release tags as release.yml (and by hand), not on every
+# push, to keep Actions minutes down: the arm64 half builds under QEMU.
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to publish as, e.g. v1.6.0 (also moves latest)'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    env:
+      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and image names
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag }}"; [ -z "$TAG" ] && TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in v[0-9]*) ;; *) echo "::error::'$TAG' is not a vX.Y.Z tag"; exit 1 ;; esac
+          VER="${TAG#v}"                          # 1.6.0
+          MINOR="$(echo "$VER" | cut -d. -f1-2)"  # 1.6
+          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          IMAGES="ghcr.io/${OWNER}/restreamair"
+          if [ "$HAS_DOCKERHUB" = "true" ]; then
+            IMAGES="$IMAGES docker.io/${{ secrets.DOCKERHUB_USERNAME }}/restreamair"
+          fi
+          TAGS=""
+          for img in $IMAGES; do
+            TAGS="${TAGS}${img}:${VER},${img}:${MINOR},${img}:latest,"
+          done
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS%,}" >> "$GITHUB_OUTPUT"
+          echo "Publishing: ${TAGS%,}"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: env.HAS_DOCKERHUB == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # The Dockerfile's build stage runs restream_selftest, so each
+      # architecture's image is only pushed if its known-answer vectors pass.
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=ReStreamAir
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Pull back what was pushed and prove the panel answers, on the runner's
+      # own architecture.
+      - name: Smoke test the published image
+        run: |
+          IMG="$(echo '${{ steps.meta.outputs.tags }}' | cut -d, -f1)"
+          docker run -d --name ra -p 8787:8787 "$IMG"
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8787/ping && break
+            sleep 1
+          done
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/)" = "200"
+          docker rm -f ra

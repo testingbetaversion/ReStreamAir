@@ -315,6 +315,19 @@ check to run when changing those optional scripts; it is not part of core CI.
 
 ### Docker
 
+Prebuilt images for `linux/amd64` and `linux/arm64` are published on every
+release:
+
+```bash
+docker run -d --name restreamair \
+  -p 8787:8787 \
+  -v restreamair-data:/data \
+  ghcr.io/testingbetaversion/restreamair:latest
+```
+
+Tags are `latest`, the release (`1.6.0`) and its minor line (`1.6`). To build
+the image yourself instead:
+
 ```bash
 docker build -t restreamair .
 docker run -d --name restreamair \
